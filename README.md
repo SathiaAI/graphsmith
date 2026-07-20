@@ -180,8 +180,8 @@ A compliance register template (obligations, data classification, content rules,
 **In design — System Blueprint & Architecture Review Gate** ([#2](https://github.com/SathiaAI/graphsmith/issues/2))
 Information architecture for multi-piece systems: a system blueprint (piece inventory, single-owner data map, frozen contract cards, blast-radius statements), lightweight decision records, a blocking architecture review gate with a concrete rubric and mandatory triggers, and chaos testing extended to the seams between pieces — kill one piece mid-handoff, prove the others' state survives.
 
-**In review — everything above, plus the shipped skill itself**
-Both designs and the live v0.1.0 code are going through a three-pass cross-model adversarial review — external model families attacking the shipped scripts (by executing them, not just reading them) and both designs, with findings, dissents, and verdicts dispositioned publicly on the issues. Zero-finding reviews are treated as invalid. Same medicine the skill prescribes.
+**Reviewed — [findings published](docs/reviews/2026-07-20-council-review.md)**
+The shipped v0.1.0 and both designs went through a three-pass cross-model adversarial review: GPT-5.1, Gemini 2.5 Pro, and DeepSeek R1 attacking executed evidence from the live scripts. 23 findings, dissents preserved, every one dispositioned. Verdicts: v0.1.0 sound-but-needs-patch (v0.1.1 in progress — including a full linter redesign and an honest correction to the exactly-once claim), both designs proceed with council-hardened redesigns. The review caught our flagship claim overpromising — and we published that. Same medicine the skill prescribes.
 
 ## FAQ
 
