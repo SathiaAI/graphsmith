@@ -2,10 +2,32 @@
   "name": "graphsmith-skill",
   "version": "0.1.0",
   "description": "Build AI agent workflows that survive crashes, never duplicate work, and don't make things up. One skill for Claude Code, Codex, Gemini CLI, Cursor, Windsurf/Devin, Hermes, and Copilot.",
-  "bin": { "graphsmith-skill": "scripts/install.js" },
-  "files": ["SKILL.md", "README.md", "LICENSE", "scripts/", "references/"],
-  "engines": { "node": ">=18" },
-  "repository": { "type": "git", "url": "git+https://github.com/SathiaAI/graphsmith.git" },
-  "keywords": ["agent-skills", "ai-agents", "multi-agent", "graph-engineering", "orchestration", "claude", "codex", "gemini", "cursor", "knosky"],
+  "bin": {
+    "graphsmith-skill": "scripts/install.js"
+  },
+  "files": [
+    "SKILL.md",
+    "scripts/",
+    "references/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SathiaAI/graphsmith.git"
+  },
+  "keywords": [
+    "agent-skills",
+    "ai-agents",
+    "multi-agent",
+    "graph-engineering",
+    "orchestration",
+    "claude",
+    "codex",
+    "gemini",
+    "cursor",
+    "knosky"
+  ],
   "license": "MIT"
 }
