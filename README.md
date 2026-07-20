@@ -1,10 +1,31 @@
-# GraphSmith
+<div align="center">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io)
+# ⚒️ GraphSmith
 
 **Describe the job. Approve the plan. Get an AI workflow that's *proven* to survive failure — before you ever trust it.**
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases)
+
 Works identically in Claude Code, Codex CLI, Gemini CLI, Cursor, Windsurf / Devin Desktop, Hermes, and VS Code Copilot via the [Agent Skills open standard](https://agentskills.io). One install, every agent.
+
+[Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
+
+</div>
+
+<details>
+<summary><b>Table of contents</b></summary>
+
+- [The problem](#the-problem)
+- [The solution](#the-solution)
+- [The outcome](#the-outcome)
+- [60-second start](#60-second-start)
+- [What's in the box](#whats-in-the-box)
+- [Detailed guide](#detailed-guide)
+- [Warnings & disclaimers](#warnings-disclaimers)
+- [What this skill does NOT do](#what-this-skill-does-not-do)
+- [FAQ](#faq)
+
+</details>
 
 ---
 
@@ -12,13 +33,15 @@ Works identically in Claude Code, Codex CLI, Gemini CLI, Cursor, Windsurf / Devi
 
 AI makes it easy to build multi-step automations — and easy to build them wrong in the same three ways, every time:
 
-**1. Amnesia.** The workflow crashes at step 7 of 10 and restarts from step 1 — redoing paid API calls, re-scraping, re-generating. 73% of enterprise AI agent deployments hit reliability failures in their first year, and the math is unforgiving: a workflow that's 85% reliable per step fails 4 out of 5 times across 10 steps.
+**1. Amnesia.** The workflow crashes at step 7 of 10 and restarts from step 1 — redoing paid API calls, re-scraping, re-generating. [73% of enterprise AI agent deployments hit reliability failures in their first year](https://agentmarketcap.ai/blog/2026/04/10/durable-agent-execution-production-temporal-modal-event-sourced), and the math is unforgiving: a workflow that's 85% reliable per step fails 4 out of 5 times across 10 steps (0.85¹⁰ ≈ 20% survival).
 
-**2. Duplication.** A retry after a half-finished step sends the same email twice, charges the same card twice, posts the same message twice. Audits of AI-generated automation code find the same four omissions over and over: error handling, safe re-runs, retries, and logging.
+**2. Duplication.** A retry after a half-finished step sends the same email twice, charges the same card twice, posts the same message twice. Audits of AI-generated automation code find the same four omissions over and over: error handling, safe re-runs, retries, and logging ([Sonar, *State of Code* survey, Jan 2026](https://earezki.com/ai-news/2026-04-26-vibe-coding-just-failed-its-first-real-audit/)).
 
 **3. Hallucination.** Ask the AI about your own codebase and it confidently invents functions, files, and APIs that don't exist — then builds on top of them.
 
-None of these show up in the demo. All of them show up in week two. And the people hitting them are increasingly not engineers — founders, PMs, and operators building real automations with no way to know these failure modes exist until they're living them.
+None of these show up in the demo. All of them show up in week two — and the cost is measurable: [63% of developers have spent more time debugging AI-generated code than writing it themselves](https://www.hostinger.com/blog/vibe-coding-statistics/) (JetBrains, 2026), [43% of AI-generated changes needed post-deployment debugging](https://www.javacodegeeks.com/2026/06/vibe-coding-goes-wrong-what-ai-generated-code-actually-breaks-in-production.html), and the documented incident list already includes [an AI agent wiping a production database during an explicit code freeze](https://getautonoma.com/blog/vibe-coding-failures).
+
+And the people hitting these failures are increasingly not engineers — [4 out of 5 people building with AI tools have no technical background](https://subhrajyotimahato.com/blog/vibe-coding-statistics/) (Lovable, *Build Economy* report), while [37% of US developers are actively vibe coding](https://www.hostinger.com/blog/vibe-coding-statistics/) (Stack Overflow, 2025). Founders, PMs, and operators are building real automations with no way to know these failure modes exist until they're living them.
 
 ## The solution
 
