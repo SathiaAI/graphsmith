@@ -80,6 +80,12 @@ git clone https://github.com/SathiaAI/graphsmith
 node graphsmith/scripts/install.js
 ```
 
+Or via the [skills CLI](https://skills.sh) (installs into whichever agents it detects):
+
+```bash
+npx skills add SathiaAI/graphsmith
+```
+
 The installer detects every AI coding agent on your machine and installs into each. Then open your agent and say:
 
 > *"Build me an agent that researches new leads and drafts outreach emails."*
