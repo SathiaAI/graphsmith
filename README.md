@@ -177,6 +177,9 @@ Driven by real user questions — the best way to influence it is to [open an is
 **In design — v0.2.0: Regulated industries extension** ([#1](https://github.com/SathiaAI/graphsmith/issues/1))
 A compliance register template (obligations, data classification, content rules, jurisdictions) that lives in *your* repo while GraphSmith stays one public skill. When the skill detects `docs/compliance/register.yaml`, regulated mode activates: risk-tier gates key off your classifications, evidence packets cite your obligation IDs, and claims about your policies require citations. Includes hardening from adversarial review (default-deny classification, stale-register guards, log hygiene) and new compliance probes for the chaos harness. Design will pass cross-model adversarial review before it ships — the same rule the skill enforces on your workflows.
 
+**In design — System Blueprint & Architecture Review Gate** ([#2](https://github.com/SathiaAI/graphsmith/issues/2))
+Information architecture for multi-piece systems: a system blueprint (piece inventory, single-owner data map, frozen contract cards, blast-radius statements), lightweight decision records, a blocking architecture review gate with a concrete rubric and mandatory triggers, and chaos testing extended to the seams between pieces — kill one piece mid-handoff, prove the others' state survives.
+
 ## FAQ
 
 **Do I need to know how to code?**
