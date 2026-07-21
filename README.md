@@ -228,4 +228,10 @@ Open an issue with your agent name/version, OS, and the failing script's output.
 
 ---
 
+## Acknowledgments
+
+The two flagship roadmap designs — the [v0.2.0 Regulated Industries Extension](https://github.com/SathiaAI/graphsmith/issues/1) and the [System Blueprint & Architecture Review Gate](https://github.com/SathiaAI/graphsmith/issues/2) — originated from evaluation feedback by **[Jason Wishard](https://github.com/periodicdesign)**, an executive assessing GraphSmith for regulated-industry use. Feedback that sharp deserves its name on the record.
+
+---
+
 Born from building [Sathia](https://sathia.ai) - where "just say it" becomes action.
