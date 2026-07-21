@@ -6,7 +6,7 @@
 
 **Describe the job. Approve the plan. Get an AI workflow that's *proven* to survive failure — before you ever trust it.**
 
-[![Adversarially reviewed](https://img.shields.io/badge/adversarially%20reviewed-GPT--5.1%20%C2%B7%20Gemini%202.5%20Pro%20%C2%B7%20DeepSeek%20R1-E8850C?labelColor=0D1117)](docs/reviews/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases)
+[![Adversarially reviewed](https://img.shields.io/badge/adversarially%20reviewed-GPT--5.1%20%C2%B7%20Gemini%202.5%20Pro%20%C2%B7%20DeepSeek%20R1-E8850C?labelColor=0D1117)](docs/reviews/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases) [![CI](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml/badge.svg)](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml)
 
 <a href="docs/reviews/"><img src="assets/adversarial-review-badge.png" alt="Adversarially reviewed by GPT-5.1 · Gemini 2.5 Pro · DeepSeek R1 — reports in the repo" width="820"></a>
 
@@ -62,6 +62,21 @@ GraphSmith is a skill your AI agent follows — it injects the engineering disci
 Already have a broken automation? The linter diagnoses it — mapping "it keeps forgetting / duplicating / looping" to the specific violation, with file and line.
 
 ## The outcome
+
+<div align="center">
+  <a href="https://sathiaai.github.io/graphsmith/"><img src="assets/killtest.svg" alt="Real chaos.js kill test — crash mid-flight, resume without redoing finished work, all checks pass" width="760"></a>
+</div>
+
+**Reproduce it yourself** — ~30s, public repo, zero dependencies, no API keys:
+
+```bash
+git clone https://github.com/SathiaAI/graphsmith
+cd graphsmith
+node scripts/scaffold.js demo && node scripts/chaos.js demo
+```
+
+_A safety-halt on an uncertain send also counts as a pass — that is the guard doing its job._
+
 
 | Without this skill | With it |
 |---|---|
