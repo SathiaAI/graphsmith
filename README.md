@@ -8,6 +8,8 @@
 
 [![Adversarially reviewed](https://img.shields.io/badge/adversarially%20reviewed-GPT--5.1%20%C2%B7%20Gemini%202.5%20Pro%20%C2%B7%20DeepSeek%20R1-E8850C?labelColor=0D1117)](docs/reviews/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases)
 
+<a href="docs/reviews/"><img src="assets/adversarial-review-badge.png" alt="Adversarially reviewed by GPT-5.1 · Gemini 2.5 Pro · DeepSeek R1 — reports in the repo" width="820"></a>
+
 Works identically in Claude Code, Codex CLI, Gemini CLI, Cursor, Windsurf / Devin Desktop, Hermes, and VS Code Copilot via the [Agent Skills open standard](https://agentskills.io). One install, every agent.
 
 [Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
@@ -47,6 +49,8 @@ None of these show up in the demo. All of them show up in week two — and the c
 And the people hitting these failures are increasingly not engineers — [4 out of 5 people building with AI tools have no technical background](https://subhrajyotimahato.com/blog/vibe-coding-statistics/) (Lovable, *Build Economy* report), while [37% of US developers are actively vibe coding](https://www.hostinger.com/blog/vibe-coding-statistics/) (Stack Overflow, 2025). Founders, PMs, and operators are building real automations with no way to know these failure modes exist until they're living them.
 
 ## The solution
+
+<div align="center"><img src="assets/infographic.png" alt="How GraphSmith works — crash timeline, three failures and fixes, the 4-step flow, and the proof strip" width="900"></div>
 
 GraphSmith is a skill your AI agent follows — it injects the engineering discipline at the moment code is generated, so you don't have to know it:
 
