@@ -14,7 +14,7 @@ Works identically in Claude Code, Codex CLI, Gemini CLI, Cursor, Windsurf / Devi
 
 [Reproduce it](https://sathiaai.github.io/graphsmith/) · [Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
 
-<a href="https://sathiaai.github.io/graphsmith/"><img src="assets/graphsmith-demo.gif" alt="GraphSmith in motion — an agent workflow builds, is killed mid-run, and resumes from its last checkpoint instead of restarting from step one" width="760"></a>
+<a href="https://sathiaai.github.io/graphsmith/"><img src="assets/graphsmith-demo.gif" alt="GraphSmith in motion — an agent workflow builds, is killed mid-run, and resumes from its last checkpoint instead of restarting; then the three failure modes it fixes — amnesia, duplication, hallucination — and a live proof run" width="760"></a>
 
 </div>
 
