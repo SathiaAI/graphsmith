@@ -10,7 +10,12 @@ on:
   workflow_dispatch:
 
 jobs:
+  verify:
+    # Nothing publishes unless the full proof battery is green (PD-5):
+    # selftest, dogfood lint, scaffold, chaos — on Linux + Windows, Node 18 + 22.
+    uses: ./.github/workflows/ci.yml
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read

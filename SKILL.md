@@ -33,8 +33,8 @@ If genuinely ambiguous, ask one short question; otherwise infer and proceed.
 
 If the task involves an existing repo or docs folder:
 
-1. Run `node scripts/knosky-sync.js` — checks the latest KnoSky release and updates the local install (cross-platform, non-blocking: offline or registry failures never stop the task; it says what version it's using and moves on).
-2. From the project root run `knosky .` — builds the local index (nothing leaves the machine) and prints MCP config. Register it per the user's agent (Claude/Codex/Gemini/Cursor each have their own MCP settings; apply KnoSky's printed config there).
+1. Run `node scripts/knosky-sync.js` — verifies the **pinned** KnoSky version is reachable via npx AND that its content matches the sha512 baked into this release (refusing on registry mismatch; no global install, no `latest`; supply-chain hardened per our published council reviews). Non-blocking: offline or registry failures never stop the task. Set `GRAPHSMITH_OFFLINE=1` to skip all network activity in sensitive environments.
+2. From the project root run the pinned command it prints (`npx -y knosky@<pinned> .`) — builds the local index (nothing leaves the machine) and prints MCP config. Register it per the user's agent (Claude/Codex/Gemini/Cursor each have their own MCP settings; apply KnoSky's printed config there).
 3. **Cite or flag.** Every claim about existing code carries a KnoSky citation (real path). If you can't cite, say "inferring." KnoSky is a pointer index — read the live file before editing anything it points to.
 
 Skip Phase 0 only for fully greenfield work.
@@ -66,7 +66,7 @@ Default to the fewest workers that work. Add workers in response to observed fai
 node scripts/scaffold.js <project-name>
 ```
 
-It generates a runnable, zero-dependency Node project: `manager.js` (deterministic routing, per-step JSON checkpoints keyed by run ID, resume on restart, capped retries, structured logs), `workers/` (stub workers that run with no API keys so it works immediately), and a README. Then replace stub workers with the user's real logic — LLM calls live ONLY inside workers, wired to whatever model the user has. Do not restructure what the scaffold enforces; extend it.
+It generates a runnable, zero-dependency Node project: `manager.js` (deterministic routing, per-step JSON checkpoints keyed by run ID — fsync-durable, with corrupt checkpoints backed up and re-run instead of bricking the run — resume on restart, capped retries, collision-proof default run IDs, structured logs), `workers/` (stub workers with an **fsync'd** write-ahead intent guard — intent → effect → completion, durable across power loss, a LOUD HALT on intent-without-completion instead of a silent re-send, and a ready-made `idempotencyKey` (`runId:step`) to hand to external APIs; they run with no API keys so it works immediately), and a README. The manager validates step names at start and takes a per-run lock — the same claim-with-a-lease rule the coordination layer preaches, with a lease + heartbeat (not pid-liveness alone): a second manager on the same run refuses while the first is alive and its lease is fresh, and a lock whose holder has died or whose lease has expired (a heartbeat renews it, so a recycled pid can't fake liveness) is stolen automatically — so a crashed run self-recovers within ~30s with no manual file deletion. Then replace stub workers with the user's real logic — LLM calls live ONLY inside workers, wired to whatever model the user has. Do not restructure what the scaffold enforces; extend it.
 
 **Existing agent code (mostly engineer mode):** run the linter —
 
@@ -74,7 +74,7 @@ It generates a runnable, zero-dependency Node project: `manager.js` (determinist
 node scripts/graphlint.js <path>
 ```
 
-It scans JS/TS/Python for the discipline violations: unbounded LLM loops, missing persistence, clock/randomness near control flow, unkeyed external writes. Findings are heuristic — verify each against the live file (with KnoSky citations) before proposing the smallest fix. Fix violations in severity order; don't rebuild what passes.
+It builds a project model (import graph, cross-file LLM reachability) and scans JS/TS/Python for the discipline violations: unbounded LLM loops — including condition-variable loops and loops whose LLM lives in an imported worker — missing persistence, clock/randomness near control flow, and external writes without a KEYED guard. `node scripts/graphlint.js --selftest` runs its shipped regression corpus (every adversarial-review probe is a case). Findings are heuristic — verify each against the live file (with KnoSky citations) before proposing the smallest fix. Fix violations in severity order; don't rebuild what passes.
 
 **Scale honestly.** The scaffold's JSON-file checkpoints are correct for single-machine jobs up to roughly thousands of steps. Beyond that, consult `references/graduation.md` for the upgrade ladder (SQLite → framework checkpointer → durable execution engine) and the thresholds for each rung. Never ship the toy tier to a workload that outgrew it — and never ship Temporal to a 5-step script.
 
@@ -85,10 +85,13 @@ node scripts/chaos.js <project-dir>
 ```
 
 The harness (works on any project following the scaffold's checkpoint conventions):
-- **Kill test** — starts a run, kills the process mid-execution, restarts, asserts it resumed from the last save point.
-- **Double-run test** — asserts no step's side effects executed twice across the crash/resume cycle.
+- **Kill test** — starts a run, kills the process mid-execution (and asserts the kill landed mid-flight, never a hollow green), restarts, asserts it resumed from the last save point.
+- **Double-run test** — asserts no step's *recorded* side effects executed twice across the crash/resume cycle, and that intent→effect→completion ordering held. A safety-halt counts as a pass ONLY when the on-disk intent/effect state earns it — a halt string without the halt state, or after a duplicate, FAILS (the verdict comes from state, never from a string).
+- **Power-loss probe** — stages the on-disk state a lost flush leaves (intent recorded, completion gone) and proves the restart HALTS instead of re-sending. SIGKILL alone can never exercise this class; staged state can.
+- **Lock probes** (three) — a concurrent manager on the same run must refuse; a dead holder's stale lock must be stolen; and a live-but-recycled pid must be judged by its lease, not its pid alone (expired lease → stolen, fresh heartbeat → refused). Every green prints the fault model: process crash + staged power loss + same-run concurrency + pid-reuse/lease-expiry; NOT disk corruption beyond torn writes, and never your business logic.
+- **Halt path** — if the crash landed inside a side-effect window, the restart halting loudly with UNRESOLVED SIDE EFFECT is a PASS of the safety property (the workflow refused to guess about external state); resolve per the printed instructions and re-run.
 
-Both must pass before handover. If the project doesn't follow scaffold conventions (e.g., pre-existing code), state that the harness doesn't apply and verify the equivalent properties manually, showing your evidence.
+A full pass (or a safety-halt pass) is required before handover. Be precise in handover language: the harness proves crash recovery and exactly-once *recorded* effects; exactly-once delivery to an external system additionally requires an idempotency key that system honors (`runId + ":" + step` — see `references/graduation.md`, rungs 3–4). If the project doesn't follow scaffold conventions (e.g., pre-existing code), state that the harness doesn't apply and verify the equivalent properties manually, showing your evidence.
 
 Also confirm: blueprint was approved; stop rules fire; existing-code claims are cited; the manager reads top-to-bottom without you.
 

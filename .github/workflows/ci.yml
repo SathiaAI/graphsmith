@@ -1,0 +1,40 @@
+name: CI
+
+# The claims in the README are enforced here, not just locally:
+# linter self-test (line-pinned regression corpus), dogfood lint of the
+# skill's own scripts, and a full scaffold + chaos run (crash recovery,
+# exactly-once recorded effects, power-loss halt, run locking) on the
+# oldest supported Node and the current LTS, on Linux and Windows.
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [18, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check every script
+        run: node -e "require('fs').readdirSync('scripts').filter(f=>f.endsWith('.js')).forEach(f=>{require('child_process').execFileSync(process.execPath,['--check','scripts/'+f],{stdio:'inherit'})})"
+      - name: Linter self-test (line-pinned regression corpus)
+        run: node scripts/graphlint.js --selftest
+      - name: Dogfood — lint the skill's own scripts
+        run: node scripts/graphlint.js scripts/
+      - name: Scaffold a project
+        run: node scripts/scaffold.js ci-proj
+      - name: Run + resume the scaffolded project
+        run: |
+          cd ci-proj
+          node manager.js ci-run
+          node manager.js ci-run
+      - name: Chaos harness (kill, resume, exactly-once, power-loss, locks)
+        run: node scripts/chaos.js ci-proj

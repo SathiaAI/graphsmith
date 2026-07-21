@@ -138,7 +138,7 @@ Reference by ID everywhere. The traceability chain FR → TASK → TEST → PR �
 
 [knosky](https://github.com/SathiaAI/knosky) turns the repository into a queryable index: pointers plus light projections (title, headings, a short excerpt, tags) linking to live files. It is a map and a router, not a copy of the content — agents use it to find where something lives, then read the live file.
 
-- Generate or refresh the index from the repo root: `npx knosky .` (produces `city-data.json` and the `city.html` view).
+- Generate or refresh the index from the repo root: `npx knosky@0.6.3 .` — pinned; keep in step with the version in `scripts/knosky-sync.js`, which also verifies the tarball's content hash (produces `city-data.json` and the `city.html` view).
 - Exclusions follow `.gitignore` plus a `.kcignore` for anything extra; `.git`, `node_modules`, `secrets/`, `keys/` and `.env*` are skipped automatically. Use `--share-safe` (strips absolute paths, runs secret detection and fails closed) before an index leaves the machine; redaction flags mask project-specific terms.
 - Agents query through the knosky MCP server: `kc_search` (find by query), `kc_get_node` (file detail), `kc_list_categories` (browse structure), `kc_related` (connected files), `kc_get_provenance` (change history).
 - Refresh triggers: any merge to main re-indexes in CI; any document change re-indexes locally before the PR.

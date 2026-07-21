@@ -31,7 +31,7 @@ The core skill keeps ONE workflow reliable. This reference keeps MULTIPLE agents
 
 ## Discovery: how agents find truth from a cold start
 
-Keep one small manifest listing every planning document with ID, path, version, and status (draft / approved / superseded). Agents build only from approved documents, locate them by ID through the manifest — never by guessing paths — and register anything new they create in the same change. Pair the manifest with a KnoSky index over the repo (`npx knosky .`), and give every agent the same cold-start ritual: read the manifest, load the index, read the operating rules, then search for prior art before writing anything new. A document that contradicts the code is a defect — fix one or the other.
+Keep one small manifest listing every planning document with ID, path, version, and status (draft / approved / superseded). Agents build only from approved documents, locate them by ID through the manifest — never by guessing paths — and register anything new they create in the same change. Pair the manifest with a KnoSky index over the repo (`npx knosky@0.6.3 .` — pinned and integrity-checked via `scripts/knosky-sync.js`), and give every agent the same cold-start ritual: read the manifest, load the index, read the operating rules, then search for prior art before writing anything new. A document that contradicts the code is a defect — fix one or the other.
 
 ## Escalation triggers — the agent stops and asks a human
 

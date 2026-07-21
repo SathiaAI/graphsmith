@@ -1,6 +1,6 @@
 {
   "name": "graphsmith-skill",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Build AI agent workflows that survive crashes, never duplicate work, and don't make things up. One skill for Claude Code, Codex, Gemini CLI, Cursor, Windsurf/Devin, Hermes, and Copilot.",
   "bin": {
     "graphsmith-skill": "scripts/install.js"
@@ -8,7 +8,8 @@
   "files": [
     "SKILL.md",
     "scripts/",
-    "references/"
+    "references/",
+    "tests/"
   ],
   "engines": {
     "node": ">=18"

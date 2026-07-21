@@ -1,0 +1,65 @@
+{
+  "note": "Every adversarial-review probe (Pass A E5-E7 + Pass D PD-4/6/15, reviews of 2026-07-20) is a permanent regression case. mustFind asserts recall; atLine pins the finding to the real code line (a comment FP creates an extra match and fails maxCount); mustBeCleanAtOrAbove asserts precision; REVIEW = zero findings of any kind.",
+  "cases": [
+    {
+      "file": "e5-clock-routing.js",
+      "mustFind": "R4",
+      "atLine": 3,
+      "maxCount": 1
+    },
+    {
+      "file": "e6a-unbounded-condition.js",
+      "mustFind": "R1",
+      "atLine": 5,
+      "maxCount": 1
+    },
+    {
+      "file": "e6b-manager.js",
+      "mustFind": "R1",
+      "atLine": 5,
+      "maxCount": 1
+    },
+    {
+      "file": "e6c-suppressed-charge.js",
+      "mustFind": "R3",
+      "atLine": 5,
+      "maxCount": 1
+    },
+    {
+      "file": "e7-clean-express.js",
+      "mustBeCleanAtOrAbove": "MEDIUM"
+    },
+    {
+      "file": "clean-keyed-worker.js",
+      "mustBeCleanAtOrAbove": "MEDIUM"
+    },
+    {
+      "file": "clean-bounded.js",
+      "mustBeCleanAtOrAbove": "MEDIUM"
+    },
+    {
+      "file": "clean-manager.js",
+      "mustBeCleanAtOrAbove": "MEDIUM"
+    },
+    {
+      "file": "e8a-comment-string-immunity.js",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "e8b-timer-loop.js",
+      "mustFind": "R1",
+      "atLine": 5,
+      "maxCount": 1
+    },
+    {
+      "file": "e8c-hoisted-random.js",
+      "mustFind": "R4",
+      "atLine": 12,
+      "maxCount": 1
+    },
+    {
+      "file": "e8d-multiline-template.js",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    }
+  ]
+}
