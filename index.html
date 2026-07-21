@@ -267,7 +267,7 @@ a { color: inherit; text-decoration: none; }
         <p class="tagline">AI workflows that survive</p>
         <p class="hero-lead">Describe the job. Approve the plan. Get a workflow that&rsquo;s proven to survive failure &mdash; before you ever trust it.</p>
         <div class="hero-actions">
-          <a href="#proof" class="btn-primary">See the kill test</a>
+          <a href="#crash" class="btn-primary">See the kill test</a>
           <span class="hero-line">Runs in a minute. Zero dependencies. No API keys.</span>
         </div>
       </div>
@@ -277,7 +277,7 @@ a { color: inherit; text-decoration: none; }
     <!-- SHOW THE THING: the Crash Timeline. Row A crashes and restarts; Row B resumes and finishes. -->
     <section class="screen" id="crash" aria-label="Crash timeline">
       <div class="screen-bar">
-        <span class="screen-tag">CRASH TIMELINE · LIVE</span>
+        <span class="screen-tag">CRASH TIMELINE · REPLAY</span>
         <span class="screen-grid">STEP 7 OF 10 · POWER LOSS</span>
       </div>
 
@@ -323,10 +323,69 @@ a { color: inherit; text-decoration: none; }
 
       </div>
 
-      <div class="screen-feed" role="presentation">
-        <span class="feed-item">run 8f3a &nbsp; step 7 &nbsp; KILLED (chaos harness)</span>
-        <span class="feed-item">run 8f3a &nbsp; resume &nbsp; step 7 &rarr; 10 &nbsp; OK · no duplicate side effects</span>
-      </div>
+      <div class="gsk-term" id="killtest" aria-label="Recorded chaos.js run — real output">
+  <div class="gsk-tbar">
+    <span class="gsk-d"></span><span class="gsk-d"></span><span class="gsk-d"></span>
+    <span class="gsk-tt">real run · node scripts/chaos.js · kill-tested on Linux + Windows in CI</span>
+    <button class="gsk-replay" type="button" aria-label="Replay the run">&#8635; replay</button>
+  </div>
+  <pre class="gsk-tbody" aria-live="polite"></pre>
+</div>
+<style>
+.gsk-term{max-width:780px;margin:28px auto 0;background:#0a0e14;border:1px solid #22303f;border-radius:10px;overflow:hidden;font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;box-shadow:0 12px 44px rgba(0,0,0,.45)}
+.gsk-tbar{display:flex;align-items:center;gap:8px;padding:9px 13px;background:#0d1420;border-bottom:1px solid #1c2836}
+.gsk-d{width:10px;height:10px;border-radius:50%;background:#33404f;flex:0 0 auto}
+.gsk-d:nth-child(1){background:#e5342a66}.gsk-d:nth-child(2){background:#f5a62366}.gsk-d:nth-child(3){background:#2ea04366}
+.gsk-tt{color:#7d8ea0;font-size:11px;letter-spacing:.02em;margin-left:6px;flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gsk-replay{background:transparent;border:1px solid #2a3a4a;color:#c9a24b;font:inherit;font-size:11px;padding:3px 10px;border-radius:6px;cursor:pointer;flex:0 0 auto}
+.gsk-replay:hover{border-color:#f5a623;color:#f5a623}
+.gsk-tbody{margin:0;padding:16px 18px;min-height:340px;font-size:12.5px;line-height:1.7;color:#c6d0da;white-space:pre-wrap;word-break:break-word}
+.gsk-tbody .p{color:#5f7488}.gsk-tbody .j{color:#9fb0c0}.gsk-tbody .k{color:#ff6b5e;font-weight:700}.gsk-tbody .ok{color:#f5a623}.gsk-tbody .fin{color:#ffce6b;font-weight:700;letter-spacing:.03em}
+</style>
+<script>
+(function(){
+  var L=[
+    ["$ node manager.js kt","p",140],
+    ['{"runId":"kt","step":"01-gather","status":"ok","ms":310}',"j",360],
+    ["⚡  SIGKILL — crash mid-run (power loss)","k",560],
+    ["$ node manager.js kt          # same command → resumes","p",360],
+    ['{"step":"__lock__","status":"stale lock (pid 2679 not running) — stolen"}',"j",190],
+    ['{"step":"01-gather","status":"skipped (checkpoint exists)"}   ← not redone',"j",190],
+    ['{"step":"02-process","status":"ok","ms":304}',"j",130],
+    ['{"step":"03-deliver","status":"ok","ms":306}',"j",130],
+    ['{"step":"__done__","status":"complete"}',"j",440],
+    ["$ node scripts/chaos.js demo","p",360],
+    ["✅ Kill landed MID-FLIGHT after 1/3 checkpoint(s)","ok",160],
+    ["✅ restart resumed from save points — no finished work redone","ok",160],
+    ["✅ every recorded side effect ran exactly once","ok",160],
+    ["✅ power-loss state HALTED loudly instead of re-sending","ok",160],
+    ["✅ concurrent run refused · dead lock stolen · pid-reuse handled","ok",320],
+    ["🏁 ALL CHECKS PASSED","fin",0]
+  ];
+  var term=document.getElementById('killtest'); if(!term) return;
+  var body=term.querySelector('.gsk-tbody'), btn=term.querySelector('.gsk-replay'), timers=[], playing=false;
+  function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function clearAll(){timers.forEach(clearTimeout);timers=[];}
+  function play(){
+    if(playing) return; playing=true; clearAll(); body.innerHTML='';
+    var d=0;
+    L.forEach(function(ln,i){
+      timers.push(setTimeout(function(){
+        var row=document.createElement('div');
+        row.className=ln[1]; row.innerHTML=esc(ln[0]);
+        body.appendChild(row); body.scrollTop=body.scrollHeight;
+        if(i===L.length-1) playing=false;
+      },d));
+      d+=ln[2];
+    });
+  }
+  btn.addEventListener('click',play);
+  if('IntersectionObserver' in window){
+    var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){play();io.disconnect();}});},{threshold:.3});
+    io.observe(term);
+  } else { play(); }
+})();
+</script>
     </section>
 
   </main>
