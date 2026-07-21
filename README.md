@@ -243,6 +243,22 @@ Open an issue with your agent name/version, OS, and the failing script's output.
 
 ---
 
+## Contributors
+
+People who shaped GraphSmith beyond the code:
+
+<table>
+  <tr>
+    <td align="center" width="160">
+      <a href="https://github.com/periodicdesign">
+        <img src="https://github.com/periodicdesign.png" width="72" height="72" alt="Jason Wishard"><br>
+        <sub><b>Jason Wishard</b></sub>
+      </a><br>
+      <sub>&#128161; ideas &amp; roadmap &middot; &#128269; evaluation feedback</sub>
+    </td>
+  </tr>
+</table>
+
 ## Acknowledgments
 
 The two flagship roadmap designs — the [v0.2.0 Regulated Industries Extension](https://github.com/SathiaAI/graphsmith/issues/1) and the [System Blueprint & Architecture Review Gate](https://github.com/SathiaAI/graphsmith/issues/2) — originated from evaluation feedback by **[Jason Wishard](https://github.com/periodicdesign)**, an executive assessing GraphSmith for regulated-industry use. Feedback that sharp deserves its name on the record.
