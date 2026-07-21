@@ -12,7 +12,7 @@
 
 Works identically in Claude Code, Codex CLI, Gemini CLI, Cursor, Windsurf / Devin Desktop, Hermes, and VS Code Copilot via the [Agent Skills open standard](https://agentskills.io). One install, every agent.
 
-[🌐 See it live](https://sathiaai.github.io/graphsmith/) · [Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
+[Reproduce it](https://sathiaai.github.io/graphsmith/) · [Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
 
 <a href="https://sathiaai.github.io/graphsmith/"><img src="assets/graphsmith-demo.gif" alt="GraphSmith in motion — an agent workflow builds, is killed mid-run, and resumes from its last checkpoint instead of restarting from step one" width="760"></a>
 
