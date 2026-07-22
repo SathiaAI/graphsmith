@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const STATE_SCHEMA = require("../schemas/state-store.schema.json");
 
 const SCHEMA_VERSION = "1.0";
 const DEFAULT_LEASE_MS = 30000;
@@ -49,25 +50,92 @@ function stableId(parts) {
   return sha256(parts.map((part) => String(part)).join("\0")).slice(0, 24);
 }
 
+function schemaErrors(value, schema, location = "$", root = STATE_SCHEMA) {
+  if (schema.$ref) {
+    const target = schema.$ref.split("/").slice(1).reduce((current, part) => current[part.replace(/~1/g, "/").replace(/~0/g, "~")], root);
+    return schemaErrors(value, target, location, root);
+  }
+  if (schema.oneOf) {
+    const matches = schema.oneOf.filter((candidate) => schemaErrors(value, candidate, location, root).length === 0).length;
+    return matches === 1 ? [] : [`${location} must match exactly one record schema (matched ${matches})`];
+  }
+  if (Object.prototype.hasOwnProperty.call(schema, "const") && value !== schema.const) return [`${location} must equal ${JSON.stringify(schema.const)}`];
+  if (schema.enum && !schema.enum.some((candidate) => candidate === value)) return [`${location} has an unsupported value`];
+
+  if (schema.type) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const matchesType = types.some((type) => {
+      if (type === "null") return value === null;
+      if (type === "object") return value !== null && typeof value === "object" && !Array.isArray(value);
+      if (type === "array") return Array.isArray(value);
+      if (type === "integer") return Number.isSafeInteger(value);
+      if (type === "number") return typeof value === "number" && Number.isFinite(value);
+      return typeof value === type;
+    });
+    if (!matchesType) return [`${location} must be ${types.join(" or ")}`];
+  }
+
+  const errors = [];
+  if (typeof value === "string") {
+    if (schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${location} is too short`);
+    if (schema.pattern && !new RegExp(schema.pattern).test(value)) errors.push(`${location} has an invalid format`);
+  }
+  if (typeof value === "number") {
+    if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${location} is below its minimum`);
+    if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) errors.push(`${location} is below its exclusive minimum`);
+    if (schema.maximum !== undefined && value > schema.maximum) errors.push(`${location} is above its maximum`);
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) errors.push(`${location} has too few items`);
+    if (schema.items) value.forEach((item, index) => errors.push(...schemaErrors(item, schema.items, `${location}[${index}]`, root)));
+  }
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of schema.required || []) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) errors.push(`${location}.${key} is required`);
+    }
+    const properties = schema.properties || {};
+    for (const [key, child] of Object.entries(value)) {
+      if (Object.prototype.hasOwnProperty.call(properties, key)) errors.push(...schemaErrors(child, properties[key], `${location}.${key}`, root));
+      else if (schema.additionalProperties === false) errors.push(`${location}.${key} is not allowed`);
+    }
+  }
+  return errors;
+}
+
+function validateStateRecord(record, context) {
+  const errors = schemaErrors(record, STATE_SCHEMA);
+  if (errors.length) throw fail(`Invalid state record in ${context}: ${errors[0]}`, "CORRUPT_STATE");
+  return record;
+}
+
+function parseStateJson(raw, context) {
+  let record;
+  try { record = JSON.parse(raw); }
+  catch (error) { throw fail(`Invalid JSON in ${context}: ${error.message}`, "CORRUPT_STATE"); }
+  return validateStateRecord(record, context);
+}
+
 function parseJsonLines(raw, file) {
   if (!raw) return [];
   const lines = raw.split("\n");
   const records = [];
   for (let index = 0; index < lines.length; index++) {
     if (!lines[index]) continue;
+    let record;
     try {
-      records.push(JSON.parse(lines[index]));
+      record = JSON.parse(lines[index]);
     } catch (error) {
       const isTornTail = index === lines.length - 1 && !raw.endsWith("\n");
       if (isTornTail) break;
       throw fail(`Corrupt JSONL record in ${file} at line ${index + 1}: ${error.message}`, "CORRUPT_STATE");
     }
+    records.push(validateStateRecord(record, `${file} at line ${index + 1}`));
   }
   return records;
 }
 
 function jsonLines(records) {
-  return records.length === 0 ? "" : `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+  return records.length === 0 ? "" : `${records.map((record) => JSON.stringify(validateStateRecord(record, "JSONL write"))).join("\n")}\n`;
 }
 
 function defaultWindow() {
@@ -77,12 +145,16 @@ function defaultWindow() {
 function parseWindow(raw) {
   if (!raw) return defaultWindow();
   try {
-    const value = JSON.parse(raw);
-    if (value.schema_version !== SCHEMA_VERSION || !Number.isSafeInteger(value.state_rev)) throw new Error("invalid version or revision");
-    return value;
+    return parseStateJson(raw, FILES.window);
   } catch (error) {
     throw fail(`Corrupt ${FILES.window}: ${error.message}`, "CORRUPT_STATE");
   }
+}
+
+function validateStateContent(file, content) {
+  if (file === FILES.window) parseWindow(content);
+  else parseJsonLines(content, file);
+  return content;
 }
 
 function clone(value) {
@@ -161,6 +233,7 @@ class StateStore {
   }
 
   _appendDurable(filePath, record) {
+    validateStateRecord(record, path.basename(filePath));
     const fd = fs.openSync(filePath, "a");
     try {
       fs.writeSync(fd, `${JSON.stringify(record)}\n`);
@@ -169,6 +242,7 @@ class StateStore {
   }
 
   _atomicReplace(file, content) {
+    validateStateContent(file, content);
     const target = this._path(file);
     const temporary = `${target}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
     const fd = fs.openSync(temporary, "wx");
@@ -192,11 +266,12 @@ class StateStore {
 
   _readLock() {
     try {
-      const record = JSON.parse(fs.readFileSync(this.lockPath, "utf8"));
+      const record = parseStateJson(fs.readFileSync(this.lockPath, "utf8"), path.basename(this.lockPath));
       return { record, stat: fs.statSync(this.lockPath) };
     } catch (error) {
       if (error.code === "ENOENT") return null;
-      throw fail(`Unreadable state lock: ${error.message}`, "CORRUPT_LOCK");
+      if (error.code === "CORRUPT_STATE") throw error;
+      throw fail(`Unreadable state lock: ${error.message}`, "CORRUPT_STATE");
     }
   }
 
@@ -209,7 +284,7 @@ class StateStore {
     const fd = fs.openSync(this.lockPath, "r");
     try {
       const raw = fs.readFileSync(fd, "utf8");
-      const current = JSON.parse(raw);
+      const current = parseStateJson(raw, path.basename(this.lockPath));
       if (current.owner_token !== ownerToken) return false;
       fs.unlinkSync(this.lockPath);
       return true;
@@ -226,6 +301,7 @@ class StateStore {
         proc_start_hint: `${process.pid}:${Math.floor(Date.now() - process.uptime() * 1000)}`,
         owner_token: ownerToken,
       };
+      validateStateRecord(record, path.basename(this.lockPath));
       try {
         const fd = fs.openSync(this.lockPath, "wx");
         try { fs.writeSync(fd, JSON.stringify(record)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
@@ -256,7 +332,7 @@ class StateStore {
   _renewLock(ownerToken) {
     const fd = fs.openSync(this.lockPath, "r+");
     try {
-      const current = JSON.parse(fs.readFileSync(fd, "utf8"));
+      const current = parseStateJson(fs.readFileSync(fd, "utf8"), path.basename(this.lockPath));
       if (current.owner_token !== ownerToken) throw fail("Refusing to renew a lock owned by another token", "LOCK_OWNER_MISMATCH");
       const now = new Date();
       fs.futimesSync(fd, now, now);
@@ -315,6 +391,7 @@ class StateStore {
       const before = this._read(file);
       const after = make(before, stateRev);
       if (typeof after !== "string") throw fail(`Mutation builder for ${file} did not return serialized content`, "INVALID_MUTATION");
+      validateStateContent(file, after);
       return {
         file,
         before_sha256: sha256(before),
@@ -990,6 +1067,30 @@ function selftest() {
     const swept = restarted.runRegistry.sweepExpired();
     if (!swept.includes("run-expire") || restarted.runRegistry.list().some((run) => run.run_id === "run-expire")) throw new Error("expired registry lease was not swept");
     tests.push({ name: "registry-lease-sweep", status: "pass" });
+
+    const windowPath = restarted._path(FILES.window);
+    const validWindowRaw = fs.readFileSync(windowPath, "utf8");
+    const hostileWindow = JSON.parse(validWindowRaw);
+    hostileWindow.unexpected_hostile_key = true;
+    fs.writeFileSync(windowPath, JSON.stringify(hostileWindow));
+    let windowRejected = false;
+    try { restarted.window.get(); }
+    catch (error) { windowRejected = error.code === "CORRUPT_STATE"; }
+    fs.writeFileSync(windowPath, validWindowRaw);
+
+    const registryPath = restarted._path(FILES.registry);
+    const validRegistryRaw = fs.readFileSync(registryPath, "utf8");
+    const registryLines = validRegistryRaw.trimEnd().split("\n");
+    const hostileRegistry = JSON.parse(registryLines[0]);
+    hostileRegistry.unexpected_hostile_key = true;
+    registryLines[0] = JSON.stringify(hostileRegistry);
+    fs.writeFileSync(registryPath, `${registryLines.join("\n")}\n`);
+    let jsonlRejected = false;
+    try { restarted.runRegistry.list(); }
+    catch (error) { jsonlRejected = error.code === "CORRUPT_STATE"; }
+    fs.writeFileSync(registryPath, validRegistryRaw);
+    if (!windowRejected || !jsonlRejected) throw new Error("unknown state-record keys were not rejected on read");
+    tests.push({ name: "schema-rejects-hostile-keys-on-read", status: "pass" });
 
     return { schema_version: SCHEMA_VERSION, status: "pass", tests };
   } finally {
