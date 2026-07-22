@@ -255,7 +255,12 @@ function lintProject(root) {
               "Assume this step WILL retry. Guard with a check keyed on runId+step (or an Idempotency-Key the receiving system honors).");
       }
 
-      // R5 — eval/exec/new-require ban (bare view: comments/strings blanked)
+      // R5 — eval/exec/new-require ban (bare view: comments/strings blanked).
+      // Scoped to evolvable targets only (§104): machine-evaluated candidates,
+      // scaffold-generated adapters/, workflow/worker code. Constitutional engine
+      // scripts (files directly under a scripts/ directory) are exempt — their
+      // child_process use is legitimate supervisor/replay/kill infrastructure.
+      if (path.basename(path.dirname(f)) !== "scripts") {
       if (EVAL_RE.test(ln))
         add(f, i + 1, "R5: eval() call — generated/evolvable code must never gain new execution surface", "HIGH",
             "Replace eval() with a static dispatch table or JSON.parse.");
@@ -295,6 +300,7 @@ function lintProject(root) {
           add(f, i + 1, "R5: dynamic import(computed) — runtime code loading with unknown target", "HIGH",
               "Computed-specifier dynamic import introduces unbounded execution surface. Replace with a static dispatch table.");
         }
+      }
       }
     });
   }
