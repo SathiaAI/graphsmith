@@ -27,4 +27,5 @@ Once frozen, these contracts are the ONLY sync points between build workers (coo
 The authoritative registry is contract 11 §Constitutional set (superset per panel pass 1, mechanically re-derived in Phase A from the enforcement dependency graph, then frozen in the release manifest).
 
 ## Panel history
-Pass 1 (2026-07-21): gpt-5.6-sol-pro (redesign-required, 28) · gemini-3.1-pro-preview (fix-then-freeze, 7) · deepseek-v4-pro (fix-then-freeze, 6). All BLOCKING/MAJOR findings adopted or narrowed in v2; disposition in `.plans/reviews/stage0/DISPOSITION.md` (internal).
+Pass 1 (2026-07-21): gpt-5.6-sol-pro (redesign-required, 28) · gemini-3.1-pro-preview (fix-then-freeze, 7) · deepseek-v4-pro (fix-then-freeze, 6) → all adopted/narrowed in v2 (contract 01 redesigned).
+Pass 2 (2026-07-21, on v2 + disposition): gemini (fix-then-freeze, 4) · deepseek (fix-then-freeze, 2) · gpt-5.6-sol-pro (redesign-required, 15). All three resolution-checks confirm pass-1 blockers resolved; all 21 pass-2 findings adopted/narrowed in v3 (one recorded divergence: abandonment → FLAGGED-human, not auto-rollback). Dispositions in `.plans/reviews/stage0/DISPOSITION.md` (internal).

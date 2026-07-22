@@ -17,17 +17,17 @@ Unit = scenario; paired: candidate and baseline on identical (scenario, seed, ev
 
 ## Multiplicity / alpha ledger (GPT-10)
 - Candidates batch-generated (≤3/cycle) before any scoring. Selection on the selection split only; **selection rule (DeepSeek-4): the candidate with the largest discordant-win advantage on the selection split; tie → lexicographically smallest candidate-semantic fingerprint** (contract 02 definition). Exactly one candidate reaches confirmation; α spent once there.
-- **Durable alpha ledger** (`.graphsmith/state/alpha-ledger.jsonl`): every confirmation attempt records (corpus-state hash, confirmation-split membership hash, candidate fingerprint + FAMILY). Per corpus-state: max **3** confirmations EVER; further cycles require corpus growth (new scenarios re-seed the splits). A failed candidate's **family** (same edit-target set per the contract 02 fingerprint's target component) cannot re-enter confirmation against the same corpus state — near-duplicate retry is refused, not just exact-duplicate (GPT-10).
+- **Durable alpha ledger with REAL alpha spending (P2-GPT-6):** per corpus-state, three confirmation slots are preallocated at **α = 0.05/3 ≈ 0.0167 each (Bonferroni)** — family-wise error ≤ 0.05 across everything ever confirmed against one corpus state. Before ANY confirmation data is accessed, a `RESERVED{corpus_state, split_hash, fingerprint, family, alpha_slot}` record is fsync'd to `.graphsmith/state/alpha-ledger.jsonl` (via state-store); **a reservation consumes its slot even if the process crashes** — completion records close it, lease-controlled recovery classifies orphans, and no result is ever read without a prior reservation. Further cycles require corpus growth (new scenarios re-seed the splits). A failed candidate's **family** (same edit-target set per the contract 02 fingerprint's target component) cannot re-enter confirmation against the same corpus state — near-duplicate retry is refused, not just exact-duplicate (GPT-10). The Tier-3 decision rule reads: promote only if exact-test p ≤ the slot's allocated α.
 - Split: deterministic seeded partition, 60% selection / 40% confirmation; rotation by cycle counter; the confirmation membership used in a recorded attempt is sealed in the ledger. Proposer never sees per-scenario results or split membership (access audit, boundary B6/B14).
 
-## Missing / crashed runs (Gemini-6, GPT-11)
-| Case | Rule |
-|---|---|
-| Candidate-side failure attributable to the candidate (its run crashes/HALTs/breaches budget) | counts as candidate LOSS on that pair |
-| Baseline-side or infrastructure failure (baseline crash, evaluator error, host failure) | pair INVALID → one bounded retry of the pair; still failing → pair EXCLUDED and counted |
-| Both sides fail | pair EXCLUDED and counted |
-| Excluded pairs > 20% of the corpus | cycle INCONCLUSIVE (not a rejection; not buffered) |
-Attribution rule is frozen: failure inside the candidate's evaluation copy = candidate-attributable; anything else = infrastructure.
+## Missing / crashed runs (v3 — closed attribution taxonomy: P2-GPT-7)
+Each side is classified INDEPENDENTLY first, by **recorded cause code** (closed enum, recorded by the evaluation harness): `cand_fault` (candidate's workflow crashed/HALTed/breached its declared budget — cause codes from contract 07's budget/halt/tripwire families) · `infra_fault` (evaluator error, host failure, evaluation-copy setup failure, provider outage) · `ok`. Process location alone never decides — an infra cause code inside the candidate copy is still `infra_fault`.
+| candidate \ baseline | ok | infra_fault | cand-run cand_fault |
+|---|---|---|---|
+| **ok** | scored pair | retry baseline once → else EXCLUDED | (n/a) |
+| **infra_fault** | retry candidate once → else EXCLUDED | retry both once → else EXCLUDED | (n/a) |
+| **cand_fault** | candidate LOSS | **candidate LOSS** (precedence: a candidate-attributable failure is a loss regardless of the baseline's state) | — |
+Excluded pairs > 20% of the corpus → cycle INCONCLUSIVE (not a rejection; not buffered).
 
 ## Determinism & pinning
 Per-scenario pinned seeds in the corpus file; evaluator (scenario.js + corpus) hash-pinned at cycle start, changes ship in separate PRs and re-baseline; model provider+ID+version recorded per run — mid-cycle model change invalidates the cycle. **Replay is honestly stochastic where providers are** (GPT-25): what is deterministic is the decision function over the recorded evidence bundle (contract 08). Noise floor: same-vs-same discordance published per release; deltas inside it are reported "flat."

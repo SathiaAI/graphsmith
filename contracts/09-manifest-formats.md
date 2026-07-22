@@ -16,7 +16,7 @@ Status: DRAFT. Two manifests, two claims (plan §2-I1): release manifest proves 
 ```
 Trust root: the package integrity chain that delivered the artifact (contract 05, assumption 1). Hashing rules (v2 — GPT-26): **raw-byte SHA-256, always** — no content normalization at hash time (normalized-before-hash would let byte changes evade integrity and conflicts with byte-exact rollback). The CRLF problem is solved at the BYTES, not the hash: release build + install materialization write canonical LF bytes for text files (enforced `.gitattributes eol=lf` on the constitutional/evolvable set; binaries untouched); the sentinel verifies the bytes on disk as they are. Path canonicalization (repo-relative, forward slashes, NFC, case-fold **collision refusal** — collisions rejected, not folded together) applies to PATHS only.
 
-## Project manifest (`.graphsmith/project.manifest.json`, generated at install/scaffold)
+## Project manifest (`.graphsmith/state/project.manifest.json` — canonical path, P2-GPT-5; generated at install/scaffold)
 Same shape plus:
 ```json
 { "kind": "project", "generated_at": "…", "parent_release_sha256": "hash of release.manifest.json",
@@ -28,8 +28,8 @@ Updated ONLY by the promotion transaction (contract 01, VERIFIED→DONE) — the
 ## Workflow manifest (`workflow.manifest.json`, per scaffolded project — plan §3.6)
 Frozen-file hashes (manager, routing, stop rules, intent guards, **tunables bounds**), loader policy, budget declarations (§7 set), adapter capability files (contract 06). Language: "separated for review and future tuning" — never "evolution-ready."
 
-## Adoption log (`.graphsmith/adoption-log.jsonl`)
-Hash-chained JSONL: each entry `{ schema_version, seq, txid, fingerprint, kind, evidence_ref, human: {name, decision, ts}, prev_sha256, entry_sha256 }`.
+## Adoption log (`.graphsmith/state/adoption-log.jsonl` — canonical path per contract 01 §Topology, P2-GPT-5)
+Hash-chained JSONL: each entry `{ schema_version, seq, txid, **status: "committing" | "effective" | "aborted"**, fingerprint, kind, evidence_ref, human: {name, decision, ts}, prev_sha256, entry_sha256 }` (closed schema ships as `schemas/adoption-entry.schema.json` — P2-GPT-4). **Anchoring rule:** the project manifest's `adoption_log_head` anchors the LAST entry in the chain regardless of status — compensating `aborted` entries advance the head like any other entry, so `expected_log_head` is never ambiguous.
 - Claim discipline: **rewrite-detecting relative to the anchored head** (head lives in the protected project manifest) — NEVER described as "immutable" (F15).
 - Optional `graphsmith anchor export` emits the head for external anchoring (stronger claims are the USER'S to make).
 - Verification: sentinel walks the chain from the anchored head; any break → evolvable-surface freeze domain (plan §5).

@@ -9,7 +9,7 @@ Conventions: Node ≥ 18, CommonJS, zero runtime deps [KnoSky: scripts/scaffold.
 | File(s) | Sole owner (family) | Testers (never authors of the file) | Tier |
 |---|---|---|---|
 | `scripts/gate.js` (Gates 1–4 decision engine, all phases) | DeepSeek | GPT-sol-pro + Grok | SECURITY |
-| `scripts/window-store.js` (Gate-4 durable store, contract 02) | GPT-sol (codex) | DeepSeek + Gemini | SECURITY |
+| `scripts/state-store.js` (single writer for ALL `.graphsmith/state/`: window store, universal run registry, run anchors, alpha ledger, rejected buffer, rollback families — P2-GPT-2/14) | GPT-sol (codex) | DeepSeek + Gemini | SECURITY |
 | `scripts/promote.js` (contract 01) | GPT-sol (codex) | Grok + DeepSeek | SECURITY |
 | `scripts/verify.js` (sentinel, Phase A core + Phase E `--profiles`) | Claude Sonnet | Gemini + DeepSeek (A), Gemini + Grok (E) | SECURITY |
 | `scripts/manifest.js` | Qwen | GPT-sol-pro + Gemini | SECURITY |
@@ -34,7 +34,11 @@ Conventions: Node ≥ 18, CommonJS, zero runtime deps [KnoSky: scripts/scaffold.
 | `lab/` (contract 12: fixtures, tasks, agents, score.js, ledgers) | Claude Haiku | Qwen + DeepSeek (scorer integrity) | SECURITY (scorer) |
 | `tests/attacks/{constitutional,toctou,module-escape}/` | Grok | Gemini + DeepSeek | SECURITY |
 
-Phase mapping unchanged (plan §11): A = gate/verify/manifest/promote/window-store/loaders/scenario/CI/attacks/lab-skeleton · B = scaffold+watchdog+capabilities+heal+graphlint · C = evalenv+event-compiler+evolve+gate3/4 wiring+test/redteam · D = watch/diagnostics/watcher · E = profiles/action/protocol/badge/matrix/shadow/assure-minimal · F = docs/demos.
+Phase mapping unchanged (plan §11): A = gate/verify/manifest/promote/state-store/loaders/scenario/CI/attacks/lab-skeleton · B = scaffold+watchdog+capabilities+heal+graphlint · C = evalenv+event-compiler+evolve+gate3/4 wiring+test/redteam · D = watch/diagnostics/watcher · E = profiles/action/protocol/badge/matrix/shadow/assure-minimal · F = docs/demos.
+
+## Ownership completeness (P2-GPT-14)
+- **Test trees:** `tests/<component>/` is OWNED BY THE TESTER family of that component (authors barred from writing their component's tests — that IS the rotation); with two tester families, each owns a named subdirectory. `schemas/*.schema.json` belongs to the lane that owns the emitting script. Generated artifacts (manifests, matrices) are owned by their generator's lane; fixtures under `lab/` by the lab lane.
+- **Mechanical check:** before Phase A dispatch, the orchestrator generates `.plans/ownership-map.json` enumerating every planned path → exactly one owner; zero or multiple owners fails Stage 0 mechanically. The map is regenerated and re-checked at every phase boundary.
 
 ## Constitutional set (superset — GPT-24; mechanically re-derived in Phase A from the enforcement dependency graph, then frozen in the release manifest)
 gate.js · verify.js · promote.js · window-store.js · manifest.js · loaders.js · event-compiler.js · scenario.js · evalenv.js · watchdog.js · graphlint.js · docs-lint.js · risk-policy.json · scaffolded manager/supervisor/intent-guard templates · CI workflow entries · schemas/ · tunables BOUNDS · this contracts/ directory.

@@ -21,6 +21,7 @@ gate3Prepare(candidateId) -> { diff, plainEnglish, evidence, inverse: TypedEdit[
 gate4Admit(txid, opts) / gate4Observe(runResult) / gate4Close() -> WindowState
 ```
 `TypedEdit`: `{ file, anchor, op: "replace|insert|delete|set-knob", payload, schema_ref }` — bounded edits, never rewrites (plan §1 design law). All types carry `schema_version`.
+**Alias translation (P2-Gemini-3):** the proposer emits TypedEdits addressed by ALIAS (`file: "p02"`, per contract 07's opaque view). A trusted pre-gate translation layer in evolve.js maps aliases → canonical paths via the cycle's evidence map BEFORE gate1Static validates; a proposer-emitted literal path (anything not matching the alias grammar) is an AUTOMATIC Gate-1 reject — a real path in proposer output is by construction hallucinated or leaked.
 
 ## CLI
 ```

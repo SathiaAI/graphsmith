@@ -1,12 +1,15 @@
 # Contract 02 — Gate-4 Observation Window (v2 — durable store + CAS)
 Status: DRAFT v2 (post-panel-pass-1: GPT-6/7/8, DeepSeek-2/6). Operational canary, NOT a statistical gate (F9).
 
-## Durable store (owned by `scripts/window-store.js` — its own lane, contract 11)
-`.graphsmith/state/window.json` + `window-journal.jsonl` (fsync'd). Every mutation is CAS on a monotonic `state_rev`: read rev → journal intent{rev, op} → atomic file replace {rev+1} → journal done. A lost CAS retries on the fresh state; a crashed mutation recovers by inspect-and-roll-forward (same discipline as contract 01).
+## Durable store (owned by `scripts/state-store.js` — the single writer for ALL `.graphsmith/state/`, contract 11; P2-GPT-2)
+`.graphsmith/state/window.json` + `window-journal.jsonl` (fsync'd). **All window mutations are serialized under the state-store owner-token lock (single writer)** — "CAS" here means the cooperative expected-`state_rev` verification that single writer performs before each journaled mutation, never a lock-free conditional rename (P2-GPT-2 wording fix; contract 01 §Concurrency claims applies verbatim). Crashed mutations recover by inspect-and-roll-forward.
 
-## Run registration (closes the observation races — GPT-6, DeepSeek-2)
-- Every managed run start REGISTERS: CAS-append `{run_id, tree_id (its pinned snapshot), started}` to the window store when a window is OBSERVING. Registration decides eligibility once, atomically: a run is an OBSERVED run iff it registered while `observed_count < N` and its `tree_id` == the window's adopted tree; the same CAS increments `observed_count`. No double-counting, no ambiguous Nth run.
-- During ROLLING_BACK: **new run starts are refused** ("rollback in progress — retry shortly"); in-flight registered runs complete on their pinned trees and are marked `superseded` at rollback commit.
+## Run registration (v3 — universal registry, slot accounting: P2-GPT-13, Gemini-2, DeepSeek-2)
+- ALL managed runs register in the universal run registry (contract 01 §GC) with lease + heartbeat. A registering run is additionally an **OBSERVED run** iff a window is OBSERVING ∧ its `tree_id` == the window's adopted tree ∧ an admitted slot is free; the same serialized mutation claims the slot. No double-counting, no ambiguous Nth run.
+- The window tracks slots separately: `admitted` (claimed), `active`, and per-slot **terminal disposition** ∈ {completed_pass, completed_hard_fail, completed_soft_wobble, abandoned, superseded}. A window may reach CLOSED_* only when every admitted slot has a terminal disposition.
+- **Abandoned runs** (registry lease expired without deregistration — crash/OOM/power): swept by the next state-store operation or `watch`; disposition `abandoned` sets the FLAG bit and the slot is NOT refilled. Cause is unknown (adoption vs infrastructure), so abandonment NEVER auto-rolls-back and never silently passes: a window containing any `abandoned` slot closes as **CLOSED_FLAGGED → human review**. (Recorded divergence: pass-2 Gemini proposed treating abandonment as a HARD auto-rollback trigger; rejected as thrash-prone on infra flakes — auto-rollback stays reserved for evidenced hard failures, F9-consistent.)
+- **Window wall-clock cap** (DeepSeek-2): `max_window_wall_time` (tunable, bounds frozen; default 7 days) → CLOSED_FLAGGED with evidence. No window blocks the pipeline forever.
+- During ROLLING_BACK: new run starts are refused; in-flight runs complete on pinned trees, marked `superseded` at rollback commit.
 
 ## States
 | State | Notes |

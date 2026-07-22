@@ -14,9 +14,9 @@ Status: DRAFT v2 (post-panel-pass-1: GPT-19/20, Gemini-5). Every adapter declare
 **Capability variants (mutually exclusive `oneOf` — GPT-20; JSON-Schema conditionals enforce the pairings):**
 | Variant | Required fields | Valid for |
 |---|---|---|
-| `local-transactional` | none | `effect_type: "local"` ONLY (a local-filesystem effect). An external effect_type (`send/charge/post/write-remote/delete-remote`) CANNOT declare it — schema-rejected |
+| `local-transactional` | `inspection: {marker_path_pattern | journal_convention}` — the deterministic on-disk convention the manager checks to decide landed/not-landed (P2-GPT-10; a bare label is schema-rejected) | `effect_type: "local"` ONLY. External effect_types CANNOT declare it — schema-rejected |
 | `idempotent-by-key` | `idempotency_key_param` (where `runId:step` goes [KnoSky: scripts/scaffold.js:263]) | external effects |
-| `status-checkable` | `status_check: {method, path, terminal_states[]}` | external effects |
+| `status-checkable` | `status_check: {method, path, op_identity_param, authoritative: bool, outcomes: {completed[], definitively_not_executed[], unknown[]}, retry_after_absence: "requires-idempotency-key" \| "declared-final" , inherit_auth: bool \| headers[] (P2-Gemini-4)}` | external effects |
 | `none` | — | external effects (the honest default) |
 | `read-only` | — | `effect_type: "read"` |
 **Destinations:** absolute scheme+host+path patterns; scheme ∈ {https}; no bare `*` host; wildcards only in the path tail; matched post-canonicalization (lowercase host, resolved dots, observed post-redirect destination must ALSO match). DNS re-resolution is not claimed (documented limit).
@@ -28,7 +28,7 @@ Every write-ahead intent record (the v0.1.1 guard [KnoSky: scripts/scaffold.js:2
 On kill/resume, for each intent-without-completion, in order:
 1. `read-only` / no intents in flight → **"no external effects in flight."**
 2. `local-transactional` → local state inspected (transaction either landed or didn't) → **"safe to resume (local effect, inspected)."**
-3. `status-checkable` → resume runs the **reconciliation state machine FIRST**: call `status_check`; an authoritative terminal state marks the intent resolved (completion or confirmed-absent, journaled) → then "safe to resume (reconciled via status check)". Non-authoritative / unavailable / non-terminal answer → **falls through to 5**.
+3. `status-checkable` → resume runs the **reconciliation state machine FIRST** (P2-GPT-10 semantics): call `status_check` with the recorded `op_identity_param` (and forwarded auth per `inherit_auth`). ONLY two outcomes resolve the intent: `completed` (journaled as done) or `definitively_not_executed` from an `authoritative: true` check — and a retry after confirmed absence is permitted ONLY under the declared `retry_after_absence` guarantee (idempotency key or remote finality); a `definitively_not_executed` that cannot exclude a delayed original effect must be declared `authoritative: false` by the adapter author. `unknown`, unavailable, non-authoritative, or auth-failed → **falls through to 5**.
 4. `idempotent-by-key` → **"resume will retry with the recorded idempotency key — safe ASSUMING the remote honors the declared key (declaration by the adapter author, not verified by GraphSmith)"** (Gemini-5 wording requirement — the assumption is IN the message).
 5. `none`, or any unresolved case → **"reconciliation required"** → the LOUD-HALT path with printed check/fix instructions [KnoSky: scripts/scaffold.js:252-259].
 Default posture: **every unresolved intent is "reconciliation required" until a rule above affirmatively upgrades it** (GPT-19).
