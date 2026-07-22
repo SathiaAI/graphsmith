@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/adoption-entry.schema.json",
+  "title": "GraphSmith adoption-log entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "seq",
+    "txid",
+    "status",
+    "fingerprint",
+    "kind",
+    "evidence_ref",
+    "human",
+    "prev_sha256",
+    "entry_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "seq": { "type": "integer", "minimum": 1 },
+    "txid": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "status": { "enum": ["committing", "effective", "aborted"] },
+    "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "kind": { "enum": ["doc", "knob", "code", "migration"] },
+    "evidence_ref": { "type": "string", "minLength": 1 },
+    "human": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "decision", "ts"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "decision": { "type": "string", "minLength": 1 },
+        "ts": { "type": "string", "minLength": 1 }
+      }
+    },
+    "prev_sha256": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      ]
+    },
+    "entry_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

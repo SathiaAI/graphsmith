@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/promotion-journal.schema.json",
+  "title": "GraphSmith promotion transaction journal record",
+  "oneOf": [
+    { "$ref": "#/$defs/txBegin" },
+    { "$ref": "#/$defs/stageDone" },
+    { "$ref": "#/$defs/validated" },
+    { "$ref": "#/$defs/logIntent" },
+    { "$ref": "#/$defs/logDone" },
+    { "$ref": "#/$defs/windowPending" },
+    { "$ref": "#/$defs/swapIntent" },
+    { "$ref": "#/$defs/swapDone" },
+    { "$ref": "#/$defs/outcomeIntent" },
+    { "$ref": "#/$defs/outcomeDone" },
+    { "$ref": "#/$defs/manifestIntent" },
+    { "$ref": "#/$defs/manifestDone" },
+    { "$ref": "#/$defs/windowFinal" },
+    { "$ref": "#/$defs/txDone" },
+    { "$ref": "#/$defs/txAbort" },
+    { "$ref": "#/$defs/recoveryBegin" },
+    { "$ref": "#/$defs/recoveryStep" },
+    { "$ref": "#/$defs/recoveryDone" }
+  ],
+  "x-legal-transitions": {
+    "TX_BEGIN": ["STAGE_DONE", "TX_ABORT"],
+    "STAGE_DONE": ["VALIDATED", "TX_ABORT"],
+    "VALIDATED": ["LOG_APPEND_INTENT", "TX_ABORT"],
+    "LOG_APPEND_INTENT": ["LOG_APPEND_DONE"],
+    "LOG_APPEND_DONE": ["WINDOW_PENDING", "OUTCOME_APPEND_INTENT"],
+    "WINDOW_PENDING": ["SWAP_INTENT", "OUTCOME_APPEND_INTENT"],
+    "SWAP_INTENT": ["SWAP_DONE"],
+    "SWAP_DONE": ["OUTCOME_APPEND_INTENT"],
+    "OUTCOME_APPEND_INTENT": ["OUTCOME_APPEND_DONE"],
+    "OUTCOME_APPEND_DONE": ["MANIFEST_INTENT"],
+    "MANIFEST_INTENT": ["MANIFEST_DONE"],
+    "MANIFEST_DONE": ["WINDOW_FINAL", "TX_ABORT"],
+    "WINDOW_FINAL": ["TX_DONE"],
+    "RECOVERY_BEGIN": ["RECOVERY_STEP", "RECOVERY_DONE"],
+    "RECOVERY_STEP": ["RECOVERY_STEP", "RECOVERY_DONE"]
+  },
+  "$defs": {
+    "version": { "const": "1.0" },
+    "txid": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullableSha": { "oneOf": [{ "$ref": "#/$defs/sha" }, { "type": "null" }] },
+    "tree": { "type": "string", "pattern": "^v-[0-9a-f]{8,64}$" },
+    "base": {
+      "type": "object",
+      "required": ["schema_version", "record_type", "txid"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "record_type": { "type": "string" },
+        "txid": { "$ref": "#/$defs/txid" }
+      }
+    },
+    "txBegin": {
+      "allOf": [{ "$ref": "#/$defs/base" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "expected_active_sha", "expected_log_head", "packet"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "record_type": { "const": "TX_BEGIN" },
+        "txid": { "$ref": "#/$defs/txid" },
+        "expected_active_sha": { "$ref": "#/$defs/sha" },
+        "expected_log_head": { "$ref": "#/$defs/nullableSha" },
+        "packet": { "type": "object" }
+      }
+    },
+    "stageDone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "tree", "tree_manifest_sha", "from_pointer", "to_pointer"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "STAGE_DONE" }, "txid": { "$ref": "#/$defs/txid" },
+        "tree": { "$ref": "#/$defs/tree" }, "tree_manifest_sha": { "$ref": "#/$defs/sha" },
+        "from_pointer": { "type": "object" }, "to_pointer": { "type": "object" }
+      }
+    },
+    "validated": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "VALIDATED" }, "txid": { "$ref": "#/$defs/txid" } }
+    },
+    "logIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "entry_sha", "entry"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "LOG_APPEND_INTENT" }, "txid": { "$ref": "#/$defs/txid" }, "entry_sha": { "$ref": "#/$defs/sha" }, "entry": { "$ref": "adoption-entry.schema.json" } }
+    },
+    "logDone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "entry_sha", "status"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "LOG_APPEND_DONE" }, "txid": { "$ref": "#/$defs/txid" }, "entry_sha": { "$ref": "#/$defs/sha" }, "status": { "const": "committing" } }
+    },
+    "windowPending": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "window_id"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "WINDOW_PENDING" }, "txid": { "$ref": "#/$defs/txid" }, "window_id": { "type": "string", "minLength": 1 } }
+    },
+    "swapIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "from_tree", "to_tree", "to_pointer"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "SWAP_INTENT" }, "txid": { "$ref": "#/$defs/txid" }, "from_tree": { "$ref": "#/$defs/tree" }, "to_tree": { "$ref": "#/$defs/tree" }, "to_pointer": { "type": "object" } }
+    },
+    "swapDone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "observed_active_sha"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "SWAP_DONE" }, "txid": { "$ref": "#/$defs/txid" }, "observed_active_sha": { "$ref": "#/$defs/sha" } }
+    },
+    "outcomeIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "terminal_entry_sha", "entry"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "OUTCOME_APPEND_INTENT" }, "txid": { "$ref": "#/$defs/txid" }, "terminal_entry_sha": { "$ref": "#/$defs/sha" }, "entry": { "$ref": "adoption-entry.schema.json" } }
+    },
+    "outcomeDone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "terminal_entry_sha", "status"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "OUTCOME_APPEND_DONE" }, "txid": { "$ref": "#/$defs/txid" }, "terminal_entry_sha": { "$ref": "#/$defs/sha" }, "status": { "enum": ["effective", "aborted"] } }
+    },
+    "manifestIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "new_head_sha", "manifest"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "MANIFEST_INTENT" }, "txid": { "$ref": "#/$defs/txid" }, "new_head_sha": { "$ref": "#/$defs/sha" }, "manifest": { "type": "object" } }
+    },
+    "manifestDone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "new_head_sha"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "MANIFEST_DONE" }, "txid": { "$ref": "#/$defs/txid" }, "new_head_sha": { "$ref": "#/$defs/sha" } }
+    },
+    "windowFinal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "window_id", "state"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "WINDOW_FINAL" }, "txid": { "$ref": "#/$defs/txid" }, "window_id": { "type": "string", "minLength": 1 }, "state": { "enum": ["OBSERVING", "CLOSED_ROLLED_BACK"] } }
+    },
+    "txDone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "state"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "TX_DONE" }, "txid": { "$ref": "#/$defs/txid" }, "state": { "const": "DONE" } }
+    },
+    "txAbort": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "reason"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "TX_ABORT" }, "txid": { "$ref": "#/$defs/txid" }, "reason": { "type": "string", "minLength": 1 }, "compensating_entry_sha": { "$ref": "#/$defs/sha" } }
+    },
+    "recoveryBegin": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "observed_state"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "RECOVERY_BEGIN" }, "txid": { "$ref": "#/$defs/txid" }, "observed_state": { "type": "object" } }
+    },
+    "recoveryStep": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "action"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "RECOVERY_STEP" }, "txid": { "$ref": "#/$defs/txid" }, "action": { "type": "string", "minLength": 1 } }
+    },
+    "recoveryDone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "record_type", "txid", "outcome"],
+      "properties": { "schema_version": { "$ref": "#/$defs/version" }, "record_type": { "const": "RECOVERY_DONE" }, "txid": { "$ref": "#/$defs/txid" }, "outcome": { "enum": ["done", "aborted", "halt"] } }
+    }
+  }
+}
