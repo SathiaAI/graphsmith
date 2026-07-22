@@ -27,7 +27,7 @@ class SeededRandom {
     h.update(String(this.counter).padStart(16, "0"));
     const digest = h.digest();
     this.counter++;
-    return digest.readUInt32BE(0) / 0xffffffff;
+    return digest.readUInt32BE(0) / 0x100000000;
   }
 
   choice(array) {
@@ -146,12 +146,13 @@ const PARAMETERIZABLE_DETAILS = {
   ],
 };
 
-function generateFixture(baseType, seed) {
+function generateFixture(baseType, seed, opts) {
   const template = FIXTURE_TEMPLATES[baseType];
   if (!template) {
     throw new Error(`Unknown fixture type: ${baseType}`);
   }
 
+  opts = opts || {};
   const rng = new SeededRandom(seed);
 
   /* Sealed variant: choose surface details from RNG. */
@@ -159,7 +160,6 @@ function generateFixture(baseType, seed) {
     schema_version: SCHEMA_VERSION,
     type: baseType,
     seed: seed,
-    sealed_at: new Date().toISOString(),
     description: template.description,
     initialState: JSON.parse(JSON.stringify(template.initialState)),
     operations: template.operations.map((op) => JSON.parse(JSON.stringify(op))),
@@ -171,10 +171,16 @@ function generateFixture(baseType, seed) {
     },
   };
 
+  /* Only include sealed_at if explicitly provided (harness-supplied timestamp). */
+  if (opts.sealedAt) {
+    variant.sealed_at = opts.sealedAt;
+  }
+
   return variant;
 }
 
-function generateFixtures(baseDir, seed) {
+function generateFixtures(baseDir, seed, opts) {
+  opts = opts || {};
   const fixtureDir = path.join(baseDir, "fixtures");
   if (!fs.existsSync(fixtureDir)) {
     fs.mkdirSync(fixtureDir, { recursive: true });
@@ -182,7 +188,7 @@ function generateFixtures(baseDir, seed) {
 
   const fixtures = {};
   for (const fixtureType of Object.keys(FIXTURE_TEMPLATES)) {
-    const fixture = generateFixture(fixtureType, seed);
+    const fixture = generateFixture(fixtureType, seed, opts);
     const filename = path.join(fixtureDir, `${fixtureType}.json`);
     fs.writeFileSync(filename, JSON.stringify(fixture, null, 2));
     fixtures[fixtureType] = fixture;
@@ -209,16 +215,13 @@ function selftest() {
       throw new Error("Seed not recorded");
     }
 
-    /* Test 2: Same seed produces identical fixtures (determinism).
-     * Note: sealed_at timestamp is metadata only, excluded from comparison. */
+    /* Test 2: Same seed produces identical fixtures (determinism). */
     const fixtures2 = generateFixtures(tmpDir2, seed1);
 
-    const f1Clean = JSON.parse(JSON.stringify(fixtures1["F-clean"]));
-    const f2Clean = JSON.parse(JSON.stringify(fixtures2["F-clean"]));
-    delete f1Clean.sealed_at;
-    delete f2Clean.sealed_at;
+    const f1Clean = JSON.stringify(fixtures1["F-clean"]);
+    const f2Clean = JSON.stringify(fixtures2["F-clean"]);
 
-    if (JSON.stringify(f1Clean) !== JSON.stringify(f2Clean)) {
+    if (f1Clean !== f2Clean) {
       throw new Error("Determinism failed: same seed produced different fixtures");
     }
 
@@ -226,12 +229,10 @@ function selftest() {
     const seed2 = "fedcba9876543210fedcba9876543210";
     const fixtures3 = generateFixtures(tmpDir3, seed2);
 
-    const f1CleanVsDiff = JSON.parse(JSON.stringify(fixtures1["F-clean"]));
-    const f3Clean = JSON.parse(JSON.stringify(fixtures3["F-clean"]));
-    delete f1CleanVsDiff.sealed_at;
-    delete f3Clean.sealed_at;
+    const f1CleanVsDiff = JSON.stringify(fixtures1["F-clean"]);
+    const f3Clean = JSON.stringify(fixtures3["F-clean"]);
 
-    if (JSON.stringify(f1CleanVsDiff) === JSON.stringify(f3Clean)) {
+    if (f1CleanVsDiff === f3Clean) {
       throw new Error("Different seeds produced identical fixtures");
     }
 

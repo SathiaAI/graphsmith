@@ -213,6 +213,35 @@ Any mutation → automatic cell FAIL, regardless of agent output.
 
 ---
 
+## Deferred Items & Fail-Safe Scoping
+
+Phase A skeleton marks features as `unavailable` when they require capabilities added in later phases. **Unavailable is not a pass** — it's honest scoping:
+
+### Live Agent Execution (Phase B+)
+- **T1 Build**: `t1-build-correct` property → `unavailable` (requires hidden acceptance + chaos tests)
+- **T3 Heal**: `t3-heal-verified` property → `unavailable` (requires harness to apply patch in fresh copy + hidden tests)
+- **T4 Evolve**: Full edit/gate scoring → deferred
+- **T5 Resume**: Full adoption-log replay → deferred
+- **ADV-1..N**: Full adversarial scoring → deferred
+
+### OS-Level Ledger Protection (Phase C)
+Ledger append-only enforcement requires OS-level immutability flags (out of Phase A scope):
+- `chattr +a <ledger>` (Linux: append-only flag)
+- `uchg` (BSD/macOS: unchangeable flag)
+- Out-of-workspace storage (isolated from agent's filesystem)
+
+**Phase A Ledger Honesty**: `verifyLedger(path) → {ok, brokenAt}` detects tampering via hash chain (`prev_hash` on each entry). Scorer can call this to detect truncation/overwrite. Physical file deletion/truncation remain possible without OS-level protection.
+
+### Platform Isolation Proof (Phase C)
+- `platformCanProveIsolation=true` requires: ptrace hooks, filesystem monitoring, or cgroup/seccomp isolation from harness
+- Skeleton defaults `false`; Phase C adds actual probing
+
+### Internal Pass-Criteria Evaluation (Never Agent-Exposed)
+- `checkPassCriteria()` in `lab/tasks/index.js` is harness-internal; agents never see it
+- Prevents agents from learning what makes a cell pass
+
+---
+
 ## Phase B+ (Live Cells)
 
 Phase A builds the skeleton only. Phase B introduces:

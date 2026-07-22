@@ -7,8 +7,61 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const SCHEMA_VERSION = "1.0";
+
+function sha256(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function verifyLedger(ledgerPath) {
+  /* Detect tampering via hash chain (item 5).
+   * Each entry carries prev_hash = sha256(previous canonical entry).
+   * A broken/truncated/overwritten chain → tampered. */
+  if (!fs.existsSync(ledgerPath)) {
+    return { ok: true, brokenAt: null };
+  }
+
+  try {
+    const content = fs.readFileSync(ledgerPath, "utf8");
+    const lines = content.split("\n").filter((line) => line.trim().length > 0);
+
+    let prevEntryHash = null;
+    for (let i = 0; i < lines.length; i++) {
+      let entry;
+      try {
+        entry = JSON.parse(lines[i]);
+      } catch (e) {
+        return { ok: false, brokenAt: i, reason: "entry-not-valid-json" };
+      }
+
+      /* Calculate canonical hash of this entry (before checking prev_hash). */
+      const entryForHash = { ...entry };
+      delete entryForHash.prev_hash;
+      const currentHash = sha256(JSON.stringify(entryForHash));
+
+      /* If this is not the first entry, verify prev_hash matches previous entry. */
+      if (i > 0) {
+        if (entry.prev_hash !== prevEntryHash) {
+          return {
+            ok: false,
+            brokenAt: i,
+            reason: "prev-hash-mismatch",
+            expected: prevEntryHash,
+            got: entry.prev_hash,
+          };
+        }
+      }
+
+      prevEntryHash = currentHash;
+    }
+
+    return { ok: true, brokenAt: null };
+  } catch (e) {
+    return { ok: false, brokenAt: -1, reason: "read-error", error: e.message };
+  }
+}
 
 /* Ledger entry types and formats. */
 const ENTRY_TYPES = {
@@ -51,7 +104,7 @@ class LedgerWriter {
       args: processInfo.args || [],
       cwd: processInfo.cwd || null,
       env_keys: processInfo.env ? Object.keys(processInfo.env) : [],
-      parentPid: processInfo.parentPid || null,
+      parentPid: processInfo.parentPid ?? null,
     };
 
     this._append(this.processLedgerPath, entry);
@@ -63,7 +116,7 @@ class LedgerWriter {
       type: ENTRY_TYPES.PROCESS_EXIT,
       timestamp: new Date().toISOString(),
       pid: processInfo.pid,
-      exitCode: processInfo.exitCode || null,
+      exitCode: processInfo.exitCode ?? null,
       signal: processInfo.signal || null,
       duration: processInfo.duration || null,
     };
@@ -126,8 +179,31 @@ class LedgerWriter {
     return entry;
   }
 
-  /* Append a JSON object to a ledger file (one per line, JSONL format). */
+  /* Append a JSON object to a ledger file (one per line, JSONL format).
+   * Compute prev_hash for hash chain verification. */
   _append(ledgerPath, entry) {
+    /* Read the last entry to compute prev_hash. */
+    let prevHash = null;
+    if (fs.existsSync(ledgerPath)) {
+      try {
+        const content = fs.readFileSync(ledgerPath, "utf8");
+        const lines = content.split("\n").filter((line) => line.trim().length > 0);
+        if (lines.length > 0) {
+          const lastEntry = JSON.parse(lines[lines.length - 1]);
+          const lastEntryForHash = { ...lastEntry };
+          delete lastEntryForHash.prev_hash;
+          prevHash = sha256(JSON.stringify(lastEntryForHash));
+        }
+      } catch (e) {
+        /* If we can't read or parse, proceed without prev_hash chain. */
+        prevHash = null;
+      }
+    }
+
+    if (prevHash) {
+      entry.prev_hash = prevHash;
+    }
+
     const line = JSON.stringify(entry);
     fs.appendFileSync(ledgerPath, line + "\n");
   }
@@ -289,4 +365,4 @@ if (require.main === module) {
   console.log(JSON.stringify({ entry_types: ENTRY_TYPES }, null, 2));
 }
 
-module.exports = { LedgerWriter, ENTRY_TYPES, SCHEMA_VERSION };
+module.exports = { LedgerWriter, verifyLedger, ENTRY_TYPES, SCHEMA_VERSION };

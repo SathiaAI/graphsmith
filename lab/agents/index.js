@@ -131,7 +131,9 @@ const ADAPTERS = {
 };
 
 /* Cell attestation structure. Contract 12 §Attestation: each cell records
- * CLI name+version, provider, model ID+version string, platform. */
+ * CLI name+version, provider, model ID+version string, platform.
+ * Missing required fields are recorded as null and collected in a 'missing' array.
+ * Returns complete: boolean to indicate if all required fields are present. */
 function createAttestation(adapterId, opts) {
   opts = opts || {};
   const adapter = ADAPTERS[adapterId];
@@ -140,21 +142,46 @@ function createAttestation(adapterId, opts) {
     throw new Error(`Unknown adapter: ${adapterId}`);
   }
 
-  return {
+  /* Required fields (per Contract 12 §Attestation). */
+  const requiredFields = ["cli_name", "cli_version", "provider", "model_id", "model_version", "platform"];
+  const missing = [];
+
+  /* Record fields that were given; mark missing required fields as null. */
+  const attestation = {
     adapter_id: adapterId,
     adapter_name: adapter.name,
     cli_name: adapter.cliName,
-    cli_version: opts.cliVersion || "unknown",
+    cli_version: opts.cliVersion || null,
     provider: adapter.provider,
-    model_id: opts.modelId || "unknown",
-    model_version: opts.modelVersion || "unknown",
-    platform: opts.platform || "unknown",
-    generated_at: new Date().toISOString(),
+    model_id: opts.modelId || null,
+    model_version: opts.modelVersion || null,
+    platform: opts.platform || null,
   };
+
+  /* Collect missing required fields. */
+  if (!opts.cliVersion) {
+    missing.push("cli_version");
+  }
+  if (!opts.modelId) {
+    missing.push("model_id");
+  }
+  if (!opts.modelVersion) {
+    missing.push("model_version");
+  }
+  if (!opts.platform) {
+    missing.push("platform");
+  }
+
+  attestation.complete = missing.length === 0;
+  attestation.missing = missing;
+
+  return attestation;
 }
 
 /* Headless mode check. Contract 12: "No headless mode → 'unavailable,'
- * never green". */
+ * never green" (item 7).
+ * If adapter.supportsHeadlessMode === false, the entire cell is unavailable,
+ * regardless of isHeadlessMode argument. */
 function validateHeadlessMode(adapterId, isHeadlessMode) {
   const adapter = ADAPTERS[adapterId];
 
@@ -162,7 +189,8 @@ function validateHeadlessMode(adapterId, isHeadlessMode) {
     return { valid: false, reason: "Unknown adapter" };
   }
 
-  if (isHeadlessMode && !adapter.supportsHeadlessMode) {
+  /* If the adapter doesn't support headless mode at all, the cell is unavailable. */
+  if (!adapter.supportsHeadlessMode) {
     return {
       valid: false,
       reason: `${adapter.name} does not support headless mode`,
@@ -170,6 +198,12 @@ function validateHeadlessMode(adapterId, isHeadlessMode) {
     };
   }
 
+  /* If the adapter supports headless and we're using headless, all is valid. */
+  if (isHeadlessMode && adapter.supportsHeadlessMode) {
+    return { valid: true };
+  }
+
+  /* If not using headless or headless is not an option, valid. */
   return { valid: true };
 }
 
@@ -191,15 +225,24 @@ function createCell(adapterId, opts) {
     };
   }
 
-  return {
-    valid: true,
-    adapterId,
-    adapterName: adapter.name,
-    provider: adapter.provider,
-    attestation: createAttestation(adapterId, opts),
-    timeout: opts.timeoutMs || 300000,
-    trials: opts.trials || 3,
-  };
+  try {
+    const attestation = createAttestation(adapterId, opts);
+    return {
+      valid: true,
+      adapterId,
+      adapterName: adapter.name,
+      provider: adapter.provider,
+      attestation,
+      timeout: opts.timeoutMs || 300000,
+      trials: opts.trials || 3,
+    };
+  } catch (e) {
+    return {
+      valid: false,
+      reason: e.message,
+      scoreAs: "unavailable",
+    };
+  }
 }
 
 function getAdapter(adapterId) {
@@ -229,7 +272,7 @@ function selftest() {
       }
     }
 
-    /* Test 3: Attestation creation works. */
+    /* Test 3: Attestation creation works with all required fields. */
     const att = createAttestation("claude_p", {
       cliVersion: "1.0.0",
       modelId: "claude-3-opus",
@@ -237,8 +280,23 @@ function selftest() {
       platform: "linux",
     });
 
-    if (!att.adapter_id || !att.provider) {
+    if (!att.adapter_id || !att.provider || !att.cli_version || att.cli_version === null) {
       throw new Error("Attestation creation failed");
+    }
+    if (!att.complete || att.missing.length !== 0) {
+      throw new Error("Complete attestation should have complete: true and missing: []");
+    }
+
+    /* Test 3b: Attestation marks missing fields without throwing. */
+    const attIncomplete = createAttestation("claude_p", { cliVersion: "1.0.0" });
+    if (attIncomplete.complete !== false) {
+      throw new Error("Incomplete attestation should have complete: false");
+    }
+    if (!Array.isArray(attIncomplete.missing) || !attIncomplete.missing.includes("model_id")) {
+      throw new Error("Missing fields should be tracked in missing array");
+    }
+    if (attIncomplete.model_id !== null) {
+      throw new Error("Missing model_id should be recorded as null");
     }
 
     /* Test 4: Headless mode validation works. */
@@ -247,29 +305,38 @@ function selftest() {
       throw new Error("opencode should support headless mode");
     }
 
-    const headlessFail = validateHeadlessMode("claude_p", true);
+    /* Test 4b: Non-headless adapters are always unavailable (item 7). */
+    const headlessFail = validateHeadlessMode("claude_p", false);
     if (headlessFail.valid) {
-      throw new Error("claude -p should not support headless mode");
+      throw new Error("claude -p (non-headless adapter) should be unavailable regardless of isHeadlessMode");
     }
     if (headlessFail.scoreAs !== "unavailable") {
-      throw new Error("Headless unsupported should score as 'unavailable'");
+      throw new Error("Non-headless adapter should score as 'unavailable'");
     }
 
-    /* Test 5: Cell creation works. */
-    const cell = createCell("claude_p", {
+    /* Test 5: Cell creation works with headless-supporting adapter. */
+    const cell = createCell("opencode", {
       cliVersion: "1.0.0",
-      modelId: "claude-3-opus",
-      isHeadlessMode: false,
+      modelId: "deepseek/deepseek-v3",
+      modelVersion: "2024-01",
+      platform: "linux",
+      isHeadlessMode: true,
     });
 
     if (!cell.valid || !cell.attestation) {
       throw new Error("Cell creation failed");
     }
 
-    /* Test 6: Cell fails gracefully with headless mode unsupported. */
-    const cellHeadlessFail = createCell("claude_p", { isHeadlessMode: true });
+    /* Test 6: Cell fails with non-headless adapter (item 7). */
+    const cellHeadlessFail = createCell("claude_p", {
+      cliVersion: "1.0.0",
+      modelId: "claude-3-opus",
+      modelVersion: "2024-01",
+      platform: "linux",
+      isHeadlessMode: false,
+    });
     if (cellHeadlessFail.valid) {
-      throw new Error("Cell should fail with headless mode unsupported");
+      throw new Error("Cell should fail with non-headless adapter");
     }
     if (cellHeadlessFail.scoreAs !== "unavailable") {
       throw new Error("Cell failure should score as 'unavailable'");
