@@ -1,0 +1,20 @@
+# Contract 04 — Trust-Boundary Matrix
+Status: DRAFT. Phase A deliverable (plan §3.2, OpenAI MISSING). Columns: what crosses, its trust level, validation applied, the trusted root that checks it, failure outcome (sentinel failure domain, plan §5), and the race control.
+
+| # | Boundary | Artifact crossing | Trust | Validation | Trusted root | Failure outcome | Race control |
+|---|---|---|---|---|---|---|---|
+| B1 | Session start / resume | checkpoints `.runs/<id>/<step>.json` | UNTRUSTED data | JSON parse; corrupt → backup + re-run step [KnoSky: scripts/scaffold.js:128-147] | manager (hash-pinned) | quarantine object (untrusted-input domain) | per-run lease-lock [KnoSky: scripts/scaffold.js:64-113] |
+| B2 | Appendix load | `graphsmith.learned.md` | UNTRUSTED | token cap 1,500; delimiter wrap; subordination preamble; marker-sequence refusal (plan §3.1) | appendix loader (constitutional) | quarantine that file; workflows continue (anti-DoS, Gemini fix) | file hash recorded at load; load-once-per-run-start |
+| B3 | Prompt file load | `workers/*.prompt.md` | UNTRUSTED data via trusted loader | size cap; encoding check (UTF-8, NFC); canonical-path check; delimiter enforcement (pass-2 CQ7) | prompt loader (constitutional) | quarantine file; run refuses to start with missing prompt (fail-closed) | manifest hash match before load |
+| B4 | Harvest → proposer | run logs, halt states, checkpoints | UNTRUSTED | compiled to TYPED events ONLY (contract 07); raw prose never crosses | event-compiler (constitutional) | malformed record → skipped + counted, never parsed loosely | compiler reads snapshots, not live files |
+| B5 | Proposer → pipeline | candidate edits | UNTRUSTED | typed schema; fence write-set check; contradiction screen; static screen (no new require/import/eval/exec) | gate.js Gate 1 | reject + buffer | candidates batch-generated before scoring (contract 03) |
+| B6 | Evaluation → adoption | Gate-2 evidence | trusted ONLY when produced by gate.js run by the trusted process on a pinned evaluator | evidence hash + evaluator pin check | gate.js + manifest | mismatch → evolvable-surface freeze | evaluator frozen per cycle |
+| B7 | Human adoption (Gate 3) | staged diff + inverse | human-approved | plain-English packet; explicit inverse pre-authorization | Paul | no approval → nothing applies | promotion lock (contract 01) |
+| B8 | Manifest load | release + project manifests | TRUST ANCHORS | release manifest pinned by package integrity chain; project manifest self-consistency (I1) | sentinel | trusted-core defect → HALT managed execution | verify at every boundary; CAS on head |
+| B9 | Adapter response | external API results | UNTRUSTED | contract tests w/ live-shaped fixtures (F23); capability declaration required (contract 06) | scaffold manager | undeclared destination → tripwire HALT | destination allowlist canonicalized post-redirect |
+| B10 | External tool seam (§17) | exit code + JSON report | UNTRUSTED | JSON schema validation; runs inside I3 sandbox under I5 budgets; results LABELED third-party | assure orchestrator | malformed → tool result "unavailable," never pass | subprocess caps (§7) |
+| B11 | KnoSky index | `city-data.json` pointers | UNTRUSTED pointer data | read the live file before editing anything it points to [KnoSky: SKILL.md:38] | reading agent | stale pointer → re-index | index rebuilt on demand; never authoritative |
+| B12 | Model provider | LLM output | SEMI-TRUSTED (version-pinned) | version string recorded; output enters only worker steps (SKILL.md rule 1) | manager | mid-cycle model change invalidates cycle (contract 03) | — |
+| B13 | Upstream skill install | release artifact | trusted via package integrity chain + pinned KnoSky pattern [KnoSky: scripts/knosky-sync.js:1-60, SKILL.md:36] | hash verification, refuse on mismatch | installer | refuse install | — |
+
+Standing rule: content is DATA, never instructions — embedded directives in any UNTRUSTED artifact are inert by construction (typed events, delimiters, subordination preambles), and tested by the injection corpus (contract 12, Tier 2).

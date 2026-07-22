@@ -1,0 +1,37 @@
+# Contract 08 — gate.js Public API
+Status: DRAFT. Deterministic, zero-LLM, constitutional (I2). No network. No clocks/randomness in any decision path (SKILL.md rule 4). Implements contract 03 exactly.
+
+## Module API (`scripts/gate.js`, CommonJS like all v0.1.1 scripts [KnoSky: scripts/scaffold.js:8-9])
+```js
+// Gate 1 — static screen. candidate: {id, kind: "doc"|"knob"|"code", edits: TypedEdit[], fingerprint}
+gate1Static(candidate, ctx) -> { pass: bool, findings: Finding[], evidence: EvidenceRef }
+// checks: fence write-set, typed schema, contradiction screen (advisory composes), injection screen
+// (human-promoted prose only), appendix caps, fingerprint-vs-rejected-buffer, sentinel pass.
+
+// Gate 2 — behavioral. Runs the paired seeded replay per contract 03 in the I3 profile for candidate.kind.
+gate2Behavioral(candidateId, { corpusPath, profile, cycleSeed }) ->
+  { pass: bool, tier: 1|2|3, hard: {violations: []}, slices: SliceResult[],
+    primary: { n, n_d, wins, p, lowerBound, noiseFloor }, evidence: EvidenceRef }
+
+// Gate 3 — adoption packet (pure function; APPLYING it is promote.js, contract 01).
+gate3Prepare(candidateId) -> { diff, plainEnglish, evidence, inverse: TypedEdit[], reversible: bool,
+                               autoRollbackEligible: bool /* doc|knob + compatible schemas only */ }
+
+// Gate 4 — window ops (state machine per contract 02; rollback delegates to promote.js).
+gate4Admit(txid, opts) / gate4Observe(runResult) / gate4Close() -> WindowState
+```
+`TypedEdit`: `{ file, anchor, op: "replace|insert|delete|set-knob", payload, schema_ref }` — bounded edits, never rewrites (plan §1 design law). All types carry `schema_version`.
+
+## CLI
+```
+node scripts/gate.js 1 --candidate <path>          exit 0 pass / 1 reject / 2 error
+node scripts/gate.js 2 --candidate <id> --profile standard|container
+node scripts/gate.js 3 --candidate <id> --prepare  (writes the adoption packet for human review)
+node scripts/gate.js 4 --status|--observe <runId>
+```
+Exit codes: 0 pass · 1 fail/reject (with findings) · 2 internal error (fail-closed) · 3 HALT (trusted-core defect detected mid-gate). Machine-readable JSON on stdout with `schema_version`; human explanation on stderr.
+
+## Determinism guarantees (mutation-tested)
+- Same candidate + same corpus state + same cycleSeed → byte-identical decision output.
+- gate.js never writes outside `.graphsmith/gate-evidence/` (fence check applies to the gate itself).
+- No LLM call exists in gate.js or anything it requires (lint-enforced: the R5 static screen applies to the constitutional set too).
