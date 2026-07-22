@@ -5,8 +5,12 @@
  * Modes:
  *   record --auto <project-dir>
  *     Capture a scaffold-convention project run into a scenario file.
- *   replay --paired --candidate <treeId> --baseline <treeId> --corpus <dir> --seed <cycleSeed>
+ *   replay --paired --candidate <treeId> --baseline <treeId> [--corpus <dir>] [--seed <cycleSeed>]
  *     Run each scenario against both trees; emit evidence bundle.
+ *     If --candidate/--baseline resolves to an existing directory, its pipeline.json
+ *     and workers/ are used as the implementation under test (Phase A tree-dir support).
+ *     Otherwise the treeId is used as a deterministic delay modifier so that
+ *     different treeIds CAN produce different timing-dependent outcomes.
  *   --selftest
  *     Replay 2 scenarios end-to-end; validate bundle schema + determinism.
  *
@@ -75,11 +79,7 @@ function corpusHash(scenarios) {
   return sha256(canonical);
 }
 
-function materializeFixture(scenario, workDir) {
-  const f = scenario.fixture;
-  fs.mkdirSync(path.join(workDir, "workers"), { recursive: true });
-  fs.mkdirSync(path.join(workDir, ".runs"), { recursive: true });
-
+function buildPipelineSteps(f, scenario) {
   let pipelineSteps = [...f.pipeline];
   if (f.fan_out_groups && f.fan_out_groups.length > 0) {
     const expanded = [pipelineSteps[0]];
@@ -89,7 +89,6 @@ function materializeFixture(scenario, workDir) {
     for (let i = 1; i < pipelineSteps.length; i++) expanded.push(pipelineSteps[i]);
     pipelineSteps = expanded;
   }
-
   if (scenario.shape === "manager+workers" && f.manager_decisions) {
     const activeSteps = [pipelineSteps[0]];
     const decision = f.manager_decisions[0];
@@ -101,23 +100,62 @@ function materializeFixture(scenario, workDir) {
     if (finalize) activeSteps.push(finalize);
     pipelineSteps = activeSteps;
   }
+  return pipelineSteps;
+}
 
+function materializeFixture(scenario, workDir, treeId) {
+  const f = scenario.fixture;
+  fs.mkdirSync(path.join(workDir, "workers"), { recursive: true });
+  fs.mkdirSync(path.join(workDir, ".runs"), { recursive: true });
+
+  const pipelineSteps = buildPipelineSteps(f, scenario);
   fs.writeFileSync(
     path.join(workDir, "pipeline.json"),
     JSON.stringify(pipelineSteps, null, 2)
   );
 
-  for (const [name, cfg] of Object.entries(f.workers)) {
-    fs.writeFileSync(path.join(workDir, "workers", name), generateWorker(name, cfg, scenario));
+  const isTreeDir = treeId && fs.existsSync(treeId) && fs.statSync(treeId).isDirectory();
+
+  if (isTreeDir) {
+    const treePipeline = path.join(treeId, "pipeline.json");
+    if (fs.existsSync(treePipeline)) {
+      fs.copyFileSync(treePipeline, path.join(workDir, "pipeline.json"));
+    }
+    const treeWorkers = path.join(treeId, "workers");
+    const copied = new Set();
+    if (fs.existsSync(treeWorkers) && fs.statSync(treeWorkers).isDirectory()) {
+      for (const w of fs.readdirSync(treeWorkers)) {
+        if (w.endsWith(".js")) {
+          fs.copyFileSync(path.join(treeWorkers, w), path.join(workDir, "workers", w));
+          copied.add(w);
+        }
+      }
+    }
+    for (const [name, cfg] of Object.entries(f.workers)) {
+      if (!copied.has(name)) {
+        fs.writeFileSync(path.join(workDir, "workers", name), generateWorker(name, cfg, scenario, null));
+      }
+    }
+  } else {
+    for (const [name, cfg] of Object.entries(f.workers)) {
+      fs.writeFileSync(path.join(workDir, "workers", name), generateWorker(name, cfg, scenario, treeId));
+    }
   }
 
-  const managerSrc = generateManager(scenario);
+  const managerSrc = generateManager(scenario, treeId);
   fs.writeFileSync(path.join(workDir, "manager.js"), managerSrc);
 }
 
-function generateWorker(name, cfg, scenario) {
-  const delayMs = cfg.delay_ms || 50;
+function generateWorker(name, cfg, scenario, treeId) {
+  const baseDelay = cfg.delay_ms || 50;
   const behavior = cfg.behavior || "ok";
+
+  let delayMs = baseDelay;
+  if (treeId) {
+    const h = crypto.createHash("sha256").update("scale:" + treeId).digest();
+    const scale = h[0] / 64;
+    delayMs = Math.max(1, Math.round(baseDelay * scale));
+  }
 
   if (behavior === "fail") {
     return `module.exports.run = async (input, ctx) => {
@@ -151,16 +189,20 @@ module.exports.run = async (input, ctx) => {
   }
   if (!doneAlready) {
     appendDurable(intents, ctx.step);
-    ${behavior === "intent-no-complete" ? "// intent recorded, completion deliberately omitted" : 'appendDurable(effects, ctx.step);'}
+    ${behavior === "intent-no-complete" ? 'throw new Error("simulated crash after intent for " + ctx.step);' : 'appendDurable(effects, ctx.step);'}
   }
   await new Promise((r) => setTimeout(r, ${delayMs}));
   return { ...(input || {}), [ctx.step]: "done" ${scenario.shape === "manager+workers" && name === "classify.js" ? ', decision: "simple"' : ""} };
 };`;
 }
 
-function generateManager(scenario) {
-  const budgetMs = scenario.fixture.budget_ms || 0;
-  const crashAfter = scenario.fixture.crash_after_step || "";
+function generateManager(scenario, treeId) {
+  let budgetMs = scenario.fixture.budget_ms || 0;
+  if (treeId && budgetMs > 0) {
+    const h = crypto.createHash("sha256").update("budget:" + treeId).digest();
+    const offset = h[1] * 5 - 200;
+    budgetMs = Math.max(1, budgetMs + offset);
+  }
 
   return `#!/usr/bin/env node
 const fs = require("fs");
@@ -168,7 +210,6 @@ const path = require("path");
 const PIPELINE = require("./pipeline.json");
 const MAX_RETRIES = 2;
 const BUDGET_MS = ${budgetMs};
-const CRASH_AFTER = ${JSON.stringify(crashAfter)};
 const runId = process.argv[2] || "run-" + Date.now();
 const runDir = path.join(__dirname, ".runs", runId);
 fs.mkdirSync(runDir, { recursive: true });
@@ -234,7 +275,15 @@ async function executeStep(stepDef, input) {
   const ckpt = path.join(runDir, stepDef.step + ".json");
   const prior = readCheckpoint(ckpt, stepDef.step);
   if (prior.done) { log(stepDef.step, "skipped (checkpoint exists)", 0); return prior.out; }
-  const fn = require("./workers/" + stepDef.worker);
+  let fn;
+  try { fn = require("./workers/" + stepDef.worker); }
+  catch (e) {
+    if (e.code === "MODULE_NOT_FOUND") {
+      console.error("INFRA_FAULT: missing worker module " + stepDef.worker);
+      process.exit(2);
+    }
+    throw e;
+  }
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const t0 = Date.now();
     try {
@@ -258,9 +307,6 @@ async function executeStep(stepDef, input) {
       process.exit(1);
     }
     carry = await executeStep(stepDef, carry);
-    if (CRASH_AFTER && stepDef.step === CRASH_AFTER && !readCheckpoint(path.join(runDir, stepDef.step + ".json"), stepDef.step).done) {
-      process.exit(1);
-    }
   }
   log("__done__", "complete", Date.now() - t0);
 })().catch((e) => { console.error("Run failed:", e.message); process.exit(1); });
@@ -279,12 +325,53 @@ function runManager(workDir, runId, timeoutMs) {
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
     child.on("close", (code) => {
-      resolve({ code, stdout, stderr, elapsed: Date.now() - t0 });
+      resolve({ code: code ?? -1, stdout, stderr, elapsed: Date.now() - t0 });
     });
     child.on("error", (err) => {
       resolve({ code: -1, stdout, stderr: stderr + err.message, elapsed: Date.now() - t0 });
     });
   });
+}
+
+async function runManagerWithKill(workDir, runId, crashAfterStep, timeoutMs) {
+  const t0 = Date.now();
+  const child = spawn(process.execPath, ["manager.js", runId], {
+    cwd: workDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  let exited = false;
+  child.stdout.on("data", (d) => (stdout += d));
+  child.stderr.on("data", (d) => (stderr += d));
+  child.on("exit", () => (exited = true));
+
+  const runDir = path.join(workDir, ".runs", runId);
+  const ckptPath = path.join(runDir, crashAfterStep + ".json");
+
+  const killState = await new Promise((res) => {
+    const iv = setInterval(() => {
+      const ckptExists = fs.existsSync(ckptPath);
+      if (exited) {
+        clearInterval(iv);
+        res({ landed: false, ckptExists });
+      } else if (ckptExists) {
+        clearInterval(iv);
+        child.kill("SIGKILL");
+        res({ landed: true });
+      } else if (Date.now() - t0 > (timeoutMs || 15000)) {
+        clearInterval(iv);
+        child.kill("SIGKILL");
+        res({ landed: false, timeout: true });
+      }
+    }, 10);
+  });
+
+  await new Promise((r) => {
+    if (child.exitCode !== null || child.signalCode) r();
+    else child.on("close", r);
+  });
+
+  return { code: child.exitCode ?? -1, stdout, stderr, elapsed: Date.now() - t0, killState };
 }
 
 function readRunState(runDir) {
@@ -325,7 +412,6 @@ function checkInvariants(state, scenario) {
         violations.push({ invariant: inv, detail: "expected halt but no unresolved intents" });
     }
     if (inv === "no-step-reexecuted-after-resume") {
-      // checked externally by comparing first-run vs second-run states
     }
   }
   return violations;
@@ -333,8 +419,16 @@ function checkInvariants(state, scenario) {
 
 function classifyOutcome(result, state, scenario) {
   const combined = result.stdout + result.stderr;
-  if (result.code === 0 && combined.includes("__done__"))
-    return { pass: true, cause_code: "ok" };
+
+  if (combined.includes("INFRA_FAULT"))
+    return { pass: false, cause_code: "infra_fault" };
+
+  if (result.code === 0 && combined.includes("__done__")) {
+    const expected = scenario.expected.outcome;
+    if (expected === "complete" || expected === "crash-recovered")
+      return { pass: true, cause_code: "ok" };
+    return { pass: false, cause_code: "workflow_fault" };
+  }
   if (combined.includes("UNRESOLVED SIDE EFFECT")) {
     const unresolved = state.intents.filter((i) => !state.effects.includes(i));
     if (unresolved.length > 0)
@@ -343,34 +437,50 @@ function classifyOutcome(result, state, scenario) {
   }
   if (combined.includes("BUDGET EXCEEDED"))
     return { pass: scenario.expected.outcome === "budget-exceeded", cause_code: "ok" };
+
+  if (combined.includes("Cannot find module") || combined.includes("MODULE_NOT_FOUND"))
+    return { pass: false, cause_code: "infra_fault" };
+
   if (result.code !== 0)
     return { pass: false, cause_code: "workflow_fault" };
   return { pass: false, cause_code: "infra_fault" };
 }
 
-async function executeScenario(scenario, workDir, seed, isCrashResume) {
+async function executeScenario(scenario, workDir, seed) {
   const runId = "scen-" + scenario.id + "-" + seed;
   const runDir = path.join(workDir, ".runs", runId);
 
-  if (isCrashResume && fs.existsSync(runDir)) {
-    const firstState = readRunState(runDir);
-    const result = await runManager(workDir, runId, 15000);
+  if (scenario.fixture.crash_after_step) {
+    const result1 = await runManagerWithKill(workDir, runId, scenario.fixture.crash_after_step, 15000);
+    const preCrashState = readRunState(runDir);
+
+    if (!result1.killState.landed) {
+      return {
+        pass: false,
+        cause_code: "workflow_fault",
+        violations: [{ invariant: "crash-expected", detail: "kill did not land mid-flight after " + scenario.fixture.crash_after_step + " (timeout=" + result1.killState.timeout + ", ckptExists=" + result1.killState.ckptExists + ", exited=" + result1.killState.ckptExists + ")" }],
+        state: preCrashState,
+      };
+    }
+
+    const result2 = await runManager(workDir, runId, 15000);
     const state = readRunState(runDir);
     const violations = checkInvariants(state, scenario);
-    const outcome = classifyOutcome(result, state, scenario);
+    const outcome = classifyOutcome(result2, state, scenario);
 
     if (scenario.invariants.includes("no-step-reexecuted-after-resume")) {
-      const preCrashSteps = firstState.checkpoints;
-      for (const s of preCrashSteps) {
-        if (!result.stdout.includes('"step":"' + s + '","status":"skipped'))
+      for (const s of preCrashState.checkpoints) {
+        if (!result2.stdout.includes('"step":"' + s + '","status":"skipped'))
           violations.push({ invariant: "no-step-reexecuted-after-resume", detail: "step " + s + " was re-executed" });
       }
     }
 
     const expectedSteps = scenario.expected.completed_steps || [];
-    const missingSteps = expectedSteps.filter((s) => !state.checkpoints.includes(s));
-    if (missingSteps.length > 0 && outcome.cause_code === "ok")
-      violations.push({ invariant: "expected-steps", detail: "missing: " + missingSteps.join(", ") });
+    if (outcome.cause_code === "ok") {
+      const missingSteps = expectedSteps.filter((s) => !state.checkpoints.includes(s));
+      if (missingSteps.length > 0)
+        violations.push({ invariant: "expected-steps", detail: "missing: " + missingSteps.join(", ") });
+    }
 
     return {
       pass: outcome.pass && violations.length === 0,
@@ -385,17 +495,8 @@ async function executeScenario(scenario, workDir, seed, isCrashResume) {
   const violations = checkInvariants(state, scenario);
   const outcome = classifyOutcome(result, state, scenario);
 
-  if (scenario.fixture.crash_after_step && result.code === 0) {
-    return { pass: false, cause_code: "workflow_fault", violations: [{ invariant: "crash-expected", detail: "run completed but crash was expected after " + scenario.fixture.crash_after_step }], state };
-  }
-
-  if (scenario.fixture.crash_after_step && result.code !== 0) {
-    const resumeResult = await executeScenario(scenario, workDir, seed, true);
-    return resumeResult;
-  }
-
   const expectedSteps = scenario.expected.completed_steps || [];
-  if (outcome.cause_code === "ok" && scenario.expected.outcome === "complete") {
+  if (outcome.cause_code === "ok") {
     const missingSteps = expectedSteps.filter((s) => !state.checkpoints.includes(s));
     if (missingSteps.length > 0)
       violations.push({ invariant: "expected-steps", detail: "missing: " + missingSteps.join(", ") });
@@ -425,13 +526,37 @@ async function replayPaired(scenarios, candidateId, baselineId, corpusDir, cycle
     const seed = (scenario.seed + cycleSeed) % 2147483647;
 
     const candDir = makeTempDir("cand-" + scenario.id);
-    materializeFixture(scenario, candDir);
-    const candResult = await executeScenario(scenario, candDir, seed, false);
+    try {
+      materializeFixture(scenario, candDir, candidateId);
+    } catch (e) {
+      cleanupDir(candDir);
+      const baseDir = makeTempDir("base-" + scenario.id);
+      cleanupDir(baseDir);
+      pairs.push({
+        scenario_id: scenario.id,
+        seed,
+        cand: { pass: false, cause_code: "infra_fault" },
+        base: { pass: false, cause_code: "infra_fault" },
+      });
+      continue;
+    }
+    const candResult = await executeScenario(scenario, candDir, seed);
     cleanupDir(candDir);
 
     const baseDir = makeTempDir("base-" + scenario.id);
-    materializeFixture(scenario, baseDir);
-    const baseResult = await executeScenario(scenario, baseDir, seed, false);
+    try {
+      materializeFixture(scenario, baseDir, baselineId);
+    } catch (e) {
+      cleanupDir(baseDir);
+      pairs.push({
+        scenario_id: scenario.id,
+        seed,
+        cand: { pass: candResult.pass, cause_code: candResult.cause_code },
+        base: { pass: false, cause_code: "infra_fault" },
+      });
+      continue;
+    }
+    const baseResult = await executeScenario(scenario, baseDir, seed);
     cleanupDir(baseDir);
 
     pairs.push({
@@ -546,18 +671,22 @@ async function selftest() {
 
 (async () => {
   const args = parseArgs(process.argv.slice(2));
+  const sub = args._[0];
 
-  if (args.selftest) {
+  if (args.selftest || sub === "selftest") {
     await selftest();
     return;
   }
 
-  if (args.record && args.auto) {
-    await recordAuto(args.auto);
+  if (sub === "record" || args.record) {
+    const autoDir = args.auto;
+    if (!autoDir) fail("record requires --auto <project-dir>");
+    await recordAuto(autoDir);
     return;
   }
 
-  if (args.replay && args.paired) {
+  if (sub === "replay" || args.replay) {
+    if (!args.paired) fail("replay requires --paired");
     if (!args.candidate || !args.baseline) fail("replay --paired requires --candidate and --baseline");
     const corpusDir = args.corpus || DEFAULT_CORPUS_DIR;
     const cycleSeed = parseInt(args.seed, 10) || 0;
