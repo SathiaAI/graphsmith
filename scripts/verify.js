@@ -63,7 +63,15 @@
  *   `node_modules`), which is exactly what verifyTree()'s internal
  *   walkDir()+case-fold-collision+symlink-refusal logic is built for; (b)
  *   `generate(...)` inside --selftest's fixture builder, where `rootDir` is
- *   always a temp directory this file created and fully controls.
+ *   always a temp directory this file created and fully controls; (c)
+ *   `generate("tree", {rootDir: <one declared top-level dir>})` inside
+ *   detectExtraFiles() (D2 hardening, below) — bounded to exactly the
+ *   top-level directories a manifest's OWN file list names (e.g. `scripts/`),
+ *   never the live project root, so an unlisted file inside a
+ *   constitutional/evolvable directory is caught without ever walking `.git`
+ *   or `node_modules` (those never appear as a manifest-declared directory,
+ *   and are explicitly skip-listed as a second line of defense against a
+ *   hostile manifest that tries to name one).
  *   DOCUMENTED DEVIATION: for the RELEASE and PROJECT manifests' per-file
  *   hash lists, this file does NOT call `manifest.generate(kind, {rootDir:
  *   <live project root>, includeOnly})`. manifest.js's `generate()`/
@@ -223,11 +231,15 @@ function stripInternal(obj) {
 // verifyFileList(rootDir, files) — the scoped, per-file replacement for a
 // full-tree walk (see file header). Re-implements ONLY the checks that are
 // safe and meaningful at file-list scope: canonical-path shape, case-fold
-// collision, symlink refusal, existence, and raw-byte hash match. Does NOT
-// detect "extra" files on disk beyond the declared list (that would require
-// a walk — the whole reason this scoped approach exists) — that is a
-// documented, narrower guarantee than manifest.js's verifyTree() gives for
-// the evolvable tree, stated here rather than silently assumed away.
+// collision, symlink refusal, existence, and raw-byte hash match. This
+// function alone does NOT detect "extra" files on disk beyond the declared
+// list (that needs a walk, deliberately not done here at the unbounded
+// rootDir scope — see file header). Extra-file detection is handled by the
+// separate, narrowly-SCOPED detectExtraFiles() below (D2 hardening): it
+// walks only the top-level directories a manifest's own file list names
+// (e.g. `scripts/`), so it gets the same "extras are visible" guarantee
+// manifest.js's verifyTree() gives for the evolvable tree, without ever
+// walking `.git`/`node_modules`/the unbounded project root.
 // ---------------------------------------------------------------------------
 
 function verifyFileList(rootDir, files) {
@@ -310,6 +322,66 @@ function verifyFileList(rootDir, files) {
 }
 
 // ---------------------------------------------------------------------------
+// detectExtraFiles(rootDir, declaredFiles) — D2 hardening: files present on
+// disk but absent from a manifest's file list were previously invisible
+// (verifyFileList only ever looks AT declared paths). Scoped deliberately
+// narrow: only the TOP-LEVEL directories a manifest's own file list names
+// (e.g. "scripts" from "scripts/gate.js") are scanned, each via
+// manifest.generate("tree", {rootDir: <that one directory>}) — bounded to a
+// directory the manifest itself declares is integrity-relevant, never the
+// live project root, so this can never walk `.git`/`node_modules`/anything
+// else unrelated (SKIP_TOP_DIRS below is a second, defense-in-depth guard
+// against a hostile manifest that tries to name one of those as a top-level
+// directory anyway). generate() throws on a symlink found during that scoped
+// walk (manifest.js:37-41) — surfaced as a scan_errors entry, not swallowed.
+// ---------------------------------------------------------------------------
+
+const SKIP_TOP_DIRS = new Set([".git", "node_modules", ".graphsmith"]);
+// .graphsmith is skip-listed here specifically: its integrity is already
+// covered by dedicated, purpose-built checks elsewhere in this file (the
+// active-tree walk, the adoption-log chain walk) that understand its
+// internal structure (state.lock/journal files that are EXPECTED to exist
+// and change between runs); re-walking it generically here would either
+// duplicate those checks or misreport ordinary operational state as a
+// "surprise extra file."
+
+function detectExtraFiles(rootDir, declaredFiles) {
+  const declaredSet = new Set((declaredFiles || []).map((f) => f && f.path).filter((p) => typeof p === "string"));
+  const topDirs = new Set();
+  for (const p of declaredSet) {
+    if (!p.includes("/")) continue; // a declared file directly at rootDir has no directory to scope a scan to
+    const first = p.split("/")[0];
+    if (first && !SKIP_TOP_DIRS.has(first)) topDirs.add(first);
+  }
+
+  const extras = [];
+  const scanErrors = [];
+  for (const dir of [...topDirs].sort()) {
+    const abs = path.join(rootDir, dir);
+    let stat;
+    try {
+      stat = fs.lstatSync(abs);
+    } catch (_) {
+      continue; // directory doesn't exist -- verifyFileList already reports the declared files under it as "missing"
+    }
+    if (!stat.isDirectory()) continue; // symlinked/odd top entry -- verifyFileList's own symlink-refusal covers the declared file itself
+    let manifest;
+    try {
+      manifest = manifestLib.generate("tree", { rootDir: abs });
+    } catch (e) {
+      scanErrors.push({ dir, error: e.message });
+      continue;
+    }
+    for (const f of manifest.files) {
+      const fullRelPath = `${dir}/${f.path}`;
+      if (!declaredSet.has(fullRelPath)) extras.push(fullRelPath);
+    }
+  }
+  extras.sort();
+  return { extras, scoped_dirs: [...topDirs].sort(), scan_errors: scanErrors };
+}
+
+// ---------------------------------------------------------------------------
 // Release verification (release-verified axis) — contract 09 §Release
 // manifest; contract 05 assumption 1 ("the release artifact's integrity
 // chain... is the T-profile trust root").
@@ -356,17 +428,35 @@ function verifyRelease(rootDir, opts) {
   const mismatchedConstitutional = mismatched.filter((r) => constitutionalSetNorm.has(r.path));
   const mismatchedOther = mismatched.filter((r) => !constitutionalSetNorm.has(r.path));
 
+  // D2 hardening: an unlisted file sitting inside a directory that also
+  // hosts a declared constitutional_set file is flagged as constitutional-
+  // adjacent (trusted-core territory); an unlisted file elsewhere in a
+  // declared directory is flagged as "other" (still fails release-verified,
+  // conservatively treated as evolvable-surface — see runIntegrity).
+  const extraInfo = detectExtraFiles(rootDir, m.files);
+  const constitutionalTopDirs = new Set(constitutionalSet.map((p) => p.split("/")[0]));
+  const extraConstitutional = extraInfo.extras
+    .filter((p) => constitutionalTopDirs.has(p.split("/")[0]))
+    .map((p) => ({ path: p, status: "extra-unlisted-file" }));
+  const extraOther = extraInfo.extras
+    .filter((p) => !constitutionalTopDirs.has(p.split("/")[0]))
+    .map((p) => ({ path: p, status: "extra-unlisted-file" }));
+  const scanErrorResults = extraInfo.scan_errors.map((e) => ({ path: e.dir, status: "scan-error", detail: e.error }));
+
+  const ok = listCheck.ok && schemaOk && extraInfo.extras.length === 0 && extraInfo.scan_errors.length === 0;
+
   return {
-    status: listCheck.ok && schemaOk ? "yes" : "no",
+    status: ok ? "yes" : "no",
     path: foundPath,
     schema_version: m.schema_version,
     schema_version_ok: schemaOk,
     release: m.release,
     constitutional_set: constitutionalSet,
     files_checked: listCheck.results.length,
-    mismatched_constitutional: mismatchedConstitutional,
-    mismatched_other: mismatchedOther,
+    mismatched_constitutional: [...mismatchedConstitutional, ...extraConstitutional],
+    mismatched_other: [...mismatchedOther, ...extraOther, ...scanErrorResults],
     results: listCheck.results,
+    extra_files_scan: extraInfo,
   };
 }
 
@@ -414,10 +504,26 @@ function verifyProjectManifest(rootDir, releaseInfo) {
     parentReleaseOk = releaseBuf ? sha256Hex(releaseBuf) === m.parent_release_sha256 : null;
   }
 
-  const ok = listCheck.ok && schemaOk && parentReleaseOk !== false;
+  // D2 hardening (same rationale and shape as verifyRelease, above): scoped
+  // to the top-level directories the project manifest's own file list names.
+  // `results` (verifyFileList's own output) is left untouched — extras are
+  // additive, surfaced via `extra_files`/`extra_files_scan`, never mixed
+  // into the declared-file-list results array.
+  const extraInfo = detectExtraFiles(rootDir, m.files);
+  const extraFiles = extraInfo.extras.map((p) => ({ path: p, status: "extra-unlisted-file" }));
+  const scanErrorResults = extraInfo.scan_errors.map((e) => ({ path: e.dir, status: "scan-error", detail: e.error }));
+
+  const ok = listCheck.ok && schemaOk && parentReleaseOk !== false && extraInfo.extras.length === 0 && extraInfo.scan_errors.length === 0;
+  let reason = null;
+  if (!ok) {
+    if (!schemaOk) reason = "schema-version-mismatch";
+    else if (!listCheck.ok) reason = "hash-mismatch";
+    else if (parentReleaseOk === false) reason = "parent-release-mismatch";
+    else reason = "extra-unlisted-file";
+  }
   return {
     status: ok ? "yes" : "no",
-    reason: ok ? null : "hash-mismatch",
+    reason,
     path: projPath,
     schema_version: m.schema_version,
     schema_version_ok: schemaOk,
@@ -426,6 +532,8 @@ function verifyProjectManifest(rootDir, releaseInfo) {
     adoption_log_head_declared: m.adoption_log_head || null,
     files_checked: listCheck.results.length,
     results: listCheck.results,
+    extra_files: [...extraFiles, ...scanErrorResults],
+    extra_files_scan: extraInfo,
   };
 }
 
@@ -523,22 +631,47 @@ function verifyPromptConformance(activeTreeResult) {
 // ---------------------------------------------------------------------------
 // Adoption-log chain walk vs the anchored head — contract 09 §Adoption log:
 // "rewrite-detecting relative to the anchored head... NEVER 'immutable'
-// (F15)." No `schemas/adoption-entry.schema.json` has shipped yet (contract
-// 09 says it will, P2-GPT-4), so entry shape is validated against the
-// textual field list in contract 09 directly, flagged [inferring] where the
-// contract does not pin an exact value (e.g. the genesis entry's
-// prev_sha256). entry_sha256 is verified for CHAIN LINKAGE (does entry[i]'s
-// prev_sha256 equal entry[i-1]'s entry_sha256, and does the tail anchor the
-// project manifest's declared head) — never recomputed from entry content,
-// because no frozen schema yet pins the exact canonical serialization
-// promote.js will use to compute it; recomputing against a guessed
-// serialization could produce false mismatches once promote.js ships its
-// own. Chain-linkage verification is exactly what the "rewrite-detecting
-// relative to an anchored head" claim requires: a single spliced/rewritten
-// entry breaks prev_sha256 continuity at the point of the anchor even
-// without re-hashing content; a full, internally-consistent rewrite of the
-// whole chain AND the separately-stored anchor is the documented A6
-// out-of-scope case (contract 05).
+// (F15)." `schemas/adoption-entry.schema.json` now ships (promote.js's lane)
+// — entry shape is validated against ITS closed schema's field list, with
+// [inferring] flags only where neither the schema nor promote.js pins a
+// value (the genesis entry's prev_sha256).
+//
+// entry_sha256 is now verified TWO ways, closing the gap this file's
+// deviation #5 (build v1) deferred: (1) CHAIN LINKAGE — entry[i]'s
+// prev_sha256 equals entry[i-1]'s entry_sha256, and the tail anchors the
+// project manifest's declared head; (2) CONTENT DIGEST — entry_sha256 is
+// RECOMPUTED from the entry's own bytes and compared to the claimed value,
+// catching a body-content change (fingerprint/human/kind/etc.) that a
+// linkage-only check cannot see because it never touches entry_sha256 itself.
+//
+// The recomputation is NOT a guess: it is byte-for-byte the algorithm
+// scripts/promote.js already ships and tests (--selftest, kill-and-recover
+// cases), read directly rather than re-derived independently, per this
+// task's "if the canonical serialization is genuinely ambiguous... match
+// exactly what promote.js writes" instruction:
+//   - WRITE  (scripts/promote.js:308-322 buildEntry()): builds the entry
+//     object in field order schema_version, seq, txid, status, fingerprint,
+//     kind, evidence_ref, human, prev_sha256 — THEN computes
+//     `entry.entry_sha256 = sha256(JSON.stringify(entry))` (i.e. hashed
+//     BEFORE entry_sha256 exists on the object) — and appendDurable()
+//     (promote.js:80-85) writes that same object with
+//     `JSON.stringify(record)` (compact, no whitespace) + "\n".
+//   - VERIFY (scripts/promote.js:131-145 adoptionEntries()): on each parsed
+//     entry, `const body = {...entry}; delete body.entry_sha256;` then
+//     compares `sha256(JSON.stringify(body))` to the claimed entry_sha256.
+// `{...entry}` after `JSON.parse()` preserves the ORIGINAL on-disk key order
+// for ordinary (non-numeric) string keys — an ECMAScript object-key-
+// enumeration guarantee, not an assumption — so `JSON.stringify({...entry}
+// minus entry_sha256)` reproduces exactly the bytes buildEntry() hashed.
+// verifyAdoptionEntryDigest() below performs the identical
+// spread-then-delete-then-stringify-then-hash sequence, so it necessarily
+// agrees with promote.js's own writer on every entry promote.js produces —
+// confirmed by the D1 selftest case, below, and by cross-checking against a
+// LIVE promote.js-produced entry (see the header DEPENDENCIES note — no
+// separate canonicalization was invented). A single-entry content edit
+// (linkage fields left untouched) now fails THIS check even though the
+// prev_sha256 chain still walks cleanly — exactly the D1 gap Grok's
+// adversarial suite named.
 // ---------------------------------------------------------------------------
 
 const ADOPTION_ENTRY_REQUIRED = [
@@ -571,6 +704,17 @@ function validateAdoptionEntryShape(entry) {
     errors.push("human missing/invalid");
   }
   return errors;
+}
+
+// Recomputes entry_sha256 from the entry's own content and compares to the
+// claimed value — the exact algorithm scripts/promote.js:131-145 uses to
+// verify its own log (see the block comment above ADOPTION_ENTRY_REQUIRED).
+// Returns the recomputed digest (for evidence) alongside the ok flag.
+function verifyAdoptionEntryDigest(entry) {
+  const body = { ...entry };
+  delete body.entry_sha256;
+  const recomputed = sha256Hex(Buffer.from(JSON.stringify(body)));
+  return { ok: recomputed === entry.entry_sha256, recomputed };
 }
 
 function verifyAdoptionLog(rootDir, projectInfo) {
@@ -617,6 +761,7 @@ function verifyAdoptionLog(rootDir, projectInfo) {
 
   let chainOk = true;
   const chainErrors = [];
+  const digestErrors = [];
   if (entries[0].prev_sha256 !== null) {
     chainOk = false;
     chainErrors.push(`entry[0] (seq ${entries[0].seq}) prev_sha256 is not null — no genesis anchor [inferring: contract 09 does not pin a genesis sentinel value; null is this file's documented convention]`);
@@ -631,6 +776,26 @@ function verifyAdoptionLog(rootDir, projectInfo) {
       chainErrors.push(`entry[${i}] seq ${entries[i].seq} is not entry[${i - 1}].seq + 1`);
     }
   }
+  // Content-digest recomputation (D1 hardening) — kept as an INDEPENDENT
+  // flag from the prev_sha256/seq linkage checks above (chain_ok stays
+  // linkage-only in the returned report; content_digest_ok is reported
+  // separately), even though either failing marks the overall log
+  // "chain-broken" below. A body-content edit that leaves prev_sha256/seq
+  // untouched fails HERE, because entry_sha256 is recomputed from the
+  // entry's own bytes using promote.js's own algorithm
+  // (verifyAdoptionEntryDigest(), above), not merely compared for chain
+  // continuity.
+  let digestOk = true;
+  for (let i = 0; i < entries.length; i++) {
+    const digest = verifyAdoptionEntryDigest(entries[i]);
+    if (!digest.ok) {
+      digestOk = false;
+      digestErrors.push(
+        `entry[${i}] (seq ${entries[i].seq}) entry_sha256 does not match its recomputed content digest (claimed ${entries[i].entry_sha256}, recomputed ${digest.recomputed}) — body content changed while linkage fields may be untouched`
+      );
+    }
+  }
+  chainErrors.push(...digestErrors);
 
   const tail = entries[entries.length - 1];
   let headAnchorOk = null;
@@ -644,12 +809,13 @@ function verifyAdoptionLog(rootDir, projectInfo) {
   }
 
   return {
-    status: chainOk && headAnchorOk !== false ? "ok" : "chain-broken",
+    status: chainOk && digestOk && headAnchorOk !== false ? "ok" : "chain-broken",
     path: logPath,
     entries_read: entries.length,
     tail_entry_sha256: tail.entry_sha256,
     tail_status: tail.status,
     chain_ok: chainOk,
+    content_digest_ok: digestOk,
     head_anchor_ok: headAnchorOk,
     chain_errors: chainErrors,
   };
@@ -1088,6 +1254,38 @@ function runSelftest() {
     }
     record("trusted-core/restored/happy-path-again", runIntegrity(root, {}).failure_domain === "none");
 
+    // B2) trusted-core: an UNDECLARED file appears inside a directory that
+    // also hosts declared constitutional_set files -- the D2 hardening case.
+    // Previously invisible (verifyFileList only ever looks AT declared
+    // paths); detectExtraFiles() scans the declared top-level directory
+    // ("scripts") and must catch the extra.
+    {
+      const extraPath = path.join(root, "scripts", "backdoor.js");
+      fs.writeFileSync(extraPath, "// undeclared file dropped alongside constitutional files\nmodule.exports = {};\n");
+      const report = runIntegrity(root, {});
+      const rel = report.checks.release;
+      const found = (rel.mismatched_constitutional || []).some((r) => r.path === "scripts/backdoor.js" && r.status === "extra-unlisted-file");
+      record("extra-constitutional-file/flagged", found, JSON.stringify(rel.mismatched_constitutional));
+      record("extra-constitutional-file/release-verified-no", report.release_verified === "no", report.release_verified);
+      record("extra-constitutional-file/failure-domain-trusted-core", report.failure_domain === "trusted-core", report.failure_domain);
+      record("extra-constitutional-file/exit-code-3", integrityExitCode(report) === 3);
+      fs.unlinkSync(extraPath);
+      record("extra-constitutional-file/restored-happy-path", runIntegrity(root, {}).failure_domain === "none");
+    }
+
+    // B3) evolvable-surface: an UNDECLARED file inside a directory tracked by
+    // the PROJECT manifest only (not constitutional_set) is flagged too, and
+    // classified evolvable-surface rather than trusted-core.
+    {
+      const extraPath = path.join(root, "scripts", "sneaky.js");
+      fs.writeFileSync(extraPath, "// undeclared, but this fixture's project manifest also tracks scripts/\nmodule.exports = {};\n");
+      const report = runIntegrity(root, {});
+      const found = (report.checks.project.extra_files || []).some((r) => r.path === "scripts/sneaky.js" && r.status === "extra-unlisted-file");
+      record("extra-project-file/flagged", found, JSON.stringify(report.checks.project.extra_files));
+      record("extra-project-file/self-consistent-no", report.self_consistent === "no", report.self_consistent);
+      fs.unlinkSync(extraPath);
+    }
+
     // C) evolvable-surface: tamper an evolvable-tree payload file -> frozen mode.
     {
       const original = fs.readFileSync(fx.goodPromptPath);
@@ -1111,6 +1309,28 @@ function runSelftest() {
       const report = runIntegrity(root, {});
       record("adoption-log-break/chain-broken", report.checks.adoption_log.status === "chain-broken");
       record("adoption-log-break/failure-domain", report.failure_domain === "evolvable-surface", report.failure_domain);
+      fs.writeFileSync(fx.adoptionLogPath, original);
+    }
+
+    // D2) evolvable-surface: adoption-log entry BODY tampered while linkage
+    // (prev_sha256, seq, entry_sha256 itself) is left untouched -- the D1
+    // hardening case. A linkage-only walk would report this chain "ok"; the
+    // content-digest recomputation (verifyAdoptionEntryDigest, matching
+    // scripts/promote.js:131-145 byte-for-byte) must catch it.
+    {
+      const original = fs.readFileSync(fx.adoptionLogPath, "utf8");
+      const lines = original
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      lines[1].fingerprint = "f".repeat(64); // body content changed; prev_sha256/seq/entry_sha256 left exactly as-is
+      fs.writeFileSync(fx.adoptionLogPath, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+      const report = runIntegrity(root, {});
+      const adop = report.checks.adoption_log;
+      record("adoption-content-tamper/linkage-still-intact", adop.chain_ok === true, adop.chain_ok);
+      record("adoption-content-tamper/content-digest-fails", adop.content_digest_ok === false, adop.content_digest_ok);
+      record("adoption-content-tamper/status-chain-broken", adop.status === "chain-broken", adop.status);
+      record("adoption-content-tamper/failure-domain", report.failure_domain === "evolvable-surface", report.failure_domain);
       fs.writeFileSync(fx.adoptionLogPath, original);
     }
 
@@ -1322,6 +1542,8 @@ module.exports = {
   runPlatformProbe,
   runSelftest,
   verifyFileList,
+  detectExtraFiles,
+  verifyAdoptionEntryDigest,
   diffDestinations,
   sha256Hex,
 };
