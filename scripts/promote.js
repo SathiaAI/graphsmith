@@ -79,8 +79,21 @@ function fsyncDirectory(directory) {
 
 function appendDurable(file, record) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  let separator = "";
+  try {
+    const stat = fs.statSync(file);
+    if (stat.size > 0) {
+      const readFd = fs.openSync(file, "r");
+      const last = Buffer.alloc(1);
+      try { fs.readSync(readFd, last, 0, 1, stat.size - 1); }
+      finally { fs.closeSync(readFd); }
+      if (last[0] !== 0x0a) separator = "\n";
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
   const fd = fs.openSync(file, "a");
-  try { fs.writeSync(fd, `${JSON.stringify(record)}\n`); fs.fsyncSync(fd); }
+  try { fs.writeSync(fd, `${separator}${JSON.stringify(record)}\n`); fs.fsyncSync(fd); }
   finally { fs.closeSync(fd); }
 }
 
@@ -344,15 +357,16 @@ function expectedState(paths, activeSha, head, phase) {
 function acquire(root) {
   const store = createStore(root);
   const lock = store._testing.acquireLock();
+  let sweptLeaseIds;
   try {
     store._recoverJournal();
-    store._sweepExpiredLocked();
+    sweptLeaseIds = store._sweepExpiredLocked();
   } catch (error) {
     clearInterval(lock.heartbeat);
     try { store._testing.releaseLock(lock.ownerToken); } catch {}
     throw error;
   }
-  return { store, lock };
+  return { store, lock, sweptLeaseIds };
 }
 
 function release(store, lock) {
@@ -429,7 +443,58 @@ function finalizeWindow(store, packet, txid) {
 function updateProjectManifest(paths, pointer, head) {
   const manifest = readProjectManifest(paths);
   manifest.adoption_log_head = head;
+  manifest.active_tree = pointer.tree;
+  manifest.active_tree_manifest_sha256 = pointer.tree_manifest_sha256;
   return manifest;
+}
+
+function manifestMatches(manifest, pointer, head) {
+  return manifest.adoption_log_head === head &&
+    manifest.active_tree === pointer.tree &&
+    manifest.active_tree_manifest_sha256 === pointer.tree_manifest_sha256;
+}
+
+function completedTreeHistory(paths) {
+  const records = parseJsonl(paths.journal);
+  const completed = new Set(records.filter((record) => record.record_type === "TX_DONE").map((record) => record.txid));
+  const history = [];
+  for (const record of records) {
+    if (record.record_type !== "STAGE_DONE" || !completed.has(record.txid)) continue;
+    if (history.length === 0) history.push(record.from_pointer.tree);
+    if (history[history.length - 1] !== record.tree) history.push(record.tree);
+  }
+  return history;
+}
+
+function rollbackEligiblePrevious(paths, activePointer) {
+  const records = recordsFor(paths, activePointer.txid);
+  const begin = lastRecord(records, "TX_BEGIN");
+  const staged = lastRecord(records, "STAGE_DONE");
+  if (!begin || !staged || !lastRecord(records, "TX_DONE")) return null;
+  const packet = begin.packet;
+  return ["doc", "knob"].includes(packet.kind) && packet.reversible === true && packet.auto_rollback_eligible === true
+    ? staged.from_pointer.tree : null;
+}
+
+function garbageCollect(paths, store, sweptLeaseIds) {
+  const active = activeIdentity(paths).pointer;
+  const history = completedTreeHistory(paths);
+  const older = new Set(history.slice(0, Math.max(0, history.length - 2)));
+  const protectedTrees = new Set([active.tree, rollbackEligiblePrevious(paths, active)].filter(Boolean));
+  const registryRecords = store._registryState(store._read("run-registry.jsonl").split("\n").filter(Boolean).map((line) => parseJson(line, "run-registry.jsonl")));
+  for (const registration of registryRecords.values()) protectedTrees.add(registration.tree_id);
+  const deletedTreeIds = [];
+  for (const entry of fs.readdirSync(paths.evolvable, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^v-[0-9a-f]{8,64}$/.test(entry.name) || !older.has(entry.name) || protectedTrees.has(entry.name)) continue;
+    fs.rmSync(path.join(paths.evolvable, entry.name), { recursive: true, force: true });
+    deletedTreeIds.push(entry.name);
+  }
+  if (deletedTreeIds.length) fsyncDirectory(paths.evolvable);
+  if (sweptLeaseIds.length || deletedTreeIds.length) {
+    const evidence = JSON.stringify({ swept_lease_ids: sweptLeaseIds, deleted_tree_ids: deletedTreeIds });
+    journalRecord(paths, active.txid, "RECOVERY_STEP", { action: `GC_SWEEP ${evidence}` });
+  }
+  return { sweptLeaseIds, deletedTreeIds };
 }
 
 function maybeCrash(input, point) {
@@ -459,7 +524,7 @@ function promote(input) {
   fs.mkdirSync(paths.state, { recursive: true });
   fs.mkdirSync(paths.evolvable, { recursive: true });
 
-  const { store, lock } = acquire(root);
+  const { store, lock, sweptLeaseIds } = acquire(root);
   let txid;
   let phase = "LEASED";
   let committing = null;
@@ -476,6 +541,7 @@ function promote(input) {
     if (!packet.rollback_of && !["NO_WINDOW", "CLOSED_PASS", "CLOSED_ROLLED_BACK", "CLOSED_FLAGGED"].includes(window.state)) {
       throw failure(`Cannot promote while Gate-4 window is ${window.state}`, "WINDOW_EXISTS");
     }
+    garbageCollect(paths, store, sweptLeaseIds);
     txid = sha256(packet.fingerprint + active.sha).slice(0, 16);
     journalRecord(paths, txid, "TX_BEGIN", { expected_active_sha: active.sha, expected_log_head: head, packet });
     phase = "BEGUN";
@@ -526,7 +592,7 @@ function promote(input) {
     const manifest = updateProjectManifest(paths, toPointer, effective.entry_sha256);
     journalRecord(paths, txid, "MANIFEST_INTENT", { new_head_sha: effective.entry_sha256, manifest });
     atomicReplace(paths.projectManifest, `${JSON.stringify(manifest, null, 2)}\n`);
-    if (readProjectManifest(paths).adoption_log_head !== effective.entry_sha256) throw failure("Post-manifest verification failed", "HALT");
+    if (!manifestMatches(readProjectManifest(paths), toPointer, effective.entry_sha256)) throw failure("Post-manifest verification failed", "HALT");
     journalRecord(paths, txid, "MANIFEST_DONE", { new_head_sha: effective.entry_sha256 });
     phase = "MANIFEST";
     maybeCrash(input, "after-manifest");
@@ -562,12 +628,36 @@ function recoveryHalt(paths, txid, message, evidence) {
   throw failure(`HALT: ${message}`, "HALT", evidence);
 }
 
+function repairTornJournal(paths) {
+  const raw = readFile(paths.journal, "utf8");
+  if (!raw || raw.endsWith("\n")) return null;
+  const lineStart = raw.lastIndexOf("\n") + 1;
+  const finalLine = raw.slice(lineStart);
+  try { JSON.parse(finalLine); return null; }
+  catch {}
+  atomicReplace(paths.journal, raw.slice(0, lineStart));
+  return { truncated_bytes: Buffer.byteLength(finalLine), truncated_prefix: finalLine };
+}
+
+function cleanupAbandonedStaging(paths) {
+  const fallbackTxid = activeIdentity(paths).pointer.txid;
+  for (const entry of fs.readdirSync(paths.evolvable, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(".staging-")) continue;
+    fs.rmSync(path.join(paths.evolvable, entry.name), { recursive: true, force: true });
+    const candidate = entry.name.slice(".staging-".length);
+    const txid = /^[0-9a-f]{16}$/.test(candidate) ? candidate : fallbackTxid;
+    journalRecord(paths, txid, "RECOVERY_STEP", { action: `remove-abandoned-staging:${entry.name}` });
+  }
+  fsyncDirectory(paths.evolvable);
+}
+
 function recover(projectRoot = process.cwd()) {
   const root = path.resolve(projectRoot);
   const paths = locations(root);
   const { store, lock } = acquire(root);
   const outcomes = [];
   try {
+    const tornTail = repairTornJournal(paths);
     for (const txid of unfinishedTransactions(paths)) {
       let records = recordsFor(paths, txid);
       const begin = lastRecord(records, "TX_BEGIN");
@@ -579,6 +669,7 @@ function recover(projectRoot = process.cwd()) {
         log_head: logHead(paths),
         manifest_head: readProjectManifest(paths).adoption_log_head,
       };
+      if (tornTail) observed.truncated_journal_tail = tornTail;
       journalRecord(paths, txid, "RECOVERY_BEGIN", { observed_state: observed });
       if (!staged || !logIntent) {
         if (staged && activeIdentity(paths).pointer.tree !== staged.tree) fs.rmSync(path.join(paths.evolvable, staged.tree), { recursive: true, force: true });
@@ -615,9 +706,10 @@ function recover(projectRoot = process.cwd()) {
 
       if (outcomeIntent && outcomeIntent.entry.status === "aborted") {
         if (head === logIntent.entry_sha) appendEntry(paths, outcomeIntent.entry);
-        const manifest = lastRecord(records, "MANIFEST_INTENT")?.manifest || updateProjectManifest(paths, activeIdentity(paths).pointer, outcomeIntent.terminal_entry_sha);
+        const activePointer = activeIdentity(paths).pointer;
+        const manifest = updateProjectManifest(paths, activePointer, outcomeIntent.terminal_entry_sha);
         if (!lastRecord(records, "MANIFEST_INTENT")) journalRecord(paths, txid, "MANIFEST_INTENT", { new_head_sha: outcomeIntent.terminal_entry_sha, manifest });
-        if (readProjectManifest(paths).adoption_log_head !== outcomeIntent.terminal_entry_sha) atomicReplace(paths.projectManifest, `${JSON.stringify(manifest, null, 2)}\n`);
+        if (!manifestMatches(readProjectManifest(paths), activePointer, outcomeIntent.terminal_entry_sha)) atomicReplace(paths.projectManifest, `${JSON.stringify(manifest, null, 2)}\n`);
         journalRecord(paths, txid, "MANIFEST_DONE", { new_head_sha: outcomeIntent.terminal_entry_sha });
         journalRecord(paths, txid, "TX_ABORT", { reason: "recovered compensating abort", compensating_entry_sha: outcomeIntent.terminal_entry_sha });
         journalRecord(paths, txid, "RECOVERY_DONE", { outcome: "aborted" });
@@ -656,13 +748,13 @@ function recover(projectRoot = process.cwd()) {
       }
       records = recordsFor(paths, txid);
       let manifestIntent = lastRecord(records, "MANIFEST_INTENT");
+      const manifest = updateProjectManifest(paths, staged.to_pointer, terminal.terminal_entry_sha);
       if (!manifestIntent) {
-        const manifest = updateProjectManifest(paths, staged.to_pointer, terminal.terminal_entry_sha);
         manifestIntent = { new_head_sha: terminal.terminal_entry_sha, manifest };
         journalRecord(paths, txid, "MANIFEST_INTENT", manifestIntent);
       }
-      if (readProjectManifest(paths).adoption_log_head !== terminal.terminal_entry_sha) {
-        atomicReplace(paths.projectManifest, `${JSON.stringify(manifestIntent.manifest, null, 2)}\n`);
+      if (!manifestMatches(readProjectManifest(paths), staged.to_pointer, terminal.terminal_entry_sha)) {
+        atomicReplace(paths.projectManifest, `${JSON.stringify(manifest, null, 2)}\n`);
         journalRecord(paths, txid, "RECOVERY_STEP", { action: "replace-project-manifest" });
       }
       if (!lastRecord(recordsFor(paths, txid), "MANIFEST_DONE")) journalRecord(paths, txid, "MANIFEST_DONE", { new_head_sha: terminal.terminal_entry_sha });
@@ -674,6 +766,7 @@ function recover(projectRoot = process.cwd()) {
       journalRecord(paths, txid, "RECOVERY_DONE", { outcome: "done" });
       outcomes.push({ txid, state: "DONE" });
     }
+    cleanupAbandonedStaging(paths);
     return { state: outcomes.length ? "RECOVERED" : "CLEAN", transactions: outcomes };
   } finally {
     release(store, lock);
@@ -731,7 +824,7 @@ function createFixture(root) {
   fs.writeFileSync(paths.active, pointerBytes(pointer));
   fs.writeFileSync(paths.projectManifest, `${JSON.stringify({
     schema_version: SCHEMA_VERSION, kind: "project", generated_at: "selftest", parent_release_sha256: null,
-    adoption_log_head: null, files: [], workflow_manifests: [],
+    adoption_log_head: null, active_tree: tree, active_tree_manifest_sha256: sha256(manifestBytes), files: [], workflow_manifests: [],
   }, null, 2)}\n`);
   return { paths, tree };
 }
@@ -761,10 +854,30 @@ function selftest() {
     tests.push({ name, status: "pass" });
   };
   try {
+    const closeWindow = (root) => {
+      const store = createStore(root);
+      const lock = store._testing.acquireLock();
+      try {
+        store._commit([{
+          file: "window.json",
+          make: (raw, rev) => {
+            const current = parseJson(raw, "window.json");
+            current.state = "CLOSED_PASS";
+            current.state_rev = rev;
+            return JSON.stringify(current);
+          },
+        }]);
+      } finally {
+        clearInterval(lock.heartbeat);
+        store._testing.releaseLock(lock.ownerToken);
+      }
+    };
     const happyRoot = path.join(base, "happy");
     createFixture(happyRoot);
     const happy = promote(testPacket(happyRoot, "happy"));
     check("happy-path-adoption", happy.state === "DONE" && adoptionEntries(locations(happyRoot)).at(-1).status === "effective");
+    const happyPaths = locations(happyRoot);
+    check("manifest-carries-tree-identity", manifestMatches(readProjectManifest(happyPaths), activeIdentity(happyPaths).pointer, logHead(happyPaths)));
 
     for (const point of ["before-swap", "after-swap", "after-manifest"]) {
       const root = path.join(base, point);
@@ -776,6 +889,48 @@ function selftest() {
       const paths = locations(root);
       check(`kill-and-recover-${point}`, crashed && recovered.transactions[0].state === "DONE" && readProjectManifest(paths).adoption_log_head === logHead(paths));
     }
+
+    const tornRoot = path.join(base, "torn-tail");
+    createFixture(tornRoot);
+    let tornCrashed = false;
+    try { promote(testPacket(tornRoot, "torn-tail", { __test_crash_at: "after-swap" })); }
+    catch (error) { tornCrashed = error.code === "SIMULATED_CRASH"; }
+    const tornPaths = locations(tornRoot);
+    const journalRaw = readFile(tornPaths.journal, "utf8");
+    const completeEnd = journalRaw.lastIndexOf("\n", journalRaw.length - 2) + 1;
+    const finalLine = journalRaw.slice(completeEnd).replace(/\n$/, "");
+    fs.writeFileSync(tornPaths.journal, journalRaw.slice(0, completeEnd) + finalLine.slice(0, Math.max(1, Math.floor(finalLine.length / 2))));
+    const tornRecovered = recover(tornRoot);
+    const recoveryBegin = parseJsonl(tornPaths.journal).find((record) => record.record_type === "RECOVERY_BEGIN");
+    check("torn-tail-recovery-rolls-forward", tornCrashed && tornRecovered.transactions[0].state === "DONE" && recoveryBegin.observed_state.truncated_journal_tail.truncated_bytes > 0);
+
+    const stagingRoot = path.join(base, "abandoned-staging");
+    const stagingFixture = createFixture(stagingRoot);
+    const stagingTxid = sha256("abandoned-staging").slice(0, 16);
+    const stagingPaths = locations(stagingRoot);
+    const stagingDir = path.join(stagingPaths.evolvable, `.staging-${stagingTxid}`);
+    fs.mkdirSync(stagingDir);
+    fs.writeFileSync(path.join(stagingDir, "partial"), "partial");
+    journalRecord(stagingPaths, stagingTxid, "TX_BEGIN", {
+      expected_active_sha: activeIdentity(stagingPaths).sha, expected_log_head: null,
+      packet: testPacket(stagingRoot, "abandoned-staging"),
+    });
+    recover(stagingRoot);
+    check("recover-removes-abandoned-staging", !fs.existsSync(stagingDir) && stagingFixture.tree === activeIdentity(stagingPaths).pointer.tree);
+
+    const gcRoot = path.join(base, "gc");
+    const gcFixture = createFixture(gcRoot);
+    promote(testPacket(gcRoot, "gc1"));
+    const gcPaths = locations(gcRoot);
+    const treeB = activeIdentity(gcPaths).pointer.tree;
+    closeWindow(gcRoot);
+    promote(testPacket(gcRoot, "gc2", { edits: [{ schema_version: SCHEMA_VERSION, schema_ref: "selftest", file: "graphsmith.learned.md", anchor: "gc1", op: "replace", payload: "gc2" }] }));
+    closeWindow(gcRoot);
+    createStore(gcRoot, { leaseMs: 60 * 60 * 1000, heartbeatMs: 1000 }).runRegistry.register("live-seed-reader", gcFixture.tree);
+    promote(testPacket(gcRoot, "gc3", { edits: [{ schema_version: SCHEMA_VERSION, schema_ref: "selftest", file: "graphsmith.learned.md", anchor: "gc2", op: "replace", payload: "gc3" }] }));
+    closeWindow(gcRoot);
+    promote(testPacket(gcRoot, "gc4", { edits: [{ schema_version: SCHEMA_VERSION, schema_ref: "selftest", file: "graphsmith.learned.md", anchor: "gc3", op: "replace", payload: "gc4" }] }));
+    check("gc-deletes-orphan-spares-live-lease", !fs.existsSync(path.join(gcPaths.evolvable, treeB)) && fs.existsSync(path.join(gcPaths.evolvable, gcFixture.tree)));
 
     const abortRoot = path.join(base, "abort");
     createFixture(abortRoot);
