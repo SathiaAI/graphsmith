@@ -2,3 +2,7 @@ node_modules/
 .runs/
 *.log
 .DS_Store
+
+# Internal v0.2.0 build planning — never publish to the public repo
+.plans/
+BUILD-LEDGER.md
