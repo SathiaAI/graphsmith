@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "id": "fanout-crash-resume",
+  "shape": "fan-out",
+  "tier": "smoke",
+  "seed": 2002,
+  "failure_mode": "crash-resume",
+  "fixture": {
+    "pipeline": [
+      { "step": "01-init", "worker": "init.js" },
+      { "step": "02-merge", "worker": "merge.js" }
+    ],
+    "workers": {
+      "init.js": { "behavior": "ok", "delay_ms": 50 },
+      "worker-a.js": { "behavior": "ok", "delay_ms": 50 },
+      "worker-b.js": { "behavior": "ok", "delay_ms": 50 },
+      "worker-c.js": { "behavior": "ok", "delay_ms": 50 },
+      "merge.js": { "behavior": "ok", "delay_ms": 50 }
+    },
+    "fan_out_groups": [
+      [
+        { "step": "02a-branch", "worker": "worker-a.js" },
+        { "step": "02b-branch", "worker": "worker-b.js" },
+        { "step": "02c-branch", "worker": "worker-c.js" }
+      ]
+    ],
+    "crash_after_step": "02a-branch"
+  },
+  "expected": {
+    "outcome": "crash-recovered",
+    "completed_steps": ["01-init", "02a-branch", "02b-branch", "02c-branch", "02-merge"]
+  },
+  "invariants": [
+    "no-duplicate-effects",
+    "intent-before-effect",
+    "no-step-reexecuted-after-resume"
+  ]
+}

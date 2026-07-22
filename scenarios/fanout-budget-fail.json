@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0",
+  "id": "fanout-budget-fail",
+  "shape": "fan-out",
+  "tier": "smoke",
+  "seed": 2004,
+  "failure_mode": "budget-fail",
+  "fixture": {
+    "pipeline": [
+      { "step": "01-init", "worker": "init.js" },
+      { "step": "02-merge", "worker": "merge.js" }
+    ],
+    "workers": {
+      "init.js": { "behavior": "ok", "delay_ms": 50 },
+      "worker-a.js": { "behavior": "ok", "delay_ms": 50 },
+      "worker-b.js": { "behavior": "delay", "delay_ms": 500 },
+      "worker-c.js": { "behavior": "ok", "delay_ms": 50 },
+      "merge.js": { "behavior": "ok", "delay_ms": 50 }
+    },
+    "fan_out_groups": [
+      [
+        { "step": "02a-branch", "worker": "worker-a.js" },
+        { "step": "02b-branch", "worker": "worker-b.js" },
+        { "step": "02c-branch", "worker": "worker-c.js" }
+      ]
+    ],
+    "budget_ms": 200
+  },
+  "expected": {
+    "outcome": "budget-exceeded",
+    "completed_steps": ["01-init"]
+  },
+  "invariants": [
+    "no-duplicate-effects",
+    "intent-before-effect"
+  ]
+}

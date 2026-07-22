@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0",
+  "id": "pipeline-budget-fail",
+  "shape": "pipeline",
+  "tier": "smoke",
+  "seed": 1004,
+  "failure_mode": "budget-fail",
+  "fixture": {
+    "pipeline": [
+      { "step": "01-gather", "worker": "gather.js" },
+      { "step": "02-process", "worker": "process.js" },
+      { "step": "03-deliver", "worker": "deliver.js" }
+    ],
+    "workers": {
+      "gather.js": { "behavior": "ok", "delay_ms": 50 },
+      "process.js": { "behavior": "delay", "delay_ms": 500 },
+      "deliver.js": { "behavior": "ok", "delay_ms": 50 }
+    },
+    "budget_ms": 200
+  },
+  "expected": {
+    "outcome": "budget-exceeded",
+    "completed_steps": ["01-gather"]
+  },
+  "invariants": [
+    "no-duplicate-effects",
+    "intent-before-effect"
+  ]
+}
