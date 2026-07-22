@@ -1,32 +1,36 @@
-# Contract 03 — Normative Statistical Appendix (Gate 2)
-Status: DRAFT. Required by plan §4 Gate 2 (OpenAI F10/MISSING). gate.js implements THIS document; divergence is a Gate-2 bug.
+# Contract 03 — Normative Statistical Appendix (Gate 2) — v2
+Status: DRAFT v2 (post-panel-pass-1: GPT-9/10/11/12, Gemini-6, DeepSeek-4). gate.js implements THIS document; divergence is a Gate-2 bug.
+
+## Scope narrowing (GPT-9 — claims narrower than implementation)
+v0.2.0 freezes **one endpoint type: binary scenario pass/fail**. Continuous-score endpoints are NOT machine-decidable in v0.2.0 (they surface descriptively only); freezing a continuous estimand + interval procedure is a v0.2.x item. This is recorded in the property matrix.
 
 ## Design
-- **Unit of analysis:** the scenario. **Design:** paired — candidate and baseline run the identical (scenario, seed, evaluator, model-version) tuple.
-- **Order of evaluation (short-circuit):** (1) hard invariants → (2) critical slices → (3) primary endpoint. Failure at any tier stops evaluation; tiers are never averaged against each other.
+Unit = scenario; paired: candidate and baseline on identical (scenario, seed, evaluator-hash, model-version) tuples. Order: (1) hard invariants → (2) critical slices → (3) primary endpoint; short-circuit; never averaged across tiers.
 
-## Tier 1 — Hard invariants (never averaged)
-Any single violation in any scenario run → candidate REJECTED. The hard-invariant list is part of the frozen corpus definition (per-shape: e.g., "no duplicate recorded external effect," "halt fired on staged intent-without-completion" — semantics inherited from the v0.1.1 chaos properties [KnoSky: SKILL.md:87-94]).
+## Tier 1 — Hard invariants: any violation in any run → REJECTED (per-shape list frozen in the corpus; semantics inherited from chaos properties [KnoSky: SKILL.md:87-94]).
+## Tier 2 — Critical slices: predeclared subsets; any regression (`pass_rate_cand < pass_rate_base` on the slice) → REJECTED; ties pass.
 
-## Tier 2 — Critical slices
-Predeclared scenario subsets (per shape and per posture). Rule: no slice may regress: `pass_rate(candidate, slice) ≥ pass_rate(baseline, slice)` exactly (n is small; no tolerance). A tie is acceptable; a regression rejects.
+## Tier 3 — Primary endpoint (binary, exactly one)
+- **Estimand:** P(candidate passes, baseline fails) − P(candidate fails, baseline passes) on the frozen corpus distribution (unconditional discordance advantage). Reported with its exact-conditional decision rule:
+- **Decision rule:** one-sided exact sign test on discordant pairs at **α = 0.05**: promote only if `P(X ≥ x | n_d, ½) ≤ 0.05` (X~Binomial). Concordant pairs are uninformative for the test and reported descriptively. The unconditional estimate `(wins − losses)/n` is published alongside with an exact Clopper-Pearson-style one-sided bound on the discordant split — both shown; the sign test is THE gate.
+- **Power precheck (GPT-12):** before any candidate run, compute the maximum attainable discordant wins given baseline's corpus results; if no outcome could satisfy the rule (needs n_d ≥ 5 all-wins at minimum), the cycle is declared **INCONCLUSIVE_UNDERPOWERED** up front: no promotion, and the candidate is NOT placed in the rejected buffer. Underpowered ≠ defective.
 
-## Tier 3 — Primary endpoint (exactly one, predeclared)
-- **Estimand:** the per-scenario paired difference in the declared score (default score: binary scenario pass). Effect measure for binary: discordant-pair advantage.
-- **Decision rule:** one-sided test that candidate > baseline at **α = 0.05**; equivalently the one-sided 95% lower confidence bound on the paired improvement must exceed 0.
-  - Binary scores: exact binomial (sign) test on discordant pairs — reject H0 only if `P(X ≥ x | n_d, 0.5) ≤ 0.05` where `n_d` = discordant pairs, `x` = candidate-wins. (At n_d < 5 no result can pass — this is intentional: small evidence cannot promote.)
-  - Continuous scores (declared per corpus): one-sided Wilcoxon signed-rank at α = 0.05 plus a bootstrap (B = 2,000, seeded) percentile lower bound > 0. Both must agree; disagreement → no promotion.
-- **Multiplicity / alpha spending:** candidates are generated in ONE batch (max 3/cycle, plan §4) BEFORE any scoring. Selection happens on the selection split only; exactly ONE selected candidate reaches the confirmation split; α is spent once, on that confirmation. No re-testing of a failed candidate on the same corpus state (fingerprint-buffered).
-- **Selection/confirmation split:** deterministic partition of the corpus (seeded hash of scenario IDs), rotated by cycle counter so membership shifts every cycle; the proposer NEVER sees per-scenario results or held-out membership (access audit — contract 04).
+## Multiplicity / alpha ledger (GPT-10)
+- Candidates batch-generated (≤3/cycle) before any scoring. Selection on the selection split only; **selection rule (DeepSeek-4): the candidate with the largest discordant-win advantage on the selection split; tie → lexicographically smallest candidate-semantic fingerprint** (contract 02 definition). Exactly one candidate reaches confirmation; α spent once there.
+- **Durable alpha ledger** (`.graphsmith/state/alpha-ledger.jsonl`): every confirmation attempt records (corpus-state hash, confirmation-split membership hash, candidate fingerprint + FAMILY). Per corpus-state: max **3** confirmations EVER; further cycles require corpus growth (new scenarios re-seed the splits). A failed candidate's **family** (same edit-target set per the contract 02 fingerprint's target component) cannot re-enter confirmation against the same corpus state — near-duplicate retry is refused, not just exact-duplicate (GPT-10).
+- Split: deterministic seeded partition, 60% selection / 40% confirmation; rotation by cycle counter; the confirmation membership used in a recorded attempt is sealed in the ledger. Proposer never sees per-scenario results or split membership (access audit, boundary B6/B14).
 
-## Missing / crashed runs
-Any scenario whose paired run is incomplete (crash, timeout, budget breach) counts as: candidate LOSS if either side is missing. No imputation, no exclusion. (Conservative by construction; stated in evidence output.)
+## Missing / crashed runs (Gemini-6, GPT-11)
+| Case | Rule |
+|---|---|
+| Candidate-side failure attributable to the candidate (its run crashes/HALTs/breaches budget) | counts as candidate LOSS on that pair |
+| Baseline-side or infrastructure failure (baseline crash, evaluator error, host failure) | pair INVALID → one bounded retry of the pair; still failing → pair EXCLUDED and counted |
+| Both sides fail | pair EXCLUDED and counted |
+| Excluded pairs > 20% of the corpus | cycle INCONCLUSIVE (not a rejection; not buffered) |
+Attribution rule is frozen: failure inside the candidate's evaluation copy = candidate-attributable; anything else = infrastructure.
 
 ## Determinism & pinning
-- Seeds: per-scenario pinned seeds recorded in the corpus file; runs re-executable byte-comparable where the model permits.
-- Evaluator: scenario.js + corpus hash-pinned in the manifest at cycle start; evaluator changes ship in separate PRs and re-baseline (plan §3.5); evaluator frozen at RC.
-- Model: provider + model ID + version string recorded per run; a mid-cycle model change invalidates the cycle.
-- Noise floor: each release publishes same-vs-same (baseline vs baseline) discordance as the run-to-run noise estimate; deltas inside the noise floor are reported as "flat" (design law: publish where results are flat, plan §1).
+Per-scenario pinned seeds in the corpus file; evaluator (scenario.js + corpus) hash-pinned at cycle start, changes ship in separate PRs and re-baseline; model provider+ID+version recorded per run — mid-cycle model change invalidates the cycle. **Replay is honestly stochastic where providers are** (GPT-25): what is deterministic is the decision function over the recorded evidence bundle (contract 08). Noise floor: same-vs-same discordance published per release; deltas inside it are reported "flat."
 
-## Reporting (release notes, plan §13.8)
-Held-out table: n scenarios, n_d discordant, x wins, p-value, lower bound, noise floor, verdict. Never the word "proven."
+## Reporting
+Held-out table: n, n_d, wins, exact p, unconditional estimate + bound, exclusions, noise floor, verdict ∈ {promote, reject, inconclusive_underpowered, inconclusive_missingness}. Never "proven."

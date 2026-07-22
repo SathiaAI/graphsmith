@@ -24,4 +24,7 @@ Once frozen, these contracts are the ONLY sync points between build workers (coo
 - Every claim herein about existing v0.1.1 code carries a KnoSky citation (real `path:line`) or the marker **[inferring]**.
 
 ## Constitutional set (I2 — hash-pinned, unreachable by any evolution path)
-`scripts/gate.js` · `scripts/verify.js` (sentinel) · `scripts/promote.js` · `scripts/event-compiler.js` · `scripts/scenario.js` · `scripts/evalenv.js` · risk policy + tunables BOUNDS (not values) · scaffolded `manager.js` + intent guards + supervisor · loaders (appendix/prompt) · CI workflow entries · this contracts/ directory itself.
+The authoritative registry is contract 11 §Constitutional set (superset per panel pass 1, mechanically re-derived in Phase A from the enforcement dependency graph, then frozen in the release manifest).
+
+## Panel history
+Pass 1 (2026-07-21): gpt-5.6-sol-pro (redesign-required, 28) · gemini-3.1-pro-preview (fix-then-freeze, 7) · deepseek-v4-pro (fix-then-freeze, 6). All BLOCKING/MAJOR findings adopted or narrowed in v2; disposition in `.plans/reviews/stage0/DISPOSITION.md` (internal).

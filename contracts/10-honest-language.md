@@ -1,28 +1,16 @@
-# Contract 10 — Honest-Language Rules + Banned-Strings Lint (lint-checkable)
-Status: DRAFT. Two lists, one lint (runs in the CI docs job, plan Phase F). Applies to every repo-bound artifact: README, SKILL.md, PROTOCOL.md, references/, docs/, release notes, code comments, commit messages.
+# Contract 10 — Honest-Language Rules + Banned-Strings Lint (v2)
+Status: DRAFT v2 (post-panel-pass-1: Gemini-1, GPT-21/22, DeepSeek-5). Applies to every repo-bound artifact.
 
 ## List A — Honest-language phrase rules (public copy)
-| Banned (unqualified) | Required form |
-|---|---|
-| proven | "tested: <what the test shows>" — never beyond test evidence (PA-1 lesson) |
-| immutable | "rewrite-detecting vs an anchored head" |
-| certified / certification | "adversarial review" / "attestation of tested behavior" |
-| sandboxed / sandbox | "disposable evaluation copy with mocked effects" (standard) or "container-isolated" (container profile, named) |
-| exactly-once | "exactly-once *recorded*; external exactly-once requires an idempotency key the system honors" |
-| constant monitoring / always-on | "continuous-at-every-boundary" |
-| tamper-proof | "tamper-evident vs anchored head" |
-| pen-test / penetration test (about GraphSmith's own capability) | "architecture-level adversarial battery" (§17 boundary) |
-| certified secure / security guaranteed / guaranteed | (no permitted form — remove the claim) |
-| cannot reach the network (standard profile) | (container profile only, with the socket-denial test cited) |
-Lint mechanics: case-insensitive phrase match on rendered text; per-line allowlist marker `<!-- lint-allow: honest-language (reason) -->` for quoting-the-ban contexts like this file; CI fails on any unallowed hit.
+Banned unqualified → required form: **proven** → "tested: <what the test shows>" · **immutable** → "rewrite-detecting vs an anchored head" · **certified** → "adversarial review"/"attestation of tested behavior" · **sandboxed** → "disposable evaluation copy with mocked effects" (standard) / "container-isolated" (container) · **exactly-once** → state the capability class + assumption per contract 06 (no fixed replacement phrase — GPT-22) · **constant monitoring** → "continuous-at-every-boundary" · **tamper-proof** → "tamper-evident vs anchored head" · **pen-test** (about GraphSmith itself) → "architecture-level adversarial battery" · **certified secure / security guaranteed / guaranteed / cannot fail** → remove the claim · **atomic** (about Windows behavior) → probe-verified wording only (contract 01) · **cannot reach the network** → container profile only, socket-denial test cited.
 
-## List B — Publication hygiene (maintainer directive, plan Phase F)
-No references to external research projects, their orgs, repos, or paper identifiers in ANY repo-bound artifact. Mechanism (keeps the identifiers themselves out of the repo):
-1. The raw identifier list lives ONLY in the maintainer's private workspace (`.plans/hygiene/banned-identifiers.txt` — git-ignored; Paul supplies/extends it).
-2. The repo ships `ci/banned-hashes.json`: `{ "algo": "sha256", "normalize": "lowercase, strip non-alphanumerics", "hashes": ["…"] }`.
-3. The docs-job lint normalizes every token n-gram (n = 1..4) of each shipped text file the same way and fails on any hash match. Hashes reveal nothing; the list is maintainable privately.
-4. Failure message says "publication-hygiene violation in <file>:<line>" WITHOUT echoing the matched term into public CI logs.
+Lint mechanics (GPT-22): context-aware — scans rendered prose and comments, skips code identifiers and quoted-ban contexts carrying `<!-- lint-allow: honest-language (reason) -->` (this file and the rules fixtures use it); ships with a tested fixture corpus (true-positive + false-positive cases) like the lint-corpus pattern [KnoSky: tests/lint-corpus/expected.json]; rule-list changes are **constitutional-set changes** (protected review + manifest hash bump), never routine.
 
-## Scope notes
-- Council-review docs for `docs/reviews/` are scrubbed to List B before commit; raw pass-1/pass-2 responses stay internal (plan Phase F).
-- The lint tool itself is constitutional-set adjacent (CI entry), Phase A CI deliverable; List A/B content updates are routine-tier.
+## List B — Publication hygiene (v2 mechanism — Gemini-1/GPT-21: unsalted hashes are dictionary-attackable)
+1. **Prevention (primary): local pre-commit/pre-release scanner** on the maintainer's machine — reads the RAW private list (`.plans/hygiene/banned-identifiers.txt`, git-ignored, maintainer-supplied) and blocks the commit/release. The raw list never leaves the private workspace.
+2. **Detection (secondary): trusted-CI scan with a keyed digest.** The repo ships NO digests. The CI docs job (trusted context only — push to main / release; never fork-PR contexts) receives `HYGIENE_HMAC_KEY` and `HYGIENE_DIGESTS` as CI secrets and scans HMAC-SHA256(key, normalized n-gram) per token n-gram, n = 1..len(longest identifier) derived per-identifier (DeepSeek-5 — no fixed n=4 cap). Nothing in the repo is dictionary-attackable; public CI logs never echo matches (file:line only).
+3. Normalization: Unicode NFKC + confusable folding, lowercase, strip non-alphanumerics, decode %-encodings and URLs; applied to file contents AND filenames. History note (GPT-21): CI detects post-push; prevention is step 1 — this split is stated, not hidden.
+4. Scope: docs/reviews/ publications scrubbed pre-commit; raw pass-1/pass-2 council responses remain internal-only.
+
+## Governance
+Both lists versioned; every change = a ledger row + manifest bump. The lint tool lane: contract 11 (docs-lint). Failure messages never quote the banned term.

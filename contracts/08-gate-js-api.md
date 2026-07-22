@@ -31,7 +31,10 @@ node scripts/gate.js 4 --status|--observe <runId>
 ```
 Exit codes: 0 pass · 1 fail/reject (with findings) · 2 internal error (fail-closed) · 3 HALT (trusted-core defect detected mid-gate). Machine-readable JSON on stdout with `schema_version`; human explanation on stderr.
 
+## Decision engine vs replay runner (v2 — GPT-25)
+gate.js is the **pure decision engine**: it consumes a recorded, hashed **evidence bundle** (scenario outcomes, invariant results, slice tables) and decides. The **replay runner** is scenario.js: it executes workflows in the I3 profile and MAY be stochastic where model providers are (contract 03 acknowledges this); it produces the bundle and its hash. Gate 2 = scenario.js produces → gate.js decides.
+
 ## Determinism guarantees (mutation-tested)
-- Same candidate + same corpus state + same cycleSeed → byte-identical decision output.
-- gate.js never writes outside `.graphsmith/gate-evidence/` (fence check applies to the gate itself).
-- No LLM call exists in gate.js or anything it requires (lint-enforced: the R5 static screen applies to the constitutional set too).
+- Same evidence bundle (same hash) → byte-identical decision output. Replay stochasticity is a property of the runner and is disclosed, never averaged away (contract 03 pinning applies).
+- Persistence split: gate.js writes ONLY `.graphsmith/gate-evidence/`; window state belongs to window-store.js; rejected buffer/alpha ledger writes go through the state API (contract 11 lanes) — the write fence is enforceable because ownership is exclusive.
+- No LLM call exists in gate.js or anything it requires (lint-enforced: the R5 static screen applies to the constitutional set too). scenario.js invokes workflows that call models — inside workers only, per SKILL.md rule 1.

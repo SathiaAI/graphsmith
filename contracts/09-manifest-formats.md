@@ -14,7 +14,7 @@ Status: DRAFT. Two manifests, two claims (plan §2-I1): release manifest proves 
   "created_by": { "ci_workflow": "…", "run_url": "…" }
 }
 ```
-Trust root: the package integrity chain that delivered the artifact (contract 05, assumption 1). Hashing rules: canonical repo-relative paths, forward slashes, case-folded compare, Unicode NFC, **normalized line endings (LF) before hashing** — Windows checkouts rewrite CRLF, so raw-byte hashes would false-alarm on every Windows machine (plan §3.1 canonicalization list; the cross-platform burn risk, plan §12).
+Trust root: the package integrity chain that delivered the artifact (contract 05, assumption 1). Hashing rules (v2 — GPT-26): **raw-byte SHA-256, always** — no content normalization at hash time (normalized-before-hash would let byte changes evade integrity and conflicts with byte-exact rollback). The CRLF problem is solved at the BYTES, not the hash: release build + install materialization write canonical LF bytes for text files (enforced `.gitattributes eol=lf` on the constitutional/evolvable set; binaries untouched); the sentinel verifies the bytes on disk as they are. Path canonicalization (repo-relative, forward slashes, NFC, case-fold **collision refusal** — collisions rejected, not folded together) applies to PATHS only.
 
 ## Project manifest (`.graphsmith/project.manifest.json`, generated at install/scaffold)
 Same shape plus:
@@ -34,5 +34,8 @@ Hash-chained JSONL: each entry `{ schema_version, seq, txid, fingerprint, kind, 
 - Optional `graphsmith anchor export` emits the head for external anchoring (stronger claims are the USER'S to make).
 - Verification: sentinel walks the chain from the anchored head; any break → evolvable-surface freeze domain (plan §5).
 
+## Adoption-log commit ordering (v2 — aligned with contract 01: GPT-2)
+Entry appended (status `committing`) BEFORE the pointer swap; project manifest updated AFTER the swap with `adoption_log_head = entry_sha`; aborted transactions append a compensating `aborted` entry — the chain is append-only and every txid's outcome is present. The previous tree is retained per contract 01's GC policy, so a rollback target always exists while eligible.
+
 ## Sentinel reporting (verify --integrity)
-Output states exactly one of: `release-verified` (release manifest chain intact) / `self-consistent` (project manifest only) / the failure domain engaged. The circular-trust limit is printed on request (`--trust-model`): a privileged local attacker who rewrites sentinel + both manifests is out of scope (A6), stated in those words.
+Release verification and project self-consistency are **independent axes, both reported** (GPT-26): `release-verified: yes|no|unavailable` AND `self-consistent: yes|no` — never collapsed into one word. Failure engages the applicable domain (plan §5). The circular-trust limit is printed on request (`--trust-model`): a privileged local attacker who rewrites sentinel + both manifests is out of scope (A6), stated in those words.

@@ -1,32 +1,35 @@
-# Contract 07 — Typed Lesson-Event Schema (harvest boundary B4)
-Status: DRAFT. The ONLY representation in which harvested run artifacts may reach the proposer (plan §3.2/§3.4). Raw prose never crosses; embedded instructions are structurally inert.
+# Contract 07 — Typed Lesson-Event Schema (v2 — opaque IDs + authenticated sources)
+Status: DRAFT v2 (post-panel-pass-1: GPT-13/14/15, Gemini-3). The ONLY representation in which harvested artifacts reach the proposer.
 
-## Event record (JSONL, `.graphsmith/events.jsonl`; schema_version on every line)
+## Two outputs, hard-split (GPT-13 — the core v2 change)
+1. **Proposer view** (`events-proposer.jsonl`): what the mining/proposal LLM sees. Contains ONLY: closed enums, numbers, and **opaque compiler-assigned aliases** (`step_ref: "s01"`, `run_ref: "r03"`, `path_ref: "p02"`). NO raw step names, run IDs, paths, or any producer-controlled string ever appears here — instruction-shaped identifiers (`step: "ignore_previous_instructions"`) cannot reach model context, because no producer-chosen string survives into this view.
+2. **Human evidence map** (`events-evidence.jsonl`): alias → real (run_id, step, path:line), charset-checked (`^[A-Za-z0-9._:/-]{1,256}$` — applied to run_id too, Gemini-3), for human review of proposals. Never placed in model context by any GraphSmith code path (lint-checked: the proposer prompt builder imports only the proposer view).
+
+## Event record (published JSON Schema ships as `schemas/lesson-event.schema.json` — GPT-15; `additionalProperties: false`; canonical JSON serialization; all ints bounded, all numbers finite)
 ```json
-{
-  "schema_version": "1.0",
-  "event_id": "sha256(run_id + seq)[:16]",
-  "run_id": "string (from run log)",
-  "step": "string (^[A-Za-z0-9._-]+$ — same charset the manager enforces [KnoSky: scripts/scaffold.js:44-45])",
-  "ts": "ISO8601 copied from the run log line, never wall-clock at compile time",
+{ "schema_version": "1.0", "seq": "int (required, total order)", "event_id": "sha256(run_ref+seq)[:16]",
+  "run_ref": "^r[0-9]{2,6}$", "step_ref": "^s[0-9]{2,6}$", "ts": "ISO8601 copied from the source record",
   "type": "run_halt | budget_breach | tripwire | retry_exhausted | step_failure | corrupt_checkpoint | lock_contention | scenario_fail | human_correction | adoption | rollback",
-  "code": "string from the CLOSED per-type code enum (e.g. halt.unresolved_side_effect, budget.max_wall_time, tripwire.undeclared_destination)",
-  "counters": { "attempt": "int", "duration_ms": "int", "...type-specific numeric fields": "number" },
-  "evidence_ref": { "path": "repo-relative canonical path", "line": "int|null" },
-  "fingerprint": "sha256(normalize(type + code + step))"
-}
+  "code": "closed per-type enum (e.g. halt.unresolved_side_effect, budget.max_wall_time)",
+  "counters": "closed per-type object schema — no free keys (GPT-15)",
+  "lossy": "bool (source value replaced by code)", "evidence_ref": "^p[0-9]{2,6}$ (alias)",
+  "fingerprint": "sha256(normalize(type+code+step_ref))  // EVENT fingerprint — distinct from the candidate-semantic fingerprint (contract 02)" }
 ```
+Companion records (also schema'd): `compiler_stats` (counts incl. `skipped`, `quarantined`, `dropped_refs`) and the evidence-map entry.
+
+## Source authentication (GPT-14)
+| Event type | Sole authorized producer (trusted root) |
+|---|---|
+| adoption, rollback | `.graphsmith/state/adoption-log.jsonl` + window store ONLY (contract 01/02 artifacts) — never run logs |
+| human_correction | Gate-3 packet decisions recorded by promote.js — never run logs |
+| run_halt, budget_breach, tripwire, retry_exhausted, step_failure, corrupt_checkpoint, lock_contention | manager-written run records. Phase B managers write a per-run hash chain (each log line carries prev-hash; chain head in the run's final checkpoint) — the compiler verifies the chain and refuses unchained/broken segments |
+| scenario_fail | scenario.js result files (hash-pinned evaluator) |
+A record of a type arriving from a non-authorized source is REJECTED + counted. **Safety-relevant integrity failures invalidate the harvest cycle** (not merely a counter): any broken/missing chain segment, or any skipped record of types {run_halt, budget_breach, tripwire, rollback}, marks the cycle `harvest_invalid` — no proposals from partial adverse evidence (selective-deletion defense, GPT-14/16).
 
 ## Compiler rules (event-compiler.js — constitutional)
-1. Input: checkpoints, structured log lines (the one-line-per-step JSON logs [KnoSky: scripts/scaffold.js:35-36]), halt state files, intents/effects logs. Input is read as DATA; no field of any input is ever evaluated, executed, or passed to an LLM raw.
-2. Every string field in the OUTPUT is either (a) drawn from a closed enum, (b) charset-restricted to `[A-Za-z0-9._:/-]` with a hard length cap (256), or (c) a number. There is NO free-text field. A source value that doesn't fit is replaced by its code + `"lossy": true` — never truncated prose.
-3. Malformed/unparseable source records: skipped, counted in `compiler_stats.skipped`, quarantined by path reference — never "best-effort parsed."
-4. `evidence_ref` paths are canonicalized (realpath, repo-relative); refs escaping the project root are dropped + counted.
-5. Determinism: same inputs → byte-identical output (stable sort by (run_id, ts, seq); no clocks/randomness — SKILL.md rule 4).
-6. The proposer consumes events + aggregate counts ONLY. It never receives checkpoints, logs, prompts, or scenario contents (proposer isolation, plan §3.2), and never per-scenario Gate-2 results (contract 03).
-
-## Sanitizer (defense-in-depth on the compiler output before the proposer)
-Rejects any record whose fields contain delimiter/marker sequences (the appendix-loader refusal list, shared single source of truth), overlong values, or non-schema keys. Rejection is loud (counted + evidenced), never silent repair.
-
-## Fingerprints
-`normalize` = lowercase, collapse repeated separators, strip digits-only suffixes (so `step-003` families dedupe). Used by: rejected buffer (cap 100), Gate-4 thrash guard (contract 02), dedup screen (Gate 1).
+1. Inputs read as DATA; nothing evaluated/executed; nothing passed to an LLM raw.
+2. Determinism: same inputs → byte-identical outputs (stable sort by (run_ref, ts, seq); no clocks/randomness).
+3. `evidence_ref` targets canonicalized (realpath, repo-relative); escapes dropped + counted.
+4. Malformed non-safety records: quarantined by reference + counted — never best-effort parsed.
+5. Proposer isolation (B5/B6): the proposer consumes `events-proposer.jsonl` + aggregate counts ONLY.
+6. Sanitizer (defense-in-depth): rejects any proposer-view record with non-schema keys, out-of-range values, or — belt-and-suspenders on a supposedly alias-only view — anything matching the shared marker/delimiter refusal list (single source of truth with the appendix loader). Rejection is loud.

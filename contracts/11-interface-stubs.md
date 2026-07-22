@@ -1,44 +1,54 @@
-# Contract 11 — Per-Component Interface Stubs, Ownership Lanes, Rotation
-Status: DRAFT. One writer per lane (coordination rule 1): a component's builder owns EXACTLY the files listed; touching another lane's files fails the orchestrator gate. Builder/tester families per blueprint §6; security tier = 2 non-Anthropic tester families + Paul's gate.
+# Contract 11 — Interface Stubs, Ownership Lanes, Rotation (v2 — lane conflicts resolved)
+Status: DRAFT v2 (post-panel-pass-1: Gemini-4, GPT-23/24). **One owner per physical file for the whole release.** A lane lists every file the owner may touch; the orchestrator gate rejects out-of-lane diffs. Task specs are self-contained (verbatim contract/plan excerpts embedded by the orchestrator — workers never fetch the plan).
 
-Conventions binding every component: Node ≥ 18, CommonJS, zero runtime dependencies (v0.1.1 house style [KnoSky: scripts/scaffold.js:2-9]); no clocks/randomness in decision paths; `schema_version` on every artifact; JSON to stdout / prose to stderr; exit codes 0/1/2(/3 where contract 08 applies); every script has `--selftest` where feasible (pattern: [KnoSky: SKILL.md:77]).
+Conventions: Node ≥ 18, CommonJS, zero runtime deps [KnoSky: scripts/scaffold.js:2-9]; no clocks/randomness in decision paths; `schema_version` everywhere; JSON stdout / prose stderr; exit codes 0/1/2(/3); `--selftest` where feasible [KnoSky: SKILL.md:77].
 
-## Phase A
-| Component | Lane (owns) | Public surface | Tier | Builder → Tester(s) |
-|---|---|---|---|---|
-| A1 gate.js | `scripts/gate.js`, `tests/gate/` | contract 08 | SECURITY | DeepSeek → GPT-sol-pro + Grok |
-| A2 sentinel | `scripts/verify.js`, `tests/verify/` | `verify --integrity --selftest --profiles --trust-model`; failure domains (plan §5); dual manifests (contract 09) | SECURITY | Claude Sonnet → Gemini + DeepSeek |
-| A3 promote.js | `scripts/promote.js`, `tests/promote/` | `promote(packet)`, `rollback(txid)`, `recover()`; contract 01 exactly | SECURITY | GPT-sol (codex) → Grok + DeepSeek |
-| A4 manifest.js | `scripts/manifest.js`, `tests/manifest/` | `generate(kind)`, `verifyTree(manifestPath)`, canonicalization per contract 09 | SECURITY | Qwen → GPT-sol-pro + Gemini |
-| A5 scenario.js + seed corpus | `scripts/scenario.js`, `scenarios/` (12 smoke-tier, per shape) | `record --auto`, `replay --paired --seed`, corpus schema w/ pinned seeds | routine | Qwen → Claude Sonnet |
-| A6 CI (3-OS) | `.github/workflows/ci.yml` (extend existing [KnoSky: .github/workflows/ci.yml]) | matrix: windows/macos/ubuntu; jobs: selftests, attack suites, docs lint (contract 10) | SECURITY | Claude Sonnet → DeepSeek + GPT-sol-pro |
-| A7 attack suites | `tests/attacks/{constitutional,toctou,module-escape}/` | runnable batteries; each case = fixture + expected containment | SECURITY | Grok → Gemini + DeepSeek |
-| A8 lab harness spec impl | `lab/` (fixtures, battery, scorers — contract 12) | `node lab/run.js --agent <adapter> --task <T#>` | routine | Claude Haiku → Qwen |
+**Rotation rule (tightened per GPT-23):** a family that authored ANY revision of a file never tests that file, in any phase. Security tier = 2 independent tester families (both non-Anthropic when the builder is Anthropic; else ≥1 non-Anthropic + any second independent family).
 
-## Phase B
-| B1 supervisor | scaffold template additions in `scripts/scaffold.js` (manager budget block) + `scripts/watchdog.js` | full §7 budget set; breach → HALT + evidence; `--acknowledge-budget`; separate watchdog process (blocked-event-loop kill) | SECURITY | Qwen → GPT-sol-pro + Grok |
-| B2 adapter capabilities | scaffold template `adapters/*.capability.json` + manager kill-message derivation | contract 06 | SECURITY | Claude Sonnet → DeepSeek + Gemini |
-| B3 prompt separation + workflow.manifest + tunables | scaffold templates: `workers/*.prompt.md`, `workflow.manifest.json`, `tunables.json` | contract 09 workflow-manifest section; loader per B3 boundary | routine | Claude Haiku → Qwen |
-| B4 heal.js (staged-only) | `scripts/heal.js`, `tests/heal/` | `heal --diagnose`, `heal --stage`, `heal rollback <id>` (byte-exact); typed-vs-code split (plan §3.3); diagnosis via event compiler only | SECURITY | Grok-build → GPT-sol-pro + DeepSeek |
-| B5 graphlint R5/R6 | `scripts/graphlint.js` (extend — existing rules R1–R4 [KnoSky: scripts/graphlint.js:182-210]), `tests/lint-corpus/` additions | R5: eval/new Function/raw exec/new require-import in machine-evaluated candidates + scaffold adapters; R6: adapter capability declaration present + destination allowlist match | routine | DeepSeek → Claude Sonnet |
+## File-owner registry (whole release — resolves A1/C4, A2/E1, scaffold pile-ups)
+| File(s) | Sole owner (family) | Testers (never authors of the file) | Tier |
+|---|---|---|---|
+| `scripts/gate.js` (Gates 1–4 decision engine, all phases) | DeepSeek | GPT-sol-pro + Grok | SECURITY |
+| `scripts/window-store.js` (Gate-4 durable store, contract 02) | GPT-sol (codex) | DeepSeek + Gemini | SECURITY |
+| `scripts/promote.js` (contract 01) | GPT-sol (codex) | Grok + DeepSeek | SECURITY |
+| `scripts/verify.js` (sentinel, Phase A core + Phase E `--profiles`) | Claude Sonnet | Gemini + DeepSeek (A), Gemini + Grok (E) | SECURITY |
+| `scripts/manifest.js` | Qwen | GPT-sol-pro + Gemini | SECURITY |
+| `scripts/loaders.js` (appendix + prompt loaders, B2/B3 — NEW lane, GPT-24) | Claude Sonnet | DeepSeek + Grok | SECURITY |
+| `scripts/scenario.js` + `scenarios/` | Qwen | Claude Sonnet | routine |
+| `scripts/event-compiler.js` + `schemas/lesson-event.schema.json` | DeepSeek | Gemini + Grok | SECURITY |
+| `scripts/evolve.js` + migration API (`scripts/migrate.js`, F16 redaction test) | DeepSeek | GPT-sol-pro + Gemini | SECURITY |
+| `scripts/heal.js` | Grok-build | GPT-sol-pro + DeepSeek | SECURITY |
+| `scripts/evalenv.js` | Claude Sonnet | DeepSeek + Gemini | SECURITY |
+| `scripts/scaffold.js` (ALL template changes B1–B3 integrate here under ONE owner) | Claude Sonnet | GPT-sol-pro + Qwen (behavioral), DeepSeek (security review of manager/supervisor templates) | SECURITY |
+| `scripts/watchdog.js` (separate process, §7) | Qwen | GPT-sol-pro + Grok | SECURITY |
+| `scripts/graphlint.js` (R5/R6 additions; existing R1–R4 [KnoSky: scripts/graphlint.js:182-210]) + `tests/lint-corpus/` | DeepSeek | Claude Sonnet + Gemini | routine |
+| `scripts/risk-policy.json` + capability policy (syntactic allowlist, plan §3.3 — NEW lane) | Claude Sonnet | DeepSeek + GPT-sol-pro | SECURITY |
+| `scripts/test.js`, `scripts/redteam.js`, `scripts/assure.js` (minimal packet, §17) + external-tool runner | Grok | Gemini + DeepSeek | SECURITY (seam) |
+| `scripts/watch.js` | Claude Haiku | Qwen | routine |
+| `scripts/diagnostics.js` | Claude Sonnet | GPT-sol-pro + DeepSeek | SECURITY (I4) |
+| `scripts/watcher.js` (advisory, off-default) | Qwen | Claude Sonnet | routine |
+| `scripts/docs-lint.js` (contract 10 lists A+B — NEW lane) | Claude Haiku | DeepSeek + Gemini | SECURITY (CI enforcement) |
+| `scripts/badge.js` + property-matrix generator (`scripts/property-matrix.js` — NEW lane) | Claude Haiku | Gemini + GPT-sol-pro | routine |
+| `.github/workflows/*` (extends existing [KnoSky: .github/workflows/ci.yml]) + `action/` + `ci-templates/` | Claude Sonnet | DeepSeek + GPT-sol-pro | SECURITY |
+| `GRAPHSMITH-PROTOCOL.md`, `SPEC-CHANGES.md`, RELEASING.md, docs | Claude Sonnet | GPT-sol-pro | routine |
+| `lab/` (contract 12: fixtures, tasks, agents, score.js, ledgers) | Claude Haiku | Qwen + DeepSeek (scorer integrity) | SECURITY (scorer) |
+| `tests/attacks/{constitutional,toctou,module-escape}/` | Grok | Gemini + DeepSeek | SECURITY |
 
-## Phase C
-| C1 evalenv (I3) | `scripts/evalenv.js`, `tests/evalenv/` | `create(profile)` → disposable copy (full copy, no shared git metadata, module-isolation: NODE_PATH hygiene + resolution check + symlink audit), `destroy()`, transactional clean + age-GC | SECURITY | Claude Sonnet → DeepSeek + Gemini |
-| C2 event-compiler + sanitizer | `scripts/event-compiler.js`, `tests/events/` | contract 07 | SECURITY | DeepSeek → Gemini + Grok |
-| C3 evolve.js | `scripts/evolve.js`, `tests/evolve/` | harvest→mine→≤3 bounded edits→Gates 1–4; staged-only; rejected buffer; `.graphsmith/` state + migration API (F16) | SECURITY | DeepSeek → GPT-sol-pro + Gemini |
-| C4 Gate 3+4 wiring | `scripts/gate.js` gate3/gate4 sections + window state | contracts 02, 08 | SECURITY | GPT-sol (codex) → DeepSeek + Grok |
-| C5 assurance cmds | `scripts/test.js` (wraps scenario+chaos [KnoSky: scripts/chaos.js:1-20]), `redteam.js` | §17: deterministic pass/fail + per-check evidence; BYO attack cases; external-tool seam (exit-code + JSON contract) | SECURITY (seam) | Grok → Gemini + DeepSeek |
+Phase mapping unchanged (plan §11): A = gate/verify/manifest/promote/window-store/loaders/scenario/CI/attacks/lab-skeleton · B = scaffold+watchdog+capabilities+heal+graphlint · C = evalenv+event-compiler+evolve+gate3/4 wiring+test/redteam · D = watch/diagnostics/watcher · E = profiles/action/protocol/badge/matrix/shadow/assure-minimal · F = docs/demos.
 
-## Phase D
-| D1 watch | `scripts/watch.js` | local tail of checkpoints/logs/budgets/tripwires; kill w/ capability message (contract 06) | routine | Claude Haiku → Qwen |
-| D2 diagnostics export | `scripts/diagnostics.js` | preview + redaction, aggregate counters default, zero upload code (static-checked) | SECURITY (I4) | Claude Sonnet → GPT-sol-pro + DeepSeek |
-| D3 advisory watcher | `scripts/watcher.js` | OFF by default; structured logs only; flag-only; batched | routine | Qwen → Claude Sonnet |
+## Constitutional set (superset — GPT-24; mechanically re-derived in Phase A from the enforcement dependency graph, then frozen in the release manifest)
+gate.js · verify.js · promote.js · window-store.js · manifest.js · loaders.js · event-compiler.js · scenario.js · evalenv.js · watchdog.js · graphlint.js · docs-lint.js · risk-policy.json · scaffolded manager/supervisor/intent-guard templates · CI workflow entries · schemas/ · tunables BOUNDS · this contracts/ directory.
 
-## Phase E
-| E1 verify --profiles | `scripts/verify.js` extension | R/E/B/T/G + Q/X per-check evidence, verifier version, platform | SECURITY | Claude Sonnet → Gemini + Grok |
-| E2 CI action + GitLab template | `action/` + `ci-templates/` | wraps verify; pinned-SHA usage documented | SECURITY | GPT-sol (codex) → Claude Sonnet + DeepSeek |
-| E3 PROTOCOL.md + SPEC-CHANGES.md | `GRAPHSMITH-PROTOCOL.md`, `SPEC-CHANGES.md` | draft banner; schemas from contracts 06/07/09; profile definitions with checks + limits | routine (Paul reads pre-merge anyway) | Claude Sonnet → GPT-sol-pro |
-| E4 badge | `scripts/badge.js` | evidence-carrying render (profile string + verifier + platform + date + CI link); stale → downgrade; unprovable → "unavailable" | routine | Claude Haiku → Gemini |
-| E5 Loop 3 shadow CI | `.github/workflows/shadow-eval.yml` | held-out deltas on SKILL/references PRs; trusted workflow; no lesson intake | SECURITY | DeepSeek → GPT-sol-pro + Gemini |
-
-Phase F components are docs/demos over the above (routine; honest-language lint gates them). Rotation invariant holds in every row above: no family in both columns; security rows have 2 tester families, both non-Anthropic except where the builder is non-Anthropic (then Anthropic may be ONE of the two).
+## Component stubs (signatures; unchanged items carried from v1)
+- `promote.js`: `promote(packet) → {txid, state}` · `rollback(txid_or_inverse)` · `recover()` — contract 01 exactly.
+- `window-store.js`: `admit(tx)` · `register(runId, treeId)` · `deregister(runId, result)` · `status()` — contract 02 CAS ops.
+- `gate.js`: contract 08 (decision engine only; all persistence via window-store/state APIs).
+- `verify.js`: `--integrity --selftest --profiles --trust-model --platform-probe` (probe added per contract 01).
+- `loaders.js`: `loadAppendix(ctx)` / `loadPrompt(worker)` — resolve via `.graphsmith/evolvable/ACTIVE`, enforce B2/B3, return `{content, treeId, hash}`.
+- `manifest.js`: `generate(kind)` · `verifyTree(manifest, root)` — contract 09 canonicalization.
+- `event-compiler.js`: `compile(runDirs) → {proposerView, evidenceMap, stats}` — contract 07.
+- `evalenv.js`: `create(profile) → {dir, destroy()}` — module-isolation checks, secret-scrub, budgets.
+- `heal.js`: `--diagnose` · `--stage` · `rollback <id>` (byte-exact) — typed-vs-code split (plan §3.3).
+- `evolve.js`: `cycle()` — harvest→mine→≤3 bounded edits→Gates 1–4, staged-only.
+- `test.js`/`redteam.js`/`assure.js`: §17 — deterministic pass/fail + per-check evidence; container-required for untrusted tools (B10); assure-minimal packet in v0.2.0, full format v0.2.x.
+- `watchdog.js`: spawned by manager; kills on blocked-event-loop budget breach; chaos-grade resume proof.
