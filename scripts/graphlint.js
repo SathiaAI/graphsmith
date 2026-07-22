@@ -51,6 +51,27 @@ const GUARD_TOKENS = /\b(idempoten|Idempotency-Key|dedup|upsert|ON CONFLICT|if_n
 const GUARD_LOOKUP = /(\.includes\(|\.has\(|existsSync|readFileSync|SELECT\s+1|findOne|get\()/i;
 const GUARD_KEY = /\b(runId|run_id|ctx\.step|jobId|job_id|messageId|message_id|eventId|event_id|dedupeKey|idempotencyKey|key)\b/;
 
+// R5 — eval/exec/new-require patterns (bare view — strings/comments blanked)
+const EVAL_RE = /\beval\b\s*\(/;
+const NEW_FUNCTION_RE = /\bnew\s+Function\b\s*\(/;
+const FUNCTION_CTOR_RE = /\bFunction\b\s*\(\s*(["'`])/; // Function( as constructor (string-arg form)
+const EXEC_SPAWN_RE = /\b(?:execSync|exec|spawnSync|spawn)\b\s*\(/;
+const DYNAMIC_IMPORT_RE = /\bimport\s*\(/;
+const REQUIRE_IMPORT_RE = /\brequire\s*\(/;
+const CHILD_PROCESS_REF = /(?:require|from)\s*[(]\s*["'`]child_process["'`]/;
+
+// Node.js >= 18 builtins (these do NOT introduce new execution surface)
+const BUILTINS = new Set([
+  "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster",
+  "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns",
+  "domain", "events", "fs", "fs/promises", "http", "http2", "https",
+  "inspector", "module", "net", "os", "path", "perf_hooks", "process",
+  "punycode", "querystring", "readline", "repl", "stream", "stream/consumers",
+  "stream/promises", "stream/web", "string_decoder", "test", "timers",
+  "timers/promises", "tls", "trace_events", "tty", "url", "util", "util/types",
+  "v8", "vm", "wasi", "worker_threads", "zlib",
+]);
+
 // PD-4: rules must never fire on comments or string literals. Two views per
 // file, both preserving line numbers: codeLines (comments stripped, strings
 // kept — import names, "POST" methods and Idempotency-Key headers stay
@@ -149,9 +170,38 @@ function lintProject(root) {
   const rootAbs = path.resolve(root);
   const rootIsFile = !fs.statSync(rootAbs).isDirectory();
   const add = (file, line, rule, severity, fix) =>
-    findings.push({ file: rootIsFile ? path.basename(file) : path.relative(rootAbs, file), line, rule, severity, fix });
+    findings.push({ file: rootIsFile ? path.basename(file) : path.relative(rootAbs, file).replace(/\\/g, "/"), line, rule, severity, fix });
 
   let anyLLM = false, anyPersist = false;
+
+  // Build module frequency map for new-require detection (R5):
+  // a non-builtin, non-local require that appears in ONLY one file is "new".
+  const moduleFiles = new Map(); // spec -> Set of files
+  for (const f of files) {
+    const { codeSrc } = model.get(f);
+    const re = /require\s*\(\s*["'`]([^"'`]+)["'`]/g;
+    let m;
+    while ((m = re.exec(codeSrc))) {
+      const spec = m[1];
+      if (BUILTINS.has(spec) || spec.startsWith(".") || spec.startsWith("/")) continue;
+      if (!moduleFiles.has(spec)) moduleFiles.set(spec, new Set());
+      moduleFiles.get(spec).add(f);
+    }
+  }
+  // Also track dynamic import() specifiers for the same purpose.
+  const importModuleFiles = new Map(); // spec -> Set of files
+  for (const f of files) {
+    const { codeSrc } = model.get(f);
+    const re = /import\s*\(\s*["'`]([^"'`]+)["'`]/g;
+    let m;
+    while ((m = re.exec(codeSrc))) {
+      const spec = m[1];
+      if (BUILTINS.has(spec) || spec.startsWith(".") || spec.startsWith("/")) continue;
+      if (!importModuleFiles.has(spec)) importModuleFiles.set(spec, new Set());
+      importModuleFiles.get(spec).add(f);
+    }
+  }
+
   for (const f of files) {
     const { codeLines, bareLines, codeSrc } = model.get(f);
     anyLLM ||= model.get(f).hasLLM; anyPersist ||= PERSIST.test(codeSrc);
@@ -204,11 +254,80 @@ function lintProject(root) {
               isWrite ? "MEDIUM" : "REVIEW",
               "Assume this step WILL retry. Guard with a check keyed on runId+step (or an Idempotency-Key the receiving system honors).");
       }
+
+      // R5 — eval/exec/new-require ban (bare view: comments/strings blanked)
+      if (EVAL_RE.test(ln))
+        add(f, i + 1, "R5: eval() call — generated/evolvable code must never gain new execution surface", "HIGH",
+            "Replace eval() with a static dispatch table or JSON.parse.");
+      if (NEW_FUNCTION_RE.test(ln))
+        add(f, i + 1, "R5: new Function() constructor — dynamically compiled code introduces unbounded execution surface", "HIGH",
+            "Replace new Function() with a fixed set of pure functions or pre-compiled dispatch.");
+      if (FUNCTION_CTOR_RE.test(ln) && !NEW_FUNCTION_RE.test(ln))
+        add(f, i + 1, "R5: Function() used as constructor — potential dynamic-code execution surface", "REVIEW",
+            "Verify this is not constructing code from an untrusted or evolvable source.");
+      if (EXEC_SPAWN_RE.test(ln) && CHILD_PROCESS_REF.test(codeSrc))
+        add(f, i + 1, "R5: child_process exec/spawn call — shell execution surface", "HIGH",
+            "Spawned processes must be declared as adapter effects. Prefer spawn() with fixed argv — never shell-string exec().");
+      const clnR5 = codeLines[i];
+      if (REQUIRE_IMPORT_RE.test(ln)) {
+        const m = clnR5.match(/require\s*\(\s*["'`]([^"'`]+)["'`]/);
+        if (m && !m[1].includes("${")) {
+          const spec = m[1];
+          if (!BUILTINS.has(spec) && !spec.startsWith(".") && !spec.startsWith("/")) {
+            const filesWith = moduleFiles.get(spec) || new Set();
+            if (filesWith.size <= 1)
+              add(f, i + 1, `R5: new-require("${spec}") — introduces an external module into the execution graph`, "REVIEW",
+                  "External requires expand execution surface. Declare this dependency intentionally and add a capability declaration if it performs effects.");
+          }
+        }
+      }
+      if (DYNAMIC_IMPORT_RE.test(ln)) {
+        const m = clnR5.match(/import\s*\(\s*["'`]([^"'`]+)["'`]/);
+        if (m && !m[1].includes("${")) {
+          const spec = m[1];
+          if (!BUILTINS.has(spec) && !spec.startsWith(".") && !spec.startsWith("/")) {
+            const filesWith = importModuleFiles.get(spec) || new Set();
+            if (filesWith.size <= 1)
+              add(f, i + 1, `R5: dynamic import("${spec}") — runtime code loading`, "HIGH",
+                  "Dynamic imports introduce non-deterministic execution surface. Replace with a static import or declare as an adapter capability.");
+          }
+        } else {
+          add(f, i + 1, "R5: dynamic import(computed) — runtime code loading with unknown target", "HIGH",
+              "Computed-specifier dynamic import introduces unbounded execution surface. Replace with a static dispatch table.");
+        }
+      }
     });
   }
   if (anyLLM && !anyPersist)
     findings.push({ file: ".", line: 0, rule: "R2: no save points found anywhere", severity: "HIGH", fix:
         "LLM workflow with zero persistence: a crash restarts from step 1. Checkpoint each step's output keyed by run ID." });
+
+  // R6 — adapter capability presence (contract 06)
+  const adaptersDir = path.join(rootAbs, "adapters");
+  if (fs.existsSync(adaptersDir) && fs.statSync(adaptersDir).isDirectory()) {
+    const capFiles = (() => { try { return fs.readdirSync(adaptersDir); } catch { return []; } })()
+      .filter((n) => n.endsWith(".capability.json"));
+    const declaredIds = new Set();
+    for (const cf of capFiles) {
+      try {
+        const cap = JSON.parse(fs.readFileSync(path.join(adaptersDir, cf), "utf8"));
+        if (cap.adapter_id) declaredIds.add(cap.adapter_id);
+      } catch {}
+    }
+    for (const f of files) {
+      const baseName = path.basename(f, path.extname(f));
+      if (declaredIds.has(baseName)) continue;
+      const { codeSrc } = model.get(f);
+      if (!f.startsWith(adaptersDir + path.sep) && f !== adaptersDir) continue;
+      const isFrameworkResp = FRAMEWORK_RESP.test(codeSrc);
+      const hasExternalEffect = (WRITE_CALL.test(codeSrc) && !isFrameworkResp) ||
+        (FETCH_CALL.test(codeSrc) && MUTATING_METHOD.test(codeSrc));
+      if (hasExternalEffect)
+        add(f, 1, `R6: file "${baseName}" has external effects but no declared adapter capability`, "HIGH",
+            `Create adapters/${baseName}.capability.json per contract 06 declaring capability (idempotent-by-key, status-checkable, or none).`);
+    }
+  }
+
   return { files, findings };
 }
 
