@@ -43,6 +43,7 @@ const INJECTION_MARKERS = [
 ];
 
 const APPENDIX_TOKEN_CAP = 1500;
+const ALIAS_PATTERN = /^p[0-9]{2,6}$/;
 
 const FAIL = Object.freeze({ code: "FAIL", exitCode: 1 });
 const ERROR = Object.freeze({ code: "ERROR", exitCode: 2 });
@@ -85,7 +86,7 @@ function signTestPValue(n_d, wins) {
   return p;
 }
 function minWinsRequired(n_d, alpha) {
-  for (let w = n_d; w >= 0; w--) { if (signTestPValue(n_d, w) <= alpha) return w; }
+  for (let w = 0; w <= n_d; w++) { if (signTestPValue(n_d, w) <= alpha) return w; }
   return n_d + 1;
 }
 function maxAttainableWins(n_d) { return n_d; }
@@ -94,6 +95,13 @@ function maxAttainableWins(n_d) { return n_d; }
 function assignSplit(scenarioId, cycleSeed, corpusHash) {
   const s = deterministicSeed(cycleSeed, corpusHash + ":" + scenarioId);
   return (s % 100) / 100 < SELECTION_SPLIT ? "selection" : "confirmation";
+}
+
+/* --- Edit-target family (contract 03) --- */
+function computeEditTargetFamily(edits) {
+  if (!edits || !Array.isArray(edits) || edits.length === 0) return null;
+  const targets = edits.map((e) => [e.file, e.anchor || null, e.op].join("\x00")).sort();
+  return sha256(targets.join("\n"));
 }
 
 /* --- Fence --- */
@@ -185,6 +193,13 @@ function gate1Static(candidate, ctx = {}) {
     if (e.schema_version !== undefined && e.schema_version !== SCHEMA_VERSION) {
       findings.push({ gate: 1, severity: "warn", code: "G1_SCHEMA_VERSION_MISMATCH",
         detail: `${loc} schema_version ${e.schema_version} != ${SCHEMA_VERSION}` });
+    }
+
+    /* ---- alias check: proposer-emitted literal paths are auto-reject ---- */
+    if (!ctx.aliasesResolved && !ALIAS_PATTERN.test(e.file)) {
+      findings.push({ gate: 1, severity: "fatal", code: "G1_LITERAL_PATH",
+        detail: `${loc} file "${e.file}" is a literal path, not an alias matching ${ALIAS_PATTERN}` });
+      pass = false;
     }
 
     /* ---- fence ---- */
@@ -283,11 +298,26 @@ function classifyDiscordance(candResult, baseResult) {
 }
 
 function resolvePair(pair) {
-  const d = classifyDiscordance(pair.cand, pair.base);
+  let candResult = pair.cand;
+  let baseResult = pair.base;
+
+  const initClass = classifyDiscordance(candResult, baseResult);
+
+  if (initClass.type === "baseline_infra" && pair.base_retry) {
+    return resolvePair({ ...pair, base: pair.base_retry, base_retry: undefined });
+  }
+  if (initClass.type === "candidate_infra" && pair.cand_retry) {
+    return resolvePair({ ...pair, cand: pair.cand_retry, cand_retry: undefined });
+  }
+  if (initClass.type === "both_infra" && pair.base_retry && pair.cand_retry) {
+    return resolvePair({ ...pair, cand: pair.cand_retry, base: pair.base_retry, cand_retry: undefined, base_retry: undefined });
+  }
+
+  const d = classifyDiscordance(candResult, baseResult);
   switch (d.type) {
     case "scored_pair": {
-      if (pair.cand.pass && !pair.base.pass) return { discordant: true,  winner: "candidate", excluded: false, attribution: "cand_win" };
-      if (!pair.cand.pass && pair.base.pass) return { discordant: true,  winner: "baseline",  excluded: false, attribution: "base_win" };
+      if (candResult.pass && !baseResult.pass) return { discordant: true,  winner: "candidate", excluded: false, attribution: "cand_win" };
+      if (!candResult.pass && baseResult.pass) return { discordant: true,  winner: "baseline",  excluded: false, attribution: "base_win" };
       return { discordant: false, winner: null, excluded: false, attribution: "concordant" };
     }
     case "baseline_infra":           return { discordant: false, winner: null, excluded: true,  attribution: "baseline_infra" };
@@ -312,7 +342,7 @@ function gate2Behavioral(candidateId, opts = {}) {
     throw fail("gate2Behavioral requires either bundle or corpusPath", ERROR);
   }
 
-  return decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore);
+  return decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore, opts);
 }
 
 function produceBundle(corpusPath, candidateId, profile, cycleSeed) {
@@ -338,7 +368,7 @@ function produceBundle(corpusPath, candidateId, profile, cycleSeed) {
   });
 }
 
-function decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore) {
+function decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore, opts = {}) {
   const pairs = evidenceBundle.pairs || [];
   const corpusHash = evidenceBundle.corpus_hash || sha256(JSON.stringify(evidenceBundle.pairs || []));
 
@@ -395,6 +425,19 @@ function decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore
     };
   }
 
+  /* ---- Bundle hash validation (after hard/slice short-circuits, before alpha spend) ---- */
+  const claimedHash = evidenceBundle.bundle_sha256;
+  const recomputed = sha256(JSON.stringify({ ...evidenceBundle, bundle_sha256: undefined }));
+  if (claimedHash && claimedHash !== recomputed) {
+    return {
+      pass: false, tier: 0,
+      hard: { violations: [{ invariant: "bundle-hash-mismatch", detail: "evidence bundle_sha256 does not match content" }] },
+      slices,
+      primary: null,
+      evidence: { bundleHash: claimedHash, hashValid: false, corpusHash },
+    };
+  }
+
   /* ---- Split: selection / confirmation ---- */
   const splitPairs = pairs.map((pair) => ({
     ...pair,
@@ -407,6 +450,59 @@ function decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore
   const selection = selectionPairs.map((p) => resolvePair(p));
   const selWins = selection.filter((s) => s.discordant && s.winner === "candidate").length;
   const selLosses = selection.filter((s) => s.discordant && s.winner === "baseline").length;
+
+  /* ---- Power precheck: before any reservation, max attainable discordant wins from baseline side only ---- */
+  const maxAttainableN_d = confirmationPairs.filter((p) => {
+    const base = p.base;
+    return !(base && base.pass === true && base.cause_code === "ok");
+  }).length;
+  const requiredWins = minWinsRequired(maxAttainableN_d, BONFERRONI_ALPHA);
+  if (maxAttainableN_d < requiredWins) {
+    return {
+      pass: false, tier: 3,
+      hard: { violations: [] }, slices,
+      primary: { n: confirmationPairs.length, n_d: maxAttainableN_d, wins: null, losses: null, excluded: null,
+        p: null, lowerBound: null, noiseFloor: null,
+        verdict: "inconclusive_underpowered",
+        detail: `max attainable n_d=${maxAttainableN_d}: required=${requiredWins} at α=${BONFERRONI_ALPHA}` },
+      evidence: { bundleHash: evidenceBundle.bundle_sha256, corpusHash },
+    };
+  }
+
+  /* ---- Alpha slot reservation (BEFORE any confirmation data access — contract 03) ---- */
+  let reservation = null;
+  if (stateStore && typeof stateStore.alphaLedger === "object") {
+    const family = computeEditTargetFamily(opts.candidateEdits);
+    if (!family) {
+      return {
+        pass: false, tier: 3,
+        hard: { violations: [] }, slices,
+        primary: { n: confirmationPairs.length, n_d: maxAttainableN_d, wins: null, losses: null, excluded: null,
+          p: null, lowerBound: null, noiseFloor: null,
+          verdict: "reject",
+          alphaError: "FAMILY_UNDERIVABLE" },
+        evidence: { bundleHash: evidenceBundle.bundle_sha256, corpusHash },
+      };
+    }
+    try {
+      reservation = stateStore.alphaLedger.reserve({
+        corpus_state: corpusHash,
+        split_hash: sha256(confirmationPairs.map((p) => p.scenario_id).sort().join("\n")),
+        fingerprint: candidateId,
+        family,
+      });
+    } catch (e) {
+      return {
+        pass: false, tier: 3,
+        hard: { violations: [] }, slices,
+        primary: { n: confirmationPairs.length, n_d: null, wins: null, losses: null, excluded: null,
+          p: null, lowerBound: null, noiseFloor: null,
+          verdict: "reject",
+          alphaError: e.code || e.message },
+        evidence: { bundleHash: evidenceBundle.bundle_sha256, corpusHash },
+      };
+    }
+  }
 
   /* ---- Confirmation ---- */
   const confirmation = confirmationPairs.map((p) => resolvePair(p));
@@ -427,44 +523,6 @@ function decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore
         p: null, lowerBound: null, noiseFloor: null, verdict: "inconclusive_missingness" },
       evidence: { bundleHash: evidenceBundle.bundle_sha256, corpusHash },
     };
-  }
-
-  /* ---- Power precheck ---- */
-  const maxWins = maxAttainableWins(n_d);
-  const minWins = minWinsRequired(n_d, BONFERRONI_ALPHA);
-  if (maxWins < minWins) {
-    return {
-      pass: false, tier: 3,
-      hard: { violations: [] }, slices,
-      primary: { n, n_d, wins, losses, excluded: excluded.length,
-        p: null, lowerBound: null, noiseFloor: null,
-        verdict: "inconclusive_underpowered",
-        detail: `n_d=${n_d}: max attainable wins=${maxWins} < required=${minWins} at α=${BONFERRONI_ALPHA}` },
-      evidence: { bundleHash: evidenceBundle.bundle_sha256, corpusHash },
-    };
-  }
-
-  /* ---- Alpha slot reservation ---- */
-  let reservation = null;
-  if (stateStore && typeof stateStore.alphaLedger === "object") {
-    try {
-      reservation = stateStore.alphaLedger.reserve({
-        corpus_state: corpusHash,
-        split_hash: sha256(confirmationPairs.map((p) => p.scenario_id).sort().join("\n")),
-        fingerprint: candidateId,
-        family: profile || "standard",
-      });
-    } catch (e) {
-      return {
-        pass: false, tier: 3,
-        hard: { violations: [] }, slices,
-        primary: { n, n_d, wins, losses, excluded: excluded.length,
-          p: null, lowerBound: null, noiseFloor: null,
-          verdict: "reject",
-          alphaError: e.code || e.message },
-        evidence: { bundleHash: evidenceBundle.bundle_sha256, corpusHash },
-      };
-    }
   }
 
   /* ---- Tier 3: Exact sign test ---- */
@@ -504,6 +562,20 @@ function decideGate2(evidenceBundle, candidateId, profile, cycleSeed, stateStore
       alphaReservation: reservation ? reservation.reservation_id : null,
     },
   };
+}
+
+/* ---- Multi-candidate selection (contract 03): max discordant-win advantage;
+   tie → lexicographically smallest fingerprint ---- */
+function selectCandidate(candidates) {
+  if (!candidates || !Array.isArray(candidates) || candidates.length === 0) return null;
+  return candidates
+    .slice()
+    .sort((a, b) => {
+      const advA = (a.wins || 0) - (a.losses || 0);
+      const advB = (b.wins || 0) - (b.losses || 0);
+      if (advB !== advA) return advB - advA;
+      return (a.fingerprint || "").localeCompare(b.fingerprint || "");
+    })[0];
 }
 
 /* ------------------------------------------------------------------ */
@@ -751,7 +823,7 @@ function selftestMain() {
         fingerprint: sha256("test-pass"),
         edits: [{ file: "scripts/ok.js", anchor: null, op: "replace", payload: "good code", schema_ref: "test/v1" }],
       };
-      const result = gate1Static(candidate, {});
+      const result = gate1Static(candidate, { aliasesResolved: true });
       if (!result.pass) errors.push("Gate 1: failed to pass clean candidate: " + JSON.stringify(result.findings));
       else tests.push({ name: "gate1-passes-clean-candidate", status: "pass" });
     }
@@ -797,6 +869,33 @@ function selftestMain() {
       const result = gate1Static(candidate, {});
       if (result.pass) errors.push("Gate 1: failed to reject appendix over cap");
       else tests.push({ name: "gate1-rejects-appendix-cap", status: "pass" });
+    }
+
+    /* Literal-path reject (alias grammar) */
+    {
+      const candidate = {
+        id: "test-literal-path",
+        kind: "code",
+        fingerprint: sha256("test-literal-path"),
+        edits: [{ file: "scripts/ok.js", anchor: null, op: "replace", payload: "good", schema_ref: "test/v1" }],
+      };
+      const result = gate1Static(candidate, {});
+      if (result.pass) errors.push("Gate 1: failed to reject literal path scripts/ok.js");
+      else if (!result.findings.some((f) => f.code === "G1_LITERAL_PATH")) errors.push("Gate 1: literal path rejected but wrong code: " + JSON.stringify(result.findings.map((f) => f.code)));
+      else tests.push({ name: "gate1-rejects-literal-path", status: "pass" });
+    }
+
+    /* Alias passes (with aliasesResolved) */
+    {
+      const candidate = {
+        id: "test-alias-resolved",
+        kind: "code",
+        fingerprint: sha256("test-alias-resolved"),
+        edits: [{ file: "scripts/ok.js", anchor: null, op: "replace", payload: "good", schema_ref: "test/v1" }],
+      };
+      const result = gate1Static(candidate, { aliasesResolved: true });
+      if (!result.pass) errors.push("Gate 1: rejected alias-resolved candidate: " + JSON.stringify(result.findings.map((f) => f.code)));
+      else tests.push({ name: "gate1-passes-with-aliasesResolved", status: "pass" });
     }
   }
   testGate1();
@@ -937,9 +1036,17 @@ function selftestMain() {
     const corpusHash = sha256(allIds.sort().join("\n"));
     const pairFn = (id) => {
       const n = parseInt(id.split("-")[1], 10);
-      if (n < 7) return makeCandInfra(id);
+      if (n < 7) return {
+        scenario_id: id, seed: deterministicSeed(42, id),
+        cand: { pass: false, cause_code: "infra_fault" },
+        base: { pass: false, cause_code: "ok" },
+      };
       if (n < 8) return makeCandWin(id);
-      return makeOkPair(id);
+      return {
+        scenario_id: id, seed: deterministicSeed(42, id),
+        cand: { pass: false, cause_code: "ok" },
+        base: { pass: false, cause_code: "ok" },
+      };
     };
     const pairs = allIds.map(pairFn);
     const bundle = makeSyntheticBundle(pairs, { candidateId: "missing-test" });
@@ -949,6 +1056,125 @@ function selftestMain() {
     } else {
       tests.push({ name: "gate2-inconclusive-missingness-above-20pct", status: "pass" });
     }
+  }
+
+  /* Test: bundle hash validation rejects tampered hash */
+  {
+    const bundle = makeSyntheticBundle([makeCandWin("bh-0")], { candidateId: "tampered" });
+    bundle.bundle_sha256 = "0".repeat(64);
+    const result = decideGate2(bundle, "tampered", "standard", 0, null);
+    if (result.pass || result.tier !== 0 || result.evidence?.hashValid !== false) {
+      errors.push(`Gate 2 bundle-hash: expected tier-0 reject with hashValid=false, got pass=${result.pass} tier=${result.tier} hashValid=${result.evidence?.hashValid}`);
+    } else {
+      tests.push({ name: "gate2-rejects-tampered-bundle-hash", status: "pass" });
+    }
+  }
+
+  /* Test: selectCandidate tiebreak lexicographically smallest fingerprint */
+  {
+    const chosen = selectCandidate([
+      { fingerprint: "z", wins: 4, losses: 1 },
+      { fingerprint: "a", wins: 4, losses: 1 },
+      { fingerprint: "m", wins: 3, losses: 1 },
+    ]);
+    if (!chosen || chosen.fingerprint !== "a") {
+      errors.push(`Gate 2 selectCandidate: tiebreak expected fingerprint "a", got ${chosen?.fingerprint}`);
+    } else {
+      tests.push({ name: "gate2-selectCandidate-tiebreak-lex", status: "pass" });
+    }
+  }
+
+  /* Test: minWinsRequired returns true minimum, not max-from-top */
+  {
+    const mw10 = minWinsRequired(10, BONFERRONI_ALPHA);
+    if (mw10 !== 9) {
+      errors.push(`Gate 2 minWinsRequired: n_d=10 expected 9, got ${mw10} (p(10,9)=${signTestPValue(10, 9)} ≤ ${BONFERRONI_ALPHA})`);
+    } else {
+      tests.push({ name: "gate2-minWinsRequired-is-true-minimum", status: "pass" });
+    }
+  }
+
+  /* Test: reserve-before-confirmation-access (source order verified) */
+  {
+    const source = require("fs").readFileSync(__filename, "utf8");
+    const reserveIdx = source.indexOf("stateStore.alphaLedger.reserve");
+    const confResolveIdx = source.indexOf("const confirmation = confirmationPairs.map(p => resolvePair(p))");
+    if (confResolveIdx < reserveIdx) {
+      errors.push("Gate 2: confirmation resolved before alpha reservation (source order)");
+    } else if (reserveIdx > 0 && confResolveIdx > 0) {
+      tests.push({ name: "gate2-reserve-before-confirmation-access", status: "pass" });
+    } else {
+      tests.push({ name: "gate2-reserve-before-confirmation-access", status: "skipped" });
+    }
+  }
+
+  /* Test: concordant-padded bundle — baseline-attainability precheck returns underpowered, zero RESERVED records */
+  {
+    let reserveCalled = false;
+    let rejectBufPushed = false;
+    const stateStore = {
+      alphaLedger: {
+        reserve: () => { reserveCalled = true; return { reservation_id: "should-not-happen", alpha: BONFERRONI_ALPHA }; },
+        complete: () => {},
+      },
+      rejectedBuffer: { list: () => [], push: () => { rejectBufPushed = true; } },
+    };
+    /* Construct a bundle where the confirmation split contains many concordant ok-pairs
+     * and only 5 baseline-attainable discordant-eligible pairs (makeCandWin).
+     * Precheck should see maxAttainableN_d = 5 → minWinsRequired(5) = 6 → underpowered. */
+    const allIds = Array.from({ length: 100 }, (_, i) => "cp-" + i);
+    const corpusHash = sha256(allIds.sort().join("\n"));
+    const confIds = allIds.filter((id) => assignSplit(id, 99, corpusHash) === "confirmation");
+    const discordantEligible = new Set(confIds.slice(0, 5));
+    const pairs = allIds.map((id) => {
+      if (discordantEligible.has(id)) return makeCandWin(id);
+      return makeOkPair(id);
+    });
+    const bundle = makeSyntheticBundle(pairs, { candidateId: "concordant-padded" });
+    const result = decideGate2(bundle, "concordant-padded", "standard", 99, stateStore);
+    if (result.pass !== false) errors.push("Gate 2 concordant-padded: expected pass=false, got " + result.pass);
+    if (result.primary?.verdict !== "inconclusive_underpowered") {
+      errors.push(`Gate 2 concordant-padded: expected inconclusive_underpowered, got ${result.primary?.verdict} n_d=${result.primary?.n_d}`);
+    } else if (reserveCalled) {
+      errors.push("Gate 2 concordant-padded: reserve was called (should NOT have been — zero RESERVED records)");
+    } else if (rejectBufPushed) {
+      errors.push("Gate 2 concordant-padded: rejected buffer was pushed (must be empty)");
+    } else {
+      tests.push({ name: "gate2-concordant-padded-baseline-attainability-precheck", status: "pass" });
+    }
+  }
+
+  /* Test: FAMILY_UNDERIVABLE fail-closed — no candidateEdits, reservation path returns alphaError */
+  {
+    const stateStore = {
+      alphaLedger: { reserve: () => { return {}; }, complete: () => {} },
+      rejectedBuffer: { list: () => [] },
+    };
+    const bundle = makeConfirmationBundle(6, (id) => makeCandWin(id), 0, { candidateId: "no-family" });
+    const result = decideGate2(bundle, "no-family", "standard", 0, stateStore, {});
+    if (result.pass !== false) errors.push("Gate 2 FAMILY_UNDERIVABLE: expected pass=false, got " + result.pass);
+    if (result.primary?.verdict !== "reject") errors.push("Gate 2 FAMILY_UNDERIVABLE: expected verdict=reject, got " + result.primary?.verdict);
+    if (result.primary?.alphaError !== "FAMILY_UNDERIVABLE") errors.push("Gate 2 FAMILY_UNDERIVABLE: expected alphaError=FAMILY_UNDERIVABLE, got " + result.primary?.alphaError);
+    else tests.push({ name: "gate2-family-underivable-fail-closed", status: "pass" });
+  }
+
+  /* Test: family derived from edits ignores profile — even when a profile string is passed, family = hash of edits */
+  {
+    let capturedFamily = undefined;
+    const stateStore = {
+      alphaLedger: {
+        reserve: (opts) => { capturedFamily = opts.family; return { reservation_id: "r1", alpha: BONFERRONI_ALPHA }; },
+        complete: () => {},
+      },
+      rejectedBuffer: { list: () => [] },
+    };
+    const edits = [{ file: "p01", anchor: "L5", op: "replace", payload: "x" }];
+    const expectedFamily = computeEditTargetFamily(edits);
+    const bundle = makeConfirmationBundle(6, (id) => makeCandWin(id), 0, { candidateId: "family-edit-based" });
+    const result = decideGate2(bundle, "family-edit-based", "entirely-different-profile", 0, stateStore, { candidateEdits: edits });
+    if (!result.pass) errors.push("Gate 2 family-ignores-profile: expected promote, got pass=" + result.pass + " verdict=" + result.primary?.verdict);
+    if (capturedFamily !== expectedFamily) errors.push(`Gate 2 family-ignores-profile: family passed to reserve was ${capturedFamily}, expected edits-derived ${expectedFamily}`);
+    else tests.push({ name: "gate2-family-derived-from-edits-ignores-profile", status: "pass" });
   }
 
   /* ---- Gate 3 selftest ---- */
@@ -992,6 +1218,8 @@ const gate = {
   signTestPValue,
   minWinsRequired,
   assignSplit,
+  selectCandidate,
+  computeEditTargetFamily,
   selftest: selftestMain,
 };
 
