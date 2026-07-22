@@ -9,8 +9,8 @@ Conventions: Node ≥ 18, CommonJS, zero runtime deps [KnoSky: scripts/scaffold.
 | File(s) | Sole owner (family) | Testers (never authors of the file) | Tier |
 |---|---|---|---|
 | `scripts/gate.js` (Gates 1–4 decision engine, all phases) | DeepSeek | GPT-sol-pro + Grok | SECURITY |
-| `scripts/state-store.js` (single writer for ALL `.graphsmith/state/`: window store, universal run registry, run anchors, alpha ledger, rejected buffer, rollback families — P2-GPT-2/14) | GPT-sol (codex) | DeepSeek + Gemini | SECURITY |
-| `scripts/promote.js` (contract 01) | GPT-sol (codex) | Grok + DeepSeek | SECURITY |
+| `scripts/state-store.js` (single writer for ALL `.graphsmith/state/`: window store, universal run registry, run anchors, alpha ledger, rejected buffer, rollback families — P2-GPT-2/14) | GPT-sol (OpenRouter) | DeepSeek + Gemini | SECURITY |
+| `scripts/promote.js` (contract 01) | GPT-sol (OpenRouter) | Grok + DeepSeek | SECURITY |
 | `scripts/verify.js` (sentinel, Phase A core + Phase E `--profiles`) | Claude Sonnet | Gemini + DeepSeek (A), Gemini + Grok (E) | SECURITY |
 | `scripts/manifest.js` | Qwen | GPT-sol-pro + Gemini | SECURITY |
 | `scripts/loaders.js` (appendix + prompt loaders, B2/B3 — NEW lane, GPT-24) | Claude Sonnet | DeepSeek + Grok | SECURITY |
@@ -41,11 +41,11 @@ Phase mapping unchanged (plan §11): A = gate/verify/manifest/promote/state-stor
 - **Mechanical check:** before Phase A dispatch, the orchestrator generates `.plans/ownership-map.json` enumerating every planned path → exactly one owner; zero or multiple owners fails Stage 0 mechanically. The map is regenerated and re-checked at every phase boundary.
 
 ## Constitutional set (superset — GPT-24; mechanically re-derived in Phase A from the enforcement dependency graph, then frozen in the release manifest)
-gate.js · verify.js · promote.js · window-store.js · manifest.js · loaders.js · event-compiler.js · scenario.js · evalenv.js · watchdog.js · graphlint.js · docs-lint.js · risk-policy.json · scaffolded manager/supervisor/intent-guard templates · CI workflow entries · schemas/ · tunables BOUNDS · this contracts/ directory.
+gate.js · verify.js · promote.js · **state-store.js** (P3-6: the single state writer is constitutional; there is NO separate window-store.js — its API lives in state-store.js) · manifest.js · loaders.js · event-compiler.js · scenario.js · evalenv.js · watchdog.js · graphlint.js · docs-lint.js · risk-policy.json · scaffolded manager/supervisor/intent-guard templates · CI workflow entries · schemas/ · tunables BOUNDS · this contracts/ directory.
 
 ## Component stubs (signatures; unchanged items carried from v1)
 - `promote.js`: `promote(packet) → {txid, state}` · `rollback(txid_or_inverse)` · `recover()` — contract 01 exactly.
-- `window-store.js`: `admit(tx)` · `register(runId, treeId)` · `deregister(runId, result)` · `status()` — contract 02 CAS ops.
+- `state-store.js` window API: `admitPending(tx)` · `finalize(windowId)` · `register(runId, treeId)` · `deregister(runId, result)` · `status()` — contract 02 serialized ops (P3-6: no separate window-store.js file exists).
 - `gate.js`: contract 08 (decision engine only; all persistence via window-store/state APIs).
 - `verify.js`: `--integrity --selftest --profiles --trust-model --platform-probe` (probe added per contract 01).
 - `loaders.js`: `loadAppendix(ctx)` / `loadPrompt(worker)` — resolve via `.graphsmith/evolvable/ACTIVE`, enforce B2/B3, return `{content, treeId, hash}`.

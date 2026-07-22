@@ -29,7 +29,7 @@ A record of a type arriving from a non-authorized source is REJECTED + counted. 
 
 ## Compiler rules (event-compiler.js — constitutional)
 1. Inputs read as DATA; nothing evaluated/executed; nothing passed to an LLM raw.
-2. Determinism: same inputs → byte-identical outputs (stable sort by (run_ref, ts, seq); no clocks/randomness).
+2. Determinism: same inputs → byte-identical outputs (stable sort by **(run_ref, ord, seq)** — compiler-assigned fields only; source timestamps never influence proposer-view ordering — P3-7; no clocks/randomness).
 3. `evidence_ref` targets canonicalized (realpath, repo-relative); escapes dropped + counted.
 4. Malformed non-safety records: quarantined by reference + counted — never best-effort parsed.
 5. Proposer isolation (B5/B6): the proposer consumes `events-proposer.jsonl` + aggregate counts ONLY.

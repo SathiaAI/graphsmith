@@ -21,7 +21,10 @@ Directories are never swapped. The evolvable surface is materialized as immutabl
   ACTIVE                              # pointer file: { schema_version, txid, tree, tree_manifest_sha256 }
   v-<treehash>/                       # immutable tree: learned.md, workers/*.prompt.md, tunables.json, …
     tree.manifest.json                # closed schema (P2-GPT-11): {schema_version, files:[{path, sha256, bytes}]} —
-                                      # COMPLETE inventory; loaders/recovery reject extra or missing files
+                                      # COMPLETE inventory of all payload files, excluding exactly tree.manifest.json
+                                      # itself (the sole metadata exception, P3-3 — no self-hash fixed point); the
+                                      # manifest file is bound instead via tree_manifest_sha256 in ACTIVE + journal.
+                                      # Loaders/recovery reject any extra or missing payload file.
 ```
 Canonical location note (P2-GPT-5): `project.manifest.json` and `adoption-log.jsonl` live under `.graphsmith/state/` — contract 09 refers to THESE paths; any other path reference is an error.
 All `.graphsmith/state/` writes go through ONE module: `scripts/state-store.js` (single writer, owner-token lock, journaled revisions — contract 11 lane).
@@ -34,7 +37,8 @@ All `.graphsmith/state/` writes go through ONE module: `scripts/state-store.js` 
 Lease + heartbeat semantics from [KnoSky: scripts/scaffold.js:64-113], with: (a) lock content = `{ pid, proc_start_hint, owner_token: random128 }`; renew/release/steal verify `owner_token` (compare-before-write) — pid-reuse cannot renew another owner's lease; (b) promotion lease/heartbeat bounds are frozen in the release manifest; `GRAPHSMITH_LEASE_MS`/`GRAPHSMITH_HEARTBEAT_MS` are honored ONLY when `GRAPHSMITH_TEST_MODE=1` (a mode the sentinel reports and CI forbids in release jobs); (c) recovery acquires the lease BEFORE reading the journal.
 
 ## Journal (closed record schema — DeepSeek-3, P2-GPT-4; every record fsync'd before its effect; ships as `schemas/promotion-journal.schema.json`)
-Happy path: `TX_BEGIN{txid, expected_active_sha, expected_log_head}` → `STAGE_DONE{tree, tree_manifest_sha}` → `VALIDATED` → `LOG_APPEND_INTENT{entry_sha}` → `LOG_APPEND_DONE` → `WINDOW_PENDING{window_id}` (Gate-4 admission coupled INSIDE this transaction — P2-GPT-3) → `SWAP_INTENT{from_tree, to_tree}` → `SWAP_DONE{observed_active_sha}` → `MANIFEST_INTENT{new_head_sha}` → `MANIFEST_DONE` → `WINDOW_FINAL{window_id}` → `TX_DONE`.
+Happy path: `TX_BEGIN{txid, expected_active_sha, expected_log_head}` → `STAGE_DONE{tree, tree_manifest_sha}` → `VALIDATED` → `LOG_APPEND_INTENT{entry_sha}` → `LOG_APPEND_DONE` (status `committing`) → `WINDOW_PENDING{window_id}` (Gate-4 admission coupled INSIDE this transaction — P2-GPT-3) → `SWAP_INTENT{from_tree, to_tree}` → `SWAP_DONE{observed_active_sha}` → `OUTCOME_APPEND_INTENT{terminal_entry_sha}` → `OUTCOME_APPEND_DONE` (appends the hash-chained terminal `effective` entry — P3-2) → `MANIFEST_INTENT{new_head_sha = terminal_entry_sha}` → `MANIFEST_DONE` (manifest anchors the TERMINAL entry) → `WINDOW_FINAL{window_id}` → `TX_DONE`.
+Abort path after LOG_APPEND: `OUTCOME_APPEND_INTENT/DONE` (terminal `aborted` entry) → `MANIFEST_INTENT/DONE` (head anchors the aborted entry) → `TX_ABORT` — both outcome paths are journaled head updates; the anchored head is ALWAYS a terminal entry (P3-2).
 Non-happy records (also closed schema): `TX_ABORT{reason, compensating_entry_sha?}` · `RECOVERY_BEGIN{observed_state}` · `RECOVERY_STEP{action}` · `RECOVERY_DONE{outcome}`. Legal-transition table ships with the schema; recovery classifies EVERY prefix, including abort-after-log-append-before-swap (which appends the compensating `aborted` entry, contract 09).
 `txid = sha256(candidate_fingerprint + expected_active_sha)[:16]` — deterministic; re-running a crashed transaction resumes the SAME txid.
 
@@ -65,7 +69,7 @@ For every INTENT-without-DONE boundary, recovery **inspects filesystem identitie
 
 ## Invariants (each mutation-tested per-transition, not just kill-sprayed — GPT-3)
 1. Nothing writes `ACTIVE` except step 5; nothing modifies a tree after VALIDATED.
-2. CAS violation anywhere → ABORT + evidence; concurrent-mutator TOCTOU harness worst outcome = clean ABORT.
+2. Expectation mismatch discovered BEFORE `TX_BEGIN` is recorded (stale proposal) → clean ABORT. Any unexpected identity/hash change observed AFTER `TX_BEGIN` (mid-transaction mutation under the lock) → **HALT with preserved evidence + sentinel failure-domain classification — never a quiet ABORT** (P3-1: in-transaction mutation is hostile-or-unexplained, the A1 detect-and-HALT promise applies). TOCTOU harness worst outcomes: pre-BEGIN → clean ABORT; post-BEGIN → HALT, no corruption.
 3. Lock held LEASED→TX_DONE; owner-token verified on renew/release/steal.
 4. Rollback = new transaction whose staged tree is the Gate-3 pre-authorized inverse; doc/knob + compatible schemas only (F8); code/migrations/external effects → human forward-recovery.
 5. A reader (run start) sees exactly one of: old tree or new tree — never neither, never a mix. During Gate-4 ROLLING_BACK, new run starts are refused (contract 02).

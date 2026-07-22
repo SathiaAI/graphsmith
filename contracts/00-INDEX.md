@@ -1,5 +1,5 @@
 # GraphSmith v0.2.0 — Stage 0 Frozen Contracts
-Status: DRAFT — awaiting non-Anthropic panel review, then Paul's Stage 0 gate.
+**Status: FROZEN v1.0 (2026-07-21).** Approved by Paul at the Stage 0 gate (blanket phase-progression approval recorded in BUILD-LEDGER). Hardened by three adversarial panel passes — 41 + 21 + 7 findings, all adopted or narrowed with recorded dispositions; final pass-3 verdict fix-then-freeze with the 7 mechanical repairs applied pre-freeze. Post-freeze changes follow the change-control rule below, no exceptions.
 Once frozen, these contracts are the ONLY sync points between build workers (coordination rule 3, `references/multi-agent-coordination.md`).
 
 | # | Contract | Governs |
