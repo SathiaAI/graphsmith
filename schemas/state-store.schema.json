@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/state-store.schema.json",
+  "title": "GraphSmith state-store records",
+  "oneOf": [
+    { "$ref": "#/$defs/lock" },
+    { "$ref": "#/$defs/journalIntent" },
+    { "$ref": "#/$defs/journalDone" },
+    { "$ref": "#/$defs/window" },
+    { "$ref": "#/$defs/registry" },
+    { "$ref": "#/$defs/anchor" },
+    { "$ref": "#/$defs/alpha" },
+    { "$ref": "#/$defs/rejected" },
+    { "$ref": "#/$defs/rollback" }
+  ],
+  "$defs": {
+    "version": { "const": "1.0" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "lock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "pid", "proc_start_hint", "owner_token"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "pid": { "type": "integer", "minimum": 1 },
+        "proc_start_hint": { "$ref": "#/$defs/nonEmpty" },
+        "owner_token": { "type": "string", "pattern": "^[a-f0-9]{32}$" }
+      }
+    },
+    "journalEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "before_sha256", "after_sha256", "content_base64"],
+      "properties": {
+        "file": { "enum": ["window.json", "run-registry.jsonl", "run-anchors.jsonl", "alpha-ledger.jsonl", "rejected-buffer.jsonl", "rollback-families.jsonl"] },
+        "before_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "after_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "content_base64": { "type": "string" }
+      }
+    },
+    "journalIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "record_type", "mutation_id", "state_rev", "effects"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "record_type": { "const": "MUTATION_INTENT" },
+        "mutation_id": { "$ref": "#/$defs/nonEmpty" },
+        "state_rev": { "$ref": "#/$defs/revision" },
+        "effects": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/journalEffect" } }
+      }
+    },
+    "journalDone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "record_type", "mutation_id", "state_rev"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "record_type": { "const": "MUTATION_DONE" },
+        "mutation_id": { "$ref": "#/$defs/nonEmpty" },
+        "state_rev": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot_id", "run_id", "status", "disposition"],
+      "properties": {
+        "slot_id": { "type": "integer", "minimum": 1 },
+        "run_id": { "$ref": "#/$defs/nonEmpty" },
+        "status": { "enum": ["active", "terminal"] },
+        "disposition": { "type": ["null", "string"], "enum": [null, "completed_pass", "completed_hard_fail", "completed_soft_wobble", "abandoned", "superseded"] }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state_rev", "state", "flag", "window"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "state_rev": { "$ref": "#/$defs/revision" },
+        "state": { "enum": ["NO_WINDOW", "ADMITTED", "OBSERVING", "ROLLING_BACK", "CLOSED_PASS", "CLOSED_ROLLED_BACK", "CLOSED_FLAGGED", "HALT_HUMAN"] },
+        "flag": { "type": "boolean" },
+        "window": {
+          "type": ["null", "object"],
+          "required": ["window_id", "adoption_txid", "candidate_fingerprint", "tree_id", "n", "baseline_metric", "created_at", "max_window_wall_time_ms", "admitted", "active", "slots"],
+          "properties": {
+            "window_id": { "$ref": "#/$defs/nonEmpty" },
+            "adoption_txid": { "$ref": "#/$defs/nonEmpty" },
+            "candidate_fingerprint": { "$ref": "#/$defs/nonEmpty" },
+            "tree_id": { "$ref": "#/$defs/nonEmpty" },
+            "n": { "type": "integer", "minimum": 1 },
+            "baseline_metric": {},
+            "created_at": { "type": "integer", "minimum": 0 },
+            "max_window_wall_time_ms": { "type": "integer", "minimum": 1 },
+            "admitted": { "type": "integer", "minimum": 0 },
+            "active": { "type": "integer", "minimum": 0 },
+            "slots": { "type": "array", "items": { "$ref": "#/$defs/slot" } },
+            "close_reason": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state_rev", "record_type", "run_id"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "state_rev": { "$ref": "#/$defs/revision" },
+        "record_type": { "enum": ["REGISTERED", "HEARTBEAT", "DEREGISTERED", "EXPIRED"] },
+        "run_id": { "$ref": "#/$defs/nonEmpty" },
+        "tree_id": { "type": "string" },
+        "lease_expires_at": { "type": "integer", "minimum": 0 },
+        "result": {}
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state_rev", "record_type", "run_id", "chain_head", "expected_terminal_status"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "state_rev": { "$ref": "#/$defs/revision" },
+        "record_type": { "const": "ANCHOR_SET" },
+        "run_id": { "$ref": "#/$defs/nonEmpty" },
+        "chain_head": { "$ref": "#/$defs/nonEmpty" },
+        "expected_terminal_status": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "alpha": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state_rev", "record_type", "reservation_id"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "state_rev": { "$ref": "#/$defs/revision" },
+        "record_type": { "enum": ["RESERVED", "COMPLETED"] },
+        "reservation_id": { "$ref": "#/$defs/nonEmpty" },
+        "corpus_state": { "type": "string" },
+        "split_hash": { "type": "string" },
+        "fingerprint": { "type": "string" },
+        "family": { "type": "string" },
+        "alpha_slot": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "alpha": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.05 },
+        "outcome": {}
+      }
+    },
+    "rejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state_rev", "record_type", "fingerprint", "value"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "state_rev": { "$ref": "#/$defs/revision" },
+        "record_type": { "const": "REJECTED" },
+        "fingerprint": { "$ref": "#/$defs/nonEmpty" },
+        "value": {}
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state_rev", "record_type", "fingerprint"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "state_rev": { "$ref": "#/$defs/revision" },
+        "record_type": { "enum": ["ROLLBACK_RECORDED", "HUMAN_ACK"] },
+        "fingerprint": { "$ref": "#/$defs/nonEmpty" },
+        "family": { "type": "string" },
+        "evidence": {},
+        "acknowledgement": {}
+      }
+    }
+  }
+}
