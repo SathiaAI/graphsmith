@@ -20,6 +20,11 @@
  *   Heartbeat: manager writes an incrementing integer counter (as string) to
  *              heartbeat-file at a regular interval (e.g. every 100ms). The
  *              watchdog polls this file and tracks when the counter last changed.
+ *              Provenance format: "<counter>:<nonce>" — the watchdog writes a
+ *              nonce to <heartbeat-file>.nonce at startup; the manager reads it
+ *              and appends it to each heartbeat write. Heartbeats without the
+ *              correct nonce are treated as legacy/untrusted and subject to a
+ *              strict max-increment heuristic (defense-in-depth against forgers).
  *   Capability: manager writes JSON to capability-file before each effect:
  *              { "capability": "<variant>", "effect_id": "<id>" }
  *              Variants: "none" | "read-only" | "local-transactional" |
@@ -28,9 +33,24 @@
  *   Halt file: on kill, watchdog writes JSON evidence:
  *              { "halt": true, "pid": <int>, "budget_ms": <int>,
  *                "elapsed_ms": <int>, "last_heartbeat": <int|null>,
- *                "kill_message": "<capability-specific>", "killed_at_mono_ms": <int> }
+ *                "kill_message": "<capability-specific>", "killed_at_mono_ms": <int>,
+ *                "inspected": { ... } }
  *   Kill signal: SIGKILL on Unix (process-group via negative pid),
  *                taskkill /T /F on Windows (process tree).
+ *
+ * D4 — Dead-man's-switch / watchdog liveness signal:
+ *   At startup, the watchdog writes a preliminary halt file (dead_man_switch: true)
+ *   to the halt-file path. On normal exit (manager exited cleanly), this file is
+ *   DELETED. On kill, it is OVERWRITTEN with real halt evidence. If the watchdog
+ *   process itself is killed (SIGKILL), the dead-man's-switch file PERSISTS,
+ *   allowing the manager (or supervisor) to detect that its guard is dead.
+ *   Additionally, the watchdog writes a reverse-heartbeat to
+ *   <halt-file>.watchdog-hb at each poll interval, containing:
+ *     { "watchdog_pid": <int>, "mono_ms": <int>, "wall_ms": <int> }
+ *   The manager can poll this file; if it stops updating (wall_ms stale by
+ *   more than 2× the poll interval), the watchdog is dead and the manager
+ *   should take defensive action (e.g., self-halt or alert).
+ *   Interface: scaffold.js wires the detection at integration time.
  */
 "use strict";
 
@@ -38,8 +58,12 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 const os = require("os");
+const crypto = require("crypto");
 
 const MONO_NS = () => Number(process.hrtime.bigint() / 1000000n);
+const MAX_LEGACY_INCREMENT = 10;
+const MAX_FIRST_COUNTER = 100;
+const STALE_THRESHOLD_MS = 30000;
 
 function parseArgs(argv) {
   const args = {};
@@ -53,15 +77,6 @@ function parseArgs(argv) {
   return args;
 }
 
-function readJsonFile(filePath) {
-  try {
-    const raw = fs.readFileSync(filePath, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
 function readFileSafe(filePath) {
   try {
     return fs.readFileSync(filePath, "utf8").trim();
@@ -70,12 +85,48 @@ function readFileSafe(filePath) {
   }
 }
 
-function deriveKillMessage(capabilityData) {
-  if (!capabilityData || !capabilityData.capability) {
+function readCapabilityFile(filePath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return { status: "missing", data: null };
+    return { status: "corrupt", data: null };
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { status: "malformed", data: null };
+  }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return { status: "malformed", data: null };
+  }
+  try {
+    const stat = fs.statSync(filePath);
+    const age = Date.now() - stat.mtimeMs;
+    if (age > STALE_THRESHOLD_MS) {
+      return { status: "stale", data };
+    }
+  } catch {}
+  return { status: "ok", data };
+}
+
+function deriveKillMessage(capStatus, capData) {
+  if (capStatus !== "ok") {
+    return `reconciliation required (capability file ${capStatus}; completion unknown, manual verification needed)`;
+  }
+  if (!capData || !("capability" in capData) || capData.capability === undefined) {
+    return "reconciliation required (capability field missing; completion unknown, manual verification needed)";
+  }
+  const cap = capData.capability;
+  const effectId = capData.effect_id || "unknown";
+  if (cap === null) {
     return "no external effects in flight";
   }
-  const cap = capabilityData.capability;
-  const effectId = capabilityData.effect_id || "unknown";
+  if (typeof cap !== "string") {
+    return "reconciliation required (capability field invalid; completion unknown, manual verification needed)";
+  }
   switch (cap) {
     case "read-only":
       return "no external effects in flight";
@@ -117,17 +168,58 @@ function pidAlive(pid) {
 function runWatchdog(opts) {
   const { pid, budgetMs, heartbeatFile, capabilityFile, haltFile } = opts;
   const pollIntervalMs = Math.max(20, Math.floor(budgetMs / 10));
-  let lastCounter = null;
+
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const nonceFile = heartbeatFile + ".nonce";
+  try { fs.writeFileSync(nonceFile, nonce); } catch {}
+
+  const deadManSwitch = {
+    halt: true,
+    dead_man_switch: true,
+    watchdog_pid: process.pid,
+    watched_pid: pid,
+    budget_ms: budgetMs,
+    started_at_mono_ms: MONO_NS(),
+    started_at_wall_ms: Date.now(),
+    kill_message: "watchdog dead-man switch — if this file persists and the watchdog is not running, the guard died",
+  };
+  try {
+    fs.mkdirSync(path.dirname(haltFile), { recursive: true });
+    fs.writeFileSync(haltFile, JSON.stringify(deadManSwitch, null, 2));
+  } catch {}
+
+  const watchdogHbFile = haltFile + ".watchdog-hb";
+
+  let lastAcceptedCounter = null;
   let lastChangeMonoMs = MONO_NS();
   let lastHeartbeatValue = null;
   let managerExited = false;
 
   return new Promise((resolve) => {
+    const reverseHb = setInterval(() => {
+      try {
+        fs.writeFileSync(watchdogHbFile, JSON.stringify({
+          watchdog_pid: process.pid,
+          mono_ms: MONO_NS(),
+          wall_ms: Date.now(),
+        }));
+      } catch {}
+    }, pollIntervalMs);
+    reverseHb.unref();
+
+    const cleanupNormal = () => {
+      try { fs.unlinkSync(haltFile); } catch {}
+      try { fs.unlinkSync(nonceFile); } catch {}
+      try { fs.unlinkSync(watchdogHbFile); } catch {}
+    };
+
     const checkPid = setInterval(() => {
       if (!pidAlive(pid)) {
         managerExited = true;
         clearInterval(checkPid);
         clearInterval(poll);
+        clearInterval(reverseHb);
+        cleanupNormal();
         resolve({ halted: false, reason: "manager_exited" });
       }
     }, Math.max(50, Math.floor(budgetMs / 4)));
@@ -135,23 +227,66 @@ function runWatchdog(opts) {
 
     const poll = setInterval(() => {
       if (managerExited) return;
+
+      if (!pidAlive(pid)) {
+        managerExited = true;
+        clearInterval(poll);
+        clearInterval(checkPid);
+        clearInterval(reverseHb);
+        cleanupNormal();
+        resolve({ halted: false, reason: "manager_exited" });
+        return;
+      }
+
       const counterRaw = readFileSafe(heartbeatFile);
-      const counter = counterRaw !== null ? parseInt(counterRaw, 10) : null;
       const nowMono = MONO_NS();
 
-      if (counter !== null && !isNaN(counter) && counter !== lastCounter) {
-        lastCounter = counter;
-        lastHeartbeatValue = counter;
-        lastChangeMonoMs = nowMono;
+      let counter = null;
+      let trusted = false;
+      if (counterRaw !== null) {
+        const colonIdx = counterRaw.indexOf(":");
+        let counterStr, nonceStr;
+        if (colonIdx >= 0) {
+          counterStr = counterRaw.slice(0, colonIdx);
+          nonceStr = counterRaw.slice(colonIdx + 1);
+        } else {
+          counterStr = counterRaw;
+          nonceStr = null;
+        }
+        const parsed = parseInt(counterStr, 10);
+        if (!isNaN(parsed)) {
+          counter = parsed;
+          if (nonceStr !== null && nonceStr === nonce) {
+            trusted = true;
+          }
+        }
+      }
+
+      if (counter !== null) {
+        if (lastAcceptedCounter === null) {
+          if (trusted || counter <= MAX_FIRST_COUNTER) {
+            lastAcceptedCounter = counter;
+            lastHeartbeatValue = counter;
+            lastChangeMonoMs = nowMono;
+          }
+        } else if (counter > lastAcceptedCounter) {
+          const increment = counter - lastAcceptedCounter;
+          if (trusted || increment <= MAX_LEGACY_INCREMENT) {
+            lastAcceptedCounter = counter;
+            lastHeartbeatValue = counter;
+            lastChangeMonoMs = nowMono;
+          }
+        }
       }
 
       const elapsedMs = nowMono - lastChangeMonoMs;
       if (elapsedMs > budgetMs) {
         clearInterval(poll);
         clearInterval(checkPid);
+        clearInterval(reverseHb);
 
-        const capabilityData = readJsonFile(capabilityFile);
-        const killMessage = deriveKillMessage(capabilityData);
+        const capResult = readCapabilityFile(capabilityFile);
+        const killMessage = deriveKillMessage(capResult.status, capResult.data);
         const killed = killProcessGroup(pid);
 
         const haltEvidence = {
@@ -163,8 +298,17 @@ function runWatchdog(opts) {
           kill_message: killMessage,
           killed_at_mono_ms: nowMono,
           kill_delivered: killed,
-          capability_at_kill: capabilityData ? capabilityData.capability : null,
-          effect_id_at_kill: capabilityData ? capabilityData.effect_id : null,
+          capability_at_kill: capResult.data ? capResult.data.capability : null,
+          effect_id_at_kill: capResult.data ? capResult.data.effect_id : null,
+          capability_file_status: capResult.status,
+          inspected: {
+            what: "capability-file",
+            status: capResult.status,
+            readable: capResult.status === "ok",
+            capability: capResult.data ? (capResult.data.capability !== undefined ? capResult.data.capability : null) : null,
+            effect_id: capResult.data ? (capResult.data.effect_id !== undefined ? capResult.data.effect_id : null) : null,
+            inspected_at_mono_ms: nowMono,
+          },
         };
 
         try {
@@ -173,6 +317,9 @@ function runWatchdog(opts) {
         } catch (e) {
           process.stderr.write(`watchdog: failed to write halt file: ${e.message}\n`);
         }
+
+        try { fs.unlinkSync(nonceFile); } catch {}
+        try { fs.unlinkSync(watchdogHbFile); } catch {}
 
         process.stdout.write(JSON.stringify(haltEvidence) + "\n");
         resolve({ halted: true, evidence: haltEvidence });
@@ -385,6 +532,332 @@ async function selftest() {
     }
 
     pass(scenario.name, `killed at ${ev.elapsed_ms}ms (budget ${BUDGET_MS}ms), message="${ev.kill_message}", state: ${state.completed.length} steps, consistent`);
+  }
+
+  // D1 selftest: missing capability file → reconciliation required
+  {
+    const name = "D1-missing-capability-fail-safe";
+    const runDir = path.join(tmpDir, "run-d1-missing");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 0;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+        if (c >= 3) {
+          clearInterval(iv);
+          const end = Date.now() + 30000;
+          while (Date.now() < end) {}
+        }
+      }, 50);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const watchdogResult = await runWatchdog({
+      pid: manager.pid,
+      budgetMs: BUDGET_MS,
+      heartbeatFile,
+      capabilityFile,
+      haltFile,
+    });
+
+    try { manager.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+    await new Promise((r) => manager.on("close", r));
+
+    if (!watchdogResult.halted) {
+      fail(name, "watchdog did not halt");
+    } else if (!watchdogResult.evidence.kill_message.includes("reconciliation required")) {
+      fail(name, `expected reconciliation required, got "${watchdogResult.evidence.kill_message}"`);
+    } else if (watchdogResult.evidence.kill_message.includes("no external effects")) {
+      fail(name, `fail-open: got "${watchdogResult.evidence.kill_message}"`);
+    } else if (watchdogResult.evidence.capability_file_status !== "missing") {
+      fail(name, `expected status "missing", got "${watchdogResult.evidence.capability_file_status}"`);
+    } else {
+      pass(name, `msg="${watchdogResult.evidence.kill_message}"`);
+    }
+  }
+
+  // D1 selftest: corrupt capability file → reconciliation required
+  {
+    const name = "D1-corrupt-capability-fail-safe";
+    const runDir = path.join(tmpDir, "run-d1-corrupt");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+
+    fs.writeFileSync(capabilityFile, "{not-valid-json");
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 0;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+        if (c >= 3) {
+          clearInterval(iv);
+          const end = Date.now() + 30000;
+          while (Date.now() < end) {}
+        }
+      }, 50);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const watchdogResult = await runWatchdog({
+      pid: manager.pid,
+      budgetMs: BUDGET_MS,
+      heartbeatFile,
+      capabilityFile,
+      haltFile,
+    });
+
+    try { manager.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+    await new Promise((r) => manager.on("close", r));
+
+    if (!watchdogResult.halted) {
+      fail(name, "watchdog did not halt");
+    } else if (!watchdogResult.evidence.kill_message.includes("reconciliation required")) {
+      fail(name, `expected reconciliation required, got "${watchdogResult.evidence.kill_message}"`);
+    } else if (watchdogResult.evidence.capability_file_status !== "malformed") {
+      fail(name, `expected status "malformed", got "${watchdogResult.evidence.capability_file_status}"`);
+    } else {
+      pass(name, `msg="${watchdogResult.evidence.kill_message}"`);
+    }
+  }
+
+  // D2 selftest: forged heartbeat (external forger) → still kills
+  {
+    const name = "D2-forged-heartbeat-still-kills";
+    const runDir = path.join(tmpDir, "run-d2");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+
+    fs.writeFileSync(capabilityFile, JSON.stringify({ capability: "none", effect_id: "forged-test" }));
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 0;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+        if (c >= 3) {
+          clearInterval(iv);
+          const end = Date.now() + 30000;
+          while (Date.now() < end) {}
+        }
+      }, 40);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const mockForgerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 1000;
+      const iv = setInterval(() => {
+        c++;
+        try { fs.writeFileSync(hb, String(c)); } catch {}
+      }, 30);
+      setTimeout(() => { clearInterval(iv); process.exit(0); }, 15000);
+    `;
+    const mockForgerPath = path.join(runDir, "mock-forger.js");
+    fs.writeFileSync(mockForgerPath, mockForgerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 150));
+
+    const forger = spawn(process.execPath, [mockForgerPath], {
+      stdio: "ignore",
+    });
+
+    const watchdogResult = await runWatchdog({
+      pid: manager.pid,
+      budgetMs: BUDGET_MS,
+      heartbeatFile,
+      capabilityFile,
+      haltFile,
+    });
+
+    try { manager.kill("SIGKILL"); } catch {}
+    try { forger.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+    await new Promise((r) => manager.on("close", r));
+
+    if (!watchdogResult.halted) {
+      fail(name, "watchdog did not halt — forged heartbeats starved the kill");
+    } else if (!watchdogResult.evidence.kill_delivered) {
+      fail(name, "kill was not delivered");
+    } else {
+      pass(name, `killed at ${watchdogResult.evidence.elapsed_ms}ms despite forged heartbeats`);
+    }
+  }
+
+  // D3 selftest: local-transactional has inspection evidence
+  {
+    const name = "D3-inspection-evidence-in-halt";
+    const runDir = path.join(tmpDir, "run-d3");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+
+    fs.writeFileSync(capabilityFile, JSON.stringify({ capability: "local-transactional", effect_id: "test-effect" }));
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 0;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+        if (c >= 3) {
+          clearInterval(iv);
+          const end = Date.now() + 30000;
+          while (Date.now() < end) {}
+        }
+      }, 50);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const watchdogResult = await runWatchdog({
+      pid: manager.pid,
+      budgetMs: BUDGET_MS,
+      heartbeatFile,
+      capabilityFile,
+      haltFile,
+    });
+
+    try { manager.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+    await new Promise((r) => manager.on("close", r));
+
+    if (!watchdogResult.halted) {
+      fail(name, "watchdog did not halt");
+    } else {
+      const ev = watchdogResult.evidence;
+      const hasInspected = Object.prototype.hasOwnProperty.call(ev, "inspected");
+      const msgHasInspected = /inspect/i.test(ev.kill_message);
+      if (!hasInspected) {
+        fail(name, "halt evidence missing 'inspected' field");
+      } else if (!msgHasInspected) {
+        fail(name, `kill_message doesn't mention inspection: "${ev.kill_message}"`);
+      } else if (!ev.inspected.readable) {
+        fail(name, `inspected.readable should be true, got ${ev.inspected.readable}`);
+      } else {
+        pass(name, `inspected field present, readable=true, msg="${ev.kill_message}"`);
+      }
+    }
+  }
+
+  // D4 selftest: dead man's switch file exists at startup
+  {
+    const name = "D4-dead-mans-switch";
+    const runDir = path.join(tmpDir, "run-d4");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+    const watchdogHbFile = haltFile + ".watchdog-hb";
+
+    fs.writeFileSync(capabilityFile, JSON.stringify({ capability: null }));
+    fs.writeFileSync(heartbeatFile, "1");
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 1;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+        if (c >= 3) {
+          clearInterval(iv);
+          const end = Date.now() + 30000;
+          while (Date.now() < end) {}
+        }
+      }, 50);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const watchdogPromise = runWatchdog({
+      pid: manager.pid,
+      budgetMs: BUDGET_MS,
+      heartbeatFile,
+      capabilityFile,
+      haltFile,
+    });
+
+    await new Promise((r) => setTimeout(r, 150));
+
+    let dmsData = null;
+    try { dmsData = JSON.parse(fs.readFileSync(haltFile, "utf8")); } catch {}
+    let reverseHbExists = fs.existsSync(watchdogHbFile);
+
+    const watchdogResult = await watchdogPromise;
+
+    try { manager.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+    await new Promise((r) => manager.on("close", r));
+
+    if (!dmsData || !dmsData.dead_man_switch) {
+      fail(name, "dead man's switch file not found or invalid at startup");
+    } else if (!watchdogResult.halted) {
+      fail(name, "watchdog did not halt");
+    } else if (watchdogResult.evidence.dead_man_switch) {
+      fail(name, "halt evidence still has dead_man_switch flag (should be overwritten)");
+    } else if (!reverseHbExists) {
+      fail(name, "reverse heartbeat file not found during watchdog run");
+    } else {
+      pass(name, "dead man's switch written at startup, overwritten by real halt evidence, reverse heartbeat active");
+    }
   }
 
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
