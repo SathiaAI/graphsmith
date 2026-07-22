@@ -18,14 +18,27 @@
 # the GitHub Actions matrix's Node axis.
 #
 # NOT included in this Phase A stub (left for a later phase, tracked here
-# so the gap is visible rather than silent):
+# so the gap is visible rather than silent) — every GitHub Actions check
+# this template omits is disclosed explicitly below, none silently:
 #   - The PR-separation guard (scripts/ci-check-pr-separation.js) is not
 #     wired to a GitLab merge_request pipeline here. To add it, a job
 #     would diff $CI_MERGE_REQUEST_DIFF_BASE_SHA against
-#     $CI_COMMIT_SHA and pipe the result the same way the GitHub Actions
-#     `pr-separation-guard` job does:
-#       git diff --name-only "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" \
+#     $CI_COMMIT_SHA (using --name-status --no-renames, per task A-ci-fix
+#     B2, so rename source paths reach the classifier) and pipe the
+#     result the same way the GitHub Actions `pr-separation-guard` job
+#     does (per task A-ci-fix B1, from a base-trusted copy of the guard
+#     script, never the MR branch's own checkout):
+#       git diff --name-status --no-renames "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" \
 #         | node scripts/ci-check-pr-separation.js
+#   - OS coverage: this stub is Linux-only (see "Phase A scope" above) —
+#     no windows-latest/macos-latest equivalent job here.
+#   - Syntax check every script (`node --check` over scripts/*.js) —
+#     GitHub's `verify` job only, not reproduced here.
+#   - graphlint selftest (`graphlint.js --selftest`) and graphlint dogfood
+#     (`graphlint.js scripts/`) — GitHub's `verify` job only, not
+#     reproduced here.
+#   - Scaffold a project (`scaffold.js`) and the chaos harness
+#     (`chaos.js`) — GitHub's `verify` job only, not reproduced here.
 #   - "Required" merge-blocking status: GitLab's equivalent of a GitHub
 #     branch-protection required status check is a merge request approval
 #     rule / pipeline-must-succeed setting in Settings > Merge requests —
@@ -57,33 +70,65 @@ stages:
     - |
       node -e "
       const fs = require('fs'), path = require('path'), cp = require('child_process');
+      // ci-suite-manifest.json (task A-ci-fix B3): gating_suites must stay
+      // green; evidence_only suites are one-shot adversarial-review
+      // harnesses that exit non-zero BY DESIGN on findings -- they are run
+      // and logged but never gate. A suite in neither list is fail-safe
+      // GATING with an explicit warning (never silently ignored).
+      const manifest = JSON.parse(fs.readFileSync('ci-suite-manifest.json', 'utf8'));
+      const gatingPrefixes = manifest.gating_suites || [];
+      const evidencePrefixes = manifest.evidence_only || [];
+      function classifySuite(p) {
+        if (evidencePrefixes.some(function (pre) { return p.startsWith(pre); })) return 'evidence_only';
+        if (gatingPrefixes.some(function (pre) { return p.startsWith(pre); })) return 'gating';
+        return 'unknown_gating';
+      }
       const root = 'tests';
       const suites = [];
       (function walk(dir) {
         for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-          const p = path.join(dir, e.name);
+          const p = path.join(dir, e.name).split(path.sep).join('/');
           if (e.isDirectory()) walk(p);
           else if (e.name === 'run-tests.js') suites.push(p);
         }
       })(root);
       suites.sort();
       console.log('Discovered ' + suites.length + ' suite(s):');
-      suites.forEach(function (s) { console.log('  ' + s); });
-      let failed = [];
+      suites.forEach(function (s) { console.log('  ' + s + '  [' + classifySuite(s) + ']'); });
+      const failedGating = [];
+      const failedEvidence = [];
+      const unknownWarned = [];
       for (const s of suites) {
+        const kind = classifySuite(s);
+        if (kind === 'unknown_gating') {
+          unknownWarned.push(s);
+          console.warn('WARNING -- ' + s + ' is not listed in ci-suite-manifest.json (gating_suites or evidence_only) -- treating as GATING (fail-safe).');
+        }
         console.log('');
-        console.log('=== ' + s + ' ===');
+        console.log('=== ' + s + ' [' + kind + '] ===');
         const r = cp.spawnSync(process.execPath, [s], { stdio: 'inherit' });
-        if (r.status !== 0) failed.push(s + ' (exit ' + r.status + ')');
+        if (r.status !== 0) {
+          if (kind === 'evidence_only') failedEvidence.push(s + ' (exit ' + r.status + ')');
+          else failedGating.push(s + ' (exit ' + r.status + ')');
+        }
       }
-      if (failed.length) {
+      console.log('');
+      if (failedEvidence.length) {
+        console.log('EVIDENCE-ONLY suite(s) reported findings (logged, does NOT gate merge):');
+        failedEvidence.forEach(function (f) { console.log('  ' + f); });
+      }
+      if (unknownWarned.length) {
+        console.log('Suite(s) absent from ci-suite-manifest.json (treated as gating, fail-safe):');
+        unknownWarned.forEach(function (f) { console.log('  ' + f); });
+      }
+      if (failedGating.length) {
         console.error('');
-        console.error('FAILED suites:');
-        failed.forEach(function (f) { console.error('  ' + f); });
+        console.error('FAILED gating suite(s):');
+        failedGating.forEach(function (f) { console.error('  ' + f); });
         process.exit(1);
       }
       console.log('');
-      console.log('All ' + suites.length + ' suite(s) passed.');
+      console.log('All gating suite(s) passed (' + suites.length + ' discovered, ' + failedEvidence.length + ' evidence-only failure(s) logged above, non-gating).');
       "
 
 phase-a:linux:node18:

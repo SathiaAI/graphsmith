@@ -10,10 +10,20 @@ name: CI
 #   - `phase-a-selftests`: every component's `--selftest` plus every
 #     committed suite under tests/<component>/<family>/run-tests.js, on a
 #     3-OS matrix (contracts/11 Tier 0: "agentless artifact conformance ...
-#     the Phase A-E test suites on macOS/Linux/Windows CI").
+#     the Phase A-E test suites on macOS/Linux/Windows CI"). Suite
+#     gate-vs-log status is decided by ../../ci-suite-manifest.json (task
+#     A-ci-fix B3) — see the step below for the rule.
 #   - `pr-separation-guard`: contracts/04 B17 / contracts/11 — a hostile
 #     contributor must not be able to mix an evaluator/corpus change with
 #     a behavior change in the same PR (scripts/ci-check-pr-separation.js).
+#     TRUST BOUNDARY (task A-ci-fix B1/B2): this job never executes the
+#     guard from the PR's own checkout — a hostile PR could otherwise edit
+#     the guard to always exit 0 and bypass the whole gate. Instead it
+#     extracts the guard SCRIPT from the trusted BASE revision via
+#     `git show <base_sha>:scripts/ci-check-pr-separation.js` into a temp
+#     file and executes only that; the changed-file list is computed with
+#     base-trusted `git diff --name-status --no-renames` (not
+#     `--name-only`, which drops rename source paths).
 #     NOTE: this job reporting a status is necessary but not sufficient —
 #     it must also be turned on as a GitHub branch-protection "required
 #     status check" (Settings > Branches) for the separation to actually
@@ -79,6 +89,15 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node }}
+      # Component selftests: this list is intentionally explicit (not
+      # dynamically discovered) for the components fully onboarded to the
+      # Phase A 3-OS parity pattern. graphlint.js already exists and is
+      # self-tested + dogfooded in the `verify` job above (2-OS,
+      # Node 18/22); bringing it into this 3-OS matrix too is a Phase B
+      # onboarding item — tracked, not duplicated here. Any FUTURE
+      # component's committed tests/<component>/<family>/run-tests.js suite
+      # is picked up automatically and gated by the dynamic step below
+      # regardless of whether it also gets a --selftest line here.
       - name: Component selftest — manifest.js
         run: node scripts/manifest.js --selftest
       - name: Component selftest — state-store.js
@@ -95,8 +114,8 @@ jobs:
         run: node scripts/verify.js --selftest
       - name: Component selftest — ci-check-pr-separation.js
         run: node scripts/ci-check-pr-separation.js --selftest
-      - name: Run every committed suite under tests/<component>/<family>/run-tests.js
-        run: node -e "const fs=require('fs'), path=require('path'), cp=require('child_process'); const root='tests'; const suites=[]; (function walk(dir){ for (const e of fs.readdirSync(dir, {withFileTypes:true})) { const p = path.join(dir, e.name); if (e.isDirectory()) walk(p); else if (e.name === 'run-tests.js') suites.push(p); } })(root); suites.sort(); console.log('Discovered ' + suites.length + ' suite(s):'); suites.forEach(function(s){ console.log('  ' + s); }); let failed = []; for (const s of suites) { console.log(''); console.log('=== ' + s + ' ==='); const r = cp.spawnSync(process.execPath, [s], {stdio:'inherit'}); if (r.status !== 0) failed.push(s + ' (exit ' + r.status + ')'); } if (failed.length) { console.error(''); console.error('FAILED suites:'); failed.forEach(function(f){ console.error('  ' + f); }); process.exit(1); } console.log(''); console.log('All ' + suites.length + ' suite(s) passed.');"
+      - name: Run every committed suite under tests/<component>/<family>/run-tests.js (gated by ci-suite-manifest.json)
+        run: node -e "const fs=require('fs'), path=require('path'), cp=require('child_process'); const manifest=JSON.parse(fs.readFileSync('ci-suite-manifest.json','utf8')); const gatingPrefixes=manifest.gating_suites||[]; const evidencePrefixes=manifest.evidence_only||[]; function classifySuite(p){ if (evidencePrefixes.some(function(pre){return p.startsWith(pre);})) return 'evidence_only'; if (gatingPrefixes.some(function(pre){return p.startsWith(pre);})) return 'gating'; return 'unknown_gating'; } const root='tests'; const suites=[]; (function walk(dir){ for (const e of fs.readdirSync(dir, {withFileTypes:true})) { const p = path.join(dir, e.name).split(path.sep).join('/'); if (e.isDirectory()) walk(p); else if (e.name === 'run-tests.js') suites.push(p); } })(root); suites.sort(); console.log('Discovered ' + suites.length + ' suite(s):'); suites.forEach(function(s){ console.log('  ' + s + '  [' + classifySuite(s) + ']'); }); const failedGating=[]; const failedEvidence=[]; const unknownWarned=[]; for (const s of suites) { const kind = classifySuite(s); if (kind === 'unknown_gating') { unknownWarned.push(s); console.warn('WARNING -- ' + s + ' is not listed in ci-suite-manifest.json (gating_suites or evidence_only) -- treating as GATING (fail-safe).'); } console.log(''); console.log('=== ' + s + ' [' + kind + '] ==='); const r = cp.spawnSync(process.execPath, [s], {stdio:'inherit'}); if (r.status !== 0) { if (kind === 'evidence_only') failedEvidence.push(s + ' (exit ' + r.status + ')'); else failedGating.push(s + ' (exit ' + r.status + ')'); } } console.log(''); if (failedEvidence.length) { console.log('EVIDENCE-ONLY suite(s) reported findings (logged, does NOT gate merge):'); failedEvidence.forEach(function(f){ console.log('  ' + f); }); } if (unknownWarned.length) { console.log('Suite(s) absent from ci-suite-manifest.json (treated as gating, fail-safe):'); unknownWarned.forEach(function(f){ console.log('  ' + f); }); } if (failedGating.length) { console.error(''); console.error('FAILED gating suite(s):'); failedGating.forEach(function(f){ console.error('  ' + f); }); process.exit(1); } console.log(''); console.log('All gating suite(s) passed (' + suites.length + ' discovered, ' + failedEvidence.length + ' evidence-only failure(s) logged above, non-gating).');"
 
   pr-separation-guard:
     name: PR separation guard (evaluator/corpus vs behavior)
@@ -111,5 +130,27 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
-      - name: Diff PR base...head and run the separation guard
-        run: git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} | node scripts/ci-check-pr-separation.js
+      - name: Extract the separation guard from the TRUSTED BASE revision (never PR head)
+        # B1 fix: a hostile PR can edit scripts/ci-check-pr-separation.js in
+        # its own checkout to always exit 0. Never execute that file from
+        # the PR's working tree — extract the guard SOURCE from the base
+        # commit (which the PR cannot control) via `git show`, into a temp
+        # file, and execute only that copy below.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          mkdir -p "$RUNNER_TEMP/trusted-guard"
+          git show "$BASE_SHA:scripts/ci-check-pr-separation.js" > "$RUNNER_TEMP/trusted-guard/ci-check-pr-separation.js"
+      - name: Diff base...head with base-trusted git (name-status, no-renames) and run the TRUSTED guard
+        # B2 fix: --name-status --no-renames makes git itself split every
+        # rename into a plain delete line + a plain add line, so both the
+        # old (possibly sensitive) and new path always reach the
+        # classifier — --name-only silently drops the rename source.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff --name-status --no-renames "$BASE_SHA" "$HEAD_SHA" | node "$RUNNER_TEMP/trusted-guard/ci-check-pr-separation.js"
