@@ -192,7 +192,9 @@ function race_postBeginActiveMutation() {
       fail(name, "hostile ACTIVE write did not change pointer hash");
       return;
     }
-    /* Attempt recover — unclassifiable ACTIVE vs journal expectations must HALT */
+    /* Attempt recover — contract 01: post-BEGIN hostile mutation → HALT specifically,
+     * exit 3, with evidence of the mutated/observed identity. CORRUPT_STATE / ABORT /
+     * exit≠3 is fail-closed-but-wrong and must FAIL this attack. */
     let recoverRes;
     try {
       promoteMod.recover(root);
@@ -201,10 +203,6 @@ function race_postBeginActiveMutation() {
       recoverRes = { ok: false, code: e.code, message: e.message, evidence: e.evidence };
     }
     const journal = parseJsonl(paths.journal);
-    const hasHaltish =
-      !recoverRes.ok &&
-      (recoverRes.code === "HALT" || recoverRes.code === "CORRUPT_STATE");
-    /* Or if recover aborts cleanly without installing hostile as "verified effective" */
     const activeNow = readActive(paths);
     const silentOverwrite =
       recoverRes.ok &&
@@ -215,28 +213,43 @@ function race_postBeginActiveMutation() {
       fail(name, "SILENT OVERWRITE: recover DONE with hostile ACTIVE");
       return;
     }
-    if (hasHaltish || (!recoverRes.ok && recoverRes.code)) {
-      pass(name, `code=${recoverRes.code} activeSha=${activeNow.sha.slice(0, 12)} evidence=${!!recoverRes.evidence}`);
+    if (recoverRes.ok || recoverRes.code !== "HALT") {
+      fail(
+        name,
+        `expected HALT exit=3 with evidence; got ok=${recoverRes.ok} code=${recoverRes.code || "none"}`
+      );
       return;
     }
-    /* Full promote after hostile mutation while unclean journal */
-    const second = catchPromote(() =>
-      promote(testPacket(root, "second-after-hostile", {
-        edits: [{
-          schema_version: SCHEMA_VERSION,
-          schema_ref: "toctou",
-          file: "graphsmith.learned.md",
-          anchor: "alpha",
-          op: "replace",
-          payload: "second",
-        }],
-      }))
-    );
-    if (second.ok && second.result.state === "DONE") {
-      fail(name, "second promote DONE after hostile ACTIVE + unfinished journal");
-    } else {
-      pass(name, `recover=${recoverRes.code || "ok"} second=${second.code || (second.result && second.result.state)}`);
+    const ev = recoverRes.evidence;
+    const evidenceHasIdentity =
+      ev &&
+      typeof ev === "object" &&
+      (ev.activeSha === afterHostile.sha ||
+        ev.observed === afterHostile.sha ||
+        Object.values(ev).some((v) => v === afterHostile.sha));
+    if (!evidenceHasIdentity) {
+      fail(name, `HALT without evidence of mutated identity; evidence=${JSON.stringify(ev)}`);
+      return;
     }
+    /* Mapped exit: HALT → 3 (same mapping as scripts/promote.js CLI). Also run CLI. */
+    const mappedExit = recoverRes.code === "HALT" ? 3 : recoverRes.code === "INVALID_PACKET" ? 2 : 1;
+    const cli = spawnSync(
+      process.execPath,
+      [path.join(REPO, "scripts", "promote.js"), "recover"],
+      { cwd: root, encoding: "utf8", timeout: 30000, env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" } }
+    );
+    if (mappedExit !== 3 || cli.status !== 3) {
+      fail(name, `HALT mappedExit=${mappedExit} cli.status=${cli.status} (both must be 3)`);
+      return;
+    }
+    if (journal.some((r) => r.record_type === "TX_DONE")) {
+      fail(name, "TX_DONE present after post-BEGIN hostile mutation HALT");
+      return;
+    }
+    pass(
+      name,
+      `code=HALT exit=3 evidence.activeSha=${String(ev.activeSha || "").slice(0, 12)} final=${activeNow.sha.slice(0, 12)}`
+    );
   } catch (e) {
     fail(name, e.message);
   }
@@ -589,11 +602,9 @@ function race_resolveThenMutate() {
 /* ------------------------------------------------------------------ */
 function race_trueParallelRename() {
   const name = "true-parallel-rename-race";
-  /* On Windows and single-threaded Node, simultaneous same-file renames
-   * under two processes are not reliably schedulable inside this harness
-   * without flaking. We probe whether the platform can express the race at
-   * all; if not, mark UNAVAILABLE (never green).
-   */
+  /* Multi-process rename-vs-rename is provable in a multi-process harness
+   * (child writers + IPC/barrier + exit codes + final disk state), but not
+   * in this single-process interleaved one. Never fake a green. */
   try {
     const dir = mk("parallel");
     const a = path.join(dir, "a.txt");
@@ -601,13 +612,15 @@ function race_trueParallelRename() {
     const t = path.join(dir, "target.txt");
     fs.writeFileSync(a, "A");
     fs.writeFileSync(b, "B");
-    /* Sequential "race" is not a real race — declare unavailable rather than green */
     unavailable(
       name,
-      "inherently unprovable in single-threaded interleaved harness; multi-process rename-vs-rename under open handles is platform-probe territory (verify --platform-probe), not claimed green here"
+      "not proven in this single-process harness; deferred to a multi-process platform-probe cell (verify --platform-probe), results are per-platform"
     );
   } catch (e) {
-    unavailable(name, e.message);
+    unavailable(
+      name,
+      "not proven in this single-process harness; deferred to a multi-process platform-probe cell (verify --platform-probe), results are per-platform"
+    );
   }
 }
 

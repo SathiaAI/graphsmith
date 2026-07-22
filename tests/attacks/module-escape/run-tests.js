@@ -188,11 +188,38 @@ function attack_evalFunction() {
 /* 3. child_process only for non-decision / opt-in spawn paths          */
 /* ------------------------------------------------------------------ */
 function attack_childProcess() {
+  /* Wrap child_process APIs before gate loads so in-memory decide path cannot
+   * spawn even if a regression adds spawn() inside gate2Behavioral. Flag is
+   * off for legitimate corpusPath→scenario.js (not exercised here). */
+  const cp = require("child_process");
+  const CP_METHODS = ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"];
+  const cpOriginals = {};
+  for (const m of CP_METHODS) cpOriginals[m] = cp[m];
+  let banDecisionSpawn = false;
+  for (const m of CP_METHODS) {
+    const orig = cpOriginals[m];
+    cp[m] = function bannedCp(...args) {
+      if (banDecisionSpawn) {
+        throw new Error(`ESCAPE: child_process.${m} on in-memory decision path`);
+      }
+      return orig.apply(this, args);
+    };
+  }
+  const gatePath = path.join(SCRIPTS, "gate.js");
+  try {
+    delete require.cache[require.resolve(gatePath)];
+  } catch (_) {}
+  let gateMod = null;
+  try {
+    gateMod = require(gatePath);
+  } catch (e) {
+    fail("child_process-posture-gate.js", `gate load failed under cp wrap: ${e.message}`);
+  }
+
   for (const name of DECISION_SCRIPTS) {
     const tname = `child_process-posture-${name}`;
     try {
       const src = readScript(name);
-      const cleaned = stripNoise(src);
       const importsCp =
         /require\s*\(\s*["']child_process["']\s*\)/.test(src) ||
         /require\s*\(\s*["']node:child_process["']\s*\)/.test(src);
@@ -201,10 +228,13 @@ function attack_childProcess() {
         continue;
       }
       /* gate.js may spawn scenario.js for corpus replay — allowed as worker side.
-       * Decision functions gate1Static / decideGate2 with in-memory bundle must not spawn.
+       * Decision functions with in-memory bundle must not spawn.
        */
       if (name === "gate.js") {
-        const gate = require(path.join(SCRIPTS, "gate.js"));
+        if (!gateMod) {
+          fail(tname, "gate module unavailable");
+          continue;
+        }
         const pairs = [{
           scenario_id: "mesc-0",
           seed: 1,
@@ -218,21 +248,28 @@ function attack_childProcess() {
           slices: [],
         };
         bundle.bundle_sha256 = sha256(JSON.stringify({ ...bundle, bundle_sha256: undefined }));
-        const before = process.listenerCount("spawn");
-        const result = gate.gate2Behavioral("mesc", { bundle, cycleSeed: 0, stateStore: null });
-        /* Result object decides; no throw. Spawn path only when corpusPath set. */
+        banDecisionSpawn = true;
+        let result;
+        try {
+          result = gateMod.gate2Behavioral("mesc", { bundle, cycleSeed: 0, stateStore: null });
+        } finally {
+          banDecisionSpawn = false;
+        }
+        /* Completing under ban proves no spawn on bundle/in-memory path. */
         if (result && typeof result.pass === "boolean") {
-          pass(tname, `in-memory decide ok pass=${result.pass}; spawn reserved for corpusPath only`);
+          pass(tname, `in-memory decide ok pass=${result.pass}; no-spawn under cp ban; spawn reserved for corpusPath only`);
         } else {
-          fail(tname, "gate2 in-memory path failed to decide");
+          fail(tname, "gate2 in-memory path failed to decide under spawn ban");
         }
         continue;
       }
       fail(tname, `ESCAPE: unexpected child_process import in ${name}`);
     } catch (e) {
+      banDecisionSpawn = false;
       fail(tname, e.message);
     }
   }
+  /* Keep wrappers (flag off) so later tests still call through originals. */
 }
 
 /* ------------------------------------------------------------------ */

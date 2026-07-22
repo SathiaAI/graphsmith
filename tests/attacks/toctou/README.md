@@ -20,7 +20,7 @@ Time-of-check / time-of-use attacks against promote + verify, contained in temp 
 
 | Case | Why |
 |---|---|
-| True multi-process rename-vs-rename under open handles | Inherently flaky / unprovable in a single-threaded interleaved harness. Marked **UNAVAILABLE**, never green. Platform probe lives in `verify --platform-probe`. |
+| True multi-process rename-vs-rename under open handles | Not proven in this single-process harness; deferred to a multi-process platform-probe cell (`verify --platform-probe`), results are per-platform. Marked **UNAVAILABLE**, never green. |
 | Cross-host NFS cache races | Out of scope for local zero-dep scripts. |
 | Privileged A6 rewriting lock + journal + both manifests mid-flight | Out of scope (contract 05). |
 
