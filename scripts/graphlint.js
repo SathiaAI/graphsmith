@@ -176,12 +176,16 @@ function lintProject(root) {
 
   // Build module frequency map for new-require detection (R5):
   // a non-builtin, non-local require that appears in ONLY one file is "new".
+  // D2 fix: gate matches against the bare view so string-literal mentions
+  // (e.g. const s = 'require("banned-module")') never count as real occurrences.
   const moduleFiles = new Map(); // spec -> Set of files
   for (const f of files) {
-    const { codeSrc } = model.get(f);
+    const { codeSrc, bareLines } = model.get(f);
+    const bareSrc = bareLines.join("\n");
     const re = /require\s*\(\s*["'`]([^"'`]+)["'`]/g;
     let m;
     while ((m = re.exec(codeSrc))) {
+      if (bareSrc[m.index] === " ") continue; // blanked in bare view → inside a string literal
       const spec = m[1];
       if (BUILTINS.has(spec) || spec.startsWith(".") || spec.startsWith("/")) continue;
       if (!moduleFiles.has(spec)) moduleFiles.set(spec, new Set());
@@ -191,10 +195,12 @@ function lintProject(root) {
   // Also track dynamic import() specifiers for the same purpose.
   const importModuleFiles = new Map(); // spec -> Set of files
   for (const f of files) {
-    const { codeSrc } = model.get(f);
+    const { codeSrc, bareLines } = model.get(f);
+    const bareSrc = bareLines.join("\n");
     const re = /import\s*\(\s*["'`]([^"'`]+)["'`]/g;
     let m;
     while ((m = re.exec(codeSrc))) {
+      if (bareSrc[m.index] === " ") continue; // blanked in bare view → inside a string literal
       const spec = m[1];
       if (BUILTINS.has(spec) || spec.startsWith(".") || spec.startsWith("/")) continue;
       if (!importModuleFiles.has(spec)) importModuleFiles.set(spec, new Set());
@@ -258,9 +264,10 @@ function lintProject(root) {
       // R5 — eval/exec/new-require ban (bare view: comments/strings blanked).
       // Scoped to evolvable targets only (§104): machine-evaluated candidates,
       // scaffold-generated adapters/, workflow/worker code. Constitutional engine
-      // scripts (files directly under a scripts/ directory) are exempt — their
-      // child_process use is legitimate supervisor/replay/kill infrastructure.
-      if (path.basename(path.dirname(f)) !== "scripts") {
+      // scripts (files in graphlint.js's OWN __dirname, the hash-pinned scripts/)
+      // are exempt — their child_process use is legitimate supervisor infrastructure.
+      // Resolving the dir guards against spoofing by any nested dir named "scripts".
+      if (path.resolve(path.dirname(f)) !== __dirname) {
       if (EVAL_RE.test(ln))
         add(f, i + 1, "R5: eval() call — generated/evolvable code must never gain new execution surface", "HIGH",
             "Replace eval() with a static dispatch table or JSON.parse.");
