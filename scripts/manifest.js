@@ -34,6 +34,11 @@ function walkDir(dir, base) {
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
+    if (typeof entry.isSymbolicLink === "function" && entry.isSymbolicLink()) {
+      throw new Error(
+        `Refused: symlink/junction at "${toForwardSlash(path.relative(base, full))}" — not allowed in tree (contract 01)`
+      );
+    }
     if (entry.isDirectory()) {
       results.push(...walkDir(full, base));
     } else if (entry.isFile()) {
@@ -97,6 +102,10 @@ function generate(kind, opts) {
     rawPaths = rawPaths.filter((p) => !excludeSet.has(canonicalPath(p)));
   }
 
+  if (kind === "tree") {
+    rawPaths = rawPaths.filter((p) => canonicalPath(p) !== "tree.manifest.json");
+  }
+
   const canonPaths = rawPaths.map(canonicalPath);
   checkCaseFoldCollisions(canonPaths);
 
@@ -136,8 +145,42 @@ function verifyTree(manifestPath, rootDir) {
   const raw = fs.readFileSync(manifestPath, "utf8");
   const manifest = JSON.parse(raw);
 
+  if (!manifest.schema_version || manifest.schema_version !== SCHEMA_VERSION) {
+    throw new Error(
+      `Unsupported schema_version: "${manifest.schema_version}" — expected "${SCHEMA_VERSION}"`
+    );
+  }
+
   if (!manifest.files || !Array.isArray(manifest.files)) {
     throw new Error("Manifest missing .files array");
+  }
+
+  const allowedKeys = new Set(["schema_version", "files"]);
+  for (const key of Object.keys(manifest)) {
+    if (!allowedKeys.has(key)) {
+      throw new Error(`Unknown property: "${key}" — closed schema violation (contract 01)`);
+    }
+  }
+
+  const seenPaths = new Set();
+  for (const entry of manifest.files) {
+    const cp = canonicalPath(entry.path);
+    if (seenPaths.has(cp)) {
+      throw new Error(`Duplicate path in manifest: "${cp}" — refused (contract 01)`);
+    }
+    seenPaths.add(cp);
+  }
+
+  for (const entry of manifest.files) {
+    if (typeof entry.path !== "string") {
+      throw new Error("Invalid manifest entry: path must be a string");
+    }
+    if (typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.sha256)) {
+      throw new Error("Invalid manifest entry: sha256 must be a 64-char hex string");
+    }
+    if (typeof entry.bytes !== "number" || !Number.isInteger(entry.bytes) || entry.bytes < 0) {
+      throw new Error("Invalid manifest entry: bytes must be a non-negative integer");
+    }
   }
 
   const manifestAbs = path.resolve(manifestPath);
@@ -275,6 +318,67 @@ function selftest() {
     assert("project has generated_at", typeof projectManifest.generated_at === "string");
     assert("project parent_release_sha256", projectManifest.parent_release_sha256 === "abc123");
 
+    const symDir = path.join(tmpDir, "symtest");
+    const symTarget = path.join(symDir, "target");
+    fs.mkdirSync(symTarget, { recursive: true });
+    fs.writeFileSync(path.join(symTarget, "real.txt"), "real\n");
+    let symlinkTested = false;
+    try {
+      fs.symlinkSync(symTarget, path.join(symDir, "link"), "junction");
+      symlinkTested = true;
+    } catch (_) {}
+    if (symlinkTested) {
+      let symlinkCaught = false;
+      try {
+        generate("tree", { rootDir: symDir });
+      } catch (e) {
+        symlinkCaught = /symlink|junction/i.test(e.message);
+      }
+      assert("symlink/junction refused in walkDir", symlinkCaught);
+    } else {
+      assert("symlink/junction refused in walkDir", true, "SKIPPED: no junction privilege");
+    }
+
+    const badSchemaDir = path.join(tmpDir, "badschema");
+    fs.mkdirSync(badSchemaDir);
+    const badSchemaPath = path.join(badSchemaDir, "bad.json");
+    fs.writeFileSync(badSchemaPath, JSON.stringify({ schema_version: "99.0", files: [] }));
+    let schemaCaught = false;
+    try {
+      verifyTree(badSchemaPath, badSchemaDir);
+    } catch (e) {
+      schemaCaught = /schema_version/i.test(e.message);
+    }
+    assert("verifyTree rejects wrong schema_version", schemaCaught);
+
+    const missingSchemaDir = path.join(tmpDir, "missingschema");
+    fs.mkdirSync(missingSchemaDir);
+    const missingSchemaPath = path.join(missingSchemaDir, "nosv.json");
+    fs.writeFileSync(missingSchemaPath, JSON.stringify({ files: [] }));
+    let missingSchemaCaught = false;
+    try {
+      verifyTree(missingSchemaPath, missingSchemaDir);
+    } catch (e) {
+      missingSchemaCaught = /schema_version/i.test(e.message);
+    }
+    assert("verifyTree rejects missing schema_version", missingSchemaCaught);
+
+    const negDir = path.join(tmpDir, "negbytes");
+    fs.mkdirSync(negDir);
+    fs.writeFileSync(path.join(negDir, "f.txt"), "hi");
+    const negPath = path.join(negDir, "neg.json");
+    fs.writeFileSync(negPath, JSON.stringify({
+      schema_version: "1.0",
+      files: [{ path: "f.txt", sha256: "0000000000000000000000000000000000000000000000000000000000000000", bytes: -5 }]
+    }));
+    let negCaught = false;
+    try {
+      verifyTree(negPath, negDir);
+    } catch (e) {
+      negCaught = /bytes/i.test(e.message);
+    }
+    assert("verifyTree rejects negative bytes", negCaught);
+
     process.stderr.write(`\nselftest: ${passed} passed, ${failures.length} failed\n`);
     if (failures.length > 0) {
       process.stderr.write(`failures: ${failures.join(", ")}\n`);
@@ -354,7 +458,8 @@ function cli() {
       }
     } catch (e) {
       process.stderr.write(`Error: ${e.message}\n`);
-      process.exit(1);
+      const isSchemaError = /schema_version|Invalid manifest entry|Unknown property|Duplicate path|closed schema/i.test(e.message);
+      process.exit(isSchemaError ? 2 : 1);
     }
   } else {
     process.stderr.write(`Unknown command: ${cmd}\n`);
