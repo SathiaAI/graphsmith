@@ -1,0 +1,95 @@
+# ci-templates/gitlab-ci.yml
+#
+# TEMPLATE — GitLab CI parity stub, Phase A (v0.2.0). This file is NOT
+# wired into any active pipeline in this repo. GitHub Actions
+# (.github/workflows/ci.yml) is the authoritative CI for GraphSmith itself.
+# This stub exists so a fork/mirror of GraphSmith on GitLab has a starting
+# point that runs the same deterministic, zero-dep checks, and so contract
+# 11's CI-parity note has a concrete answer in Phase A.
+#
+# To adopt in a GitLab project: copy this file to `.gitlab-ci.yml` at the
+# repo root and delete this header block.
+#
+# Phase A scope (deliberately minimal, per task A-ci): Linux only. The
+# 3-OS matrix (windows-latest, macos-latest, ubuntu-latest) lives in the
+# GitHub Actions workflow; GitLab's hosted Windows/macOS runners are a
+# separate, non-default (often paid) capability and are out of scope for
+# this stub. Node 18 and Node 22 (current LTS) are both covered, mirroring
+# the GitHub Actions matrix's Node axis.
+#
+# NOT included in this Phase A stub (left for a later phase, tracked here
+# so the gap is visible rather than silent):
+#   - The PR-separation guard (scripts/ci-check-pr-separation.js) is not
+#     wired to a GitLab merge_request pipeline here. To add it, a job
+#     would diff $CI_MERGE_REQUEST_DIFF_BASE_SHA against
+#     $CI_COMMIT_SHA and pipe the result the same way the GitHub Actions
+#     `pr-separation-guard` job does:
+#       git diff --name-only "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" \
+#         | node scripts/ci-check-pr-separation.js
+#   - "Required" merge-blocking status: GitLab's equivalent of a GitHub
+#     branch-protection required status check is a merge request approval
+#     rule / pipeline-must-succeed setting in Settings > Merge requests —
+#     a repo-admin action outside what any CI config file can do.
+#
+# Zero runtime deps: every command below is `node <builtin script>`, no
+# package installs, matching this repo's zero-dep-CJS convention.
+
+image: node:20
+
+stages:
+  - test
+
+.phase-a-selftests-and-suites:
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - node --version
+    - node scripts/manifest.js --selftest
+    - node scripts/state-store.js --selftest
+    - node scripts/loaders.js --selftest
+    - node scripts/scenario.js --selftest
+    - node scripts/promote.js --selftest
+    - node scripts/gate.js --selftest
+    - node scripts/verify.js --selftest
+    - node scripts/ci-check-pr-separation.js --selftest
+    - |
+      node -e "
+      const fs = require('fs'), path = require('path'), cp = require('child_process');
+      const root = 'tests';
+      const suites = [];
+      (function walk(dir) {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, e.name);
+          if (e.isDirectory()) walk(p);
+          else if (e.name === 'run-tests.js') suites.push(p);
+        }
+      })(root);
+      suites.sort();
+      console.log('Discovered ' + suites.length + ' suite(s):');
+      suites.forEach(function (s) { console.log('  ' + s); });
+      let failed = [];
+      for (const s of suites) {
+        console.log('');
+        console.log('=== ' + s + ' ===');
+        const r = cp.spawnSync(process.execPath, [s], { stdio: 'inherit' });
+        if (r.status !== 0) failed.push(s + ' (exit ' + r.status + ')');
+      }
+      if (failed.length) {
+        console.error('');
+        console.error('FAILED suites:');
+        failed.forEach(function (f) { console.error('  ' + f); });
+        process.exit(1);
+      }
+      console.log('');
+      console.log('All ' + suites.length + ' suite(s) passed.');
+      "
+
+phase-a:linux:node18:
+  extends: .phase-a-selftests-and-suites
+  image: node:18
+
+phase-a:linux:node22:
+  extends: .phase-a-selftests-and-suites
+  image: node:22

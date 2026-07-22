@@ -5,11 +5,38 @@ name: CI
 # skill's own scripts, and a full scaffold + chaos run (crash recovery,
 # exactly-once recorded effects, power-loss halt, run locking) on the
 # oldest supported Node and the current LTS, on Linux and Windows.
+#
+# Phase A (v0.2.0) additions below the original `verify` job:
+#   - `phase-a-selftests`: every component's `--selftest` plus every
+#     committed suite under tests/<component>/<family>/run-tests.js, on a
+#     3-OS matrix (contracts/11 Tier 0: "agentless artifact conformance ...
+#     the Phase A-E test suites on macOS/Linux/Windows CI").
+#   - `pr-separation-guard`: contracts/04 B17 / contracts/11 — a hostile
+#     contributor must not be able to mix an evaluator/corpus change with
+#     a behavior change in the same PR (scripts/ci-check-pr-separation.js).
+#     NOTE: this job reporting a status is necessary but not sufficient —
+#     it must also be turned on as a GitHub branch-protection "required
+#     status check" (Settings > Branches) for the separation to actually
+#     be enforced at merge time. That repo-admin step is outside what a
+#     workflow file can do and is not yet configured as of this commit.
+#
+# Trusted-workflow discipline (contracts/04 B17): every third-party action
+# below is pinned by full commit SHA, never a tag; this workflow never
+# uses `pull_request_target`; no job here reads or exposes secrets on
+# pull_request-triggered runs (secrets only ever appear in publish.yml,
+# which triggers on `release`/`workflow_dispatch`, never on a PR).
 
 on:
   push:
   pull_request:
   workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -19,8 +46,8 @@ jobs:
         node: [18, 22]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node }}
       - name: Syntax check every script
@@ -38,3 +65,51 @@ jobs:
           node manager.js ci-run
       - name: Chaos harness (kill, resume, exactly-once, power-loss, locks)
         run: node scripts/chaos.js ci-proj
+
+  phase-a-selftests:
+    name: "Phase A selftests + suites (${{ matrix.os }}, node ${{ matrix.node }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Component selftest — manifest.js
+        run: node scripts/manifest.js --selftest
+      - name: Component selftest — state-store.js
+        run: node scripts/state-store.js --selftest
+      - name: Component selftest — loaders.js
+        run: node scripts/loaders.js --selftest
+      - name: Component selftest — scenario.js
+        run: node scripts/scenario.js --selftest
+      - name: Component selftest — promote.js
+        run: node scripts/promote.js --selftest
+      - name: Component selftest — gate.js
+        run: node scripts/gate.js --selftest
+      - name: Component selftest — verify.js
+        run: node scripts/verify.js --selftest
+      - name: Component selftest — ci-check-pr-separation.js
+        run: node scripts/ci-check-pr-separation.js --selftest
+      - name: Run every committed suite under tests/<component>/<family>/run-tests.js
+        run: node -e "const fs=require('fs'), path=require('path'), cp=require('child_process'); const root='tests'; const suites=[]; (function walk(dir){ for (const e of fs.readdirSync(dir, {withFileTypes:true})) { const p = path.join(dir, e.name); if (e.isDirectory()) walk(p); else if (e.name === 'run-tests.js') suites.push(p); } })(root); suites.sort(); console.log('Discovered ' + suites.length + ' suite(s):'); suites.forEach(function(s){ console.log('  ' + s); }); let failed = []; for (const s of suites) { console.log(''); console.log('=== ' + s + ' ==='); const r = cp.spawnSync(process.execPath, [s], {stdio:'inherit'}); if (r.status !== 0) failed.push(s + ' (exit ' + r.status + ')'); } if (failed.length) { console.error(''); console.error('FAILED suites:'); failed.forEach(function(f){ console.error('  ' + f); }); process.exit(1); } console.log(''); console.log('All ' + suites.length + ' suite(s) passed.');"
+
+  pr-separation-guard:
+    name: PR separation guard (evaluator/corpus vs behavior)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+      - name: Diff PR base...head and run the separation guard
+        run: git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} | node scripts/ci-check-pr-separation.js
