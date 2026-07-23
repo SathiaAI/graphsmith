@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/obligations.schema.json",
+  "title": "GraphSmith obligations-to-controls register (register Lane B)",
+  "description": "Declarative map from a regulatory obligation to the GraphSmith control(s) that produce evidence for it, plus an HONEST coverage verdict. C2-binding (PB-8 fail-closed): unmapped/partial/misplaced coverage MUST resolve to not-covered; an obligation with no executable control is manual-only and can NEVER be auto-marked covered. This register produces evidence, never a 'compliant' verdict. Frozen Wave 0 (v0.3.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "obligation_set_id", "obligations"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "obligation_set_id": { "type": "string", "minLength": 1 },
+    "obligations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/obligation" }
+    }
+  },
+  "$defs": {
+    "obligation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["obligation_id", "source", "controls", "coverage", "evidence_vs_judgment"],
+      "properties": {
+        "obligation_id": { "type": "string", "minLength": 1 },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["framework", "clause"],
+          "properties": {
+            "framework": { "type": "string", "minLength": 1, "description": "e.g. EU-AI-Act, NIST-AI-RMF." },
+            "clause": { "type": "string", "minLength": 1, "description": "e.g. Article-12, GOVERN-1.1." }
+          }
+        },
+        "controls": {
+          "type": "array",
+          "description": "GraphSmith controls addressing this obligation. Empty array => manual-only (no executable control).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "ref"],
+            "properties": {
+              "type": { "enum": ["invariant", "profile", "gate", "harness"] },
+              "ref": { "type": "string", "minLength": 1, "description": "e.g. I1, T, Gate-3, redteam." }
+            }
+          }
+        },
+        "evidence_artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "ref"],
+          "description": "The concrete evidence demonstrating the control ran. Absent => coverage cannot be 'covered'.",
+          "properties": {
+            "type": { "enum": ["profile-result", "scenario-replay-hash", "redteam-packet"] },
+            "ref": { "type": "string", "minLength": 1 }
+          }
+        },
+        "coverage": {
+          "enum": ["covered", "partial", "manual-only", "not-covered"],
+          "description": "HONEST coverage verdict. Fail-closed default is not-covered (C2). 'covered' requires a present, matching evidence_artifact AND a non-empty controls list; an empty controls list MUST be manual-only, never covered."
+        },
+        "evidence_vs_judgment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["graphsmith_evidence", "human_judgment"],
+          "description": "Explicit split: what GraphSmith evidence attests vs what remains human judgment. Prevents a customer treating machine evidence as a compliance attestation (PB-8).",
+          "properties": {
+            "graphsmith_evidence": { "type": "string", "description": "What the cited control/evidence actually demonstrates." },
+            "human_judgment": { "type": "string", "description": "What a human must still assess; non-empty for manual-only obligations." }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/attestation-bundle.schema.json",
+  "title": "GraphSmith Attestation (GSA) Bundle Manifest",
+  "description": "Root manifest (attestation.json) of a GSA bundle: a signed, replayable, tamper-evident record of one AI-generated workflow run. DRAFT v0.1 — breaking changes possible until v1.0. This manifest indexes and hash-binds every component artifact; the manifest file itself is excluded from the artifacts map and bound via bundle_signature.manifest_sha256. Producer-agnostic: any agent/runtime may emit a conformant bundle; GraphSmith is the reference implementation. An attestation proves WHAT HAPPENED and that the record is UNALTERED — it does NOT assert the workflow is safe, correct, or compliant (evidence layer, not certification).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "bundle_id",
+    "created",
+    "producer",
+    "mode",
+    "profiles",
+    "artifacts",
+    "graph_signature",
+    "skills",
+    "capabilities",
+    "control_attestations",
+    "adversarial",
+    "bundle_signature"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "0.1",
+      "description": "GSA bundle schema version (draft). Bumped on any breaking change until v1.0."
+    },
+    "bundle_id": {
+      "type": "string",
+      "pattern": "^gsa-[0-9a-f]{16}$",
+      "description": "Stable identifier for this attestation bundle."
+    },
+    "created": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp the bundle was sealed (ISO 8601)."
+    },
+    "producer": {
+      "type": "object",
+      "description": "The implementation that produced this bundle. Any conformant producer is valid; not restricted to GraphSmith.",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "spec_version": {
+          "const": "0.1",
+          "description": "GSA spec version this producer targeted."
+        }
+      }
+    },
+    "mode": {
+      "enum": ["standard", "deterministic", "regulator"],
+      "description": "Operating mode this run executed under. 'deterministic' disables skill-generation, auto-promotion, remote registries, runtime graph modification, unbounded repair, and undeclared network. 'regulator' = deterministic + full adversarial battery + regulator-ready export."
+    },
+    "profiles": {
+      "type": "array",
+      "description": "Capability profiles this bundle attests, each independently verifiable. R=resumable, E=effect-reconciled, B=budget-enforced, T=trust-root-verified, G=gated-learning, Q=assurance-tested, A=attested, X=adversarially-tested. (Q/R/E/B/T/G/X are emitted by v0.2.0 verify.js --profiles; A is new in GSA.)",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["R", "E", "B", "T", "G", "Q", "A", "X"]
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "description": "Content-addressed index of the canonical component artifacts. Every value is an artifactRef; the verifier recomputes each sha256 against the file on disk.",
+      "required": [
+        "goal",
+        "policy",
+        "model_manifest",
+        "generated_ir",
+        "compiled_graph",
+        "validation_report",
+        "execution_trace",
+        "output_manifest",
+        "decision_record"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "goal": { "$ref": "#/$defs/artifactRef" },
+        "policy": { "$ref": "#/$defs/artifactRef" },
+        "model_manifest": { "$ref": "#/$defs/artifactRef" },
+        "generated_ir": { "$ref": "#/$defs/artifactRef" },
+        "compiled_graph": { "$ref": "#/$defs/artifactRef" },
+        "validation_report": { "$ref": "#/$defs/artifactRef" },
+        "repair_log": { "$ref": "#/$defs/artifactRef" },
+        "execution_trace": { "$ref": "#/$defs/artifactRef" },
+        "output_manifest": { "$ref": "#/$defs/artifactRef" },
+        "adversarial_report": { "$ref": "#/$defs/artifactRef" },
+        "decision_record": { "$ref": "#/$defs/artifactRef" },
+        "regulator_summary": { "$ref": "#/$defs/artifactRef" }
+      }
+    },
+    "graph_signature": {
+      "type": "object",
+      "description": "Binds the compiled graph, its policy, and its skill set at sign time (pre-execution approval / non-repudiation).",
+      "required": ["graph_hash", "policy_hash", "skill_set_hash", "signer", "signed_at", "algo", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "graph_hash": { "$ref": "#/$defs/sha256" },
+        "policy_hash": { "$ref": "#/$defs/sha256" },
+        "skill_set_hash": { "$ref": "#/$defs/sha256" },
+        "signer": { "type": "string", "minLength": 1 },
+        "signed_at": { "type": "string", "format": "date-time" },
+        "algo": { "$ref": "#/$defs/sigAlgo" },
+        "value": { "type": "string", "minLength": 1, "description": "Signature over graph_hash||policy_hash||skill_set_hash." }
+      }
+    },
+    "skills": {
+      "type": "array",
+      "description": "Provenance record for every skill used in the run.",
+      "items": { "$ref": "#/$defs/skillEntry" }
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "Declared capability grants and the requested-vs-granted result, per resource class. Enforces requested <= granted before execution.",
+      "required": ["result", "resources"],
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "enum": ["satisfied", "violated"],
+          "description": "'violated' means at least one skill requested capability beyond its grant; such a run halts pre-execution and the bundle records the violation."
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "filesystem": { "$ref": "#/$defs/capGrant" },
+            "network": { "$ref": "#/$defs/capGrant" },
+            "models": { "$ref": "#/$defs/capGrant" },
+            "subprocess": { "$ref": "#/$defs/capGrant" }
+          }
+        }
+      }
+    },
+    "control_attestations": {
+      "type": "object",
+      "description": "Explicit, verifiable predicates for the five enterprise controls. Each is independently checkable against the trace/policy; making them explicit is the point — a CTO verifies rather than trusts.",
+      "required": [
+        "auto_skill_creation_disabled",
+        "all_skills_signed_and_approved",
+        "deterministic_mode",
+        "regulator_mode",
+        "adversarial_batteries_passed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "auto_skill_creation_disabled": {
+          "type": "boolean",
+          "description": "True iff no autonomously-created skill executed in the same trust flow (kill switch active)."
+        },
+        "all_skills_signed_and_approved": {
+          "type": "boolean",
+          "description": "True iff every skill in `skills` is signed, approval_status=approved, and un-revoked."
+        },
+        "deterministic_mode": {
+          "type": "boolean",
+          "description": "True iff mode=deterministic|regulator and the trace shows none of the disabled behaviors."
+        },
+        "regulator_mode": {
+          "type": "boolean",
+          "description": "True iff mode=regulator and a regulator_summary artifact is present."
+        },
+        "adversarial_batteries_passed": {
+          "type": "boolean",
+          "description": "True iff the release's standing attack batteries passed for this producer version (X profile)."
+        }
+      }
+    },
+    "adversarial": {
+      "type": "object",
+      "description": "Results of the standing attack batteries for the producer version that emitted this bundle (X profile evidence).",
+      "required": ["suites"],
+      "additionalProperties": false,
+      "properties": {
+        "suites": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["name", "blocked", "total"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "blocked": { "type": "integer", "minimum": 0 },
+              "total": { "type": "integer", "minimum": 0 },
+              "families": {
+                "type": "array",
+                "description": "Model families the battery held across (runtime cross-family diversity), when applicable.",
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "redactions": {
+      "type": "array",
+      "description": "Record of redactions applied before sealing (field path + reason). Redaction preserves the hash chain via documented placeholders.",
+      "items": {
+        "type": "object",
+        "required": ["path", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "bundle_signature": {
+      "type": "object",
+      "description": "Signs the whole sealed bundle. manifest_sha256 binds this manifest (with the bundle_signature.value field excluded from the hash preimage). Keyless (transparency-log) signing is optional; local keypair signing is the default.",
+      "required": ["algo", "signer", "manifest_sha256", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "algo": { "$ref": "#/$defs/sigAlgo" },
+        "signer": { "type": "string", "minLength": 1 },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "value": { "type": "string", "minLength": 1 },
+        "keyless": {
+          "type": "object",
+          "description": "Optional transparency-log (Sigstore-style) attestation.",
+          "additionalProperties": false,
+          "properties": {
+            "cert": { "type": "string", "minLength": 1 },
+            "tlog_index": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Raw-byte SHA-256 hash (no content normalization)."
+    },
+    "sigAlgo": {
+      "enum": ["ed25519", "ecdsa-p256-sha256", "rsa-pss-sha256"],
+      "description": "Signature algorithm."
+    },
+    "artifactRef": {
+      "type": "object",
+      "required": ["path", "sha256", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^[^\\\\]+$",
+          "description": "Bundle-relative path, forward slashes, Unicode NFC canonicalized."
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "media_type": { "type": "string", "minLength": 1 }
+      }
+    },
+    "skillEntry": {
+      "type": "object",
+      "required": ["skill_id", "version", "implementation_hash", "approval_status", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "skill_id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "implementation_hash": { "$ref": "#/$defs/sha256" },
+        "input_schema_hash": { "$ref": "#/$defs/sha256" },
+        "output_schema_hash": { "$ref": "#/$defs/sha256" },
+        "approval_status": {
+          "enum": ["approved", "quarantined", "generated", "revoked"],
+          "description": "Only 'approved' skills may execute in a run whose control_attestations.all_skills_signed_and_approved is true."
+        },
+        "source": { "enum": ["local", "generated", "remote"] },
+        "signer": { "type": "string", "minLength": 1 },
+        "signature": { "type": "string", "minLength": 1 }
+      }
+    },
+    "capGrant": {
+      "type": "object",
+      "description": "Requested and granted capability for one resource class; requested must be a subset of granted for a satisfied result.",
+      "required": ["requested", "granted"],
+      "additionalProperties": false,
+      "properties": {
+        "requested": { "type": "array", "items": { "type": "string" } },
+        "granted": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

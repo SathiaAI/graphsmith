@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/retention-entry.schema.json",
+  "title": "GraphSmith evidence-retention entry (register Lane C)",
+  "description": "One record in the append-only, hash-chained retention log: each assure packet chained to the prior packet's hash, anchored to the adoption-log head. Verifiable offline by a third party. Honest limit (A6): a privileged local attacker who rewrites both the store and the anchor is out of scope; remote/CI anchoring is the mitigation for shared/regulated use. Frozen Wave 0 (v0.3.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "seq", "prev_packet_sha256", "packet_sha256", "anchored_head"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "seq": { "type": "integer", "minimum": 1, "description": "Monotonic position in the chain." },
+    "prev_packet_sha256": {
+      "oneOf": [
+        { "type": "null", "description": "null only for seq==1 (chain root)." },
+        { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      ]
+    },
+    "packet_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the assure packet this entry retains."
+    },
+    "anchored_head": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "The adoption-log anchored chain head at retention time. MUST be populated (the v0.2.0 stub left this null); a real retention entry binds to a concrete head."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Timestamp. EVIDENCE ONLY (C1) — never a decision input. Optional."
+    }
+  }
+}

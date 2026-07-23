@@ -16,6 +16,26 @@ Every entry records: the version, the date, what changed, and — where relevant
 
 ---
 
+## [0.2-draft] — 2026-07-23
+
+Attestation additions. Extends the protocol with the **GraphSmith Attestation (GSA)** companion standard — a portable, signed, replayable, tamper-evident record of one AI-workflow run — and freezes the register interfaces that v0.3.0 builds. Backward-compatible with a `0.1-draft` reader: every addition is optional. This entry records the **frozen Wave-0 contracts**; the implementing edits land in v0.3.0 under the notes below.
+
+### Added
+
+- **Profile A (attested).** The `profiles` set is now **R / E / B / T / G / Q / A / X**. A asserts a complete, hash-valid, signature-valid GSA bundle exists (GSA §9) and is the floor: a bundle failing verification asserts no profiles. Q (assurance-tested) is unchanged and already emitted by v0.2.0.
+- **GSA companion spec + bundle schema.** `schemas/attestation-bundle.schema.json` (frozen) and the GSA specification (verification algorithm §9, capability profiles, operating modes standard/deterministic/regulator, five recomputed control attestations). GSA is producer-agnostic and is **evidence, never certification** — a binding non-goal.
+- **Register interface freeze (Contract 13).** Five frozen schemas — `approver-attestation`, `obligations`, `retention-entry`, `register-policy`, `release-signature` — plus the namespaced assure packet-extension keys (`packet.approver` / `.obligations_coverage` / `.retention` / `.release_signature`) and the `verify.js` check-registry API. These are the plug-in surface for the v0.3.0 regulated register (approver identity, obligations→controls, retention, air-gapped verification).
+- **Signing.** Ed25519 + local keypair is the default signing model (D2), preserving I4 "no call home"; the algo set is `ed25519` (RECOMMENDED) | `ecdsa-p256-sha256` | `rsa-pss-sha256`.
+
+### Notes
+
+- Still a `-draft`: wire formats, the profile set, and gate/verification semantics may change incompatibly before `v1.0`.
+- **Decisions frozen (D1–D5):** capabilities attest **enforced-only** (D1); signing local-keypair now, keyless later (D2); adopt `verify.js`'s `{status,evidence,assumptions}`+`failure_domain`+exit `3/1/0` report contract (D3); Q added (D4); `mode` is **recomputed from evidence, never trusted-as-declared** (D5). Full text in Contract 13 and `.plans/v0.3.0/graphsmith-v0.3.0-decisions.md`.
+- **Two binding constraints** carry into every register lane: **C1** identity/timestamps are evidence, never decision inputs; **C2** partial/unmapped coverage is `not-covered`, loudly (PB-8 fail-closed).
+- **Constitutional-set flag:** wiring the check-registry loader into `verify.js` and adding the register checks are edits to the hash-pinned sentinel — they will land in v0.3.0 under **protected review + a release-manifest hash bump + a build-ledger row**, never folded silently. This Wave-0 entry freezes the *interface* only; no constitutional file is modified yet.
+
+---
+
 ## [0.1-draft] — 2026-07-23
 
 Initial public draft of the GraphSmith Protocol. Describes implemented, tested behavior only; claims are written narrower than the implementation.

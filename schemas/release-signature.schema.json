@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/release-signature.schema.json",
+  "title": "GraphSmith release signature (register Lane D — air-gapped verification)",
+  "description": "A detached maintainer signature over the release manifest, delivered out-of-band. Lets an air-gapped site verify signature -> manifest -> files with no network and no trust in the distributing registry. Extends the T (trust-root) profile from 'manifest matches disk' to 'manifest is authentic without a network'. Frozen Wave 0 (v0.3.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "algo", "signer", "manifest_sha256", "value", "delivery"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "algo": { "enum": ["ed25519", "ecdsa-p256-sha256", "rsa-pss-sha256"] },
+    "signer": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Maintainer key identifier. Trust of this key is verifier policy (out-of-band key distribution), not a GraphSmith guarantee."
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the release manifest this signature covers."
+    },
+    "value": { "type": "string", "minLength": 1, "description": "Signature over manifest_sha256." },
+    "delivery": {
+      "const": "out-of-band",
+      "description": "The signature is delivered separately from the registry it authenticates — the whole point of air-gapped trust."
+    }
+  }
+}
