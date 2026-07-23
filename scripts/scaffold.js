@@ -1139,7 +1139,16 @@ function managerJsContent() {
     "    const fd = fs.openSync(logPath, \"a\");",
     "    try { fs.writeSync(fd, line + \"\\n\"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }",
     "    if (supervisor) supervisor.recordLogBytes(Buffer.byteLength(line, \"utf8\") + 1);",
-    "  } catch (e) {}",
+    "  } catch (e) {",
+    "    // This try exists to tolerate best-effort log I/O failures (disk full, permission",
+    "    // denied) without crashing the run -- but recordLogBytes() above can throw a",
+    "    // supervisor HALT (max_log_bytes), and that is NOT an I/O failure to swallow: doing",
+    "    // so would silently absorb the halt, letting the run finish looking successful while",
+    "    // a breached budget sits unenforced in budget-state.json until the next invocation.",
+    "    // A halt (haltNow's sentinel: e.halt) always propagates; only genuine I/O errors are",
+    "    // tolerated here.",
+    "    if (e && e.halt) throw e;",
+    "  }",
     "}",
     "",
     "// STARTUP INTEGRITY -- frozen-file hashes + tunables bounds verified before",
@@ -1426,6 +1435,18 @@ function managerJsContent() {
     "      return out;",
     "    } catch (e) {",
     "      clearCapabilityInFlight();",
+    "      // A supervisor-raised HALT (budget OR tripwire -- haltNow's sentinel: e.halt) is",
+    "      // TERMINAL, never a retryable worker exception: it already recorded itself in",
+    "      // budget-state.json (haltNow saves before throwing) with the correct rule",
+    "      // attribution. Looping back into recordAttempt()/recordRetryExhausted() here would",
+    "      // (a) keep retrying past a budget the supervisor already said to stop for, and (b)",
+    "      // on final-attempt exhaustion, overwrite halted.rule with \"max_retries_per_step\",",
+    "      // burying the real breach (e.g. max_disk_mb/max_log_bytes/max_state_bytes, or any",
+    "      // other in-step budget/tripwire check -- output_tokens, subprocess counts/",
+    "      // lifetime, external-call caps) in last_error instead of reporting it as the rule",
+    "      // that actually halted the run. Propagate immediately; do not touch the retry",
+    "      // counter or call recordRetryExhausted.",
+    "      if (e && e.halt) throw e;",
     "      log(step, \"error attempt \" + (attempt + 1) + \": \" + e.message, Date.now() - t0);",
     "      if (e && e.unresolvedSideEffect) throw e;       // never retry into an unknown external state",
     "      if (attempt === MAX_RETRIES) supervisor.recordRetryExhausted(step, attempt + 1, e.message);",
@@ -2020,6 +2041,102 @@ function runSelftest() {
         JSON.stringify(ext));
 
       fs.writeFileSync(tunablesPath, originalRaw);
+    }
+
+    // ---- 10b. GS-SCAF-04/05/06 -- an in-step budget HALT (max_disk_mb / max_log_bytes /
+    // max_state_bytes -- all raised INSIDE executeStep's try, after the worker call) must be
+    // TERMINAL: halted.rule must stay the byte-cap that actually breached, never get retried
+    // into "max_retries_per_step", and (max_log_bytes specifically) must never be silently
+    // absorbed by log()'s best-effort I/O catch so the run finishes looking like a success.
+    // Uses a watchdog-absent project so the ONE log() call before the pipeline loop
+    // ("watchdog.js not present...") has a fixed, precomputable byte length -- letting
+    // log_bytes/state_bytes be seeded to land the breach exactly inside the first step's
+    // try, the same place the masked worker-error catch lives. ----
+    {
+      const realWatchdogSrc = path.join(__dirname, "watchdog.js");
+      const hadRealWatchdog = fs.existsSync(realWatchdogSrc);
+      const hiddenWatchdogSrc = realWatchdogSrc + ".selftest-hidden-mask";
+      if (hadRealWatchdog) fs.renameSync(realWatchdogSrc, hiddenWatchdogSrc);
+      const maskDir = path.join(tmpRoot, "proj-budget-mask");
+      try {
+        scaffoldProject(maskDir, "proj-budget-mask");
+      } finally {
+        if (hadRealWatchdog) fs.renameSync(hiddenWatchdogSrc, realWatchdogSrc);
+      }
+      const maskTunablesPath = path.join(maskDir, "tunables.json");
+      const maskOriginalRaw = fs.readFileSync(maskTunablesPath, "utf8");
+      const supervisorLibMask = require(path.join(maskDir, "supervisor.js"));
+
+      // A masked HALT must attribute to its real rule, exit 2, and never be retried
+      // (step_attempts stays at 1 -- proof the try/catch never looped back).
+      function assertMaskedBudgetFixed(caseName, rule, run) {
+        assertTrue(results, "byte-cap-halt-not-swallowed-by-retry:" + caseName + ":exits-2-with-correct-rule",
+          run.status === 2 && new RegExp("HALT \\(budget\\): " + rule).test(run.stderr) && !/max_retries_per_step/.test(run.stderr),
+          "status=" + run.status + " stdout=" + run.stdout + " stderr=" + run.stderr);
+        const statePath = path.join(maskDir, ".runs", caseName, "budget-state.json");
+        let finalState = null;
+        try { finalState = JSON.parse(fs.readFileSync(statePath, "utf8")); } catch (e) {}
+        assertTrue(results, "byte-cap-halt-not-swallowed-by-retry:" + caseName + ":halted.rule-is-the-byte-cap",
+          !!finalState && !!finalState.halted && finalState.halted.kind === "budget" && finalState.halted.rule === rule,
+          finalState ? JSON.stringify(finalState.halted) : "budget-state.json unreadable");
+        assertTrue(results, "byte-cap-halt-not-swallowed-by-retry:" + caseName + ":never-retried",
+          !!finalState && finalState.step_attempts && finalState.step_attempts["01-gather"] === 1,
+          finalState ? JSON.stringify(finalState.step_attempts) : "budget-state.json unreadable");
+      }
+
+      // ---- max_disk_mb: not a persisted counter (recomputed by walking runDir), so seed
+      // by dropping an oversized file in the run dir before the run dir even exists. ----
+      {
+        const runId = "e2e-disk-mask";
+        const runDir = path.join(maskDir, ".runs", runId);
+        fs.mkdirSync(runDir, { recursive: true });
+        fs.writeFileSync(path.join(runDir, "junk.bin"), Buffer.alloc(2 * 1024 * 1024, 1)); // 2MB, over the 1MB cap below
+        const patched = JSON.parse(maskOriginalRaw);
+        patched.values.max_disk_mb = 1; // frozen bound minimum
+        fs.writeFileSync(maskTunablesPath, JSON.stringify(patched, null, 2));
+        const run = spawnSync(process.execPath, ["manager.js", runId], { cwd: maskDir, encoding: "utf8", timeout: 30000 });
+        assertMaskedBudgetFixed(runId, "max_disk_mb", run);
+        fs.writeFileSync(maskTunablesPath, maskOriginalRaw);
+      }
+
+      // ---- max_state_bytes: a persisted cumulative counter -- seed it to exactly the cap so
+      // the very first checkpoint save (step 0, inside try) tips it over. ----
+      {
+        const runId = "e2e-state-mask";
+        const maxStateBytes = 1024; // frozen bound minimum
+        const runDir = path.join(maskDir, ".runs", runId);
+        fs.mkdirSync(runDir, { recursive: true });
+        const seeded = Object.assign(supervisorLibMask.defaultState(), { state_bytes: maxStateBytes });
+        fs.writeFileSync(path.join(runDir, "budget-state.json"), JSON.stringify(seeded));
+        const patched = JSON.parse(maskOriginalRaw);
+        patched.values.max_state_bytes = maxStateBytes;
+        fs.writeFileSync(maskTunablesPath, JSON.stringify(patched, null, 2));
+        const run = spawnSync(process.execPath, ["manager.js", runId], { cwd: maskDir, encoding: "utf8", timeout: 30000 });
+        assertMaskedBudgetFixed(runId, "max_state_bytes", run);
+        fs.writeFileSync(maskTunablesPath, maskOriginalRaw);
+      }
+
+      // ---- max_log_bytes: also a persisted cumulative counter, but log() itself has its own
+      // best-effort I/O catch upstream of executeStep's -- seed so the ONE fixed-length
+      // "watchdog.js not present" log call (before the pipeline loop) lands exactly AT the
+      // cap (no breach yet), so the breach happens on step 0's "ok" log call, inside try. ----
+      {
+        const runId = "e2e-log-mask";
+        const maxLogBytes = 1024; // frozen bound minimum
+        const watchdogAbsentMsg = "watchdog.js not present -- sync-execution (blocked event loop) budget is NOT enforced this run (feature-detected, documented limit)";
+        const call1Line = JSON.stringify({ runId: runId, step: "__watchdog__", status: watchdogAbsentMsg, ms: 0 });
+        const call1Bytes = Buffer.byteLength(call1Line, "utf8") + 1; // same +1 log() itself adds
+        const runDir = path.join(maskDir, ".runs", runId);
+        fs.mkdirSync(runDir, { recursive: true });
+        const seeded = Object.assign(supervisorLibMask.defaultState(), { log_bytes: maxLogBytes - call1Bytes });
+        fs.writeFileSync(path.join(runDir, "budget-state.json"), JSON.stringify(seeded));
+        const patched = JSON.parse(maskOriginalRaw);
+        patched.values.max_log_bytes = maxLogBytes;
+        fs.writeFileSync(maskTunablesPath, JSON.stringify(patched, null, 2));
+        const run = spawnSync(process.execPath, ["manager.js", runId], { cwd: maskDir, encoding: "utf8", timeout: 30000 });
+        assertMaskedBudgetFixed(runId, "max_log_bytes", run);
+        fs.writeFileSync(maskTunablesPath, maskOriginalRaw);
+      }
     }
 
     // ---- 11. D3 -- manager detects an unexpectedly dead watchdog and HALTs fail-closed ----
