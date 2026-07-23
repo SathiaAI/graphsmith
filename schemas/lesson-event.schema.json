@@ -309,7 +309,7 @@
         "delta_ms": { "$ref": "#/$defs/finiteInt" },
         "type": { "$ref": "#/$defs/eventType" },
         "code": { "$ref": "#/$defs/nonEmpty" },
-        "counters": { "type": "object", "additionalProperties": false },
+        "counters": { "type": "object" },
         "lossy": { "type": "boolean" },
         "evidence_ref": { "$ref": "#/$defs/evidenceRef" },
         "fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" }

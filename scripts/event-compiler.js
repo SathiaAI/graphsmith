@@ -144,6 +144,17 @@ function safeRef(name) {
   return name.replace(/[\\]/g, "/");
 }
 
+function canonicalizeEvidencePath(rawPathCandidate, projectRoot) {
+  if (!rawPathCandidate || typeof rawPathCandidate !== "string") return null;
+  const normalized = path.normalize(rawPathCandidate);
+  const resolved = path.resolve(projectRoot, normalized);
+  const resolvedRoot = path.resolve(projectRoot) + path.sep;
+  if (!resolved.startsWith(resolvedRoot) && resolved !== path.resolve(projectRoot)) return null;
+  const relative = path.relative(projectRoot, resolved);
+  if (relative.startsWith("..")) return null;
+  return safeRef(relative);
+}
+
 /* ---------------------------------------------------------------------------
  * State readers (data ONLY — nothing evaluated)
  * ------------------------------------------------------------------------- */
@@ -241,6 +252,7 @@ function verifyRunLog(runDir) {
 
 function extractEventsFromRun(verifiedRun, anchor, runRef) {
   const events = [];
+  const quarantinedRefs = [];
   let ordCounter = 0;
 
   for (const line of verifiedRun.lines) {
@@ -249,12 +261,29 @@ function extractEventsFromRun(verifiedRun, anchor, runRef) {
     const rawStep = body.step || "";
 
     const eventType = EVENT_TYPES.includes(rawType) ? rawType : null;
-    if (!eventType) continue;
+    if (!eventType) {
+      if (rawType && SAFETY_TYPES.has(rawType)) {
+        continue;
+      }
+      if (rawType) {
+        quarantinedRefs.push({ type: rawType, step: rawStep, reason: "unknown-type" });
+        ordCounter++;
+      }
+      continue;
+    }
 
     const runRefStr = runRef;
     const stepRefStr = `s${pad(ordCounter, 2)}`;
     const codeEnum = TYPE_CODES[eventType] || [];
     const code = codeEnum.includes(body.code) ? body.code : codeEnum[0];
+    const codeIsValid = codeEnum.includes(body.code);
+
+    if (!codeIsValid && !SAFETY_TYPES.has(eventType)) {
+      quarantinedRefs.push({ type: eventType, step: rawStep, reason: "malformed-code" });
+      ordCounter++;
+      continue;
+    }
+
     const countersRaw = body.counters || {};
     const counters = {};
     const allowedKeys = TYPE_COUNTER_KEYS[eventType] || [];
@@ -280,7 +309,7 @@ function extractEventsFromRun(verifiedRun, anchor, runRef) {
     ordCounter++;
   }
 
-  return events;
+  return { events, quarantinedRefs };
 }
 
 function verifyRunAgainstAnchor(verifiedRun, anchor) {
@@ -308,9 +337,9 @@ function extractAdoptionEvents(adoptionLog) {
       _rawType: "adoption",
       _rawStep: `adopt-${entry.txid || "?"}`,
       _rawBody: entry,
-      runRef: null,
-      stepRef: null,
-      ord: entry.seq || 0,
+      runRef: "r000",
+      stepRef: "s00",
+      ord: 0,
       deltaMs: 0,
       type: "adoption",
       code,
@@ -344,8 +373,8 @@ function extractRollbackEvents(window, adoptionLog) {
     _rawType: "rollback",
     _rawStep: `rollback-${window.window.window_id || "?"}`,
     _rawBody: window,
-    runRef: null,
-    stepRef: null,
+    runRef: "r000",
+    stepRef: "s00",
     ord: 0,
     deltaMs: 0,
     type: "rollback",
@@ -438,7 +467,9 @@ function compile(runDirs, options = {}) {
     }
 
     const runRef = assignRunRef(runId);
-    const runEvents = extractEventsFromRun(verifiedRun, anchor, runRef);
+    const { events: runEvents, quarantinedRefs: runQuarantined } = extractEventsFromRun(verifiedRun, anchor, runRef);
+
+    quarantined += runQuarantined.length;
 
     for (const ev of runEvents) {
       ev.runRef = runRef;
@@ -466,7 +497,7 @@ function compile(runDirs, options = {}) {
     for (const runDir of runDirs) {
       const verifiedRun = verifyRunLog(path.resolve(runDir));
       if (!verifiedRun.valid) continue;
-      const runEvents = extractEventsFromRun(verifiedRun, null, null);
+      const { events: runEvents } = extractEventsFromRun(verifiedRun, null, null);
       const foundTypes = new Set(runEvents.map((e) => e.type));
       for (const t of SAFETY_TYPES) {
         const hasTerminalType = foundTypes.has(t);
@@ -496,6 +527,23 @@ function compile(runDirs, options = {}) {
 
   if (harvestValid && (brokenRuns.length > 0 || rejected > 0)) {
     harvestValid = false;
+  }
+
+  /* --- D1: harvest_invalid suppresses the entire cycle --- */
+  if (!harvestValid) {
+    const stats = {
+      schema_version: SCHEMA_VERSION,
+      record_type: "compiler_stats",
+      total_events: 0,
+      skipped,
+      quarantined,
+      dropped_refs: droppedRefs,
+      rejected,
+      harvest_valid: false,
+      run_count: runDirs.length,
+      broken_runs: brokenRuns.length,
+    };
+    return { proposerView: [], evidenceMap: [], stats };
   }
 
   /* --- Stable sort by (run_ref, ord, seq) --- */
@@ -563,14 +611,15 @@ function compile(runDirs, options = {}) {
     }
 
     if (ev._rawBody && ev._rawBody.evidence_path) {
-      const relPath = safeRef(String(ev._rawBody.evidence_path));
-      if (charsetCheck(relPath, "evidence_path")) {
+      const rawEvidencePath = String(ev._rawBody.evidence_path);
+      const canonicalized = canonicalizeEvidencePath(rawEvidencePath, projectRoot);
+      if (canonicalized && charsetCheck(canonicalized, "evidence_path")) {
         evidenceMap.push({
           schema_version: SCHEMA_VERSION,
           record_type: "evidence_map_entry",
           alias: evidenceRef,
           alias_type: "evidence_ref",
-          real_value: relPath,
+          real_value: canonicalized,
         });
       } else {
         droppedRefs++;
@@ -578,13 +627,18 @@ function compile(runDirs, options = {}) {
     } else if (ev.source === "manager-run-log") {
       const evidenceValue = ev._rawBody.file || ev._rawBody.path || "";
       if (evidenceValue && charsetCheck(String(evidenceValue), "evidence_path")) {
-        evidenceMap.push({
-          schema_version: SCHEMA_VERSION,
-          record_type: "evidence_map_entry",
-          alias: evidenceRef,
-          alias_type: "evidence_ref",
-          real_value: String(evidenceValue),
-        });
+        const canonicalized = canonicalizeEvidencePath(String(evidenceValue), projectRoot);
+        const realValue = canonicalized || safeRef(String(evidenceValue));
+        if (!canonicalized) droppedRefs++;
+        else {
+          evidenceMap.push({
+            schema_version: SCHEMA_VERSION,
+            record_type: "evidence_map_entry",
+            alias: evidenceRef,
+            alias_type: "evidence_ref",
+            real_value: realValue,
+          });
+        }
       }
     }
   }
@@ -805,6 +859,173 @@ function selftest() {
       status: evidenceLeak ? "fail" : "pass",
       details: evidenceLeak ? "Evidence map real values found in proposer view" : "No evidence map real values leak into proposer view",
     });
+
+    /* --- D1 proof: Mixed cycle (good + broken run) → zero proposals --- */
+    const d1Tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gs-d1-"));
+    try {
+      const d1Root = d1Tmp;
+      const d1State = path.join(d1Root, ".graphsmith", "state");
+      fs.mkdirSync(d1State, { recursive: true });
+
+      const d1GoodDir = path.join(d1Root, "runs", "d1-good");
+      fs.mkdirSync(d1GoodDir, { recursive: true });
+      const d1GoodBodies = [
+        { seq: 0, step: "ok", type: "run_halt", code: "unknown_halt", delta_ms: 0, lossy: false, run_id: "d1-good" },
+      ];
+      const d1GoodHash = computeRecordHash("genesis", d1GoodBodies[0]);
+      fs.writeFileSync(path.join(d1GoodDir, "run.jsonl"), JSON.stringify({ prev_hash: "genesis", line_hash: d1GoodHash, ...d1GoodBodies[0] }) + "\n");
+
+      const d1BadDir = path.join(d1Root, "runs", "d1-bad");
+      fs.mkdirSync(d1BadDir, { recursive: true });
+      const d1BadBodies = [
+        { seq: 0, step: "bad", type: "run_halt", code: "unknown_halt", delta_ms: 0, lossy: false, run_id: "d1-bad" },
+      ];
+      const d1BadHash = computeRecordHash("genesis", d1BadBodies[0]);
+      fs.writeFileSync(path.join(d1BadDir, "run.jsonl"), JSON.stringify({ prev_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", line_hash: d1BadHash, ...d1BadBodies[0] }) + "\n");
+
+      fs.writeFileSync(path.join(d1State, "run-anchors.jsonl"),
+        JSON.stringify({ schema_version: SCHEMA_VERSION, state_rev: 1, record_type: "ANCHOR_SET", run_id: "d1-good", chain_head: d1GoodHash, expected_terminal_status: "run_halt" }) + "\n" +
+        JSON.stringify({ schema_version: SCHEMA_VERSION, state_rev: 2, record_type: "ANCHOR_SET", run_id: "d1-bad", chain_head: d1BadHash, expected_terminal_status: "run_halt" }) + "\n"
+      );
+
+      const d1Result = compile([d1GoodDir, d1BadDir], { projectRoot: d1Root });
+      const d1Ok = d1Result.stats.harvest_valid === false && d1Result.proposerView.length === 0;
+      tests.push({
+        name: "d1-mixed-cycle-zero-proposals",
+        status: d1Ok ? "pass" : "fail",
+        details: d1Ok ? `harvest_invalid=${d1Result.stats.harvest_valid}, proposals=${d1Result.proposerView.length}` : `harvest_valid=${d1Result.stats.harvest_valid}, proposals=${d1Result.proposerView.length}`,
+      });
+    } finally {
+      fs.rmSync(d1Tmp, { recursive: true, force: true });
+    }
+
+    /* --- D2 proof: Adoption record has schema-valid run_ref and step_ref --- */
+    const d2Tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gs-d2-"));
+    try {
+      const d2State = path.join(d2Tmp, ".graphsmith", "state");
+      fs.mkdirSync(d2State, { recursive: true });
+      fs.writeFileSync(path.join(d2State, "adoption-log.jsonl"), JSON.stringify({ status: "effective", kind: "doc_change", txid: "tx-1", seq: 1 }) + "\n");
+      const d2Result = compile([], { projectRoot: d2Tmp });
+      const d2Adopts = d2Result.proposerView.filter((e) => e.type === "adoption");
+      const d2Ok = d2Adopts.length === 1 && /^r[0-9]{2,6}$/.test(d2Adopts[0].run_ref) && /^s[0-9]{2,6}$/.test(d2Adopts[0].step_ref);
+      tests.push({
+        name: "d2-adoption-valid-runref",
+        status: d2Ok ? "pass" : "fail",
+        details: d2Ok ? `adoption run_ref=${d2Adopts[0].run_ref} step_ref=${d2Adopts[0].step_ref}` : `adoption run_ref=${d2Adopts[0].run_ref} step_ref=${d2Adopts[0].step_ref}`,
+      });
+    } finally {
+      fs.rmSync(d2Tmp, { recursive: true, force: true });
+    }
+
+    /* --- D3 proof: evidence_ref with ../ is dropped, dropped_refs ≥ 1 --- */
+    const d3Tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gs-d3-"));
+    try {
+      const d3State = path.join(d3Tmp, ".graphsmith", "state");
+      fs.mkdirSync(d3State, { recursive: true });
+      const d3RunDir = path.join(d3Tmp, "runs", "d3-run");
+      fs.mkdirSync(d3RunDir, { recursive: true });
+
+      const d3Body1 = { seq: 0, step: "01", type: "step_failure", code: "worker_error", delta_ms: 0, lossy: false, run_id: "d3-run", evidence_path: "../outside/secret.txt" };
+      const d3Hash1 = computeRecordHash("genesis", d3Body1);
+      const d3Body2 = { seq: 1, step: "02", type: "run_halt", code: "unknown_halt", delta_ms: 0, lossy: false, run_id: "d3-run" };
+      const d3Hash2 = computeRecordHash(d3Hash1, d3Body2);
+
+      fs.writeFileSync(path.join(d3RunDir, "run.jsonl"),
+        JSON.stringify({ prev_hash: "genesis", line_hash: d3Hash1, ...d3Body1 }) + "\n" +
+        JSON.stringify({ prev_hash: d3Hash1, line_hash: d3Hash2, ...d3Body2 }) + "\n"
+      );
+      fs.writeFileSync(path.join(d3State, "run-anchors.jsonl"),
+        JSON.stringify({ schema_version: SCHEMA_VERSION, state_rev: 1, record_type: "ANCHOR_SET", run_id: "d3-run", chain_head: d3Hash2, expected_terminal_status: "run_halt" }) + "\n"
+      );
+
+      const d3Result = compile([d3RunDir], { projectRoot: d3Tmp });
+      const d3EvidenceText = JSON.stringify(d3Result.evidenceMap);
+      const d3EscapeInEvidence = d3EvidenceText.includes("../outside/secret.txt");
+      const d3Ok = d3Result.stats.dropped_refs >= 1 && !d3EscapeInEvidence;
+      tests.push({
+        name: "d3-escape-path-dropped",
+        status: d3Ok ? "pass" : "fail",
+        details: d3Ok ? `dropped_refs=${d3Result.stats.dropped_refs}, escape not in evidence` : `dropped_refs=${d3Result.stats.dropped_refs}, escape_in_evidence=${d3EscapeInEvidence}`,
+      });
+    } finally {
+      fs.rmSync(d3Tmp, { recursive: true, force: true });
+    }
+
+    /* --- D4 proof: Malformed non-safety record quarantined + counted --- */
+    const d4Tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gs-d4-"));
+    try {
+      const d4State = path.join(d4Tmp, ".graphsmith", "state");
+      fs.mkdirSync(d4State, { recursive: true });
+      const d4RunDir = path.join(d4Tmp, "runs", "d4-run");
+      fs.mkdirSync(d4RunDir, { recursive: true });
+
+      const d4Body1 = { seq: 0, step: "01", type: "step_failure", code: "NOT_A_CLOSED_CODE", delta_ms: 0, lossy: false, run_id: "d4-run" };
+      const d4Hash1 = computeRecordHash("genesis", d4Body1);
+      const d4Body2 = { seq: 1, step: "02", type: "run_halt", code: "unknown_halt", delta_ms: 0, lossy: false, run_id: "d4-run" };
+      const d4Hash2 = computeRecordHash(d4Hash1, d4Body2);
+
+      fs.writeFileSync(path.join(d4RunDir, "run.jsonl"),
+        JSON.stringify({ prev_hash: "genesis", line_hash: d4Hash1, ...d4Body1 }) + "\n" +
+        JSON.stringify({ prev_hash: d4Hash1, line_hash: d4Hash2, ...d4Body2 }) + "\n"
+      );
+      fs.writeFileSync(path.join(d4State, "run-anchors.jsonl"),
+        JSON.stringify({ schema_version: SCHEMA_VERSION, state_rev: 1, record_type: "ANCHOR_SET", run_id: "d4-run", chain_head: d4Hash2, expected_terminal_status: "run_halt" }) + "\n"
+      );
+
+      const d4Result = compile([d4RunDir], { projectRoot: d4Tmp });
+      const d4StepFailures = d4Result.proposerView.filter((e) => e.type === "step_failure");
+      const d4Ok = d4Result.stats.quarantined >= 1 && d4StepFailures.length === 0;
+      tests.push({
+        name: "d4-malformed-quarantined",
+        status: d4Ok ? "pass" : "fail",
+        details: d4Ok ? `quarantined=${d4Result.stats.quarantined}, step_failure proposals=0` : `quarantined=${d4Result.stats.quarantined}, step_failure proposals=${d4StepFailures.length}`,
+      });
+    } finally {
+      fs.rmSync(d4Tmp, { recursive: true, force: true });
+    }
+
+    /* --- D5a proof: Counters reject extra keys (closed per type) --- */
+    /* Validate existing result1 events have proper closed counters */
+    const d5aFailures = [];
+    for (const ev of result1.proposerView) {
+      const allowedKeys = new Set(TYPE_COUNTER_KEYS[ev.type] || []);
+      for (const key of Object.keys(ev.counters)) {
+        if (!allowedKeys.has(key)) {
+          d5aFailures.push(`type=${ev.type} extra_key=${key}`);
+        }
+      }
+      if (ev.type === "run_halt") {
+        const countKeys = Object.keys(ev.counters).sort();
+        const expected = TYPE_COUNTER_KEYS["run_halt"].slice().sort();
+        if (JSON.stringify(countKeys) !== JSON.stringify(expected)) {
+          d5aFailures.push(`run_halt counters mismatch: ${countKeys} vs ${expected}`);
+        }
+      }
+    }
+    tests.push({
+      name: "d5a-counters-closed",
+      status: d5aFailures.length === 0 ? "pass" : "fail",
+      details: d5aFailures.length === 0 ? `All ${result1.proposerView.length} events have closed per-type counters` : d5aFailures.join("; "),
+    });
+
+    /* --- D5b proof: Producer seq never reaches proposer ord --- */
+    const d5bTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gs-d5b-"));
+    try {
+      const d5bState = path.join(d5bTmp, ".graphsmith", "state");
+      fs.mkdirSync(d5bState, { recursive: true });
+      fs.writeFileSync(path.join(d5bState, "adoption-log.jsonl"),
+        JSON.stringify({ status: "effective", kind: "doc_change", txid: "tx-safe", seq: 99 }) + "\n"
+      );
+      const d5bResult = compile([], { projectRoot: d5bTmp });
+      const d5bOrdOk = d5bResult.proposerView.every((e) => e.ord === e.seq);
+      tests.push({
+        name: "d5b-ord-compiler-assigned",
+        status: d5bOrdOk ? "pass" : "fail",
+        details: d5bOrdOk ? `All ${d5bResult.proposerView.length} events have compiler-assigned ord matching seq` : "ord did not match compiler seq",
+      });
+    } finally {
+      fs.rmSync(d5bTmp, { recursive: true, force: true });
+    }
 
     return {
       schema_version: SCHEMA_VERSION,
