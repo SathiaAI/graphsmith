@@ -3,11 +3,23 @@ name: Publish to npm
 # Publishes graphsmith-skill to npm whenever a GitHub Release is published.
 # Requires an npm granular access token with publish rights saved as the
 # NPM_TOKEN repository secret (Settings > Secrets and variables > Actions).
+#
+# Trusted-workflow discipline (contracts/04 B17): third-party actions
+# pinned by full commit SHA, never a tag. This workflow only ever
+# triggers on `release`/`workflow_dispatch` — never on a PR — so the
+# NPM_TOKEN secret is never exposed to a pull_request-triggered run.
 
 on:
   release:
     types: [published]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -20,8 +32,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org

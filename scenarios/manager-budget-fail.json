@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "id": "manager-budget-fail",
+  "shape": "manager+workers",
+  "tier": "smoke",
+  "seed": 3004,
+  "failure_mode": "budget-fail",
+  "fixture": {
+    "pipeline": [
+      { "step": "01-classify", "worker": "classify.js" },
+      { "step": "02a-route-simple", "worker": "simple.js" },
+      { "step": "02b-route-complex", "worker": "complex.js" },
+      { "step": "03-finalize", "worker": "finalize.js" }
+    ],
+    "workers": {
+      "classify.js": { "behavior": "ok", "delay_ms": 50 },
+      "simple.js": { "behavior": "delay", "delay_ms": 500 },
+      "complex.js": { "behavior": "ok", "delay_ms": 50 },
+      "finalize.js": { "behavior": "ok", "delay_ms": 50 }
+    },
+    "manager_decisions": [
+      { "after_step": "01-classify", "on_output": "simple", "next_step": "02a-route-simple" },
+      { "after_step": "01-classify", "on_output": "complex", "next_step": "02b-route-complex" }
+    ],
+    "budget_ms": 200
+  },
+  "expected": {
+    "outcome": "budget-exceeded",
+    "completed_steps": ["01-classify"]
+  },
+  "invariants": [
+    "no-duplicate-effects",
+    "intent-before-effect"
+  ]
+}

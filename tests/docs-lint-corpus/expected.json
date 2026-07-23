@@ -1,0 +1,173 @@
+{
+  "note": "Contract 10 List A honest-language lint corpus. mustFind asserts recall (rule-id + line); mustBeCleanAtOrAbove asserts precision (REVIEW = zero findings of any kind).",
+  "cases": [
+    {
+      "file": "tp-proven.md",
+      "mustFind": "R1-proven",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-immutable.md",
+      "mustFind": "R2-immutable",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-certified.md",
+      "mustFind": "R3-certified",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-sandboxed.md",
+      "mustFind": "R4-sandboxed",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-exactly-once.md",
+      "mustFind": "R5-exactly-once",
+      "atLine": 1,
+      "maxCount": 2
+    },
+    {
+      "file": "tp-constant-monitoring.md",
+      "mustFind": "R6-constant-monitoring",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-tamper-proof.md",
+      "mustFind": "R7-tamper-proof",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-pen-test.md",
+      "mustFind": "R8-pen-test",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-r9-claims.md",
+      "mustFind": "R9a-certified-secure",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-r9-claims.md",
+      "mustFind": "R9b-security-guaranteed",
+      "atLine": 2,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-r9-claims.md",
+      "mustFind": "R9c-guaranteed",
+      "atLine": 3,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-r9-claims.md",
+      "mustFind": "R9d-cannot-fail",
+      "atLine": 4,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-atomic.md",
+      "mustFind": "R10-atomic",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "tp-cannot-reach-network.md",
+      "mustFind": "R11-cannot-reach-network",
+      "atLine": 1,
+      "maxCount": 1
+    },
+    {
+      "file": "fp-negated-proven.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-negated-immutable.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-negated-certified.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-negated-sandboxed.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-negated-exactly-once.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-negated-guaranteed.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-proven.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-immutable.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-certified.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-sandboxed.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-exactly-once.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-monitoring.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-tamper-proof.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-pen-test.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-atomic.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-required-form-network.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-lint-allow-line.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-lint-allow-block.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-code-block.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-inline-code.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "fp-yaml-frontmatter.md",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    }
+  ]
+}

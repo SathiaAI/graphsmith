@@ -6,7 +6,7 @@ The core skill keeps ONE workflow reliable. This reference keeps MULTIPLE agents
 
 **1. One writer per lane.** Divide the work into lanes — module boundaries where each lane owns its files. One agent per lane at a time. Two tasks that would edit the same files are sequenced or split, never run concurrently. A merge conflict is a planning failure to fix in the plan, not something to power through.
 
-**2. Claim before work, with a lease.** Work comes from a shared, machine-readable task list. An agent claims a task by writing its ID and a lease expiry in one atomic commit — the claim commit IS the lock. Progress renews the lease; an expired lease means the agent is presumed dead and any agent may reset the task to unclaimed (and log the reset). Minimal shape:
+**2. Claim before work, with a lease.** Work comes from a shared, machine-readable task list. An agent claims a task by writing its ID and a lease expiry in a single commit — the claim commit IS the lock. Progress renews the lease; an expired lease means the agent is presumed dead and any agent may reset the task to unclaimed (and log the reset). Minimal shape:
 
 ```yaml
 - id: TASK-14

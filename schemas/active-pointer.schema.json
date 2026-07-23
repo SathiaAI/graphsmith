@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://graphsmith.dev/schemas/active-pointer.schema.json",
+  "title": "GraphSmith ACTIVE pointer",
+  "description": "Closed schema for .graphsmith/evolvable/ACTIVE (contracts/01-promotion-transaction.md, Topology: 'ACTIVE  # pointer file: { schema_version, txid, tree, tree_manifest_sha256 }'). Written only by scripts/promote.js under lock (contract 04 B15); read by scripts/loaders.js's resolveActive(), exactly once per run start (contract 04 B2/B3 race control: 'tree immutable; pointer read once at start'). Consumers MUST treat any structural or pattern violation as fail-closed corruption, not a value to coerce or default.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "txid", "tree", "tree_manifest_sha256"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Pointer file format version, independent of the tree's own content.",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "txid": {
+      "type": "string",
+      "description": "The promotion transaction that produced this pointer. Contract 01: 'txid = sha256(candidate_fingerprint + expected_active_sha)[:16]' -- 16 lowercase hex characters.",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "tree": {
+      "type": "string",
+      "description": "Directory name of the active immutable tree under .graphsmith/evolvable/, contract 01 topology: 'v-<treehash>/'. Hex-only after the 'v-' prefix so this value can never be used to traverse outside the evolvable root when joined into a filesystem path. [inferring: exact treehash length not pinned by contract 01, so a permissive 8-64 hex-char range is accepted.]",
+      "pattern": "^v-[0-9a-f]{8,64}$"
+    },
+    "tree_manifest_sha256": {
+      "type": "string",
+      "description": "sha256 of the active tree's tree.manifest.json, hex-encoded. Contract 01: 'the manifest file is bound instead via tree_manifest_sha256 in ACTIVE + journal' (the manifest cannot hash itself). scripts/loaders.js#resolveActive verifies this binding on every read; a mismatch is fail-closed corruption, never silently accepted.",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

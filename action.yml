@@ -1,0 +1,163 @@
+name: 'GraphSmith Verify'
+description: 'Run GraphSmith verification profiles to enforce deterministic merge boundaries for agent PRs. Consumers MUST pin by full commit SHA, never a tag.'
+inputs:
+  profiles:
+    description: 'Which profiles to require (comma-separated). Default: all-available'
+    required: false
+    default: 'all-available'
+  node-version:
+    description: 'Node.js version to use'
+    required: false
+    default: '20'
+  working-directory:
+    description: 'Working directory relative to repo root'
+    required: false
+    default: '.'
+  fail-on:
+    description: 'Failure mode: "unavailable-is-not-failure" (default) means unavailable profiles do NOT fail the build but failed profiles DO'
+    required: false
+    default: 'unavailable-is-not-failure'
+outputs:
+  profile-result:
+    description: 'JSON result of profile verification for downstream badge steps'
+    value: ${{ steps.verify.outputs.profile-result }}
+  verification-status:
+    description: 'Overall verification status: verified, failed, or partial'
+    value: ${{ steps.verify.outputs.verification-status }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        path: ${{ inputs.working-directory }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Run integrity check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        # FAIL-CLOSED: check exit code - non-zero fails the build
+        node scripts/verify.js --integrity
+
+    - name: Run profile verification and parse results
+      id: verify
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+
+        # Run profiles check and capture JSON output.
+        # verify.js writes pure JSON to stdout and a human summary to STDERR;
+        # capture stderr SEPARATELY so it never corrupts the JSON in RESULT
+        # (merging with 2>&1 would break the JSON.parse below on valid output).
+        # FAIL-CLOSED: check exit code - non-zero fails the build.
+        VERIFY_ERR="$(mktemp)"
+        if ! RESULT=$(node scripts/verify.js --profiles 2>"$VERIFY_ERR"); then
+          echo "::error::verify --profiles exited non-zero: $(cat "$VERIFY_ERR" 2>/dev/null)"
+          rm -f "$VERIFY_ERR"
+          exit 1
+        fi
+        rm -f "$VERIFY_ERR"
+
+        # FAIL-CLOSED: validate stdout is not empty
+        if [ -z "$RESULT" ]; then
+          echo "::error::verify --profiles produced empty stdout"
+          exit 1
+        fi
+
+        # FAIL-CLOSED: validate stdout parses as JSON
+        if ! echo "$RESULT" | node -e "JSON.parse(require('fs').readFileSync(0, 'utf8'))" 2>/dev/null; then
+          echo "::error::verify --profiles produced non-JSON stdout: $RESULT"
+          exit 1
+        fi
+
+        # Parse RESULT via stdin (no temp file) so there is no hardcoded
+        # /tmp path that resolves differently under bash vs node on Windows
+        # runners — RESULT already holds pure stdout JSON.
+        echo "profile-result<<EOF" >> $GITHUB_OUTPUT
+        echo "$RESULT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        # Determine verification status
+        FAIL_ON="${{ inputs.fail-on }}"
+        REQUIRED_PROFILES="${{ inputs.profiles }}"
+
+        # Parse the JSON and check profile statuses
+        # FAIL-CLOSED: validate JSON has profiles object
+        if ! echo "$RESULT" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); if (!d.profiles || Object.keys(d.profiles).length === 0) process.exit(1)" 2>/dev/null; then
+          echo "::error::verify --profiles JSON missing profiles object or profiles is empty"
+          exit 1
+        fi
+
+        FAILED_COUNT=0
+        UNAVAILABLE_COUNT=0
+        VERIFIED_COUNT=0
+        TOTAL_COUNT=0
+
+        # If profiles input is 'all-available', we check all profiles
+        # Otherwise, only check the specified ones
+        if [ "$REQUIRED_PROFILES" = "all-available" ]; then
+          # Extract all profile names from the JSON
+          PROFILES_TO_CHECK=$(echo "$RESULT" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(Object.keys(d.profiles||{}).join(','))")
+        else
+          PROFILES_TO_CHECK="$REQUIRED_PROFILES"
+        fi
+
+        # FAIL-CLOSED: validate PROFILES_TO_CHECK is not empty
+        if [ -z "$PROFILES_TO_CHECK" ]; then
+          echo "::error::No profiles to check - PROFILES_TO_CHECK is empty"
+          exit 1
+        fi
+
+        IFS=',' read -ra PROFS <<< "$PROFILES_TO_CHECK"
+        for prof in "${PROFS[@]}"; do
+          TOTAL_COUNT=$((TOTAL_COUNT + 1))
+          PROF_STATUS=$(echo "$RESULT" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log((d.profiles||{})['$prof']?.status||'unknown')")
+          
+          case "$PROF_STATUS" in
+            verified)
+              VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
+              echo "::notice::Profile '$prof' is VERIFIED"
+              ;;
+            failed)
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "::error::Profile '$prof' is FAILED"
+              ;;
+            unavailable)
+              UNAVAILABLE_COUNT=$((UNAVAILABLE_COUNT + 1))
+              if [ "$FAIL_ON" = "unavailable-is-not-failure" ]; then
+                echo "::notice::Profile '$prof' is UNAVAILABLE (annotated, not failed)"
+              else
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                echo "::error::Profile '$prof' is UNAVAILABLE (configured as failure)"
+              fi
+              ;;
+            not-applicable)
+              echo "::notice::Profile '$prof' is NOT APPLICABLE (annotated, not failed)"
+              ;;
+            *)
+              # FAIL-CLOSED: unknown status is a failure
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "::error::Profile '$prof' has unknown status: $PROF_STATUS (treating as failure)"
+              ;;
+          esac
+        done
+
+        # Set overall status
+        if [ $FAILED_COUNT -gt 0 ]; then
+          echo "verification-status=failed" >> $GITHUB_OUTPUT
+          echo "::error::Verification failed: $FAILED_COUNT profile(s) failed out of $TOTAL_COUNT"
+          exit 1
+        elif [ $UNAVAILABLE_COUNT -gt 0 ]; then
+          echo "verification-status=partial" >> $GITHUB_OUTPUT
+          echo "::notice::Verification partial: $UNAVAILABLE_COUNT profile(s) unavailable out of $TOTAL_COUNT (annotated, not failed)"
+        else
+          echo "verification-status=verified" >> $GITHUB_OUTPUT
+          echo "::notice::Verification verified: all $TOTAL_COUNT profile(s) checked"
+        fi

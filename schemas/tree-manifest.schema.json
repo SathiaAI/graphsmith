@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/tree-manifest.schema.json",
+  "title": "GraphSmith Tree Manifest",
+  "description": "Closed inventory of all payload files in an immutable versioned tree (contract 01 §Topology). The manifest file itself (tree.manifest.json) is excluded from the files array and bound via tree_manifest_sha256 in ACTIVE + journal.",
+  "type": "object",
+  "required": ["schema_version", "files"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Schema version for forward compatibility"
+    },
+    "files": {
+      "type": "array",
+      "description": "COMPLETE inventory of all payload files in the tree, excluding tree.manifest.json itself",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "bytes"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Repo-relative path, forward slashes, Unicode NFC canonicalized",
+            "pattern": "^[^\\\\]+$"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Raw-byte SHA-256 hash (no content normalization)",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "File size in bytes"
+          }
+        }
+      }
+    }
+  }
+}

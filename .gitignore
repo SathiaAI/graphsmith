@@ -2,3 +2,23 @@ node_modules/
 .runs/
 *.log
 .DS_Store
+
+# Secrets / deploy artifacts — never commit (orchestrator security, 2026-07-22: found untracked .env.local w/ VERCEL_OIDC_TOKEN)
+.env
+.env.*
+.vercel/
+
+# Internal v0.2.0 build planning — never publish to the public repo
+.plans/
+BUILD-LEDGER.md
+
+# Publication-hygiene local entries — maintainer-only, never commit
+scripts/banned-strings.local.json
+
+# Ephemeral tester run-outputs (regenerated every run)
+tests/**/last-run.json
+
+# test-run temp dirs (audit)
+.tmp/
+tmp-e/
+tmp-proj/

@@ -424,7 +424,7 @@ A useful plan is not "build the frontend, then the backend". Each task states it
 ```
 
 ### Claiming and leases
-- An agent claims a task by setting `claimed_by` and a lease (default: 4 hours) in one atomic commit. The claim commit is the lock.
+- An agent claims a task by setting `claimed_by` and a lease (default: 4 hours) in a single commit. The claim commit is the lock.
 - Progress (a commit or status update) renews the lease. An expired lease means the agent is presumed dead: any agent may reset the task to `unclaimed` and note the reset in the audit log (09).
 - Blocked tasks state what they are blocked on — a task ID, a frozen-contract request, or an open question routed to a human. Blocked without a reason is a protocol violation.
 
@@ -754,7 +754,7 @@ In an automated pipeline the agents are production infrastructure. You would not
 | Implementer | First-pass CI pass rate; review findings per PR; rework ratio (attempts per task); escaped defects traced to its merges | Rising retries; diffs far larger than task scope; unsupported-claim count |
 | Reviewer | Defect escape rate (bugs later found in code it approved); findings per review; attestation completeness | Zero-finding approval streaks; approvals faster than the diff could plausibly be read |
 | Architecture reviewer | Boundary violations caught vs found later by the sweep; DEC revisions proposed vs silent erosion discovered downstream | Advisory-only streaks; sweeps that never find anything |
-| QA adversary | Defects escaped to staging/production in areas it certified; severity mix of findings; false-alarm rate | Suites that never fail; findings clustered only in easy categories |
+| QA adversary | Defects escaped to staging/production in areas it reviewed; severity mix of findings; false-alarm rate | Suites that never fail; findings clustered only in easy categories |
 | Release manager | Change failure rate; rollback time when triggered; deploy-record completeness | Manual overrides; skipped bake times |
 | The documents themselves | Clarification requests per FR; drift findings per week; cold-start test pass rate | The same requirement re-litigated across multiple tasks |
 

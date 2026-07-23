@@ -1,0 +1,56 @@
+name: Evaluator stability (shadow)
+
+# Loop-3 shadow harness (plan §3.5 / §12 / §14). Runs scripts/shadow.js to
+# measure the stability + noise floor of the FROZEN Gate-2 behavioral evaluator
+# over the held-out scenario corpus, and publishes the evaluator-stability memo
+# (docs/EVALUATOR-STABILITY.md) as a build artifact.
+#
+# SHADOW-ONLY (permanent I4): this job only OBSERVES and REPORTS. shadow.js
+# never adopts, promotes, writes ACTIVE / the adoption log, or sends anything
+# upstream, and it aborts (exit 3) if either guarded file changes during a run.
+# This workflow NEVER gates a merge on an evolution/fleet claim — the memo is
+# an input to the v0.3 go/no-go decision, published for humans to read.
+#
+# TRUST BOUNDARY (contracts/04 B17): runs only from a TRUSTED context —
+# push to main and manual workflow_dispatch. It never triggers on
+# `pull_request` (so a fork PR can never run it) and never uses
+# `pull_request_target`. Every third-party action is pinned by full commit
+# SHA, never a tag. `permissions: contents: read`; no secrets are used.
+#
+# Evaluator/corpus changes stay separate from behavior changes: those PRs are
+# handled by the existing pr-separation-guard in ci.yml — this workflow does
+# not run on PRs at all.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shadow:
+    name: Shadow evaluator-stability memo
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+      - name: Shadow harness selftest (noise floor / flat-is-flat / regression detected / shadow-only / zero-egress)
+        run: node scripts/shadow.js --selftest
+      - name: Generate the evaluator-stability memo (injected reference timestamp — no wall clock in the stats path)
+        run: node scripts/shadow.js --ref-timestamp "1970-01-01T00:00:00.000Z"
+      - name: Publish the evaluator-stability memo as an artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: evaluator-stability-memo
+          path: docs/EVALUATOR-STABILITY.md
+          if-no-files-found: error

@@ -1,0 +1,128 @@
+# GraphSmith Verify - GitLab CI Template
+#
+# This template provides equivalent GraphSmith verification functionality for GitLab CI.
+# Include it in your .gitlab-ci.yml as:
+#   include:
+#     - project: 'SathiaAI/graphsmith'
+#       ref: <full_commit_sha>
+#       file: 'templates/graphsmith.gitlab-ci.yml'
+#       # IMPORTANT: Consumers MUST pin by full commit SHA, never a tag
+#
+# The verification enforces deterministic merge boundaries for agent PRs by checking
+# integrity profiles. unavailable profiles do NOT fail the build but are annotated;
+# failed profiles DO fail the build.
+
+graphsmith-verify:
+  image: node:20
+  stage: test
+  script:
+    - echo "Running GraphSmith integrity check..."
+    - |
+      set -euo pipefail
+      # FAIL-CLOSED: check exit code - non-zero fails the build
+      node scripts/verify.js --integrity
+    - echo "Running GraphSmith profile verification..."
+    - |
+      set -euo pipefail
+
+      # FAIL-CLOSED: check exit code - non-zero fails the build
+      if ! node scripts/verify.js --profiles > /tmp/profile-result.json 2>&1; then
+        echo "ERROR: verify --profiles exited non-zero"
+        cat /tmp/profile-result.json
+        exit 1
+      fi
+
+      # FAIL-CLOSED: validate stdout is not empty
+      if [ ! -s /tmp/profile-result.json ]; then
+        echo "ERROR: verify --profiles produced empty stdout"
+        exit 1
+      fi
+
+      # FAIL-CLOSED: validate stdout parses as JSON
+      if ! node -e "JSON.parse(require('fs').readFileSync('/tmp/profile-result.json', 'utf8'))" 2>/dev/null; then
+        echo "ERROR: verify --profiles produced non-JSON stdout"
+        cat /tmp/profile-result.json
+        exit 1
+      fi
+
+      # FAIL-CLOSED: validate JSON has profiles object
+      if ! node -e "const d=require('/tmp/profile-result.json'); if (!d.profiles || Object.keys(d.profiles).length === 0) process.exit(1)" 2>/dev/null; then
+        echo "ERROR: verify --profiles JSON missing profiles object or profiles is empty"
+        cat /tmp/profile-result.json
+        exit 1
+      fi
+
+      # Determine verification status
+      FAIL_ON="${GRAPHSMITH_FAIL_ON:-unavailable-is-not-failure}"
+      REQUIRED_PROFILES="${GRAPHSMITH_PROFILES:-all-available}"
+
+      # If profiles input is 'all-available', we check all profiles
+      if [ "$REQUIRED_PROFILES" = "all-available" ]; then
+        PROFILES_TO_CHECK=$(node -e "const d=require('/tmp/profile-result.json'); console.log(Object.keys(d.profiles||{}).join(','))")
+      else
+        PROFILES_TO_CHECK="$REQUIRED_PROFILES"
+      fi
+
+      # FAIL-CLOSED: validate PROFILES_TO_CHECK is not empty
+      if [ -z "$PROFILES_TO_CHECK" ]; then
+        echo "ERROR: No profiles to check - PROFILES_TO_CHECK is empty"
+        exit 1
+      fi
+
+      FAILED_COUNT=0
+      UNAVAILABLE_COUNT=0
+      VERIFIED_COUNT=0
+      TOTAL_COUNT=0
+
+      IFS=',' read -ra PROFS <<< "$PROFILES_TO_CHECK"
+      for prof in "${PROFS[@]}"; do
+        TOTAL_COUNT=$((TOTAL_COUNT + 1))
+        PROF_STATUS=$(node -e "const d=require('/tmp/profile-result.json'); console.log((d.profiles||{})['$prof']?.status||'unknown')")
+        
+        case "$PROF_STATUS" in
+          verified)
+            VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
+            echo "NOTICE: Profile '$prof' is VERIFIED"
+            ;;
+          failed)
+            FAILED_COUNT=$((FAILED_COUNT + 1))
+            echo "ERROR: Profile '$prof' is FAILED"
+            ;;
+          unavailable)
+            UNAVAILABLE_COUNT=$((UNAVAILABLE_COUNT + 1))
+            if [ "$FAIL_ON" = "unavailable-is-not-failure" ]; then
+              echo "NOTICE: Profile '$prof' is UNAVAILABLE (annotated, not failed)"
+            else
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "ERROR: Profile '$prof' is UNAVAILABLE (configured as failure)"
+            fi
+            ;;
+          not-applicable)
+            echo "NOTICE: Profile '$prof' is NOT APPLICABLE (annotated, not failed)"
+            ;;
+          *)
+            # FAIL-CLOSED: unknown status is a failure
+            FAILED_COUNT=$((FAILED_COUNT + 1))
+            echo "ERROR: Profile '$prof' has unknown status: $PROF_STATUS (treating as failure)"
+            ;;
+        esac
+      done
+
+      # Set overall status
+      if [ $FAILED_COUNT -gt 0 ]; then
+        echo "Verification FAILED: $FAILED_COUNT profile(s) failed out of $TOTAL_COUNT"
+        exit 1
+      elif [ $UNAVAILABLE_COUNT -gt 0 ]; then
+        echo "Verification PARTIAL: $UNAVAILABLE_COUNT profile(s) unavailable out of $TOTAL_COUNT (annotated, not failed)"
+      else
+        echo "Verification VERIFIED: all $TOTAL_COUNT profile(s) checked"
+      fi
+  artifacts:
+    paths:
+      - /tmp/profile-result.json
+    expire_in: 1 week
+    reports:
+      # This makes the JSON available as a test report in GitLab UI
+      junit: /tmp/profile-result.json
+  allow_failure: false
+  interruptible: true

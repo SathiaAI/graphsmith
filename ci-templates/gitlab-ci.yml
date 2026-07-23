@@ -1,0 +1,140 @@
+# ci-templates/gitlab-ci.yml
+#
+# TEMPLATE — GitLab CI parity stub, Phase A (v0.2.0). This file is NOT
+# wired into any active pipeline in this repo. GitHub Actions
+# (.github/workflows/ci.yml) is the authoritative CI for GraphSmith itself.
+# This stub exists so a fork/mirror of GraphSmith on GitLab has a starting
+# point that runs the same deterministic, zero-dep checks, and so contract
+# 11's CI-parity note has a concrete answer in Phase A.
+#
+# To adopt in a GitLab project: copy this file to `.gitlab-ci.yml` at the
+# repo root and delete this header block.
+#
+# Phase A scope (deliberately minimal, per task A-ci): Linux only. The
+# 3-OS matrix (windows-latest, macos-latest, ubuntu-latest) lives in the
+# GitHub Actions workflow; GitLab's hosted Windows/macOS runners are a
+# separate, non-default (often paid) capability and are out of scope for
+# this stub. Node 18 and Node 22 (current LTS) are both covered, mirroring
+# the GitHub Actions matrix's Node axis.
+#
+# NOT included in this Phase A stub (left for a later phase, tracked here
+# so the gap is visible rather than silent) — every GitHub Actions check
+# this template omits is disclosed explicitly below, none silently:
+#   - The PR-separation guard (scripts/ci-check-pr-separation.js) is not
+#     wired to a GitLab merge_request pipeline here. To add it, a job
+#     would diff $CI_MERGE_REQUEST_DIFF_BASE_SHA against
+#     $CI_COMMIT_SHA (using --name-status --no-renames, per task A-ci-fix
+#     B2, so rename source paths reach the classifier) and pipe the
+#     result the same way the GitHub Actions `pr-separation-guard` job
+#     does (per task A-ci-fix B1, from a base-trusted copy of the guard
+#     script, never the MR branch's own checkout):
+#       git diff --name-status --no-renames "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" \
+#         | node scripts/ci-check-pr-separation.js
+#   - OS coverage: this stub is Linux-only (see "Phase A scope" above) —
+#     no windows-latest/macos-latest equivalent job here.
+#   - Syntax check every script (`node --check` over scripts/*.js) —
+#     GitHub's `verify` job only, not reproduced here.
+#   - graphlint selftest (`graphlint.js --selftest`) and graphlint dogfood
+#     (`graphlint.js scripts/`) — GitHub's `verify` job only, not
+#     reproduced here.
+#   - Scaffold a project (`scaffold.js`) and the chaos harness
+#     (`chaos.js`) — GitHub's `verify` job only, not reproduced here.
+#   - "Required" merge-blocking status: GitLab's equivalent of a GitHub
+#     branch-protection required status check is a merge request approval
+#     rule / pipeline-must-succeed setting in Settings > Merge requests —
+#     a repo-admin action outside what any CI config file can do.
+#
+# Zero runtime deps: every command below is `node <builtin script>`, no
+# package installs, matching this repo's zero-dep-CJS convention.
+
+image: node:20
+
+stages:
+  - test
+
+.phase-a-selftests-and-suites:
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - node --version
+    - node scripts/manifest.js --selftest
+    - node scripts/state-store.js --selftest
+    - node scripts/loaders.js --selftest
+    - node scripts/scenario.js --selftest
+    - node scripts/promote.js --selftest
+    - node scripts/gate.js --selftest
+    - node scripts/verify.js --selftest
+    - node scripts/ci-check-pr-separation.js --selftest
+    - |
+      node -e "
+      const fs = require('fs'), path = require('path'), cp = require('child_process');
+      // ci-suite-manifest.json (task A-ci-fix B3): gating_suites must stay
+      // green; evidence_only suites are one-shot adversarial-review
+      // harnesses that exit non-zero BY DESIGN on findings -- they are run
+      // and logged but never gate. A suite in neither list is fail-safe
+      // GATING with an explicit warning (never silently ignored).
+      const manifest = JSON.parse(fs.readFileSync('ci-suite-manifest.json', 'utf8'));
+      const gatingPrefixes = manifest.gating_suites || [];
+      const evidencePrefixes = manifest.evidence_only || [];
+      function classifySuite(p) {
+        if (evidencePrefixes.some(function (pre) { return p.startsWith(pre); })) return 'evidence_only';
+        if (gatingPrefixes.some(function (pre) { return p.startsWith(pre); })) return 'gating';
+        return 'unknown_gating';
+      }
+      const root = 'tests';
+      const suites = [];
+      (function walk(dir) {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, e.name).split(path.sep).join('/');
+          if (e.isDirectory()) walk(p);
+          else if (e.name === 'run-tests.js') suites.push(p);
+        }
+      })(root);
+      suites.sort();
+      console.log('Discovered ' + suites.length + ' suite(s):');
+      suites.forEach(function (s) { console.log('  ' + s + '  [' + classifySuite(s) + ']'); });
+      const failedGating = [];
+      const failedEvidence = [];
+      const unknownWarned = [];
+      for (const s of suites) {
+        const kind = classifySuite(s);
+        if (kind === 'unknown_gating') {
+          unknownWarned.push(s);
+          console.warn('WARNING -- ' + s + ' is not listed in ci-suite-manifest.json (gating_suites or evidence_only) -- treating as GATING (fail-safe).');
+        }
+        console.log('');
+        console.log('=== ' + s + ' [' + kind + '] ===');
+        const r = cp.spawnSync(process.execPath, [s], { stdio: 'inherit' });
+        if (r.status !== 0) {
+          if (kind === 'evidence_only') failedEvidence.push(s + ' (exit ' + r.status + ')');
+          else failedGating.push(s + ' (exit ' + r.status + ')');
+        }
+      }
+      console.log('');
+      if (failedEvidence.length) {
+        console.log('EVIDENCE-ONLY suite(s) reported findings (logged, does NOT gate merge):');
+        failedEvidence.forEach(function (f) { console.log('  ' + f); });
+      }
+      if (unknownWarned.length) {
+        console.log('Suite(s) absent from ci-suite-manifest.json (treated as gating, fail-safe):');
+        unknownWarned.forEach(function (f) { console.log('  ' + f); });
+      }
+      if (failedGating.length) {
+        console.error('');
+        console.error('FAILED gating suite(s):');
+        failedGating.forEach(function (f) { console.error('  ' + f); });
+        process.exit(1);
+      }
+      console.log('');
+      console.log('All gating suite(s) passed (' + suites.length + ' discovered, ' + failedEvidence.length + ' evidence-only failure(s) logged above, non-gating).');
+      "
+
+phase-a:linux:node18:
+  extends: .phase-a-selftests-and-suites
+  image: node:18
+
+phase-a:linux:node22:
+  extends: .phase-a-selftests-and-suites
+  image: node:22

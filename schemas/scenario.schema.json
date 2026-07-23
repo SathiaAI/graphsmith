@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/scenario.schema.json",
+  "title": "GraphSmith Scenario",
+  "description": "A single replayable scenario: fixture project + pinned seed + expected outcomes + hard-invariant checks. Verdicts derive from on-disk state, never from output strings.",
+  "type": "object",
+  "required": ["schema_version", "id", "shape", "tier", "seed", "fixture", "expected", "invariants"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "description": "Unique scenario identifier"
+    },
+    "shape": {
+      "type": "string",
+      "enum": ["pipeline", "fan-out", "manager+workers"],
+      "description": "Workflow topology shape"
+    },
+    "tier": {
+      "type": "string",
+      "enum": ["smoke", "regression", "stress"],
+      "description": "Corpus tier"
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Pinned seed for deterministic replay"
+    },
+    "failure_mode": {
+      "type": "string",
+      "enum": ["normal", "crash-resume", "halt-uncertain", "budget-fail"],
+      "description": "What failure class this scenario exercises"
+    },
+    "fixture": {
+      "type": "object",
+      "required": ["pipeline", "workers"],
+      "additionalProperties": false,
+      "description": "Inline project definition following scaffold conventions",
+      "properties": {
+        "pipeline": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["step", "worker"],
+            "additionalProperties": false,
+            "properties": {
+              "step": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+              "worker": { "type": "string", "pattern": "^[A-Za-z0-9._-]+\\.js$" }
+            }
+          }
+        },
+        "workers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["behavior"],
+            "additionalProperties": false,
+            "properties": {
+              "behavior": {
+                "type": "string",
+                "enum": ["ok", "delay", "fail", "intent-no-complete", "budget-exceed"],
+                "description": "Stub worker behavior for replay"
+              },
+              "delay_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Simulated work duration"
+              },
+              "fail_message": {
+                "type": "string",
+                "description": "Error message for fail behavior"
+              },
+              "budget_limit_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Budget limit for budget-exceed behavior"
+              }
+            }
+          }
+        },
+        "fan_out_groups": {
+          "type": "array",
+          "description": "For fan-out shape: groups of parallel steps",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["step", "worker"],
+              "additionalProperties": false,
+              "properties": {
+                "step": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+                "worker": { "type": "string", "pattern": "^[A-Za-z0-9._-]+\\.js$" }
+              }
+            }
+          }
+        },
+        "manager_decisions": {
+          "type": "array",
+          "description": "For manager+workers shape: decision table mapping outputs to next steps",
+          "items": {
+            "type": "object",
+            "required": ["after_step", "on_output", "next_step"],
+            "additionalProperties": false,
+            "properties": {
+              "after_step": { "type": "string" },
+              "on_output": { "type": "string" },
+              "next_step": { "type": "string" }
+            }
+          }
+        },
+        "crash_after_step": {
+          "type": "string",
+          "description": "For crash-resume: step name after which to simulate crash"
+        },
+        "budget_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For budget-fail: overall run budget in ms"
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "required": ["outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": ["complete", "halt", "budget-exceeded", "crash-recovered"],
+          "description": "Expected final outcome"
+        },
+        "completed_steps": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Steps expected to have checkpoints"
+        },
+        "halt_reason": {
+          "type": "string",
+          "description": "Expected halt reason (for halt outcomes)"
+        }
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "description": "Hard-invariant checks: verdicts from on-disk state",
+      "items": {
+        "type": "string",
+        "enum": [
+          "no-duplicate-effects",
+          "intent-before-effect",
+          "halt-on-intent-without-completion",
+          "all-checkpoints-fsyncd",
+          "no-step-reexecuted-after-resume"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,162 @@
+{
+  "schema_version": "1.0.0",
+  "policy_id": "syntactic-allowlist-v1",
+  "policy_kind": "syntactic-allowlist-fail-closed",
+  "is_proof": false,
+  "description": "Declarative, versioned risk-classification policy for GraphSmith repair auto-apply eligibility (plan §3.3). This is a SYNTACTIC ALLOWLIST, NOT a proof of safety: it can only demonstrate the ABSENCE of statically-detectable external-call and obfuscation constructs in a payload. Its role is to gate which repairs may be auto-applied without a human; every gate is fail-closed (any doubt => not eligible). Canonical source aligned with scripts/heal.js STATIC_UNPROVABLE_PATTERNS / EXTERNAL_CALL_PATTERNS and scripts/graphlint.js R5 (eval/exec/new-require ban) in spirit; heal.js and scaffold.js keep their own inline copies today and may converge onto this file in a later pass.",
+  "repair_class_taxonomy": {
+    "typed": {
+      "description": "Structured, non-executable repair surfaces: prompts, tunables, scenario data, config, and other declarative data files. Typed repairs are the ONLY repair_class that can ever be auto-apply-eligible, and only when capabilityScan also proves no_external_calls.",
+      "kinds": ["prompt", "tunables", "scenario", "config", "data"]
+    },
+    "code": {
+      "description": "Any executable surface, including the manager control-plane and any file GraphSmith cannot positively classify as typed (fail-closed default). code repairs are NEVER auto-apply-eligible in v0.2.0, regardless of capabilityScan result.",
+      "kinds": ["manager", "executable", "unknown-executable-surface"]
+    }
+  },
+  "manager_detection": {
+    "description": "Manager/control-plane paths are detected case-insensitively and path-normalized so MANAGER.js, Manager.js, nested/manager.JS, manager.cjs, manager.mjs etc. never fall through to 'regular code'. Manager targets are always repair_class=code, kind=manager, is_manager=true and are hard-refused for auto-apply upstream of this policy.",
+    "case_insensitive": true,
+    "exact_basenames": ["manager.js", "manager.cjs", "manager.mjs"],
+    "basename_regex": "(?:^|/)manager(?:\\.[^/]+)?\\.js$"
+  },
+  "classification_rules": [
+    {
+      "id": "manager",
+      "order": 1,
+      "when": "manager-path",
+      "repair_class": "code",
+      "kind": "manager",
+      "is_manager": true
+    },
+    {
+      "id": "executable-extension",
+      "order": 2,
+      "when": "extension-in",
+      "extensions": ["js", "cjs", "mjs", "ts", "tsx", "jsx"],
+      "case_insensitive": true,
+      "repair_class": "code",
+      "kind": "executable",
+      "is_manager": false
+    },
+    {
+      "id": "worker-prompt",
+      "order": 3,
+      "when": "path-contains-and-basename-suffix",
+      "path_contains": "/workers/",
+      "basename_suffix": ".prompt.md",
+      "repair_class": "typed",
+      "kind": "prompt",
+      "is_manager": false
+    },
+    {
+      "id": "tunables",
+      "order": 4,
+      "when": "basename-equals",
+      "basename": "tunables.json",
+      "repair_class": "typed",
+      "kind": "tunables",
+      "is_manager": false
+    },
+    {
+      "id": "scenario",
+      "order": 5,
+      "when": "basename-equals-or-path-regex-or-basename-suffix",
+      "basename_equals": "scenario.json",
+      "path_regex": "/scenarios/.+\\.json$",
+      "path_regex_flags": "i",
+      "basename_suffix": ".scenario.json",
+      "repair_class": "typed",
+      "kind": "scenario",
+      "is_manager": false
+    },
+    {
+      "id": "config",
+      "order": 6,
+      "when": "basename-suffix-or-basename-equals-or-basename-suffix",
+      "basename_suffix": ".config.json",
+      "basename_equals": "workflow.manifest.json",
+      "fallback_basename_suffix": ".json",
+      "repair_class": "typed",
+      "kind": "config",
+      "is_manager": false
+    },
+    {
+      "id": "data",
+      "order": 7,
+      "when": "basename-suffix-any",
+      "basename_suffixes": [".md", ".txt", ".yml", ".yaml"],
+      "repair_class": "typed",
+      "kind": "data",
+      "is_manager": false
+    },
+    {
+      "id": "default-unknown",
+      "order": 8,
+      "when": "default",
+      "repair_class": "code",
+      "kind": "unknown-executable-surface",
+      "is_manager": false,
+      "note": "Fail-closed default: anything not positively classified typed is treated as code so it is never auto-applied silently."
+    }
+  ],
+  "auto_apply_eligibility": {
+    "rule": "A repair is auto-apply-eligible ONLY when repair_class == 'typed' AND capabilityScan(payload).no_external_calls == true (no external-call pattern match AND no unprovable-construct match). Any repair_class == 'code' (including is_manager == true) is NEVER auto-apply-eligible in v0.2.0, regardless of scan result -- code always requires a human gate.",
+    "requires_repair_class": "typed",
+    "requires_no_external_calls": true,
+    "code_always_ineligible": true,
+    "manager_always_ineligible": true,
+    "is_proof": false
+  },
+  "external_call_patterns": {
+    "description": "Syntactic signals of an external effect (filesystem, network, process, dynamic module load, eval). ANY match => not statically provable free of external-call involvement. Sourced from scripts/heal.js EXTERNAL_CALL_PATTERNS.",
+    "patterns": [
+      { "id": "node-fs", "pattern": "\\brequire\\s*\\(\\s*['\"]fs['\"]\\s*\\)|\\bfs\\.(read|write|append|open|unlink|rm|mkdir|rename|create)", "flags": "" },
+      { "id": "node-net", "pattern": "\\brequire\\s*\\(\\s*['\"](http|https|net|tls|dns|dgram)['\"]\\s*\\)|\\b(https?|net|tls|dns)\\.", "flags": "" },
+      { "id": "node-child-process", "pattern": "\\brequire\\s*\\(\\s*['\"]child_process['\"]\\s*\\)|\\b(exec|execFile|spawn|fork)\\s*\\(", "flags": "" },
+      { "id": "fetch", "pattern": "\\bfetch\\s*\\(", "flags": "" },
+      { "id": "process-env-or-exit", "pattern": "\\bprocess\\.(env|exit|binding)\\b", "flags": "" },
+      { "id": "dynamic-require", "pattern": "\\brequire\\s*\\(\\s*[^'\"]", "flags": "" },
+      { "id": "eval-function", "pattern": "\\beval\\s*\\(|\\bnew\\s+Function\\s*\\(", "flags": "" },
+      { "id": "worker-threads", "pattern": "\\brequire\\s*\\(\\s*['\"]worker_threads['\"]\\s*\\)", "flags": "" }
+    ]
+  },
+  "unprovable_constructs": {
+    "description": "Constructs that DEFEAT static proof of external-call absence (obfuscation / indirection). ANY match => fail-closed NOT eligible, even with zero external_call_patterns matches. Sourced from scripts/heal.js STATIC_UNPROVABLE_PATTERNS.",
+    "patterns": [
+      { "id": "from-char-code", "pattern": "\\bString\\s*\\.\\s*from(?:CharCode|CodePoint)\\s*\\(", "flags": "" },
+      { "id": "hex-or-unicode-escape", "pattern": "\\\\x[0-9a-fA-F]{2}|\\\\u[0-9a-fA-F]{4}|\\\\u\\{[0-9a-fA-F]+\\}", "flags": "" },
+      { "id": "string-concat-assembly", "pattern": "(['\"])[^'\"]{1,24}\\1\\s*\\+\\s*(['\"])[^'\"]{1,24}\\2", "flags": "" },
+      { "id": "template-assembly", "pattern": "`[^`]*\\$\\{[^}]+\\}[^`]*`", "flags": "" },
+      { "id": "computed-member", "pattern": "(?:\\b[\\w$]+|\\))\\s*\\[\\s*(['\"`]).*?\\1\\s*\\]|(?:\\b[\\w$]+|\\))\\s*\\[\\s*[^\\]0-9\\s][^ \\]]*\\]", "flags": "" },
+      { "id": "dynamic-import", "pattern": "\\bimport\\s*\\(", "flags": "" },
+      { "id": "globalthis-indirection", "pattern": "\\bglobalThis\\s*[.\\[]", "flags": "" },
+      { "id": "function-constructor", "pattern": "\\bFunction\\s*\\(|\\bReflect\\s*\\.\\s*construct\\s*\\(", "flags": "" },
+      { "id": "bare-require-import-identifier", "pattern": "\\b(?:require|import)\\b", "flags": "" },
+      { "id": "bare-fetch-identifier", "pattern": "\\bfetch\\b", "flags": "" },
+      { "id": "bare-exec-family-identifier", "pattern": "\\b(?:exec|execSync|execFile\\w*|spawn\\w*)\\b", "flags": "" },
+      { "id": "bare-child-process-identifier", "pattern": "\\bchild_process\\b", "flags": "" },
+      { "id": "bare-eval-identifier", "pattern": "\\beval\\b", "flags": "" },
+      { "id": "bare-function-identifier", "pattern": "\\bFunction\\b", "flags": "" },
+      { "id": "bare-reflect-construct-identifier", "pattern": "\\bReflect\\s*\\.\\s*construct\\b", "flags": "" },
+      { "id": "bare-globalthis-identifier", "pattern": "\\bglobalThis\\b", "flags": "" },
+      { "id": "bare-xmlhttprequest-identifier", "pattern": "\\bXMLHttpRequest\\b", "flags": "" },
+      { "id": "bare-websocket-identifier", "pattern": "\\bWebSocket\\b", "flags": "" },
+      { "id": "bare-node-net-module-identifier", "pattern": "\\b(?:net|http|https|http2|dns|tls|dgram)\\b", "flags": "" }
+    ]
+  },
+  "bounds": [
+    {
+      "id": "max_scan_input_bytes",
+      "value": 2000000,
+      "unit": "bytes",
+      "description": "Upper bound on capabilityScan input size (UTF-8 byte length of the joined text). Input at or above this bound is treated fail-closed (reported as the synthetic unprovable construct 'input-too-large') rather than regex-scanned, to bound worst-case scan cost deterministically."
+    },
+    {
+      "id": "max_reported_matches",
+      "value": 32,
+      "unit": "count",
+      "description": "Cap on the number of distinct matched-pattern ids returned per array (external-call matches, unprovable-construct matches) in capabilityScan output. Matching still fails closed beyond the cap; this bounds output size only, in stable declared-pattern order."
+    }
+  ]
+}
