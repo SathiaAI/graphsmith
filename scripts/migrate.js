@@ -53,7 +53,7 @@ const SECRET_PATTERNS = [
   { name: "private-key", pattern: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g },
   { name: "aws-key", pattern: /(?:AKIA|ASIA)[A-Z0-9]{16}/g },
   { name: "github-token", pattern: /(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}/g },
-  { name: "bearer-token", pattern: /bearer\s+[A-Za-z0-9_\-\.]{20,}/gi },
+  { name: "bearer-token", pattern: /bearer\s*:?\s+[A-Za-z0-9_\-\.]{15,}/gi },
   { name: "jwt", pattern: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
   { name: "connection-string", pattern: /(?:mongodb|postgres|mysql|redis|sqlite):\/\/[^\s'"]{10,}/gi },
   { name: "oauth-secret", pattern: /(?:client[_-]?secret|oauth[_-]?secret)\s*[:=]\s*['"]?[A-Za-z0-9_\-\.]{16,}['"]?/gi },
@@ -386,6 +386,8 @@ function selftest() {
         { record_type: "evidence", run_id: "test-5", key: "AKIAIOSFODNN7EXAMPLE" },
         { record_type: "evidence", run_id: "test-6", conn: "mongodb://admin:password123@db.example.com:27017/mydb" },
         { record_type: "evidence", run_id: "test-7", bearer: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U" },
+        { record_type: "evidence", run_id: "test-8", secret_field: "Bearer: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" },
+        { record_type: "evidence", run_id: "test-9", header: "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U" },
       ];
 
       fs.writeFileSync(evidencePath,
@@ -423,6 +425,8 @@ function selftest() {
         "AKIAIOSFODNN7EXAMPLE",
         "admin:password123",
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "Bearer: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
       ];
       for (const secret of specificChecks) {
         check("redaction-specific-secret-gone-" + secret.substring(0, 20) + "...",
