@@ -1,0 +1,87 @@
+# GraphSmith Verify - GitLab CI Template
+#
+# This template provides equivalent GraphSmith verification functionality for GitLab CI.
+# Include it in your .gitlab-ci.yml as:
+#   include:
+#     - project: 'SathiaAI/graphsmith'
+#       ref: <full_commit_sha>
+#       file: 'templates/graphsmith.gitlab-ci.yml'
+#       # IMPORTANT: Consumers MUST pin by full commit SHA, never a tag
+#
+# The verification enforces deterministic merge boundaries for agent PRs by checking
+# integrity profiles. unavailable profiles do NOT fail the build but are annotated;
+# failed profiles DO fail the build.
+
+graphsmith-verify:
+  image: node:20
+  stage: test
+  script:
+    - echo "Running GraphSmith integrity check..."
+    - node scripts/verify.js --integrity
+    - echo "Running GraphSmith profile verification..."
+    - node scripts/verify.js --profiles > /tmp/profile-result.json
+    - |
+      # Determine verification status
+      FAIL_ON="${GRAPHSMITH_FAIL_ON:-unavailable-is-not-failure}"
+      REQUIRED_PROFILES="${GRAPHSMITH_PROFILES:-all-available}"
+
+      # If profiles input is 'all-available', we check all profiles
+      if [ "$REQUIRED_PROFILES" = "all-available" ]; then
+        PROFILES_TO_CHECK=$(node -e "const d=require('/tmp/profile-result.json'); console.log(Object.keys(d.profiles||{}).join(','))")
+      else
+        PROFILES_TO_CHECK="$REQUIRED_PROFILES"
+      fi
+
+      FAILED_COUNT=0
+      UNAVAILABLE_COUNT=0
+      TOTAL_COUNT=0
+
+      IFS=',' read -ra PROFS <<< "$PROFILES_TO_CHECK"
+      for prof in "${PROFS[@]}"; do
+        TOTAL_COUNT=$((TOTAL_COUNT + 1))
+        PROF_STATUS=$(node -e "const d=require('/tmp/profile-result.json'); console.log((d.profiles||{})['$prof']?.status||'unknown')")
+        
+        case "$PROF_STATUS" in
+          failed)
+            FAILED_COUNT=$((FAILED_COUNT + 1))
+            echo "ERROR: Profile '$prof' is FAILED"
+            ;;
+          unavailable)
+            UNAVAILABLE_COUNT=$((UNAVAILABLE_COUNT + 1))
+            if [ "$FAIL_ON" = "unavailable-is-not-failure" ]; then
+              echo "NOTICE: Profile '$prof' is UNAVAILABLE (annotated, not failed)"
+            else
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "ERROR: Profile '$prof' is UNAVAILABLE (configured as failure)"
+            fi
+            ;;
+          not-yet-implemented)
+            echo "NOTICE: Profile '$prof' is NOT YET IMPLEMENTED (annotated, not failed)"
+            ;;
+          passed)
+            echo "NOTICE: Profile '$prof' is PASSED"
+            ;;
+          *)
+            echo "WARNING: Profile '$prof' has unknown status: $PROF_STATUS"
+            ;;
+        esac
+      done
+
+      # Set overall status
+      if [ $FAILED_COUNT -gt 0 ]; then
+        echo "Verification FAILED: $FAILED_COUNT profile(s) failed out of $TOTAL_COUNT"
+        exit 1
+      elif [ $UNAVAILABLE_COUNT -gt 0 ]; then
+        echo "Verification PARTIAL: $UNAVAILABLE_COUNT profile(s) unavailable out of $TOTAL_COUNT (annotated, not failed)"
+      else
+        echo "Verification PASSED: all $TOTAL_COUNT profile(s) checked"
+      fi
+  artifacts:
+    paths:
+      - /tmp/profile-result.json
+    expire_in: 1 week
+    reports:
+      # This makes the JSON available as a test report in GitLab UI
+      junit: /tmp/profile-result.json
+  allow_failure: false
+  interruptible: true

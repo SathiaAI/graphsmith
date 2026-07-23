@@ -1,0 +1,122 @@
+name: 'GraphSmith Verify'
+description: 'Run GraphSmith verification profiles to enforce deterministic merge boundaries for agent PRs. Consumers MUST pin by full commit SHA, never a tag.'
+inputs:
+  profiles:
+    description: 'Which profiles to require (comma-separated). Default: all-available'
+    required: false
+    default: 'all-available'
+  node-version:
+    description: 'Node.js version to use'
+    required: false
+    default: '20'
+  working-directory:
+    description: 'Working directory relative to repo root'
+    required: false
+    default: '.'
+  fail-on:
+    description: 'Failure mode: "unavailable-is-not-failure" (default) means unavailable profiles do NOT fail the build but failed profiles DO'
+    required: false
+    default: 'unavailable-is-not-failure'
+outputs:
+  profile-result:
+    description: 'JSON result of profile verification for downstream badge steps'
+    value: ${{ steps.verify.outputs.profile-result }}
+  verification-status:
+    description: 'Overall verification status: passed, failed, or partial'
+    value: ${{ steps.verify.outputs.verification-status }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        path: ${{ inputs.working-directory }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Run integrity check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        node scripts/verify.js --integrity
+
+    - name: Run profile verification and parse results
+      id: verify
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        # Run profiles check and capture JSON output
+        RESULT=$(node scripts/verify.js --profiles)
+        echo "$RESULT" > /tmp/profile-result.json
+        echo "profile-result<<EOF" >> $GITHUB_OUTPUT
+        echo "$RESULT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        # Determine verification status
+        FAIL_ON="${{ inputs.fail-on }}"
+        REQUIRED_PROFILES="${{ inputs.profiles }}"
+
+        # Parse the JSON and check profile statuses
+        STATUS="passed"
+        FAILED_COUNT=0
+        UNAVAILABLE_COUNT=0
+        TOTAL_COUNT=0
+
+        # If profiles input is 'all-available', we check all profiles
+        # Otherwise, only check the specified ones
+        if [ "$REQUIRED_PROFILES" = "all-available" ]; then
+          # Extract all profile names from the JSON
+          PROFILES_TO_CHECK=$(echo "$RESULT" | node -e "const d=require('/tmp/profile-result.json'); console.log(Object.keys(d.profiles||{}).join(','))")
+        else
+          PROFILES_TO_CHECK="$REQUIRED_PROFILES"
+        fi
+
+        IFS=',' read -ra PROFS <<< "$PROFILES_TO_CHECK"
+        for prof in "${PROFS[@]}"; do
+          TOTAL_COUNT=$((TOTAL_COUNT + 1))
+          PROF_STATUS=$(echo "$RESULT" | node -e "const d=require('/tmp/profile-result.json'); console.log((d.profiles||{})['$prof']?.status||'unknown')")
+          
+          case "$PROF_STATUS" in
+            failed)
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "::error::Profile '$prof' is FAILED"
+              ;;
+            unavailable)
+              UNAVAILABLE_COUNT=$((UNAVAILABLE_COUNT + 1))
+              if [ "$FAIL_ON" = "unavailable-is-not-failure" ]; then
+                echo "::notice::Profile '$prof' is UNAVAILABLE (annotated, not failed)"
+              else
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                echo "::error::Profile '$prof' is UNAVAILABLE (configured as failure)"
+              fi
+              ;;
+            not-yet-implemented)
+              echo "::notice::Profile '$prof' is NOT YET IMPLEMENTED (annotated, not failed)"
+              ;;
+            passed)
+              echo "::notice::Profile '$prof' is PASSED"
+              ;;
+            *)
+              echo "::warning::Profile '$prof' has unknown status: $PROF_STATUS"
+              ;;
+          esac
+        done
+
+        # Set overall status
+        if [ $FAILED_COUNT -gt 0 ]; then
+          STATUS="failed"
+          echo "verification-status=failed" >> $GITHUB_OUTPUT
+          echo "::error::Verification failed: $FAILED_COUNT profile(s) failed out of $TOTAL_COUNT"
+          exit 1
+        elif [ $UNAVAILABLE_COUNT -gt 0 ]; then
+          STATUS="partial"
+          echo "verification-status=partial" >> $GITHUB_OUTPUT
+          echo "::notice::Verification partial: $UNAVAILABLE_COUNT profile(s) unavailable out of $TOTAL_COUNT (annotated, not failed)"
+        else
+          STATUS="passed"
+          echo "verification-status=passed" >> $GITHUB_OUTPUT
+          echo "::notice::Verification passed: all $TOTAL_COUNT profile(s) checked"
+        fi
