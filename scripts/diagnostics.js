@@ -220,11 +220,32 @@ function summarizeCompilerStats(records) {
   };
 }
 
-const KNOWN_EVENT_TYPES = [
-  "run_halt", "budget_breach", "tripwire", "retry_exhausted",
-  "step_failure", "corrupt_checkpoint", "lock_contention",
-  "scenario_fail", "human_correction", "adoption", "rollback",
-];
+/* Closed per-type code enum, mirrored from event-compiler.js's TYPE_CODES
+ * (the same lists watcher.js validates against). Duplicated as a local
+ * frozen constant rather than require()d, because event-compiler.js is not
+ * on this file's require allowlist and importing it would (correctly) trip
+ * the I4 egress self-scan. KNOWN_EVENT_TYPES is derived from its keys so the
+ * two can never drift apart. */
+const TYPE_CODES = Object.freeze({
+  run_halt:           ["unresolved_side_effect", "out_of_memory", "signal_termination", "watchdog_timeout", "orphaned_lock", "budget_exhausted", "unknown_halt"],
+  budget_breach:      ["max_wall_time", "max_token_count", "max_api_calls", "max_step_execution", "max_memory", "max_cost"],
+  tripwire:           ["unexpected_output_schema", "production_api_call", "file_access_outside_boundary", "network_access", "privilege_escalation", "env_access"],
+  retry_exhausted:    ["max_retries_step", "max_retries_run"],
+  step_failure:       ["worker_error", "module_not_found", "worker_timeout", "invalid_output", "side_effect_mismatch", "unhandled_exception"],
+  corrupt_checkpoint: ["unreadable_file", "schema_mismatch", "hash_mismatch", "truncated_file", "missing_file"],
+  lock_contention:    ["deadlock_detected", "lease_expired", "lock_file_corrupt", "owner_mismatch", "stale_lock"],
+  scenario_fail:      ["invariant_violation", "expected_outcome_mismatch", "scenario_crash", "infra_fault", "workflow_fault"],
+  human_correction:   ["gate3_prompt_adjustment", "data_correction", "config_update", "manual_override", "knob_tune"],
+  adoption:           ["doc_change", "knob_change", "prompt_change", "code_change", "config_only", "migration"],
+  rollback:           ["hard_failure", "human_decision", "pre_authorized", "flagged", "abandoned_window"],
+});
+
+const KNOWN_EVENT_TYPES = Object.keys(TYPE_CODES);
+
+/* Any code not in its type's closed enum is bucketed under this single safe
+ * key — the untrusted raw string is NEVER emitted as an object key (object
+ * keys are not reached by value redaction). */
+const INVALID_CODE_KEY = "invalid_code";
 
 function summarizeEventsByType(records) {
   const byType = {};
@@ -238,19 +259,41 @@ function summarizeEventsByType(records) {
       continue;
     }
     byType[type].count++;
-    const code = typeof record.code === "string" && record.code ? record.code : "unknown";
+    /* Validate code against its type's closed enum BEFORE using it as a key.
+     * A poisoned/malformed code from the untrusted events-proposer.jsonl (B4)
+     * must never survive verbatim as an aggregate key. */
+    const rawCode = typeof record.code === "string" ? record.code : "";
+    const code = TYPE_CODES[type].includes(rawCode) ? rawCode : INVALID_CODE_KEY;
     byType[type].by_code[code] = (byType[type].by_code[code] || 0) + 1;
   }
   return { byType, otherCount };
 }
 
-/* Detail mode: still aliases + closed enums + numbers ONLY — never raw
- * text. Mirrors the exact field set contract 07 guarantees is safe. */
+/* Detail mode: aliases + closed enums + numbers ONLY — never raw text.
+ *
+ * SOURCE IS UNTRUSTED. Every field here originates from
+ * .graphsmith/harvest/events-proposer.jsonl, a B4 boundary
+ * (contracts/04-trust-boundary-matrix.md): nothing signs it or proves it
+ * came from event-compiler.js's compile(). A poisoned or malformed record
+ * can smuggle a secret into ANY string field — including the structural
+ * identifier fields (code/type/fingerprint/run_ref/step_ref) that would
+ * otherwise look like trusted closed enums. So we treat NO key as
+ * structurally trusted: every string value of the assembled detail record,
+ * regardless of key name, is passed through the same F16 redaction the
+ * value fields use (migrate.js redactEvidenceRecord, which walks and
+ * redacts every nested string). This is defense in depth local to the
+ * detail path — it does not rely on the outer report-wide redaction pass
+ * remembering to cover detail. Redaction is idempotent, so the later
+ * report-wide pass over the same values is harmless.
+ *
+ * evidence_ref stays an ALIAS only (the events-evidence.jsonl real-value
+ * map is never opened by this file); like every other field its alias is
+ * still redaction-eligible here. */
 function buildDetailEvents(records) {
   return records
     .map((record) => {
       if (!record || typeof record !== "object") return null;
-      return {
+      const detail = {
         seq: Number.isSafeInteger(record.seq) ? record.seq : null,
         type: typeof record.type === "string" ? record.type : null,
         code: typeof record.code === "string" ? record.code : null,
@@ -260,6 +303,9 @@ function buildDetailEvents(records) {
         fingerprint: typeof record.fingerprint === "string" ? record.fingerprint : null,
         counters: record.counters && typeof record.counters === "object" ? record.counters : {},
       };
+      /* Redact EVERY string value regardless of key — no structural-field
+       * allowlist, because the source is untrusted. */
+      return migrateLib.redactEvidenceRecord(detail);
     })
     .filter(Boolean);
 }
@@ -488,12 +534,36 @@ function selftest() {
      * prove the F16 redaction layer catches it even if it ever slipped in
      * upstream — the real end-to-end pipeline, not a unit-tested helper. */
     const plantedSecret = "sk-plantedSECRETvalue1234567890abcdef";
+
+    /* PLANTED STRUCTURAL-FIELD SECRETS: a poisoned harvest record whose
+     * "structural" identifier fields (code / fingerprint / run_ref /
+     * step_ref) each carry a real, pattern-matching secret. These fields
+     * used to look like trusted closed enums; because events-proposer.jsonl
+     * is an untrusted B4 source, they must be redacted like any value field.
+     * The probe uses an UNKNOWN event type so the code secret is isolated to
+     * the detail path (a known type would surface code as an aggregate
+     * by_code object KEY — a separate documented aggregate limitation, out
+     * of scope for this detail-redaction proof). */
+    const detailCodeSecret = "AKIA1234567890ABCDEF"; /* aws-key */
+    const detailFpSecret = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.sigABCDEF1234567890"; /* jwt */
+    const detailRunSecret = "ghp_selftestRUNref1234567890abcdef"; /* github-token */
+    const detailStepSecret = "sk-selftestSTEPref1234567890"; /* opaque-secret-prefix */
+
+    /* PLANTED AGGREGATE-KEY SECRET: a poisoned `code` on a KNOWN event type.
+     * `code` is used as an object KEY in by_code; object keys are not reached
+     * by value redaction, so an out-of-enum code must be bucketed under a
+     * single safe key ("invalid_code") and never emitted verbatim. Uses type
+     * step_failure (its count is not asserted elsewhere in this selftest). */
+    const aggCodeSecret = "AKIA9999888877776666"; /* aws-key, not in any code enum */
+
     fs.writeFileSync(
       path.join(harvestDir, "events-proposer.jsonl"),
       [
         { seq: 0, type: "run_halt", code: "unknown_halt", run_ref: "r01", step_ref: "s00", evidence_ref: "p01", fingerprint: "fp01", counters: { retries_attempted: 0, steps_completed: 1, steps_remaining: 0 } },
         { seq: 1, type: "tripwire", code: "network_access", run_ref: "r01", step_ref: "s01", evidence_ref: "p02", fingerprint: "fp02", counters: { tripwire_index: 0, total_tripwires: 1 } },
         { seq: 2, type: "budget_breach", code: "max_wall_time", run_ref: "r02", step_ref: plantedSecret, evidence_ref: "p03", fingerprint: "fp03", counters: { elapsed_ms: 10, budget_ms: 5, overshoot_ms: 5 } },
+        { seq: 3, type: "corrupt_detail_probe", code: detailCodeSecret, run_ref: detailRunSecret, step_ref: detailStepSecret, evidence_ref: "p04", fingerprint: detailFpSecret, counters: {} },
+        { seq: 4, type: "step_failure", code: aggCodeSecret, run_ref: "r05", step_ref: "s05", evidence_ref: "p05", fingerprint: "fp05", counters: {} },
       ]
         .map((r) => JSON.stringify(r))
         .join("\n") + "\n"
@@ -575,6 +645,33 @@ function selftest() {
       JSON.stringify(resultWrite.report).indexOf(plantedSecret) === -1
     );
 
+    /* --- PROOF: structural identifier fields of an untrusted detail record
+     * (code / fingerprint / run_ref / step_ref) are redacted, not trusted
+     * verbatim. None of the planted secrets survive into the written file. --- */
+    check(
+      "detail-structural-fields-secrets-do-not-survive",
+      !fileContent.includes(detailCodeSecret) &&
+        !fileContent.includes(detailFpSecret) &&
+        !fileContent.includes(detailRunSecret) &&
+        !fileContent.includes(detailStepSecret),
+      `code=${fileContent.includes(detailCodeSecret)} fp=${fileContent.includes(detailFpSecret)} run=${fileContent.includes(detailRunSecret)} step=${fileContent.includes(detailStepSecret)}`
+    );
+
+    const probeEvent =
+      resultWrite.report.detail &&
+      Array.isArray(resultWrite.report.detail.events)
+        ? resultWrite.report.detail.events.find((e) => e && e.seq === 3)
+        : null;
+    check(
+      "detail-structural-fields-replaced-with-redacted-token",
+      !!probeEvent &&
+        probeEvent.code === "[REDACTED]" &&
+        probeEvent.fingerprint === "[REDACTED]" &&
+        probeEvent.run_ref === "[REDACTED]" &&
+        probeEvent.step_ref === "[REDACTED]",
+      probeEvent ? JSON.stringify(probeEvent) : "probe detail record (seq=3) missing"
+    );
+
     /* --- PROOF: raw prompt / evidence-map real values never exported --- */
     check(
       "raw-prompt-canary-excluded",
@@ -607,6 +704,24 @@ function selftest() {
     /* --- PROOF: default (no --include-detail) mode has no detail field --- */
     const resultDefault = exportDiagnostics(root, { confirmWrite: false, outPath, log: () => {} });
     check("default-mode-no-detail-field", resultDefault.report.detail === undefined);
+
+    /* --- PROOF: a poisoned `code` on a known event type is NOT emitted as a
+     * verbatim aggregate object key in DEFAULT (aggregate) mode — it is
+     * bucketed under "invalid_code". Object keys are not reached by value
+     * redaction, so this must be enforced by enum validation, not redaction. --- */
+    const aggByCode =
+      resultDefault.report.event_counters &&
+      resultDefault.report.event_counters.by_type &&
+      resultDefault.report.event_counters.by_type.step_failure
+        ? resultDefault.report.event_counters.by_type.step_failure.by_code
+        : {};
+    check(
+      "aggregate-poisoned-code-not-emitted-as-key",
+      Object.prototype.hasOwnProperty.call(aggByCode, "invalid_code") &&
+        !Object.prototype.hasOwnProperty.call(aggByCode, aggCodeSecret) &&
+        JSON.stringify(resultDefault.report).indexOf(aggCodeSecret) === -1,
+      `by_code_keys=${JSON.stringify(Object.keys(aggByCode))}`
+    );
 
     return {
       schema_version: SCHEMA_VERSION,
