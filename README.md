@@ -6,13 +6,13 @@
 
 **Describe the job. Approve the plan. Get an AI workflow that's *proven* to survive failure — before you ever trust it.**
 
-[![Adversarially reviewed](https://img.shields.io/badge/adversarially%20reviewed-GPT--5.1%20%C2%B7%20Gemini%202.5%20Pro%20%C2%B7%20DeepSeek%20R1-E8850C?labelColor=0D1117)](docs/reviews/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases) [![CI](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml/badge.svg)](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml)
+[![Website](https://img.shields.io/badge/Website-graphsmith.ai-F5A623?labelColor=2B1D18)](https://graphsmith.ai) [![Docs](https://img.shields.io/badge/Docs-graphsmith.wiki-7B2230?labelColor=2B1D18)](https://graphsmith.wiki)[![Adversarially reviewed](https://img.shields.io/badge/adversarially%20reviewed-GPT--5.1%20%C2%B7%20Gemini%202.5%20Pro%20%C2%B7%20DeepSeek%20R1-E8850C?labelColor=0D1117)](docs/reviews/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases) [![CI](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml/badge.svg)](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml)
 
 <a href="docs/reviews/"><img src="assets/adversarial-review-badge.png" alt="Adversarially reviewed by GPT-5.1 · Gemini 2.5 Pro · DeepSeek R1 — reports in the repo" width="820"></a>
 
 Works identically in Claude Code, Codex CLI, Gemini CLI, Cursor, Windsurf / Devin Desktop, Hermes, and VS Code Copilot via the [Agent Skills open standard](https://agentskills.io). One install, every agent.
 
-[Reproduce it](https://sathiaai.github.io/graphsmith/) · [Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
+[Reproduce it](https://graphsmith.ai) · [Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
 
 <a href="https://sathiaai.github.io/graphsmith/"><img src="assets/graphsmith-demo.gif" alt="GraphSmith in motion — an agent workflow builds, is killed mid-run, and resumes from its last checkpoint instead of restarting; then the three failure modes it fixes — amnesia, duplication, hallucination — and a live proof run" width="760"></a>
 
