@@ -91,12 +91,15 @@ function validateCiUrl(value) {
   if (value == null) return false;
   const s = String(value);
   if (s !== s.trim()) return false;              // leading/trailing whitespace -> reject
-  if (/[\x00-\x1f]/.test(s)) return false;       // embedded control chars -> reject
-  const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(s); // scheme immediately before ':'
-  if (!m) return false;                          // no scheme (relative) -> reject
+  if (/[\x00-\x1f\x7f]/.test(s)) return false;   // ANY control char (null, newline, tab, DEL) -> reject
+  // scheme MUST be http/https AND be followed by a non-empty authority. The
+  // authority is everything after "://" up to the first "/", "?" or "#".
+  const m = /^(https?):\/\/([^\/?#]*)/i.exec(s);
+  if (!m) return false;                          // wrong scheme / relative / no "://" -> reject
   const scheme = m[1].toLowerCase();
   if (scheme !== 'http' && scheme !== 'https') return false;
-  return /^https?:\/\//i.test(s);                // require scheme://authority form
+  if (!m[2] || m[2].length === 0) return false;  // bare "http://" / "https://" (no host) -> reject
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,11 +229,15 @@ function buildModel(reports, opts) {
   else if (anyStale) { overallColor = COLORS.stale; overallState = 'stale'; }
   else { overallColor = COLORS.grey; overallState = 'partial'; }
 
-  const ciBounded = opts.ciRunUrl ? safeRaw(opts.ciRunUrl, BOUND.url) : null;
+  // Validate the RAW url (so control chars are seen before safeRaw neutralizes
+  // them); render the bounded/escaped form. A url is emitted as a live href
+  // ONLY when the raw value passes scheme + authority + control-char checks.
+  const ciRaw = opts.ciRunUrl != null ? String(opts.ciRunUrl) : null;
+  const ciBounded = ciRaw != null ? safeRaw(ciRaw, BOUND.url) : null;
   return { ref, maxAgeDays, platforms, profiles, anyStale, overallColor, overallState,
     verifierVersions: uniq(platforms.map((p) => p.verifier_version)),
     ciRunUrl: ciBounded,
-    ciRunUrlIsLink: validateCiUrl(ciBounded) };
+    ciRunUrlIsLink: validateCiUrl(ciRaw) };
 }
 
 // Bound + control-strip WITHOUT xml-escaping (for descriptor JSON values, which
@@ -593,6 +600,37 @@ function selftest() {
   assert(sGood.indexOf('&amp;y=2') !== -1, 'ampersand in href is xml-escaped inside the attribute', log);
   assert(buildDescriptor(mGood).ci_run_url_is_link === true && buildDescriptor(buildModel([mkReport('linux', mixed, FRESH_DATE)], { maxAgeDays: 30, now: REF, ciRunUrl: 'javascript:alert(1)' })).ci_run_url_is_link === false, 'descriptor ci_run_url_is_link reflects scheme validity', log);
 
+  // Case 5c: MALFORMED http(s) urls must NOT be linked (belt-and-suspenders).
+  //   - bare "http://" / "https://" (no host/authority)
+  //   - any url carrying a control char (null byte / newline / tab / DEL)
+  const malformed = [
+    'http://',                         // no authority
+    'https://',                        // no authority
+    'http://?x=1',                     // empty authority before query
+    'http://#frag',                    // empty authority before fragment
+    'https://a\x00b/run',              // embedded null byte
+    'https://a\nb/run',                // embedded newline
+    'https://a\tb/run',                // embedded tab
+    'https://a\x7fb/run',              // embedded DEL
+  ];
+  for (const u of malformed) {
+    const mm = buildModel([mkReport('linux', mixed, FRESH_DATE)], { maxAgeDays: 30, now: REF, ciRunUrl: u });
+    const s = renderSVG(mm);
+    assert(mm.ciRunUrlIsLink === false, `malformed ci-run-url NOT linkable: ${JSON.stringify(u)}`, log);
+    assert(s.indexOf('<a ') === -1, `no <a> wrapper for malformed url ${JSON.stringify(u)}`, log);
+    assert(validateCiUrl(u) === false, `validateCiUrl() returns falsy for ${JSON.stringify(u)}`, log);
+  }
+  // A well-formed https URL to ANY host still links (hosts are NOT allowlisted).
+  const mHost = buildModel([mkReport('linux', mixed, FRESH_DATE)], { maxAgeDays: 30, now: REF, ciRunUrl: 'https://good.example/run/1' });
+  assert(mHost.ciRunUrlIsLink === true, 'well-formed https to any host IS linkable', log);
+  assert(renderSVG(mHost).indexOf('<a xlink:href="https://good.example/run/1"') !== -1, 'https://good.example/run/1 renders as a live link', log);
+  assert(validateCiUrl('https://good.example/run/1') === true && validateCiUrl('http://ci.internal:8080/x') === true, 'validateCiUrl() returns truthy for normal http(s) urls (any host/port)', log);
+
+  // Case 5d: validateCiUrl is EXPORTED (unit-testable by external suites).
+  assert(typeof module.exports.validateCiUrl === 'function', 'validateCiUrl is exported', log);
+  assert(module.exports.validateCiUrl === validateCiUrl, 'exported validateCiUrl is the same function', log);
+  assert(module.exports.validateCiUrl('http://') === false && module.exports.validateCiUrl('javascript:alert(1)') === false && module.exports.validateCiUrl('https://good.example/x') === true, 'exported validateCiUrl behaves correctly (falsy malformed, truthy normal)', log);
+
   // Case 6: no banned honest-language words in any emitted artifact.
   const bundle = (JSON.stringify(buildDescriptor(buildModel([linuxRep, winRep], { maxAgeDays: 30, now: REF }))) + '\n' +
     renderSVG(buildModel([linuxRep, winRep], { maxAgeDays: 30, now: REF })) + '\n' +
@@ -606,9 +644,12 @@ function selftest() {
   return log.failed ? 1 : 0;
 }
 
+// Exports assigned BEFORE the CLI runner so they exist even when this file is
+// executed directly (main() calls process.exit, so a bottom-of-file assignment
+// would never run under `node scripts/badge.js`).
+module.exports = { buildModel, buildDescriptor, renderSVG, freshnessOf, effectiveStatus, enumStatus, validateCiUrl, xmlEscape, safe };
+
 if (require.main === module) {
   try { process.exit(main()); }
   catch (e) { process.stderr.write(`badge: ${e && e.message ? e.message : e}\n`); process.exit(2); }
 }
-
-module.exports = { buildModel, buildDescriptor, renderSVG, freshnessOf, effectiveStatus, enumStatus, xmlEscape, safe };
