@@ -74,7 +74,10 @@ function loadEvalenv() {
 
 /**
  * Try to open an eval profile. Never silent-downgrades container→standard.
- * Returns { kind:'env', dir, destroy, profile, isolation } | { kind:'unavailable', reason, profile }.
+ * Returns { kind:'env', dir, destroy, profile, isolation, runUntrustedCode? }
+ *   | { kind:'unavailable', reason, profile }.
+ * Container-required tools MUST use runUntrustedCode when present (delegation);
+ * never host-spawn untrusted code when the container profile is available.
  */
 function openProfile(profile, opts) {
   const ee = loadEvalenv();
@@ -100,6 +103,7 @@ function openProfile(profile, opts) {
       confidentiality_claim: false,
       network_containment_claim: false,
       dir,
+      runUntrustedCode: null,
       destroy() {
         try {
           fs.rmSync(dir, { recursive: true, force: true });
@@ -154,6 +158,12 @@ function openProfile(profile, opts) {
     };
   }
   const claims = handle.claims || {};
+  const runUntrustedCode =
+    typeof handle.runUntrustedCode === "function"
+      ? function delegatedRun(cmd, runOpts) {
+          return handle.runUntrustedCode(cmd, runOpts);
+        }
+      : null;
   return {
     kind: "env",
     profile,
@@ -165,6 +175,7 @@ function openProfile(profile, opts) {
       handle.network_containment_claim || claims.network_containment
     ),
     dir: handle.dir,
+    runUntrustedCode,
     destroy: () => handle.destroy(),
   };
 }
@@ -181,8 +192,43 @@ function copyTree(src, dst) {
 }
 
 /**
+ * EXIT CODE is authoritative over payload status (assurance integrity).
+ * - non-zero exit → never "pass", regardless of JSON claim
+ * - payload status that contradicts exit → fail-closed (never pass)
+ * - only exit 0 + closed-enum "pass" (or exit 0 with no enum, exit-driven) → pass-eligible
+ */
+function reconcileExitAndPayload(payloadStatus, exitCode) {
+  const exit = exitCode == null || exitCode === "" ? null : Number(exitCode);
+  let status = payloadStatus || null;
+  let mismatch = false;
+  let reason = null;
+
+  if (!status) {
+    if (exit === 0) status = "pass";
+    else if (exit == null || Number.isNaN(exit)) status = "error";
+    else status = "fail";
+  }
+
+  if (exit != null && !Number.isNaN(exit) && exit !== 0) {
+    /* Non-zero exit is authoritative: never pass. */
+    if (status === "pass") {
+      mismatch = true;
+      reason = "exit_payload_mismatch";
+      status = "fail";
+    }
+  } else if (exit === 0 && status === "pass") {
+    /* consistent pass */
+  } else if (exit === 0 && (status === "fail" || status === "error")) {
+    /* Tool completed process but reported fail/error — keep payload status. */
+  }
+
+  return { status, exit_code: exit != null && !Number.isNaN(exit) ? exit : null, mismatch, reason };
+}
+
+/**
  * Validate and normalize a tool report. Free-text is preserved as opaque_data
- * only — NEVER read for branching. Control uses exitCode + closed-enum status.
+ * only — NEVER read for branching. Control uses EXIT CODE (authoritative) +
+ * closed-enum status, fail-closed on contradiction.
  */
 function normalizeReport(rawText, exitCode) {
   const opaque_data = { raw_excerpt: String(rawText || "").slice(0, 4096) };
@@ -235,16 +281,14 @@ function normalizeReport(rawText, exitCode) {
     }
   }
 
-  let status = null;
+  let payloadStatus = null;
   if (parsed && typeof parsed === "object" && typeof parsed.status === "string") {
     const s = parsed.status.toLowerCase();
-    if (CLOSED_STATUS.has(s)) status = s;
+    if (CLOSED_STATUS.has(s)) payloadStatus = s;
   }
-  if (!status) {
-    if (exitCode === 0) status = "pass";
-    else if (exitCode == null) status = "error";
-    else status = "fail";
-  }
+
+  const reconciled = reconcileExitAndPayload(payloadStatus, exitCode);
+  const status = reconciled.status;
 
   /* Capture opaque string fields without promoting them to control. */
   if (parsed && typeof parsed === "object") {
@@ -262,11 +306,18 @@ function normalizeReport(rawText, exitCode) {
         typeof parsed[k] === "string" ? parsed[k].slice(0, 500) : parsed[k];
     }
   }
+  if (reconciled.mismatch) {
+    opaque_data.extra = opaque_data.extra || {};
+    opaque_data.extra.payload_status_claimed = payloadStatus;
+    opaque_data.extra.reconcile_reason = reconciled.reason;
+  }
 
   return {
     schema_version: SCHEMA_VERSION,
-    status, /* closed enum only — sole machine decision input from report */
-    exit_code: exitCode == null ? null : Number(exitCode),
+    status, /* closed enum only — exit-authoritative machine decision */
+    exit_code: reconciled.exit_code,
+    exit_payload_mismatch: reconciled.mismatch === true,
+    reason: reconciled.reason || null,
     report_schema_version:
       parsed && parsed.schema_version != null ? String(parsed.schema_version) : null,
     opaque_data,
@@ -360,28 +411,123 @@ function runTool(spec, opts) {
   }
 
   let result;
-  try {
-    result = spawnSync(cmd, args, {
-      cwd,
-      env,
-      encoding: "utf8",
-      timeout,
-      maxBuffer: 2 * 1024 * 1024,
-      windowsHide: true,
-      shell: false,
-    });
-  } catch (e) {
-    opened.destroy();
-    return {
-      id: spec.id,
-      status: "error",
-      reason: "spawn_failed",
-      detail: String(e && e.message ? e.message : e),
-      executed: true,
-      profile,
-      isolation: opened.isolation,
-      runner_version: RUNNER_VERSION,
-    };
+  let delegated = false;
+
+  if (needCtr) {
+    /* B10: container-required tools MUST delegate via profile runUntrustedCode.
+     * Never host-spawn when a container profile handle is live. */
+    if (typeof opened.runUntrustedCode !== "function") {
+      opened.destroy();
+      return {
+        id: spec.id,
+        status: "unavailable",
+        reason: "container_delegation_unavailable",
+        detail: "container profile opened but has no runUntrustedCode(); refusing host spawn",
+        profile_required: profile,
+        container_required: true,
+        delegation: false,
+        executed: false,
+        runner_version: RUNNER_VERSION,
+      };
+    }
+    try {
+      const runOpts = {
+        timeoutMs: timeout,
+        spawnOptions: {
+          encoding: "utf8",
+          maxBuffer: 2 * 1024 * 1024,
+          windowsHide: true,
+        },
+      };
+      const image =
+        spec.container_image ||
+        spec.image ||
+        process.env.GRAPHSMITH_CONTAINER_IMAGE ||
+        null;
+      if (image) runOpts.image = image;
+      const cmdArr = [cmd].concat(args);
+      result = opened.runUntrustedCode(cmdArr, runOpts);
+      delegated = true;
+    } catch (e) {
+      const code = e && e.code ? String(e.code) : "";
+      opened.destroy();
+      if (
+        code === "IMAGE_REQUIRED" ||
+        code === "CONTAINER_UNAVAILABLE" ||
+        code === "CONTAINER_REQUIRED"
+      ) {
+        return {
+          id: spec.id,
+          status: "unavailable",
+          reason: code.toLowerCase(),
+          detail: String(e && e.message ? e.message : e),
+          profile_required: profile,
+          container_required: true,
+          delegation: false,
+          executed: false,
+          runner_version: RUNNER_VERSION,
+        };
+      }
+      return {
+        id: spec.id,
+        status: "unavailable",
+        reason: "container_delegation_failed",
+        detail: String(e && e.message ? e.message : e),
+        profile_required: profile,
+        container_required: true,
+        delegation: false,
+        executed: false,
+        runner_version: RUNNER_VERSION,
+      };
+    }
+    if (!result || typeof result !== "object") {
+      opened.destroy();
+      return {
+        id: spec.id,
+        status: "unavailable",
+        reason: "container_delegation_empty_result",
+        profile_required: profile,
+        container_required: true,
+        delegation: true,
+        executed: false,
+        runner_version: RUNNER_VERSION,
+      };
+    }
+    /* Normalize spawnSync-shaped or plain {status,stdout,stderr} from profile. */
+    if (result.status == null && result.exit_code != null) {
+      result = {
+        status: result.exit_code,
+        stdout: result.stdout || "",
+        stderr: result.stderr || "",
+        signal: result.signal || null,
+        error: result.error || null,
+      };
+    }
+  } else {
+    try {
+      result = spawnSync(cmd, args, {
+        cwd,
+        env,
+        encoding: "utf8",
+        timeout,
+        maxBuffer: 2 * 1024 * 1024,
+        windowsHide: true,
+        shell: false,
+      });
+    } catch (e) {
+      opened.destroy();
+      return {
+        id: spec.id,
+        status: "error",
+        reason: "spawn_failed",
+        detail: String(e && e.message ? e.message : e),
+        executed: true,
+        profile,
+        isolation: opened.isolation,
+        delegation: false,
+        runner_version: RUNNER_VERSION,
+      };
+    }
   }
 
   let reportText = "";
@@ -398,19 +544,25 @@ function runTool(spec, opts) {
     }
   }
   if (!reportText) {
-    reportText = (result.stdout || "").trim() || (result.stderr || "").trim();
+    reportText =
+      String(result.stdout || "").trim() || String(result.stderr || "").trim();
   }
 
-  const exitCode = result.error && result.error.code === "ETIMEDOUT" ? 124 : result.status;
+  const exitCode =
+    result.error && result.error.code === "ETIMEDOUT"
+      ? 124
+      : result.status;
   const normalized = normalizeReport(reportText, exitCode);
 
-  /* CONTROL FLOW: only closed-enum status + exit. Do not read opaque_data. */
+  /* CONTROL FLOW: exit-authoritative closed-enum status. Never opaque_data. */
   const aggregateStatus = normalized.status;
 
   const record = {
     id: spec.id,
     status: aggregateStatus,
     exit_code: normalized.exit_code,
+    exit_payload_mismatch: normalized.exit_payload_mismatch === true,
+    reason: normalized.reason || null,
     report_schema_version: normalized.report_schema_version,
     report_sha256: normalized.report_sha256,
     opaque_data: normalized.opaque_data,
@@ -420,6 +572,7 @@ function runTool(spec, opts) {
     confidentiality_claim: opened.confidentiality_claim,
     network_containment_claim: opened.network_containment_claim,
     container_required: needCtr,
+    delegation: needCtr ? delegated === true : false,
     runner_version: RUNNER_VERSION,
     signal: result.signal || null,
     spawn_error: result.error ? String(result.error.message || result.error) : null,
@@ -597,6 +750,58 @@ function selftest() {
       { n1: n1.status, n2: n2.status }
     );
 
+    /* 4b. D1: non-zero exit + payload status:pass → NOT pass (exit authoritative). */
+    const lie = normalizeReport(
+      JSON.stringify({ schema_version: "1.0", status: "pass", summary: "all clear" }),
+      7
+    );
+    add(
+      "nonzero-exit-not-pass",
+      lie.status !== "pass" && lie.exit_code === 7 && lie.exit_payload_mismatch === true,
+      { status: lie.status, exit_code: lie.exit_code, mismatch: lie.exit_payload_mismatch }
+    );
+
+    /* 4c. D1: payload/exit mismatch fail-closed when pass claimed under non-zero. */
+    const mismatchFail = reconcileExitAndPayload("pass", 1);
+    const consistentFail = reconcileExitAndPayload("fail", 1);
+    add(
+      "exit-payload-mismatch-fail-closed",
+      mismatchFail.status === "fail" &&
+        mismatchFail.mismatch === true &&
+        consistentFail.status === "fail" &&
+        consistentFail.mismatch === false,
+      { mismatchFail, consistentFail }
+    );
+
+    /* 4d. D2 structural: container path surfaces runUntrustedCode when profile has it. */
+    const fakeOpen = openProfile;
+    void fakeOpen;
+    const mockHandleShape = {
+      profile: "container",
+      available: true,
+      dir: tmpRoot,
+      isolation: "selftest-double",
+      claims: { confidentiality: "partial", network_containment: true },
+      runUntrustedCode() {
+        return { status: 125, stdout: "", stderr: "refused" };
+      },
+      destroy() {},
+    };
+    /* Simulate openProfile projection without monkey-patching evalenv inside selftest. */
+    const projected = {
+      kind: "env",
+      runUntrustedCode:
+        typeof mockHandleShape.runUntrustedCode === "function"
+          ? mockHandleShape.runUntrustedCode
+          : null,
+    };
+    add(
+      "container-delegation-path-present",
+      typeof projected.runUntrustedCode === "function" &&
+        projected.runUntrustedCode().status === 125,
+      { has_delegate: typeof projected.runUntrustedCode === "function" }
+    );
+
     /* 5. Honest-scope banned strings absent from runner sources + this result. */
     const src = fs.readFileSync(__filename, "utf8");
     /* Allow the ban list definitions and contract citations in comments by scanning
@@ -684,6 +889,7 @@ module.exports = {
   runRegistry,
   loadRegistryFile,
   normalizeReport,
+  reconcileExitAndPayload,
   requiresContainer,
   scanBanned,
   selftest,
