@@ -11,3 +11,6 @@ node_modules/
 # Internal v0.2.0 build planning — never publish to the public repo
 .plans/
 BUILD-LEDGER.md
+
+# Ephemeral tester run-outputs (regenerated every run)
+tests/**/last-run.json

@@ -60,6 +60,43 @@
     {
       "file": "e8d-multiline-template.js",
       "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "e9a-eval-ban.js",
+      "mustFind": "R5",
+      "atLine": 3,
+      "maxCount": 1
+    },
+    {
+      "file": "e9b-function-ctor.js",
+      "mustFind": "R5",
+      "atLine": 3,
+      "maxCount": 1
+    },
+    {
+      "file": "e9c-exec-spawn.js",
+      "mustFind": "R5",
+      "atLine": 4,
+      "maxCount": 1
+    },
+    {
+      "file": "e9d-new-require.js",
+      "mustFind": "R5",
+      "maxCount": 2
+    },
+    {
+      "file": "e9e-clean-r5.js",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "adapters/e9f-capable.js",
+      "mustBeCleanAtOrAbove": "REVIEW"
+    },
+    {
+      "file": "adapters/e9g-no-capability.js",
+      "mustFind": "R6",
+      "atLine": 1,
+      "maxCount": 1
     }
   ]
 }
