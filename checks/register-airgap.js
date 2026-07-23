@@ -20,6 +20,19 @@ const crypto = require("crypto");
 
 const SIG_ALGOS = new Set(["ed25519", "ecdsa-p256-sha256", "rsa-pss-sha256"]);
 const HEX64 = /^[0-9a-f]{64}$/;
+const SIG_KEYS = ["schema_version", "algo", "signer", "manifest_sha256", "value", "delivery"];
+// A declared algo MUST match the actual key type — otherwise crypto.verify auto-detects
+// from the key and an algo mislabel slips through (algorithm-confusion, Codex D1/D2).
+const ALGO_KEYTYPE = { "ed25519": ["ed25519"], "ecdsa-p256-sha256": ["ec"], "rsa-pss-sha256": ["rsa", "rsa-pss"] };
+
+/* Strict shape: exactly the allowed OWN keys — rejects extra fields (additionalProperties:false)
+ * and inherited/prototype-supplied fields (own-property required). */
+function strictSigShape(sig) {
+  if (!sig || typeof sig !== "object") return false;
+  for (const k of SIG_KEYS) if (!Object.prototype.hasOwnProperty.call(sig, k)) return false;
+  for (const k of Object.keys(sig)) if (SIG_KEYS.indexOf(k) === -1) return false;
+  return true;
+}
 
 /* Deterministic canonical JSON (RFC 8785-ish): recursively sorted keys, compact.
  * No clock/random. Used to hash the manifest object stably across producers. */
@@ -51,6 +64,9 @@ function verifySignatureValue(algo, publicKeyPem, manifestSha256Hex, valueB64) {
     } catch {
       return false;
     }
+    // Enforce declared-algo === key-type (defeats algorithm confusion).
+    const allowedTypes = ALGO_KEYTYPE[algo];
+    if (!allowedTypes || allowedTypes.indexOf(keyObj.asymmetricKeyType) === -1) return false;
     if (algo === "ed25519") return crypto.verify(null, msg, keyObj, sigBuf);
     if (algo === "ecdsa-p256-sha256") return crypto.verify("sha256", msg, keyObj, sigBuf);
     if (algo === "rsa-pss-sha256") {
@@ -78,15 +94,20 @@ function verifyAirgap(ctx) {
   ];
   const fail = (msg, domain) => ({ status: "failed", evidence, assumptions, failure_domain: domain || "trusted-core", reason: msg });
 
+  // Any exception from hostile input (throwing getters, BigInt/circular/proxy in canonicalize)
+  // fails closed rather than crashing the verifier (C2).
+  try {
   if (!ctx || typeof ctx !== "object") return fail("no verification context provided");
   const { manifest, signature, trustedKeys, files } = ctx;
 
   if (!manifest || typeof manifest !== "object") return fail("release manifest missing or not an object");
-  if (!signature || typeof signature !== "object") {
+  if (signature === undefined || signature === null) {
     return { status: "not-applicable", evidence, assumptions, reason: "no release signature present (a dev checkout legitimately has none)" };
   }
+  if (typeof signature !== "object") return fail("release-signature must be an object");
 
-  // 1. Signature shape (fail-closed on any deviation).
+  // 1. Signature shape — strict own-property allowlist (rejects extra + inherited fields).
+  if (!strictSigShape(signature)) return fail("release-signature has extra, inherited, or missing fields — strict shape required");
   if (signature.schema_version !== "1.0") return fail("release-signature.schema_version must be '1.0'");
   if (!SIG_ALGOS.has(signature.algo)) return fail("release-signature.algo not in the allowed set");
   if (signature.delivery !== "out-of-band") return fail("release-signature.delivery must be 'out-of-band' — the whole point of air-gapped trust");
@@ -122,9 +143,9 @@ function verifyAirgap(ctx) {
     matchesDisk = true;
     for (const entry of manifest.files) {
       if (!entry || typeof entry.path !== "string") continue;
-      const onDisk = files[entry.path];
-      if (onDisk === undefined) { matchesDisk = false; evidence.push("matches-disk: '" + entry.path + "' absent on disk."); break; }
-      if (onDisk !== entry.sha256) { matchesDisk = false; evidence.push("matches-disk: '" + entry.path + "' hash differs from manifest."); break; }
+      // Own-property only — a polluted Object.prototype must not fake a match (Codex D3).
+      if (!Object.prototype.hasOwnProperty.call(files, entry.path)) { matchesDisk = false; evidence.push("matches-disk: '" + entry.path + "' absent on disk."); break; }
+      if (files[entry.path] !== entry.sha256) { matchesDisk = false; evidence.push("matches-disk: '" + entry.path + "' hash differs from manifest."); break; }
     }
     if (matchesDisk) evidence.push("matches-disk: all " + manifest.files.length + " manifest files match on-disk hashes.");
   }
@@ -138,6 +159,9 @@ function verifyAirgap(ctx) {
     return { status: "failed", evidence, assumptions, failure_domain: "evolvable-surface", reason: "manifest is authentic but on-disk files diverge from it" };
   }
   return { status: "verified", evidence, assumptions };
+  } catch (e) {
+    return { status: "failed", evidence, assumptions, failure_domain: "trusted-core", reason: "exception during verification — failing closed: " + (e && e.message ? e.message : String(e)) };
+  }
 }
 
 const check = {
