@@ -247,6 +247,45 @@ function verifyRunLog(runDir) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Adoption-log hash-chain verification (contract 01/02)
+ * ------------------------------------------------------------------------- */
+
+function verifyAdoptionLog(adoptionLog) {
+  if (adoptionLog.length === 0) return { valid: true, reason: null, chainHead: null };
+  if (!adoptionLog.some((e) => e.prev_hash !== undefined && e.line_hash !== undefined)) {
+    return { valid: true, reason: null, chainHead: null };
+  }
+
+  let prevHash = "genesis";
+  const hashes = [];
+
+  for (let i = 0; i < adoptionLog.length; i++) {
+    const { prev_hash, line_hash, ...body } = adoptionLog[i];
+    if (prev_hash === undefined) {
+      hashes.push(null);
+      continue;
+    }
+
+    if (i === 0 && prev_hash !== "genesis") {
+      return { valid: false, reason: "adoption-log-first-line-prehash-not-genesis", brokenAt: i, chainHead: null };
+    }
+    if (i > 0 && prev_hash !== hashes[i - 1]) {
+      return { valid: false, reason: "adoption-log-broken-chain", brokenAt: i, chainHead: hashes[i - 1] };
+    }
+
+    const computed = computeRecordHash(prevHash, body);
+    if (line_hash !== undefined && line_hash !== computed) {
+      return { valid: false, reason: "adoption-log-line-hash-mismatch", brokenAt: i, chainHead: hashes.length > 0 ? hashes[hashes.length - 1] : null };
+    }
+    hashes.push(computed);
+    prevHash = computed;
+  }
+
+  const chainHead = hashes.filter(Boolean).length > 0 ? hashes[hashes.length - 1] : null;
+  return { valid: true, reason: null, chainHead };
+}
+
+/* ---------------------------------------------------------------------------
  * Event extraction from verified run logs
  * ------------------------------------------------------------------------- */
 
@@ -410,6 +449,9 @@ function compile(runDirs, options = {}) {
     }
   }
 
+  /* --- Verify adoption-log hash chain --- */
+  const adoptionLogVerification = verifyAdoptionLog(adoptionLog);
+
   const allEvents = [];
   let skipped = 0;
   let quarantined = 0;
@@ -451,6 +493,7 @@ function compile(runDirs, options = {}) {
     const verifiedRun = verifyRunLog(resolvedDir);
 
     if (!verifiedRun.valid) {
+      rejected++;
       brokenRuns.push({ runDir: resolvedDir, reason: verifiedRun.reason, brokenAt: verifiedRun.brokenAt });
       harvestValid = false;
       continue;
@@ -461,6 +504,7 @@ function compile(runDirs, options = {}) {
 
     const anchorCheck = verifyRunAgainstAnchor(verifiedRun, anchor);
     if (!anchorCheck.ok) {
+      rejected++;
       brokenRuns.push({ runDir: resolvedDir, reason: anchorCheck.reason, detail: anchorCheck });
       harvestValid = false;
       continue;
@@ -491,6 +535,18 @@ function compile(runDirs, options = {}) {
     ev.stepRef = nextStepRef();
   }
   allEvents.push(...rollbackEvents);
+
+  /* --- Adoption-log integrity failure → harvest_invalid --- */
+  if (!adoptionLogVerification.valid) {
+    harvestValid = false;
+    brokenRuns.push({ reason: `adoption-log-${adoptionLogVerification.reason}`, brokenAt: adoptionLogVerification.brokenAt });
+  }
+
+  /* --- State tamper detection: missing window when state dir exists, no runs, no adoption log --- */
+  if (harvestValid && runDirs.length === 0 && window === null && adoptionLog.length === 0 && fs.existsSync(stateDir)) {
+    harvestValid = false;
+    brokenRuns.push({ reason: "state-tampered-missing-window" });
+  }
 
   /* --- Check for safety-relevant skipped records --- */
   if (harvestValid && brokenRuns.length === 0 && runDirs.length > 0) {
@@ -1025,6 +1081,85 @@ function selftest() {
       });
     } finally {
       fs.rmSync(d5bTmp, { recursive: true, force: true });
+    }
+
+    /* --- D6 proof: Deleted rollback from adoption-log → harvest_invalid + 0 proposals --- */
+    const d6Tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gs-d6-"));
+    try {
+      const d6State = path.join(d6Tmp, ".graphsmith", "state");
+      fs.mkdirSync(d6State, { recursive: true });
+
+      const a1Body = { status: "effective", kind: "doc_change", txid: "tx-a", seq: 1 };
+      const a1Hash = computeRecordHash("genesis", a1Body);
+      const a2Body = { status: "effective", kind: "hard_failure", txid: "tx-rb", rollback: true, seq: 2 };
+      const a2Hash = computeRecordHash(a1Hash, a2Body);
+      const a3Body = { status: "effective", kind: "doc_change", txid: "tx-c", seq: 3 };
+      const a3Hash = computeRecordHash(a2Hash, a3Body);
+
+      const adoptionEntries = [
+        { prev_hash: "genesis", line_hash: a1Hash, ...a1Body },
+        { prev_hash: a1Hash, line_hash: a2Hash, ...a2Body },
+        { prev_hash: a2Hash, line_hash: a3Hash, ...a3Body },
+      ];
+      fs.writeFileSync(path.join(d6State, "adoption-log.jsonl"), adoptionEntries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+      const d6Window = {
+        schema_version: SCHEMA_VERSION, state_rev: 1, state: "CLOSED_ROLLED_BACK", flag: true,
+        window: { window_id: "d6-window", slots: [{ disposition: "completed_hard_fail" }] },
+        adoption_log_hash: a3Hash,
+      };
+      fs.writeFileSync(path.join(d6State, "window.json"), JSON.stringify(d6Window));
+
+      const d6Result = compile([], { projectRoot: d6Tmp });
+      const d6Rollbacks = d6Result.proposerView.filter((e) => e.type === "rollback");
+      const d6Ok = d6Result.stats.harvest_valid === true && d6Rollbacks.length === 1;
+      tests.push({
+        name: "d6-rollback-from-adoption-log-valid",
+        status: d6Ok ? "pass" : "fail",
+        details: d6Ok ? "Rollback from adoption-log + window yields valid harvest" : `harvest_valid=${d6Result.stats.harvest_valid}, rollbacks=${d6Rollbacks.length}`,
+      });
+
+      /* Now break the adoption-log chain: corrupt a hash */
+      const corruptedEntries = [
+        { prev_hash: "genesis", line_hash: a1Hash, ...a1Body },
+        { prev_hash: a1Hash, line_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ...a2Body },
+        { prev_hash: a2Hash, line_hash: a3Hash, ...a3Body },
+      ];
+      fs.writeFileSync(path.join(d6State, "adoption-log.jsonl"), corruptedEntries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+      fs.writeFileSync(path.join(d6State, "window.json"), JSON.stringify(d6Window));
+
+      const d6bResult = compile([], { projectRoot: d6Tmp });
+      const d6bOk = d6bResult.stats.harvest_valid === false && d6bResult.proposerView.length === 0;
+      tests.push({
+        name: "d6-deleted-rollback-adoption-log-harvest-invalid",
+        status: d6bOk ? "pass" : "fail",
+        details: d6bOk ? `harvest_invalid=${d6bResult.stats.harvest_valid}, proposals=${d6bResult.proposerView.length}` : `harvest_valid=${d6bResult.stats.harvest_valid}, proposals=${d6bResult.proposerView.length}`,
+      });
+    } finally {
+      fs.rmSync(d6Tmp, { recursive: true, force: true });
+    }
+
+    /* --- D7 proof: Unanchored run → stats.rejected >= 1 --- */
+    const d7Tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gs-d7-"));
+    try {
+      const d7State = path.join(d7Tmp, ".graphsmith", "state");
+      fs.mkdirSync(d7State, { recursive: true });
+      const d7RunDir = path.join(d7Tmp, "runs", "d7-run");
+      fs.mkdirSync(d7RunDir, { recursive: true });
+
+      const d7Body = { seq: 0, step: "01-init", type: "run_halt", code: "unknown_halt", delta_ms: 0, lossy: false, run_id: "d7-run" };
+      const d7Hash = computeRecordHash("genesis", d7Body);
+      fs.writeFileSync(path.join(d7RunDir, "run.jsonl"), JSON.stringify({ prev_hash: "genesis", line_hash: d7Hash, ...d7Body }) + "\n");
+
+      const d7Result = compile([d7RunDir], { projectRoot: d7Tmp });
+      const d7Ok = d7Result.stats.harvest_valid === false && d7Result.stats.rejected >= 1 && d7Result.proposerView.length === 0;
+      tests.push({
+        name: "d7-unanchored-run-rejected-count",
+        status: d7Ok ? "pass" : "fail",
+        details: d7Ok ? `harvest_invalid=${d7Result.stats.harvest_valid}, rejected=${d7Result.stats.rejected}, proposals=${d7Result.proposerView.length}` : `harvest_valid=${d7Result.stats.harvest_valid}, rejected=${d7Result.stats.rejected}, proposals=${d7Result.proposerView.length}`,
+      });
+    } finally {
+      fs.rmSync(d7Tmp, { recursive: true, force: true });
     }
 
     return {
