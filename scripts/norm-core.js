@@ -29,7 +29,11 @@
 
 // --- Character-level confusable map (single-character → replacement) -----------
 
-const ZW_CHARS_RE = /[\u200B\u200C\u200D\u200E\u200F\uFEFF\u00AD]/g;
+// Strip zero-width AND bidirectional/directional format controls. The bidi
+// embeds/overrides/isolates (U+202A-202E, U+2066-2069, U+061C, U+200E/200F)
+// can visually reorder or hide a banned token from the honest-language/hygiene
+// scanners \u2014 flagged by an independent multi-model gauntlet review (mistral-large).
+const ZW_CHARS_RE = /[\u200B-\u200F\u061C\u202A-\u202E\u2066-\u2069\uFEFF\u00AD]/g;
 
 const FULLWIDTH_LATIN_MAP = {
   "\uFF10": "0", "\uFF11": "1", "\uFF12": "2", "\uFF13": "3", "\uFF14": "4",

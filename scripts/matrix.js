@@ -56,7 +56,13 @@ function escapeMarkdown(text) {
     .replace(/\*/g, "\\*")
     .replace(/_/g, "\\_")
     .replace(/`/g, "\\`")
-    .replace(/\|/g, "\\|");
+    .replace(/\|/g, "\\|")
+    // Neutralize Markdown link/image + autolink syntax so [text](javascript:..)
+    // and ![x](..) cannot survive as a live link (multi-model gauntlet review, qwen3-max).
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)");
 }
 
 function validateStatus(status) {
