@@ -99,10 +99,10 @@ The `graphsmith verify --profiles` command outputs a JSON structure with profile
 
 ### Profile Status Types
 
+- **`verified`**: The profile check passed successfully. This is the success state.
 - **`failed`**: The profile check failed. This ALWAYS fails the build.
 - **`unavailable`**: The profile cannot be checked (e.g., missing dependencies). This is annotated but does NOT fail the build by default.
-- **`not-yet-implemented`**: The profile is planned but not yet implemented. This is annotated but does NOT fail the build.
-- **`passed`**: The profile check passed successfully.
+- **`not-applicable`**: The profile is not applicable to the current context. This is annotated but does NOT fail the build.
 
 ### Failure Modes
 

@@ -22,7 +22,7 @@ outputs:
     description: 'JSON result of profile verification for downstream badge steps'
     value: ${{ steps.verify.outputs.profile-result }}
   verification-status:
-    description: 'Overall verification status: passed, failed, or partial'
+    description: 'Overall verification status: verified, failed, or partial'
     value: ${{ steps.verify.outputs.verification-status }}
 runs:
   using: 'composite'
@@ -41,6 +41,8 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
+        set -euo pipefail
+        # FAIL-CLOSED: check exit code - non-zero fails the build
         node scripts/verify.js --integrity
 
     - name: Run profile verification and parse results
@@ -48,9 +50,36 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
-        # Run profiles check and capture JSON output
-        RESULT=$(node scripts/verify.js --profiles)
-        echo "$RESULT" > /tmp/profile-result.json
+        set -euo pipefail
+
+        # Run profiles check and capture JSON output.
+        # verify.js writes pure JSON to stdout and a human summary to STDERR;
+        # capture stderr SEPARATELY so it never corrupts the JSON in RESULT
+        # (merging with 2>&1 would break the JSON.parse below on valid output).
+        # FAIL-CLOSED: check exit code - non-zero fails the build.
+        VERIFY_ERR="$(mktemp)"
+        if ! RESULT=$(node scripts/verify.js --profiles 2>"$VERIFY_ERR"); then
+          echo "::error::verify --profiles exited non-zero: $(cat "$VERIFY_ERR" 2>/dev/null)"
+          rm -f "$VERIFY_ERR"
+          exit 1
+        fi
+        rm -f "$VERIFY_ERR"
+
+        # FAIL-CLOSED: validate stdout is not empty
+        if [ -z "$RESULT" ]; then
+          echo "::error::verify --profiles produced empty stdout"
+          exit 1
+        fi
+
+        # FAIL-CLOSED: validate stdout parses as JSON
+        if ! echo "$RESULT" | node -e "JSON.parse(require('fs').readFileSync(0, 'utf8'))" 2>/dev/null; then
+          echo "::error::verify --profiles produced non-JSON stdout: $RESULT"
+          exit 1
+        fi
+
+        # Parse RESULT via stdin (no temp file) so there is no hardcoded
+        # /tmp path that resolves differently under bash vs node on Windows
+        # runners — RESULT already holds pure stdout JSON.
         echo "profile-result<<EOF" >> $GITHUB_OUTPUT
         echo "$RESULT" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
@@ -60,26 +89,42 @@ runs:
         REQUIRED_PROFILES="${{ inputs.profiles }}"
 
         # Parse the JSON and check profile statuses
-        STATUS="passed"
+        # FAIL-CLOSED: validate JSON has profiles object
+        if ! echo "$RESULT" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); if (!d.profiles || Object.keys(d.profiles).length === 0) process.exit(1)" 2>/dev/null; then
+          echo "::error::verify --profiles JSON missing profiles object or profiles is empty"
+          exit 1
+        fi
+
         FAILED_COUNT=0
         UNAVAILABLE_COUNT=0
+        VERIFIED_COUNT=0
         TOTAL_COUNT=0
 
         # If profiles input is 'all-available', we check all profiles
         # Otherwise, only check the specified ones
         if [ "$REQUIRED_PROFILES" = "all-available" ]; then
           # Extract all profile names from the JSON
-          PROFILES_TO_CHECK=$(echo "$RESULT" | node -e "const d=require('/tmp/profile-result.json'); console.log(Object.keys(d.profiles||{}).join(','))")
+          PROFILES_TO_CHECK=$(echo "$RESULT" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(Object.keys(d.profiles||{}).join(','))")
         else
           PROFILES_TO_CHECK="$REQUIRED_PROFILES"
+        fi
+
+        # FAIL-CLOSED: validate PROFILES_TO_CHECK is not empty
+        if [ -z "$PROFILES_TO_CHECK" ]; then
+          echo "::error::No profiles to check - PROFILES_TO_CHECK is empty"
+          exit 1
         fi
 
         IFS=',' read -ra PROFS <<< "$PROFILES_TO_CHECK"
         for prof in "${PROFS[@]}"; do
           TOTAL_COUNT=$((TOTAL_COUNT + 1))
-          PROF_STATUS=$(echo "$RESULT" | node -e "const d=require('/tmp/profile-result.json'); console.log((d.profiles||{})['$prof']?.status||'unknown')")
+          PROF_STATUS=$(echo "$RESULT" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log((d.profiles||{})['$prof']?.status||'unknown')")
           
           case "$PROF_STATUS" in
+            verified)
+              VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
+              echo "::notice::Profile '$prof' is VERIFIED"
+              ;;
             failed)
               FAILED_COUNT=$((FAILED_COUNT + 1))
               echo "::error::Profile '$prof' is FAILED"
@@ -93,30 +138,26 @@ runs:
                 echo "::error::Profile '$prof' is UNAVAILABLE (configured as failure)"
               fi
               ;;
-            not-yet-implemented)
-              echo "::notice::Profile '$prof' is NOT YET IMPLEMENTED (annotated, not failed)"
-              ;;
-            passed)
-              echo "::notice::Profile '$prof' is PASSED"
+            not-applicable)
+              echo "::notice::Profile '$prof' is NOT APPLICABLE (annotated, not failed)"
               ;;
             *)
-              echo "::warning::Profile '$prof' has unknown status: $PROF_STATUS"
+              # FAIL-CLOSED: unknown status is a failure
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "::error::Profile '$prof' has unknown status: $PROF_STATUS (treating as failure)"
               ;;
           esac
         done
 
         # Set overall status
         if [ $FAILED_COUNT -gt 0 ]; then
-          STATUS="failed"
           echo "verification-status=failed" >> $GITHUB_OUTPUT
           echo "::error::Verification failed: $FAILED_COUNT profile(s) failed out of $TOTAL_COUNT"
           exit 1
         elif [ $UNAVAILABLE_COUNT -gt 0 ]; then
-          STATUS="partial"
           echo "verification-status=partial" >> $GITHUB_OUTPUT
           echo "::notice::Verification partial: $UNAVAILABLE_COUNT profile(s) unavailable out of $TOTAL_COUNT (annotated, not failed)"
         else
-          STATUS="passed"
-          echo "verification-status=passed" >> $GITHUB_OUTPUT
-          echo "::notice::Verification passed: all $TOTAL_COUNT profile(s) checked"
+          echo "verification-status=verified" >> $GITHUB_OUTPUT
+          echo "::notice::Verification verified: all $TOTAL_COUNT profile(s) checked"
         fi
