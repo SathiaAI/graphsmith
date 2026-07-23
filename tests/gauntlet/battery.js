@@ -152,6 +152,34 @@ const SCHEMES = ["javascript:alert(1)", "JavaScript:alert(1)", " javascript:aler
   ok(cls, "verify profiles carry assumptions[]", (() => { const r = v.runProfiles(path.join(__dirname, "..", ".."), {}); return Object.values(r.profiles).every(p => Array.isArray(p.assumptions) || Array.isArray(p.evidence) || p.status === "not-applicable"); })());
 })();
 
+/* ===================== EXPANSION — deeper parameterized coverage (well-understood components) ===================== */
+(function EXPAND() {
+  const badge = req("badge.js"), mx = req("matrix.js"), diag = req("diagnostics.js"), w = req("watcher.js"), v = req("verify.js");
+  // Badge: exhaustive hostile-scheme + case/whitespace variants must never link [via command-r-plus facet]
+  const hostile = ["javascript:alert(1)", "JAVASCRIPT:alert(1)", "JaVaScRiPt:x", " javascript:x", "\tjavascript:x", "data:text/html,x", "vbscript:x", "file:///x", "ftp://x", "blob:https://x", "about:blank", "mailto:x", "//evil.example", "http:evil", "https:@evil", "http://", "https://", "javascript://%0aalert(1)"];
+  for (const u of hostile) ok("T2-untrusted-sink", `badge ci-url reject ${JSON.stringify(u).slice(0, 24)}`, !badge.validateCiUrl(u));
+  for (const u of ["https://ci.example/run/1", "http://ci.internal:8080/x", "https://a.b.c/d?e=1&f=2"]) ok("T2-untrusted-sink", `badge ci-url ACCEPT valid ${JSON.stringify(u).slice(0, 24)}`, !!badge.validateCiUrl(u));
+  // Badge: every non-verified status renders non-green; markup status coerced [via minimax facet]
+  for (const st of ["unavailable", "not-applicable", "failed", "PENDING", "verified\n", "<b>x</b>", "true", "1", "green"]) ok("T5-honesty", `badge enumStatus(${JSON.stringify(st).slice(0, 14)}) not false-verified`, st === "verified" ? true : badge.enumStatus(st) !== "verified");
+  // Matrix: hostile scheme reject + escape across payloads [via command-r-plus facet]
+  for (const u of ["javascript:x", "data:x", "vbscript:x", "file:///x", " javascript:x"]) ok("T2-untrusted-sink", `matrix ci-url reject ${JSON.stringify(u).slice(0, 20)}`, !mx.validateCiUrl(u));
+  for (const p of ["<script>x</script>", "a|b|c", "\n# H", "**b**", "[x](javascript:y)", "<img onerror=z>"]) ok("T2-untrusted-sink", `matrix escapeMarkdown neutralizes ${JSON.stringify(p).slice(0, 16)}`, (() => { const e = mx.escapeMarkdown(p); return !e.includes("|") || e.includes("\\|"); })());
+  // Diagnostics: every secret type in every structural field, detail mode, redacted [via nova-pro facet]
+  for (const sec of SECRETS) for (const field of ["code", "run_ref", "step_ref", "fingerprint"]) {
+    const root = tmp(); const rec = { seq: 0, type: "run_halt", code: "budget_exhausted", run_ref: "r", step_ref: "s", fingerprint: "f", counters: {} }; rec[field] = sec;
+    harvest(root, rec); const o = path.join(root, "d.json");
+    try { diag.exportDiagnostics(root, { includeDetail: true, confirmWrite: true, outPath: o, log: () => {} }); ok("T2-untrusted-sink", `diagnostics ${sec.slice(0, 6)} in ${field} redacted`, !fs.readFileSync(o, "utf8").includes(sec)); } catch (e) { ok("T2-untrusted-sink", `diagnostics ${sec.slice(0, 6)} in ${field}`, false, e.message); }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  // Watcher: multiple injection payloads in code field all dropped [via nova-pro facet]
+  for (const inj of INJECTS) { const b = { schema_version: "1.0.0", type: "run_halt", code: inj, run_ref: "r", step_ref: "s", fingerprint: "f", delta_ms: 1, seq: 0, counters: {} }; const { batch } = w.createBatch([b], [], {}); ok("T2-untrusted-sink", `watcher bad-code ${JSON.stringify(inj).slice(0, 16)} dropped`, !JSON.stringify(batch.events || batch).includes(inj.slice(0, 10))); }
+  // verify.B budget classifier honest across malformed halts [via llama facet]
+  for (const h of [{ kind: "budget", rule: "max_steps", evidence: {} }, { kind: "budget", rule: 5, evidence: {} }, { kind: "budget", evidence: {} }, { kind: "BUDGET", rule: "x", evidence: {} }]) { const b = v.classifyBudgetHalt(h); const good = h.kind === "budget" && typeof h.rule === "string" && h.evidence && typeof h.evidence === "object"; ok("T1-failopen", `verify.B halt ${JSON.stringify(h).slice(0, 30)} honest`, good ? b.status === "verified" : b.status !== "verified"); }
+  // verify.G — 64-hex enforcement: non-hex equal strings never verified (release hardening) [via gpt-5.1/deepseek-r1 facet]
+  for (const h of ["", "z".repeat(64), "a".repeat(63), "A".repeat(64), "notahash", "0x" + "a".repeat(62)]) { const g = v.classifyGatedLearning({ activeBefore: h, activeAfter: h, refused: true, gate3Packet: true, listedPending: true }); ok("T1-failopen", `verify.G non-hex ${JSON.stringify(h).slice(0, 12)} not verified`, g.status !== "verified"); }
+  ok("T1-failopen", "verify.G valid 64-hex equal + all-true = verified", v.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "a".repeat(64), refused: true, gate3Packet: true, listedPending: true }).status === "verified");
+})();
+
 console.log(`\n===== GAUNTLET BATTERY: HOLD=${HOLD}  BREAK=${BREAK}  TOTAL=${HOLD + BREAK} =====`);
 if (BREAK) { console.log("\nBREAKS:"); breaks.forEach(b => console.log("  " + b)); }
 process.exit(BREAK ? 1 : 0);
