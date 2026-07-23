@@ -57,6 +57,9 @@ function reconcile(ctx) {
   ];
   const fail = (msg) => ({ status: "failed", evidence: [], assumptions, failure_domain: "untrusted-input", coverage_map: [], regulated_mode_may_activate: false, reason: msg });
 
+  // Any exception from hostile input (throwing getters, BigInt, proxy traps, wrong types)
+  // fails closed rather than crashing the reconciler (C2).
+  try {
   if (!ctx || typeof ctx !== "object") return fail("no reconciliation context");
   const register = ctx.register;
   if (!register || typeof register !== "object" || register.schema_version !== "1.0") return fail("register missing or schema_version != '1.0'");
@@ -81,7 +84,12 @@ function reconcile(ctx) {
     }
     seenIds.add(ob.obligation_id);
 
-    const declared = COVERAGE.has(ob.declared_coverage) ? ob.declared_coverage : (COVERAGE.has(ob.coverage) ? ob.coverage : null);
+    // A present-but-invalid coverage value is corruption — refuse it, never coerce to null (fail-closed).
+    const rawDeclared = ob.declared_coverage !== undefined ? ob.declared_coverage : ob.coverage;
+    if (rawDeclared !== undefined && !COVERAGE.has(rawDeclared)) {
+      violations.push({ severity: "HIGH", obligation_id: ob.obligation_id, issue: "coverage field has an invalid value (type " + typeof rawDeclared + ") — refusing malformed obligation, fail-closed" });
+    }
+    const declared = COVERAGE.has(rawDeclared) ? rawDeclared : null;
     const actual = recomputeCoverage(ob, evidence);
 
     // C2 CRITICAL: a manual-only obligation (no executable control) can NEVER be covered.
@@ -131,6 +139,9 @@ function reconcile(ctx) {
   const out = { status, evidence: evidenceLines, assumptions, coverage_map, regulated_mode_may_activate: complete };
   if (anyViolation) out.failure_domain = "untrusted-input";
   return out;
+  } catch (e) {
+    return { status: "failed", evidence: ["exception during reconciliation — failing closed: " + (e && e.message ? e.message : String(e))], assumptions, failure_domain: "untrusted-input", coverage_map: [], regulated_mode_may_activate: false };
+  }
 }
 
 const check = {
