@@ -28,22 +28,56 @@
  *   - tunables.json                 bounded numeric knobs (values only).
  *   - workflow.manifest.json        frozen hashes of manager.js/pipeline.json/
  *     supervisor.js/capability.js/prompt-loader.js/adapters + the tunables
- *     BOUNDS (min/max/unit/semantics) — bounds live here, in a
- *     tamper-evident (self-hashed) file, so no edit can widen them.
+ *     BOUNDS (min/max/unit/semantics). This file is self-hashed and the
+ *     bounds live nowhere else -- but the self-hash is TAMPER-EVIDENCE
+ *     (integrity), not tamper-proofing: see the honest-scope note embedded
+ *     in buildWorkflowManifest() below and in verifyFrozen()'s comment in
+ *     supervisorJsContent().
  *   - watchdog.js                   copied in from the sibling
  *     scripts/watchdog.js when present at scaffold time (feature-detected;
  *     absence is tolerated both at scaffold time and at manager runtime).
  *
+ * TASK B-scaffold-FIX (this revision, attempt 1) fixed five defects two
+ * independent testers (+ orchestrator cross-validation) confirmed in the
+ * emitted supervisor/manager, all inside supervisorJsContent()/
+ * managerJsContent()/buildWorkflowManifest() below:
+ *   D1 - a corrupt/unparseable budget-state.json now HALTs fail-CLOSED
+ *        (CORRUPT_STATE) instead of silently substituting defaultState();
+ *        defaults are used ONLY for a genuinely-absent state file.
+ *   D2 - wall-time consumed between supervisor ticks and lost to a kill is
+ *        reconstructed and charged on resume via a durable, Date.now()-
+ *        anchored active_segment_started_ms (the one ADDITIONAL documented
+ *        clock exception beyond the CLOCK NOTE below -- see the "D2" comment
+ *        inside supervisorJsContent()).
+ *   D3 - manager.js now observes the watchdog child's liveness (an 'exit'/
+ *        'error' handler, no longer unref()'d away) and HALTs fail-closed on
+ *        an unexpected guard death instead of silently continuing without
+ *        sync-execution enforcement.
+ *   D4 - acknowledged_extensions[] records now capture the rule, the
+ *        tunable(s) that parameterize it, the previous breached limit, and
+ *        the new value(s) in effect -- not just a timestamp.
+ *   D5 - honest-language pass: the manifest self-hash is documented as
+ *        integrity/tamper-EVIDENCE, never tamper-proofing; the actual
+ *        anti-evolution guarantee is contract 04's gate fence (candidates/
+ *        evolve structurally cannot touch this manifest), and a same-user
+ *        arbitrary-write attacker is out of scope per contract 05 threat A6.
+ *
  * Usage: node scaffold.js <project-name> | node scaffold.js --selftest
  *
  * Zero-dependency CommonJS, Node >= 18. No clock/randomness in any
- * budget/tripwire DECISION except the one documented exception: wall-time
- * elapsed is measured with process.hrtime.bigint() (a MONOTONIC clock) and
- * only the resulting per-segment delta is added to a persisted cumulative
- * total — see the "CLOCK NOTE" comment inside supervisorJsContent() below.
- * Date.now() appears only in evidence METADATA (a human-readable timestamp
- * attached to a HALT record), never in a pass/fail comparison. Run IDs may
- * use time+entropy (an identifier, not routing — same posture as v0.1.1).
+ * budget/tripwire DECISION except two documented exceptions: (1) wall-time
+ * elapsed WITHIN one process is measured with process.hrtime.bigint() (a
+ * MONOTONIC clock) and only the resulting per-segment delta is added to a
+ * persisted cumulative total -- see the "CLOCK NOTE" comment inside
+ * supervisorJsContent() below; (2) D2's killed-segment reconstruction, which
+ * necessarily bridges a kill+restart using a persisted Date.now() anchor
+ * (process.hrtime.bigint() cannot be compared across a process restart) --
+ * see the "D2" comment in the same function. Both exceptions bias the
+ * decision toward CHARGING more wall time, never less, so neither can be
+ * used to extend a budget. Date.now() otherwise appears only in evidence
+ * METADATA (a human-readable timestamp attached to a HALT record), never in
+ * a pass/fail comparison. Run IDs may use time+entropy (an identifier, not
+ * routing — same posture as v0.1.1).
  */
 "use strict";
 const fs = require("fs");
@@ -156,6 +190,8 @@ const BUDGET_DECLARATIONS = [
   { rule: "max_subprocess_lifetime_ms", kind: "budget", tunables: ["max_subprocess_lifetime_ms"] },
   { rule: "max_output_tokens", kind: "budget", tunables: ["max_output_tokens"] },
   { rule: "sync_execution_budget_ms (watchdog)", kind: "budget", tunables: ["sync_execution_budget_ms"] },
+  { rule: "watchdog-guard-died", kind: "tripwire", tunables: [],
+    note: "D3: the manager observes the watchdog child's liveness ('exit'/'error' handlers) and HALTs fail-closed if the guard dies unexpectedly; no tunable widens this, the fix is restarting with a working watchdog." },
   { rule: "step-reentry-beyond-cap", kind: "tripwire", tunables: ["max_retries_per_step"] },
   { rule: "state-transition-stall", kind: "tripwire", tunables: ["max_step_reentry"] },
   { rule: "undeclared-destination", kind: "tripwire", tunables: [] },
@@ -539,12 +575,38 @@ function supervisorJsContent() {
     "  fs.renameSync(tmp, file);",
     "}",
     "",
-    "function readJsonIfExists(file, fallback) {",
-    "  if (!fs.existsSync(file)) return fallback;",
-    "  try { return JSON.parse(fs.readFileSync(file, \"utf8\")); }",
-    "  catch (e) { return fallback; } // corrupt budget state must never brick a run: recompute conservatively",
-    "                                  // from a fresh baseline, the same \"never brick\" posture manager.js",
-    "                                  // already applies to a corrupt checkpoint.",
+    "// D1 -- corrupt/unparseable budget-state.json must HALT fail-CLOSED, never silently",
+    "// reset to defaultState(). A run directory that already has SOME state on disk has",
+    "// accumulated run-lifetime budget; substituting a fresh baseline for unreadable JSON",
+    "// would silently wipe that budget (and any recorded halt/acknowledgement) -- exactly",
+    "// the fail-OPEN this function used to be. defaultState() is used ONLY when the state",
+    "// file is genuinely ABSENT (a fresh run that has never written one), never as a",
+    "// fallback for a present-but-corrupt one. Mirrors the constitutional pattern in",
+    "// state-store.js: corrupt on-disk state -> throw fail(..., \"CORRUPT_STATE\"), never",
+    "// proceed on guessed state.",
+    "function loadBudgetState(file) {",
+    "  if (!fs.existsSync(file)) return defaultState();",
+    "  let raw;",
+    "  try { raw = fs.readFileSync(file, \"utf8\"); }",
+    "  catch (e) {",
+    "    throw fail(",
+    "      \"budget-state.json exists at \" + file + \" but could not be read (\" + (e.code || e.message) + \"). \" +",
+    "      \"A run directory with an unreadable state file must never proceed on guessed/default counters -- \" +",
+    "      \"restore the file from backup or delete the whole run directory to start a genuinely fresh run. Refusing to start.\",",
+    "      \"CORRUPT_STATE\"",
+    "    );",
+    "  }",
+    "  try { return JSON.parse(raw); }",
+    "  catch (e) {",
+    "    throw fail(",
+    "      \"budget-state.json at \" + file + \" is present but unparseable (\" + e.message + \"). \" +",
+    "      \"Silently resetting a corrupt state file would wipe every accumulated run-lifetime budget counter and \" +",
+    "      \"any recorded halt/acknowledgement -- HALTing fail-closed instead. If the corruption is expected, restore \" +",
+    "      \"budget-state.json from a backup or delete the whole run directory to start a genuinely fresh run; do not \" +",
+    "      \"delete just this file to \\\"fix\\\" it -- that is exactly the silent reset this refusal exists to prevent.\",",
+    "      \"CORRUPT_STATE\"",
+    "    );",
+    "  }",
     "}",
     "",
     "function defaultState() {",
@@ -567,6 +629,7 @@ function supervisorJsContent() {
     "    output_tokens: 0,",
     "    acknowledged_extensions: [],",
     "    halted: null,",
+    "    active_segment_started_ms: null, // D2: durable Date.now() anchor for killed-segment reconstruction; null = no open segment yet (genuinely fresh state)",
     "  };",
     "}",
     "",
@@ -577,6 +640,19 @@ function supervisorJsContent() {
     "function sha256File(p) { return crypto.createHash(\"sha256\").update(fs.readFileSync(p)).digest(\"hex\"); }",
     "",
     "// ---- frozen-file + tunables-bounds verification -------------------------",
+    "// D5 (honest scope, not a change in behavior): self_sha256 below is TAMPER-EVIDENCE",
+    "// (integrity) -- it catches a manifest whose bytes were edited without also",
+    "// recomputing the hash (a casual or partial edit). It is NOT tamper-proofing. In",
+    "// GraphSmith's own repository the guarantee that no evolution can widen these bounds",
+    "// comes from the contract 04 GATE FENCE (candidates/evolve are structurally forbidden",
+    "// from touching this manifest, or any other constitutional file, at all) -- not from",
+    "// this hash. A same-user attacker with arbitrary filesystem write access to a",
+    "// SCAFFOLDED PROJECT -- who could also just rewrite manager.js/supervisor.js/",
+    "// capability.js directly -- is OUT OF SCOPE per contract 05 threat A6 (\"privileged",
+    "// local attacker who can rewrite sentinel + both manifests\"): such an attacker can",
+    "// widen a bound and recompute self_sha256 to match. That is a known, accepted limit",
+    "// of a same-process/same-machine tamper-evidence check, not a defeat of a tamper-proof",
+    "// claim this file never made.",
     "",
     "function computeManifestSelfHash(manifestWithoutHash) {",
     "  return crypto.createHash(\"sha256\").update(JSON.stringify(manifestWithoutHash)).digest(\"hex\");",
@@ -589,7 +665,7 @@ function supervisorJsContent() {
     "  if (recomputed !== manifest.self_sha256) {",
     "    throw fail(",
     "      \"workflow.manifest.json failed its own self-hash check (recomputed \" + recomputed + \", file claims \" + manifest.self_sha256 + \"). \" +",
-    "      \"The tunables bounds live in THIS file precisely so nothing can widen them; a mismatch here means the manifest itself was edited outside a gated change. Refusing to start.\",",
+    "      \"This self-hash is tamper-EVIDENCE, not tamper-proofing: a mismatch here means the manifest bytes were edited without also recomputing the hash. Refusing to start.\",",
     "      \"MANIFEST_SELF_HASH_MISMATCH\"",
     "    );",
     "  }",
@@ -622,7 +698,7 @@ function supervisorJsContent() {
     "    if (v < b.min || v > b.max) {",
     "      throw fail(",
     "        \"tunables.json[\\\"\" + key + \"\\\"] = \" + v + \" is outside the FROZEN bound [\" + b.min + \", \" + b.max + \"] declared in workflow.manifest.json. \" +",
-    "        \"Bounds live in the frozen manifest precisely so no edit -- automated or human -- can widen them; fix tunables.json to a value inside the bound.\",",
+    "        \"Bounds live in the frozen, self-hashed manifest; a tunables.json value outside them is refused -- fix tunables.json to a value inside the bound.\",",
     "        \"TUNABLE_OUT_OF_BOUNDS\"",
     "      );",
     "    }",
@@ -679,14 +755,27 @@ function supervisorJsContent() {
     "",
     "// ---- the supervisor itself -----------------------------------------------",
     "",
+    "// D4 -- best-effort extraction of the numeric threshold a halt's own evidence",
+    "// recorded (evidence keys follow the convention \"limit\", \"limit_ms\", or \"limit_mb\"",
+    "// across every budget/tripwire call site above), so an acknowledgement record can",
+    "// show the OLD limit next to the NEW one without hand-maintaining a second table.",
+    "function extractPreviousLimit(ev) {",
+    "  if (!ev || typeof ev !== \"object\") return null;",
+    "  for (const key of Object.keys(ev)) {",
+    "    if (/^limit/.test(key) && typeof ev[key] === \"number\") return { field: key, value: ev[key] };",
+    "  }",
+    "  return null;",
+    "}",
+    "",
     "function createSupervisor(opts) {",
     "  const root = opts.root;",
     "  const runDir = opts.runDir;",
     "  const values = opts.values;",
+    "  const manifest = opts.manifest || null; // optional: used only to enrich D4 acknowledgement records",
     "  const acknowledgeBudget = !!opts.acknowledgeBudget;",
     "  const statePath = path.join(runDir, \"budget-state.json\");",
     "  const allowlist = opts.allowlist || loadAllowlist(root);",
-    "  const state = readJsonIfExists(statePath, null) || defaultState();",
+    "  const state = loadBudgetState(statePath); // D1: throws CORRUPT_STATE instead of silently resetting",
     "",
     "  if (state.halted && !acknowledgeBudget) {",
     "    const e = fail(",
@@ -698,7 +787,30 @@ function supervisorJsContent() {
     "    throw e;",
     "  }",
     "  if (state.halted && acknowledgeBudget) {",
-    "    state.acknowledged_extensions.push({ at_iso: new Date().toISOString(), previous_halt: state.halted });",
+    "    // D4 -- capture WHAT was extended, not just that something was acknowledged:",
+    "    // the rule that halted, the tunable(s) that parameterize it (looked up from the",
+    "    // manifest's own budget_declarations so this never hand-duplicates that table),",
+    "    // the previous breached limit (pulled from the halt's own evidence), and the",
+    "    // new value(s) now in effect for those tunables.",
+    "    const priorHalt = state.halted;",
+    "    const declared = manifest && Array.isArray(manifest.budget_declarations)",
+    "      ? manifest.budget_declarations.filter(function (d) { return d.rule === priorHalt.rule; })[0]",
+    "      : null;",
+    "    const declaredTunables = declared ? declared.tunables : [];",
+    "    const newLimits = {};",
+    "    for (const t of declaredTunables) newLimits[t] = values[t];",
+    "    const prevLimit = extractPreviousLimit(priorHalt.evidence);",
+    "    state.acknowledged_extensions.push({",
+    "      at_iso: new Date().toISOString(),",
+    "      acknowledged_via: \"--acknowledge-budget\",",
+    "      rule: priorHalt.rule,",
+    "      kind: priorHalt.kind,",
+    "      tunables: declaredTunables,",
+    "      previous_limit: prevLimit ? prevLimit.value : null,",
+    "      previous_limit_field: prevLimit ? prevLimit.field : null,",
+    "      new_limits: newLimits,",
+    "      previous_halt: priorHalt,",
+    "    });",
     "    state.halted = null;",
     "  }",
     "",
@@ -718,10 +830,45 @@ function supervisorJsContent() {
     "    const now = process.hrtime.bigint();",
     "    const deltaMs = Number((now - segmentStartHr) / 1000000n);",
     "    segmentStartHr = now;",
+    "    state.active_segment_started_ms = Date.now(); // D2: re-stamp the durable kill-safe anchor at every tick",
     "    state.cumulative_wall_time_ms += deltaMs > 0 ? deltaMs : 0;",
     "    if (state.cumulative_wall_time_ms > values.max_wall_time_ms) {",
     "      haltNow(\"budget\", \"max_wall_time_ms\", evidence({ cumulative_wall_time_ms: state.cumulative_wall_time_ms, limit_ms: values.max_wall_time_ms }));",
     "    }",
+    "  }",
+    "",
+    "  // D2 -- KILLED-SEGMENT RECONSTRUCTION. process.hrtime.bigint() is only meaningful",
+    "  // WITHIN one process -- it cannot be compared across a kill+restart -- so",
+    "  // tickWallTime()'s monotonic delta alone is blind to wall time consumed between the",
+    "  // last tick and an unclean process death (e.g. a long synchronous step that never",
+    "  // calls back into the supervisor before being SIGKILLed). active_segment_started_ms",
+    "  // is the documented, Date.now()-anchored exception: re-stamped at every tick above,",
+    "  // it marks \"the run was last known to be active at this wall-clock instant\". On",
+    "  // every process start (here) -- but ONLY once we are actually about to proceed, never",
+    "  // on a refused/unacknowledged resume above, so a refused resume's on-disk state stays",
+    "  // byte-for-byte unchanged -- the elapsed wall time since that anchor is charged to",
+    "  // cumulative_wall_time_ms and re-checked against the budget, closing the kill/resume",
+    "  // budget-extension gap. This is deliberately conservative: it can charge a little idle",
+    "  // time between an actual kill and the next resume being launched, but it can never",
+    "  // UNDER-count a killed segment, so it can never be used to extend the wall-time budget.",
+    "  // Only a PRIOR process leaves this anchor set (defaultState() starts it null): a",
+    "  // genuinely fresh run has no killed segment to reconstruct, so it just stamps the",
+    "  // anchor and moves on -- an immediate budget check here would fire even for a",
+    "  // deliberately-already-exceeded test value with nothing to reconstruct, which is",
+    "  // tickWallTime()'s job on the first real tick, not this constructor's.",
+    "  if (typeof state.active_segment_started_ms === \"number\") {",
+    "    const killedSegmentMs = Date.now() - state.active_segment_started_ms;",
+    "    state.cumulative_wall_time_ms += killedSegmentMs > 0 ? killedSegmentMs : 0;",
+    "    state.active_segment_started_ms = Date.now();",
+    "    save();",
+    "    if (state.cumulative_wall_time_ms > values.max_wall_time_ms) {",
+    "      haltNow(\"budget\", \"max_wall_time_ms\", evidence({",
+    "        cumulative_wall_time_ms: state.cumulative_wall_time_ms, limit_ms: values.max_wall_time_ms, reconstructed_killed_segment: true,",
+    "      }));",
+    "    }",
+    "  } else {",
+    "    state.active_segment_started_ms = Date.now();",
+    "    save();",
     "  }",
     "",
     "  function beginStep(stepName, stepIndex) {",
@@ -937,6 +1084,8 @@ function supervisorJsContent() {
     "  createSupervisor: createSupervisor,",
     "  sha256File: sha256File,",
     "  defaultState: defaultState,",
+    "  loadBudgetState: loadBudgetState,",
+    "  extractPreviousLimit: extractPreviousLimit,",
     "};",
     "",
     "if (require.main === module) {",
@@ -999,9 +1148,11 @@ function managerJsContent() {
     "// integrity failures, not run-lifetime budget breaches, so they exit 1",
     "// rather than the HALT exit code 2 used for an in-run breach.",
     "let values;",
+    "let manifest = null; // D4: passed to createSupervisor so acknowledgement records can look up rule->tunables",
     "try {",
     "  const loaded = supervisorLib.loadTunables(__dirname);",
     "  values = loaded.values;",
+    "  manifest = loaded.manifest;",
     "} catch (e) {",
     "  console.error(\"Refusing to start: \" + e.message);",
     "  process.exit(1);",
@@ -1116,6 +1267,23 @@ function managerJsContent() {
     "}",
     "",
     "let watchdogChild = null;",
+    "let watchdogExpectedExit = false; // D3: true only while WE are intentionally killing our own watchdog (see releaseLock below)",
+    "",
+    "// D3 -- the manager must OBSERVE the watchdog's own liveness, not just spawn it and",
+    "// hope: if the guard dies (crash, OOM, external kill) with no listener, the manager",
+    "// keeps running with no sync-execution enforcement and never knows. An unexpected",
+    "// death HALTs fail-closed with evidence, exactly like any other supervisor breach.",
+    "function haltOnDeadWatchdog(reason, detail) {",
+    "  if (watchdogExpectedExit) return; // our own controlled shutdown killed it -- not a defect",
+    "  log(\"__watchdog__\", \"watchdog process \" + reason + \" unexpectedly (\" + detail + \") -- guard is dead, HALTing fail-closed: sync-execution (blocked-event-loop) enforcement is lost\", 0);",
+    "  try {",
+    "    supervisor.haltNow(\"tripwire\", \"watchdog-guard-died\", { at_iso: new Date().toISOString(), reason: reason, detail: detail });",
+    "  } catch (e) {",
+    "    console.error(e.message);",
+    "  }",
+    "  process.exit(2);",
+    "}",
+    "",
     "function spawnWatchdog() {",
     "  const watchdogPath = path.join(__dirname, \"watchdog.js\");",
     "  if (!fs.existsSync(watchdogPath)) {",
@@ -1132,7 +1300,18 @@ function managerJsContent() {
     "      \"--capability-file\", watchdogCapabilityPath,",
     "      \"--halt-file\", watchdogHaltPath,",
     "    ], { stdio: [\"ignore\", \"ignore\", \"inherit\"], detached: false });",
-    "    child.unref();",
+    "    // D3: deliberately NOT unref()'d -- an unref()'d child can still deliver its",
+    "    // 'exit' event, but only if something else happens to keep the event loop alive",
+    "    // long enough to receive it, which makes detection unreliable right when it",
+    "    // matters (the watchdog dying near the run's own natural end). Keeping the",
+    "    // handle ref'd makes detection reliable; the explicit process.exit(0) on the",
+    "    // pipeline's success path (see run() below) keeps a clean run from hanging on it.",
+    "    child.on(\"exit\", function (code, signal) {",
+    "      haltOnDeadWatchdog(\"exited\", \"pid \" + child.pid + \", code \" + code + \", signal \" + signal);",
+    "    });",
+    "    child.on(\"error\", function (err) {",
+    "      haltOnDeadWatchdog(\"errored\", \"pid \" + child.pid + \", \" + err.message);",
+    "    });",
     "    log(\"__watchdog__\", \"spawned watchdog pid \" + child.pid + \" (sync-execution budget \" + values.sync_execution_budget_ms + \"ms)\", 0);",
     "    return child;",
     "  } catch (e) {",
@@ -1142,7 +1321,7 @@ function managerJsContent() {
     "}",
     "",
     "try {",
-    "  supervisor = supervisorLib.createSupervisor({ root: __dirname, runDir: runDir, values: values, acknowledgeBudget: acknowledgeBudget });",
+    "  supervisor = supervisorLib.createSupervisor({ root: __dirname, runDir: runDir, values: values, manifest: manifest, acknowledgeBudget: acknowledgeBudget });",
     "} catch (e) {",
     "  console.error(e.message);",
     "  process.exit(e.code === \"HALT_ACK_REQUIRED\" ? 2 : 1);",
@@ -1184,7 +1363,9 @@ function managerJsContent() {
     "const releaseLock = function () {",
     "  try { clearInterval(heartbeat); } catch (e) {}",
     "  try { fs.unlinkSync(lockPath); } catch (e) {}",
-    "  try { if (watchdogChild) watchdogChild.kill(); } catch (e) {}",
+    "  // D3: mark this an EXPECTED death before killing our own watchdog, so its 'exit'",
+    "  // handler (below) does not mistake our own controlled shutdown for a dead guard.",
+    "  try { if (watchdogChild) { watchdogExpectedExit = true; watchdogChild.kill(); } } catch (e) {}",
     "};",
     "process.on(\"exit\", releaseLock);",
     "",
@@ -1259,6 +1440,9 @@ function managerJsContent() {
     "  supervisor.recordDiskUsage();",
     "  supervisor.save();",
     "  log(\"__done__\", \"complete\", 0);",
+    "  process.exit(0); // D3: the watchdog child is no longer unref()'d (so its death can be",
+    "                    // noticed), so an explicit exit is required to end the run promptly",
+    "                    // instead of waiting on that still-ref'd child handle.",
     "})().catch(function (e) {",
     "  if (e && e.halt) {",
     "    console.error(\"HALT (\" + e.halt.kind + \"): \" + e.halt.rule);",
@@ -1373,6 +1557,23 @@ function deliverWorkerExtra() {
 
 // ---------------------------------------------------------------------------
 // tunables.json + workflow.manifest.json builders
+//
+// D5(b) FOLLOW-UP (checked, not wired -- documented per task instruction rather than
+// left silent): the task asks, IF CHEAP, to emit this manifest's authoritative hash to
+// a location scripts/verify.js's `--integrity` already checks, so a widened SCAFFOLDED
+// PROJECT manifest would be caught at verify time too. Checked scripts/verify.js: its
+// `--integrity` (runIntegrity/checkDestinationsHook/tree_manifest_sha256 machinery)
+// validates the GraphSmith REPOSITORY's own tree (scripts/, contracts/, the ACTIVE
+// pointer) -- it has no notion of, or hook into, an arbitrary SCAFFOLDED PROJECT
+// directory living outside this repo (a scaffolded project's location is chosen by
+// whoever runs `node scaffold.js <name>` and is never repo-relative). There is no
+// existing location in verify.js for a scaffolded project's manifest hash to land in
+// that verify.js would ever read. Wiring a NEW one would mean teaching verify.js about
+// scaffolded-project paths -- out of lane (verify.js is off-limits per this task) and
+// a real design decision, not a cheap addition. Left as a documented follow-up, not
+// attempted here; see the honest-scope note in buildWorkflowManifest()'s `note` field
+// and in supervisorJsContent()'s verifyFrozen() comment for the (a) honest-language half
+// of D5, which IS done.
 // ---------------------------------------------------------------------------
 function tunablesJsonContent() {
   return J({ schema_version: SCHEMA_VERSION, values: tunablesValuesObject() });
@@ -1396,7 +1597,7 @@ function buildWorkflowManifest(frozenFileHashes, capabilityFileHashes) {
     },
     budget_declarations: BUDGET_DECLARATIONS,
     state_store_schema_version_reference: stateStoreModule.SCHEMA_VERSION,
-    note: "Templates in this project are separated for review and future tuning -- prompts, tunable values, and the manager/supervisor code each live in their own file so one can be reviewed or adjusted without touching the others. The BOUNDS on the tunables live here, in this frozen, self-hashed manifest, precisely so no edit -- automated or human -- can widen them.",
+    note: "Templates in this project are separated for review and future tuning -- prompts, tunable values, and the manager/supervisor code each live in their own file so one can be reviewed or adjusted without touching the others. The BOUNDS on the tunables live here, in this frozen, self-hashed manifest, and any tunables.json value outside them is refused at startup. HONEST SCOPE (read before relying on this): self_sha256 is TAMPER-EVIDENCE, not tamper-proofing -- it catches a manifest whose bytes were edited without recomputing the hash. In GraphSmith's own repository the actual guarantee that no evolution can widen these bounds comes from the contract-04 gate fence (candidates/evolve structurally cannot touch this manifest), not from this hash. A same-user attacker with arbitrary write access to a scaffolded project -- who could equally rewrite manager.js/supervisor.js/capability.js -- is out of scope per contract-05 threat A6; such an attacker could widen a bound and recompute self_sha256 to match. That is a known, accepted limit, not a defeat of a tamper-proof claim this file never made.",
   };
   const self_sha256 = crypto.createHash("sha256").update(JSON.stringify(withoutHash)).digest("hex");
   return Object.assign({}, withoutHash, { self_sha256: self_sha256 });
@@ -1423,16 +1624,16 @@ function readmeContent(name) {
     "- `supervisor.js` -- the budget + tripwire enforcement core (frozen; hashed).",
     "- `capability.js` + `adapters/*.capability.json` -- what each worker's side effect is allowed to do, and the exact kill/resume message a human sees if it's interrupted mid-effect (frozen; hashed).",
     "- `workers/*.js` + `workers/*.prompt.md` -- one job each; each worker's prompt is separated for review and future tuning from its code.",
-    "- `tunables.json` -- the numeric knobs' current VALUES. `workflow.manifest.json` freezes their min/max BOUNDS, unit, and meaning, so editing a value can never widen what it's allowed to be.",
+    "- `tunables.json` -- the numeric knobs' current VALUES. `workflow.manifest.json` freezes their min/max BOUNDS, unit, and meaning, and a value outside them is refused at startup. Honest scope: the manifest's self-hash is tamper-EVIDENCE (it catches an edited manifest whose hash wasn't recomputed), not tamper-proofing -- someone with write access to this project's files who also recomputes the hash is a same-user/local-write attacker, which is out of scope here the same way rewriting `manager.js` itself would be.",
     "",
     "## Budgets (plan section 7, enforced in supervisor.js before any worker runs)",
-    "max_steps, max_retries_per_step, max_wall_time_ms, max_external_calls (+ per-destination and per-effect-type caps), the declared destination allowlist, est_cost_ceiling_usd, max_disk_mb, memory_ceiling_mb (pair with `node --max-old-space-size=<mb> manager.js` for OS-backed enforcement), max_log_bytes, max_state_bytes, max_subprocess_count/lifetime, max_output_tokens, and the watchdog's sync_execution_budget_ms. Every breach HALTs and prints the rule plus machine-readable evidence. Totals persist across resumes (in `<runId>/budget-state.json`) on a monotonic clock (documented in supervisor.js) -- a human may extend a budget only by re-running with `--acknowledge-budget`, which records the extension; it never silently resets anything.",
+    "max_steps, max_retries_per_step, max_wall_time_ms, max_external_calls (+ per-destination and per-effect-type caps), the declared destination allowlist, est_cost_ceiling_usd, max_disk_mb, memory_ceiling_mb (pair with `node --max-old-space-size=<mb> manager.js` for OS-backed enforcement), max_log_bytes, max_state_bytes, max_subprocess_count/lifetime, max_output_tokens, and the watchdog's sync_execution_budget_ms. Every breach HALTs and prints the rule plus machine-readable evidence. Totals persist across resumes (in `<runId>/budget-state.json`) on a monotonic clock (documented in supervisor.js), including wall time consumed by a segment that got killed before its next checkpoint -- a human may extend a budget only by re-running with `--acknowledge-budget`, which records exactly what was extended (the rule, its tunable(s), the previous limit, and the new value(s)); it never silently resets anything. A present-but-unreadable/corrupt `budget-state.json` HALTs rather than silently starting over -- defaults are only ever used for a genuinely new run directory.",
     "",
     "## Tripwires (manager-observed policy checks, honest scope -- NOT OS mediation)",
     "step re-entry beyond cap (persisted across resumes) - progress judged by trusted monotonic STATE transitions, never by checkpoint churn - undeclared external destination - rate/effect-type cap breach. Every trip prints its rule, its evidence, and next steps. Auto-HALT only -- a tripwire never auto-continues.",
     "",
     "## The watchdog (blocked-event-loop case)",
-    "A manager cannot detect its own hang -- a blocked event loop can't run the code that would notice it's blocked. `manager.js` spawns `watchdog.js` (a separate process; interface documented at the top of manager.js) as a heartbeat-checked sibling. If `watchdog.js` is not present next to `manager.js`, the manager feature-detects that, logs one documented warning, and continues WITHOUT sync-execution enforcement -- every other budget above still applies.",
+    "A manager cannot detect its own hang -- a blocked event loop can't run the code that would notice it's blocked. `manager.js` spawns `watchdog.js` (a separate process; interface documented at the top of manager.js) as a heartbeat-checked sibling, and also OBSERVES that sibling's own liveness: if the watchdog process dies unexpectedly (crash, OOM, external kill), the manager notices and HALTs fail-closed rather than silently continuing without sync-execution enforcement. If `watchdog.js` is not present next to `manager.js` at all, the manager feature-detects that, logs one documented warning, and continues WITHOUT sync-execution enforcement -- every other budget above still applies.",
     "",
     "## If it crashes",
     "Run the same command with the same run name. Finished steps are skipped automatically. Progress lives in `.runs/<runId>/`. A corrupted save point is backed up automatically and the step re-runs.",
@@ -1604,13 +1805,63 @@ function runSelftest() {
       fs.writeFileSync(tunablesPath, originalRaw);
     }
 
-    // ---- 7. budget breaches HALT with evidence, one per plan §7 budget ----
     const runDirFor = (label) => {
       const d = path.join(tmpRoot, "rundir-" + label);
       fs.mkdirSync(d, { recursive: true });
       return d;
     };
     const baseValues = () => JSON.parse(fs.readFileSync(path.join(projDir, "tunables.json"), "utf8")).values;
+
+    // ---- 6b. D1 -- corrupt/unparseable budget-state.json HALTs fail-closed, never resets ----
+    {
+      const absentDir = runDirFor("d1-absent-state");
+      const fresh = supervisorLib.loadBudgetState(path.join(absentDir, "budget-state.json"));
+      assertTrue(results, "D1-genuinely-absent-state-still-gets-defaults",
+        fresh && fresh.steps_executed === 0 && fresh.halted === null && fresh.active_segment_started_ms === null,
+        JSON.stringify(fresh));
+
+      const corruptDir = runDirFor("d1-corrupt-state");
+      const statePath = path.join(corruptDir, "budget-state.json");
+      fs.writeFileSync(statePath, "{not valid json at all");
+      const err1 = expectThrows(() => supervisorLib.loadBudgetState(statePath));
+      assertTrue(results, "D1-corrupt-json-throws-CORRUPT_STATE", err1 && err1.code === "CORRUPT_STATE", err1 && err1.message);
+
+      // Full integration: a run that already accumulated real budget, then had its
+      // state file corrupted, must refuse via createSupervisor -- not silently
+      // continue on a fresh defaultState() (the exact GS-SCAF-01 / F1 fail-open).
+      const liveDir = runDirFor("d1-corrupt-after-accumulation");
+      const liveValues = Object.assign({}, baseValues(), { max_external_calls: 1000 });
+      const sup1 = supervisorLib.createSupervisor({ root: projDir, runDir: liveDir, values: liveValues, acknowledgeBudget: false });
+      sup1.recordExternalCall({ destination: "https://api.example.com/x", effect_type: "deliver", cost_usd: 0 });
+      assertTrue(results, "D1-accumulated-before-corruption", sup1.state.external_calls_total === 1, sup1.state.external_calls_total);
+      fs.writeFileSync(path.join(liveDir, "budget-state.json"), "{ this is not json");
+      const err2 = expectThrows(() => supervisorLib.createSupervisor({ root: projDir, runDir: liveDir, values: liveValues, acknowledgeBudget: false }));
+      assertTrue(results, "D1-createSupervisor-fails-closed-on-corrupt-state-never-resets",
+        err2 && err2.code === "CORRUPT_STATE", err2 ? err2.message : "createSupervisor did NOT throw -- silently proceeded on corrupt state");
+    }
+
+    // ---- 6c. D2 -- a killed segment's wall time is reconstructed and charged on resume ----
+    {
+      const killedDir = runDirFor("d2-killed-segment-under-budget");
+      const statePath = path.join(killedDir, "budget-state.json");
+      const seeded = Object.assign(supervisorLib.defaultState(), { active_segment_started_ms: Date.now() - 5000 });
+      fs.writeFileSync(statePath, JSON.stringify(seeded));
+      const values = Object.assign({}, baseValues(), { max_wall_time_ms: 3600000 }); // generous: must not halt, only charge
+      const sup = supervisorLib.createSupervisor({ root: projDir, runDir: killedDir, values: values, acknowledgeBudget: false });
+      assertTrue(results, "D2-killed-segment-reconstructed-and-charged",
+        sup.state.cumulative_wall_time_ms >= 4900, "cumulative_wall_time_ms=" + sup.state.cumulative_wall_time_ms + " (expected >= ~5000ms reconstructed from a segment started 5s ago)");
+
+      const breachDir = runDirFor("d2-killed-segment-over-budget");
+      const breachPath = path.join(breachDir, "budget-state.json");
+      const seededBreach = Object.assign(supervisorLib.defaultState(), { active_segment_started_ms: Date.now() - 5000 });
+      fs.writeFileSync(breachPath, JSON.stringify(seededBreach));
+      const tightValues = Object.assign({}, baseValues(), { max_wall_time_ms: 1000 }); // 5s killed segment > 1s budget
+      const err = expectThrows(() => supervisorLib.createSupervisor({ root: projDir, runDir: breachDir, values: tightValues, acknowledgeBudget: false }));
+      const ok = !!(err && err.halt && err.halt.kind === "budget" && err.halt.rule === "max_wall_time_ms" && err.halt.evidence.reconstructed_killed_segment === true);
+      assertTrue(results, "D2-killed-segment-alone-can-breach-the-budget-at-resume", ok, err ? JSON.stringify(err.halt || err.message) : "did not throw");
+    }
+
+    // ---- 7. budget breaches HALT with evidence, one per plan §7 budget ----
 
     function budgetTest(name, valuesPatch, drive) {
       const runDir = runDirFor(name);
@@ -1757,7 +2008,80 @@ function runSelftest() {
       const finalState = JSON.parse(fs.readFileSync(budgetStatePath, "utf8"));
       assertTrue(results, "e2e-acknowledge-budget-records-extension-not-silent-reset", Array.isArray(finalState.acknowledged_extensions) && finalState.acknowledged_extensions.length === 1 && finalState.steps_executed > 1, JSON.stringify(finalState.acknowledged_extensions) + " steps_executed=" + finalState.steps_executed);
 
+      // ---- D4: the acknowledgement record must name the rule, the tunable(s) that
+      // parameterize it, the previous breached limit, and the new value(s) -- not just
+      // a bare timestamp + a copy of the previous halt. ----
+      const ext = finalState.acknowledged_extensions[0];
+      assertTrue(results, "D4-ack-record-names-the-rule-and-tunables",
+        ext && ext.rule === "max_steps" && Array.isArray(ext.tunables) && ext.tunables.indexOf("max_steps") !== -1,
+        JSON.stringify(ext));
+      assertTrue(results, "D4-ack-record-has-previous-and-new-limit",
+        ext && ext.previous_limit === 1 && ext.new_limits && ext.new_limits.max_steps === 10,
+        JSON.stringify(ext));
+
       fs.writeFileSync(tunablesPath, originalRaw);
+    }
+
+    // ---- 11. D3 -- manager detects an unexpectedly dead watchdog and HALTs fail-closed ----
+    // runSelftest() is synchronous, so waiting uses a real blocking sleep (Atomics.wait on
+    // a throwaway SharedArrayBuffer -- zero-dep, deterministic, no shell/platform reliance)
+    // rather than a busy-spin or a platform-specific "sleep" command.
+    function sleepSyncMs(ms) {
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch (e) {}
+    }
+    if (watchdogWasCopiedIn) {
+      const d3Dir = path.join(tmpRoot, "proj-d3");
+      scaffoldProject(d3Dir, "proj-d3");
+      const d3Tunables = path.join(d3Dir, "tunables.json");
+      const d3Patched = JSON.parse(fs.readFileSync(d3Tunables, "utf8"));
+      d3Patched.values.sync_execution_budget_ms = 30000; // generous: the watchdog itself must not fire
+      fs.writeFileSync(d3Tunables, JSON.stringify(d3Patched, null, 2));
+      fs.writeFileSync(path.join(d3Dir, "workers", "gather.js"),
+        "\"use strict\";\nconst fs=require(\"fs\"),path=require(\"path\");\n" +
+        "module.exports.run=async function(_input,ctx){\n" +
+        "  fs.writeFileSync(path.join(ctx.runDir,\"ready\"),\"1\");\n" +
+        "  await new Promise(function(r){ setTimeout(r, 15000); });\n" +
+        "  return {};\n" +
+        "};\n");
+      const child = require("child_process").spawn(process.execPath, ["manager.js", "run"], { cwd: d3Dir, stdio: "ignore" });
+      const readyFile = path.join(d3Dir, ".runs", "run", "ready");
+      const managerLogFile = path.join(d3Dir, ".runs", "run", "manager.log");
+      const deadline = Date.now() + 8000;
+      while (!fs.existsSync(readyFile) && Date.now() < deadline) sleepSyncMs(50);
+      let watchdogPid = null;
+      const deadline2 = Date.now() + 3000;
+      while (watchdogPid === null && Date.now() < deadline2) {
+        try {
+          const log = fs.readFileSync(managerLogFile, "utf8");
+          const m = log.match(/spawned watchdog pid (\d+)/);
+          if (m) watchdogPid = parseInt(m[1], 10);
+        } catch (e) {}
+        if (watchdogPid === null) sleepSyncMs(50);
+      }
+      if (watchdogPid === null) {
+        assertTrue(results, "D3-manager-detects-dead-watchdog-and-logs-it", false, "watchdog pid never appeared in manager.log within the test window");
+        try { child.kill("SIGKILL"); } catch (e) {}
+      } else {
+        try {
+          if (process.platform === "win32") require("child_process").execSync("taskkill /PID " + watchdogPid + " /F", { stdio: "ignore" });
+          else process.kill(watchdogPid, "SIGKILL");
+        } catch (e) {}
+        const deadline3 = Date.now() + 5000;
+        let noticed = false;
+        while (Date.now() < deadline3) {
+          try {
+            const log = fs.readFileSync(managerLogFile, "utf8");
+            if (/watchdog.*(?:exit|dead|gone|missing|detached|died|killed)/i.test(log)) { noticed = true; break; }
+          } catch (e) {}
+          if (!noticed) sleepSyncMs(50);
+        }
+        assertTrue(results, "D3-manager-detects-dead-watchdog-and-logs-it", noticed,
+          (noticed ? "manager.log recorded the dead watchdog: " : "manager.log did NOT record the dead watchdog within the test window; log=") +
+          (fs.existsSync(managerLogFile) ? fs.readFileSync(managerLogFile, "utf8") : "(missing)"));
+        try { child.kill("SIGKILL"); } catch (e) {}
+      }
+    } else {
+      assertTrue(results, "D3-manager-detects-dead-watchdog-and-logs-it", true, "skipped: scripts/watchdog.js not present at scaffold time (feature-detected absence, out of this case's scope)");
     }
 
     const failed = results.filter((r) => !r.pass);
