@@ -192,14 +192,96 @@ const STATIC_UNPROVABLE_PATTERNS = Object.freeze([
   { id: "function-constructor", re: /\bFunction\s*\(|\bReflect\s*\.\s*construct\s*\(/ },
 ]);
 
+/* Dangerous identifiers as bare tokens (aliasing-safe). Presence after comment
+ * strip ⇒ unprovable / not eligible — catches `const r = require; r("http")`
+ * and comment-split `req/**\/uire("http")` without requiring call syntax. */
+const DANGEROUS_IDENTIFIER_PATTERNS = Object.freeze([
+  { id: "ident-require", re: /\brequire\b/ },
+  { id: "ident-import", re: /\bimport\b/ },
+  { id: "ident-fetch", re: /\bfetch\b/ },
+  { id: "ident-exec", re: /\bexec(?:Sync|File\w*)?\b/ },
+  { id: "ident-spawn", re: /\bspawn\w*\b/ },
+  { id: "ident-child-process", re: /\bchild_process\b/ },
+  { id: "ident-eval", re: /\beval\b/ },
+  { id: "ident-Function", re: /\bFunction\b/ },
+  { id: "ident-Reflect-construct", re: /\bReflect\s*\.\s*construct\b/ },
+  { id: "ident-globalThis", re: /\bglobalThis\b/ },
+  { id: "ident-XMLHttpRequest", re: /\bXMLHttpRequest\b/ },
+  { id: "ident-WebSocket", re: /\bWebSocket\b/ },
+  { id: "ident-net-modules", re: /\b(?:net|http|https|http2|dns|tls|dgram)\b/ },
+]);
+
+/**
+ * Bare view: strip // and /* *\/ comments (string-aware so https:// stays intact),
+ * then collapse whitespace so `req/**\/uire` rejoins as `require`.
+ */
+function toCapabilityBareView(src) {
+  const s = String(src || "");
+  const n = s.length;
+  let out = "";
+  let i = 0;
+  while (i < n) {
+    const c = s[i];
+    const c2 = s.slice(i, i + 2);
+    if (c2 === "//") {
+      const e = s.indexOf("\n", i);
+      i = e === -1 ? n : e;
+      continue;
+    }
+    if (c2 === "/*") {
+      const e = s.indexOf("*/", i + 2);
+      i = e === -1 ? n : e + 2;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") {
+      const quote = c;
+      const isTemplate = quote === "`";
+      out += c;
+      i++;
+      while (i < n) {
+        const ch = s[i];
+        if (ch === "\\") {
+          out += ch;
+          if (i + 1 < n) {
+            out += s[i + 1];
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        if (ch === quote) {
+          out += ch;
+          i++;
+          break;
+        }
+        if (!isTemplate && ch === "\n") {
+          break;
+        }
+        out += ch;
+        i++;
+      }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
 function capabilityPolicyScan(texts) {
-  const blob = Array.isArray(texts) ? texts.join("\n") : String(texts || "");
+  const raw = Array.isArray(texts) ? texts.join("\n") : String(texts || "");
+  const blob = toCapabilityBareView(raw);
   const matched = [];
   for (const p of EXTERNAL_CALL_PATTERNS) {
     if (p.re.test(blob)) matched.push(p.id);
   }
   // Fail-closed: any obfuscation/indirection ⇒ not statically provable clean.
   for (const p of STATIC_UNPROVABLE_PATTERNS) {
+    if (p.re.test(blob)) matched.push(p.id);
+  }
+  // Fail-closed: dangerous identifiers as bare tokens (direct or aliased).
+  for (const p of DANGEROUS_IDENTIFIER_PATTERNS) {
     if (p.re.test(blob)) matched.push(p.id);
   }
   return {
@@ -1077,6 +1159,64 @@ function selftest() {
       proposedContent: "You are gather. Plain safe prose only.\n",
     });
     rec("clean-typed-still-eligible", stCleanStill.auto_apply_eligible === true);
+
+    // Variable indirection / comment-split (fail-closed bare identifiers).
+    const stAliasRequire = stageRepair({
+      root: pr,
+      target: promptRel,
+      proposedContent: 'const r = require; r("http");\n',
+    });
+    rec(
+      "var-alias-require-not-eligible",
+      stAliasRequire.auto_apply_eligible === false &&
+        stAliasRequire.capability_policy.no_external_calls === false
+    );
+
+    const stAliasFetch = stageRepair({
+      root: pr,
+      target: promptRel,
+      proposedContent: "const f = fetch; f('https://x');\n",
+    });
+    rec(
+      "var-alias-fetch-not-eligible",
+      stAliasFetch.auto_apply_eligible === false &&
+        stAliasFetch.capability_policy.no_external_calls === false
+    );
+
+    const stCommentSplit = stageRepair({
+      root: pr,
+      target: promptRel,
+      proposedContent: 'req/**/uire("http");\n',
+    });
+    rec(
+      "comment-split-require-not-eligible",
+      stCommentSplit.auto_apply_eligible === false &&
+        stCommentSplit.capability_policy.no_external_calls === false
+    );
+
+    const stAliasExec = stageRepair({
+      root: pr,
+      target: promptRel,
+      proposedContent: 'const e = exec; e("whoami");\n',
+    });
+    rec(
+      "var-alias-exec-not-eligible",
+      stAliasExec.auto_apply_eligible === false &&
+        stAliasExec.capability_policy.no_external_calls === false
+    );
+
+    const bareAlias = capabilityPolicyScan(['const r = require; r("http");']);
+    const bareFetch = capabilityPolicyScan(["const f = fetch; f('https://x');"]);
+    const bareComment = capabilityPolicyScan(['req/**/uire("http");']);
+    const bareExec = capabilityPolicyScan(['const e = exec; e("whoami");']);
+    const bareClean = capabilityPolicyScan(["You are gather. Plain safe prose only."]);
+    const bareKnob = capabilityPolicyScan(['{ "max_retries": 3, "note": "increase timeout" }']);
+    rec("scan-var-alias-require-unprovable", bareAlias.no_external_calls === false);
+    rec("scan-var-alias-fetch-unprovable", bareFetch.no_external_calls === false);
+    rec("scan-comment-split-require-unprovable", bareComment.no_external_calls === false);
+    rec("scan-var-alias-exec-unprovable", bareExec.no_external_calls === false);
+    rec("scan-clean-prose-still-provable", bareClean.no_external_calls === true);
+    rec("scan-clean-knob-still-provable", bareKnob.no_external_calls === true);
 
     // Simulate human applying the typed repair, then rollback byte-exact.
     fs.writeFileSync(promptAbs, typedProposed);
