@@ -308,6 +308,16 @@ function runShadow(opts) {
       injected_improvement_promoted: improvementPromoted,
       improvement_verdict_distribution: impMeas.verdictCounts,
       improvement_endpoint_min: round(impMeas.endpointStats.min),
+      regression_sensitivity_scope: [
+        "The detected regression above demonstrates Tier 1/2 sensitivity ONLY: hard-invariant",
+        "violations (Tier 1) and critical-slice regressions (Tier 2). It does NOT mean every",
+        "possible regression is flagged. A Tier-3 one-sided statistical LOSS (a candidate that",
+        "loses on discordant pairs) is NOT reported as a regression here: the Gate-2 primary",
+        "endpoint is one-sided by design (contract 03 — one predeclared primary endpoint",
+        "decided by a one-sided sign test with a one-sided lower bound), so a losing candidate",
+        "reads as inconclusive / underpowered rather than a detected regression. This is a",
+        "disclosed property of the frozen evaluator, not a defect in this shadow harness.",
+      ].join(" "),
     },
     scope_note: [
       "Shadow-only (permanent I4): this harness observes and reports; it never adopts,",
@@ -387,6 +397,19 @@ function renderMemo(machine) {
   L.push("evaluator: the same frozen decision function detects an injected regression");
   L.push("and promotes an injected improvement.");
   L.push("");
+  L.push("### Regression-sensitivity scope (disclosure)");
+  L.push("- \"Injected regression detected: yes\" means **Tier 1/2 sensitivity only**:");
+  L.push("  hard-invariant violations (Tier 1) and critical-slice regressions (Tier 2).");
+  L.push("- It does **not** mean the evaluator flags every possible regression.");
+  L.push("- A Tier-3 one-sided statistical loss — a candidate that loses on discordant");
+  L.push("  pairs — is **not** reported as a regression here: the Gate-2 primary endpoint");
+  L.push("  is one-sided by design (contract 03 — one predeclared primary endpoint decided");
+  L.push("  by a one-sided sign test with a one-sided lower bound), so a losing candidate");
+  L.push("  reads as inconclusive / underpowered rather than a detected regression.");
+  L.push("- This is a disclosed property of the frozen evaluator, not a defect in this");
+  L.push("  shadow harness. A reader must not over-read \"detected: yes\" as \"detects all");
+  L.push("  regressions.\"");
+  L.push("");
   L.push("## Scope");
   L.push(machine.scope_note);
   L.push("");
@@ -454,6 +477,20 @@ function selftest() {
     check("injected-improvement-promoted",
       machine.falsification.injected_improvement_promoted === true,
       JSON.stringify(machine.falsification.improvement_verdict_distribution));
+
+    /* Honest-scope disclosure: regression detection is Tier 1/2 sensitivity only;
+     * a Tier-3 one-sided statistical loss is not flagged (evaluator is one-sided
+     * by design). Must be in BOTH the machine form AND the rendered memo. */
+    const scopeField = machine.falsification.regression_sensitivity_scope;
+    check("regression-sensitivity-scope-in-machine-form",
+      typeof scopeField === "string" && /Tier 1\/2/.test(scopeField) &&
+      /one-sided/.test(scopeField) && /contract 03/.test(scopeField),
+      "scope field = " + JSON.stringify(scopeField));
+    const memoText = renderMemo(machine);
+    check("regression-sensitivity-scope-disclosed-in-memo",
+      /Regression-sensitivity scope/.test(memoText) && /Tier 1\/2 sensitivity only/.test(memoText) &&
+      /one-sided by design/.test(memoText) && memoText.includes("regression_sensitivity_scope"),
+      "memo missing the regression-sensitivity scope disclosure");
 
     /* schema_version on the machine form. */
     check("schema-version-on-machine-form", machine.schema_version === SCHEMA_VERSION,

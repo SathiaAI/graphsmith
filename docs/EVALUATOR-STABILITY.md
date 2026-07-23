@@ -52,6 +52,19 @@ This confirms the flat null result above is not an artifact of an inert
 evaluator: the same frozen decision function detects an injected regression
 and promotes an injected improvement.
 
+### Regression-sensitivity scope (disclosure)
+- "Injected regression detected: yes" means **Tier 1/2 sensitivity only**:
+  hard-invariant violations (Tier 1) and critical-slice regressions (Tier 2).
+- It does **not** mean the evaluator flags every possible regression.
+- A Tier-3 one-sided statistical loss — a candidate that loses on discordant
+  pairs — is **not** reported as a regression here: the Gate-2 primary endpoint
+  is one-sided by design (contract 03 — one predeclared primary endpoint decided
+  by a one-sided sign test with a one-sided lower bound), so a losing candidate
+  reads as inconclusive / underpowered rather than a detected regression.
+- This is a disclosed property of the frozen evaluator, not a defect in this
+  shadow harness. A reader must not over-read "detected: yes" as "detects all
+  regressions."
+
 ## Scope
 Shadow-only (permanent I4): this harness observes and reports; it never adopts, promotes, writes ACTIVE / the adoption log, or sends anything upstream. No evolution or fleet effectiveness claim is made from this memo. This memo is an input to the v0.3 go/no-go decision, and nothing more.
 
@@ -129,7 +142,8 @@ Shadow-only (permanent I4): this harness observes and reports; it never adopts, 
     "improvement_verdict_distribution": {
       "promote": 64
     },
-    "improvement_endpoint_min": 0.48
+    "improvement_endpoint_min": 0.48,
+    "regression_sensitivity_scope": "The detected regression above demonstrates Tier 1/2 sensitivity ONLY: hard-invariant violations (Tier 1) and critical-slice regressions (Tier 2). It does NOT mean every possible regression is flagged. A Tier-3 one-sided statistical LOSS (a candidate that loses on discordant pairs) is NOT reported as a regression here: the Gate-2 primary endpoint is one-sided by design (contract 03 — one predeclared primary endpoint decided by a one-sided sign test with a one-sided lower bound), so a losing candidate reads as inconclusive / underpowered rather than a detected regression. This is a disclosed property of the frozen evaluator, not a defect in this shadow harness."
   },
   "scope_note": "Shadow-only (permanent I4): this harness observes and reports; it never adopts, promotes, writes ACTIVE / the adoption log, or sends anything upstream. No evolution or fleet effectiveness claim is made from this memo. This memo is an input to the v0.3 go/no-go decision, and nothing more."
 }
