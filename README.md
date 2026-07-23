@@ -161,7 +161,7 @@ The moment two or more agents (or sessions) build against the same repo, individ
 > **Minimum by default, full system if you want it.** The skill ships with the distilled essentials — the seven build rules and six coordination rules cover most projects. For teams running many agents against production software (real users, money, or regulated data), the repo also includes the complete **11-Document Build System** (`references/full-build-system.md`): document registry and manifest, PRD-to-task traceability, adversarial QA charter, release and rollback runbooks, agent operating protocol with risk-tiered human gates, and eval scorecards for the agents themselves. It's a great-to-have, not a prerequisite — adopt it when your project earns it, not before.
 
 ### KnoSky (the grounding layer)
-[KnoSky](https://knosky.com) turns your repo into a local map plus a read-only connector your AI cites from. It indexes pointers (titles, headings, short excerpts), never file bodies; nothing is uploaded anywhere. The skill keeps it updated each session and requires citations for any claim about existing code. Free — try it standalone with `npx knosky@0.6.3 .` (the pinned, integrity-checked version this release was reviewed against — the pin lives in `scripts/knosky-sync.js`)
+[KnoSky](https://knosky.com) turns your repo into a local map plus a read-only connector your AI cites from. It indexes pointers (titles, headings, short excerpts), never file bodies; nothing is uploaded anywhere. The skill keeps it updated each session and requires citations for any claim about existing code. Free — try it standalone with `npx knosky@0.8.0 .` (the pinned, integrity-checked version this release ships against — the pin lives in `scripts/knosky-sync.js`)
 
 ---
 

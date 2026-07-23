@@ -12,7 +12,7 @@
  * Never fails the user's task: any error degrades to "use what's cached". */
 const { execFileSync } = require("child_process");
 
-const PIN = "0.6.3"; // bump together with GraphSmith releases, after review
+const PIN = "0.8.0"; // bump together with GraphSmith releases, after review
 // PD-10: content-integrity pin. A version label alone can be re-published by a
 // compromised registry; the sha512 below is the hash of the exact tarball this
 // release was reviewed against. A mismatch means the content behind the label
@@ -20,7 +20,7 @@ const PIN = "0.6.3"; // bump together with GraphSmith releases, after review
 // registry it distrusts, so it defeats label reassignment, not a registry that
 // lies consistently; air-gapped verification belongs to the v0.2.0 regulated
 // extension. Bump PIN and EXPECTED_INTEGRITY together, never separately.
-const EXPECTED_INTEGRITY = "sha512-Iq7pL6bzTJbBGfId856S89mRjXqByMewCIdB/uUtA375r9Gr4M999VDjejqTaiXOmw9p9GpNwpr9py5mPDbbtw==";
+const EXPECTED_INTEGRITY = "sha512-YAfZijKUBLJxfSeg0XQJNDT02z+YhjP778Wi3bmBNDpWNVzJtmmUKd5Wt88+OCT6bLhMo1efcOAS9ye+zJ+LuQ==";
 const GROUND_CMD = `npx knosky@${PIN} .`;
 const win = process.platform === "win32";
 // All args are constants; shell:true is required for npm/npx .cmd shims on
