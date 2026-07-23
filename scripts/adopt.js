@@ -229,8 +229,38 @@ function observe(projectRoot, runId, treeId) {
 
 function close(projectRoot, windowId, outcome) {
   const root = path.resolve(projectRoot || ".");
+  if (outcome === "rolled_back") return closeRolledBack(root, windowId);
   const stateStore = createStore(root);
   return gate.gate4Close(windowId, outcome, stateStore);
+}
+
+/* A failed canary (outcome === "rolled_back") must ACTUALLY undo the
+ * adoption, not just stamp the window terminal. gate4Close/closeWindow only
+ * flips window.json — it never touches ACTIVE. promoteApi.rollback(windowId)
+ * IS the pre-authorized inverse (contract 01/02): it re-checks kind +
+ * reversible + auto_rollback_eligible itself and, for doc/knob, atomically
+ * swaps ACTIVE back to the pre-adoption tree (byte-exact — it reuses the
+ * original tree id, never a re-derived copy) while finalizing this SAME
+ * Gate-4 window to CLOSED_ROLLED_BACK as part of that one transaction (see
+ * promote.js's finalizeWindow rollback_of branch). For code/migration it
+ * throws FORWARD_RECOVERY_REQUIRED *before* touching ACTIVE or the window —
+ * we let that propagate so the caller is refused explicitly rather than the
+ * window silently going terminal while the code change stays adopted. */
+function closeRolledBack(root, windowId) {
+  requiredString(windowId, "windowId");
+  const previousCwd = process.cwd();
+  process.chdir(root);
+  try {
+    const rolledBack = promoteApi.rollback(windowId);
+    return {
+      state: "CLOSED_ROLLED_BACK",
+      window_id: windowId,
+      rollback_txid: rolledBack.txid,
+      rollback_state: rolledBack.state,
+    };
+  } finally {
+    process.chdir(previousCwd);
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -340,6 +370,80 @@ function makeConfirmationBundle(desiredND, candidateId) {
   };
   bundle.bundle_sha256 = sha256(JSON.stringify({ ...bundle, bundle_sha256: undefined }));
   return bundle;
+}
+
+/* Lightweight doc-edit fixture + hand-staged proposal — used by the D1/D2
+ * window-lifecycle and rollback scenarios below, which don't need the full
+ * evolve/gate1/gate2 pipeline the main chain scenario exercises (that
+ * pipeline is proven separately by chain-step1..3 above). */
+function makeDocEditFixture(root) {
+  const stateDir = path.join(root, ".graphsmith", "state");
+  const evolvableDir = path.join(root, ".graphsmith", "evolvable");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(evolvableDir, { recursive: true });
+
+  const seedDir = path.join(evolvableDir, "seed");
+  fs.mkdirSync(seedDir);
+  fs.writeFileSync(path.join(seedDir, "graphsmith.learned.md"), "alpha\n__GS_SLOT__\n");
+
+  const manifest = generate("tree", { rootDir: seedDir });
+  const manifestBytes = Buffer.from(JSON.stringify(manifest, null, 2) + "\n");
+  fs.writeFileSync(path.join(seedDir, "tree.manifest.json"), manifestBytes);
+
+  const treeHash = sha256(manifestBytes);
+  const treeName = "v-" + treeHash;
+  fs.renameSync(seedDir, path.join(evolvableDir, treeName));
+
+  const pointer = {
+    schema_version: SCHEMA_VERSION,
+    txid: "0".repeat(16),
+    tree: treeName,
+    tree_manifest_sha256: treeHash,
+  };
+  fs.writeFileSync(path.join(evolvableDir, "ACTIVE"), Buffer.from(JSON.stringify(pointer, null, 2) + "\n", "utf8"));
+
+  fs.writeFileSync(path.join(stateDir, "project.manifest.json"), JSON.stringify({
+    schema_version: SCHEMA_VERSION,
+    kind: "project",
+    generated_at: "selftest",
+    parent_release_sha256: null,
+    adoption_log_head: null,
+    active_tree: treeName,
+    active_tree_manifest_sha256: treeHash,
+    files: [],
+    workflow_manifests: [],
+  }, null, 2) + "\n");
+
+  return { treeName, treeHash };
+}
+
+function stageDocProposal(root, tag, opts = {}) {
+  const fingerprint = sha256("adopt-selftest-" + tag);
+  const record = {
+    schema_version: SCHEMA_VERSION,
+    proposal_id: fingerprint,
+    fingerprint,
+    status: "PENDING_HUMAN_REVIEW",
+    kind: opts.kind || "doc",
+    edits: [{
+      file: "graphsmith.learned.md",
+      anchor: "__GS_SLOT__",
+      op: "replace",
+      payload: "\n## " + tag + "\n__GS_SLOT__\n",
+      schema_ref: "adopt-selftest/v1",
+      schema_version: SCHEMA_VERSION,
+    }],
+    gate3: {
+      diff: [],
+      plainEnglish: "selftest " + tag,
+      inverse: [],
+      reversible: opts.reversible !== undefined ? opts.reversible : true,
+      autoRollbackEligible: opts.autoRollbackEligible !== undefined ? opts.autoRollbackEligible : true,
+    },
+    created_at: "selftest",
+  };
+  appendProposalRecord(root, record);
+  return record;
 }
 
 function selftest() {
@@ -509,6 +613,146 @@ function selftest() {
     const finalWindow = createStore(projectRoot).window.get();
     check("chain-step8-window-terminal-closed-pass", finalWindow.state === "CLOSED_PASS");
 
+    /* --- D1: admit -> observe(x window_n>1) -> close(pass) KEEPS the
+     * change. The main chain above only proved window_n=1; this proves the
+     * full canary count is actually driven to completion before close(pass)
+     * is allowed to succeed. --- */
+    const winRoot = path.join(base, "window-n");
+    const { treeName: winBaseTree } = makeDocEditFixture(winRoot);
+    const winProp = stageDocProposal(winRoot, "window-n-pass");
+    const winAdopted = adopt(winRoot, winProp.proposal_id, { confirm: true, windowN: 3 });
+    check("d1-window-n-adopt-succeeds", winAdopted.adopted === true && winAdopted.state === "DONE", JSON.stringify(winAdopted));
+
+    const winActivePath = path.join(winRoot, ".graphsmith", "evolvable", "ACTIVE");
+    const winActive = JSON.parse(fs.readFileSync(winActivePath, "utf8"));
+    check("d1-window-n-active-moved-to-new-tree", winActive.tree !== winBaseTree && winActive.txid === winAdopted.txid);
+
+    for (let i = 0; i < 3; i++) {
+      const runId = "d1-canary-" + i;
+      const obs = observe(winRoot, runId, winActive.tree);
+      check("d1-window-n-observe-" + i + "-claims-slot",
+        obs && obs.registration && obs.registration.tree_id === winActive.tree, JSON.stringify(obs));
+      createStore(winRoot).runRegistry.deregister(runId, {});
+    }
+
+    const winBeforeClose = createStore(winRoot).window.get();
+    check("d1-window-n-fully-admitted-before-close",
+      winBeforeClose.window && winBeforeClose.window.admitted === 3 &&
+        winBeforeClose.window.slots.every((s) => s.status === "terminal"),
+      JSON.stringify(winBeforeClose.window));
+
+    const winClosed = close(winRoot, winAdopted.txid, "pass");
+    check("d1-window-n-close-pass-succeeds", winClosed.state === "CLOSED_PASS", JSON.stringify(winClosed));
+
+    const winFinalActive = JSON.parse(fs.readFileSync(winActivePath, "utf8"));
+    check("d1-window-n-active-kept-after-close-pass", winFinalActive.tree === winActive.tree);
+
+    const winLog = fs.readFileSync(path.join(winRoot, ".graphsmith", "state", "adoption-log.jsonl"), "utf8")
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const winEffective = winLog[winLog.length - 1];
+    check("d1-window-n-adoption-log-effective",
+      winEffective && winEffective.status === "effective" && winEffective.fingerprint === winProp.fingerprint,
+      JSON.stringify(winEffective));
+
+    /* Negative control: an INCOMPLETE window (fewer than window_n
+     * observations) must still refuse close(pass) with WINDOW_INCOMPLETE —
+     * the D1 fix must not weaken this gate. */
+    const incRoot = path.join(base, "window-n-incomplete");
+    makeDocEditFixture(incRoot);
+    const incProp = stageDocProposal(incRoot, "window-n-incomplete");
+    const incAdopted = adopt(incRoot, incProp.proposal_id, { confirm: true, windowN: 3 });
+    const incActive = JSON.parse(fs.readFileSync(path.join(incRoot, ".graphsmith", "evolvable", "ACTIVE"), "utf8"));
+    observe(incRoot, "inc-canary-0", incActive.tree);
+    createStore(incRoot).runRegistry.deregister("inc-canary-0", {});
+    let incThrew = null;
+    try { close(incRoot, incAdopted.txid, "pass"); } catch (e) { incThrew = e; }
+    check("d1-incomplete-window-close-pass-still-refused",
+      incThrew !== null && incThrew.code === "WINDOW_INCOMPLETE", incThrew ? incThrew.code : "did not throw");
+
+    /* --- D2a: close(rolled_back) on a doc/knob (auto_rollback_eligible)
+     * change ACTUALLY restores ACTIVE byte-exact to the pre-adoption tree. */
+    const rbRoot = path.join(base, "rollback-doc");
+    const { treeName: rbBaseTree } = makeDocEditFixture(rbRoot);
+    const rbProp = stageDocProposal(rbRoot, "rollback-doc", { kind: "doc" });
+    const rbAdopted = adopt(rbRoot, rbProp.proposal_id, { confirm: true, windowN: 1 });
+    check("d2-doc-adopt-succeeds", rbAdopted.adopted === true, JSON.stringify(rbAdopted));
+
+    const rbActivePath = path.join(rbRoot, ".graphsmith", "evolvable", "ACTIVE");
+    const rbAdoptedActive = JSON.parse(fs.readFileSync(rbActivePath, "utf8"));
+    check("d2-doc-active-moved-to-new-tree", rbAdoptedActive.tree !== rbBaseTree);
+
+    observe(rbRoot, "rb-canary-1", rbAdoptedActive.tree);
+    createStore(rbRoot).runRegistry.deregister("rb-canary-1", {});
+
+    const rbClosed = close(rbRoot, rbAdopted.txid, "rolled_back");
+    check("d2-doc-close-rolled-back-reports-terminal", rbClosed && rbClosed.state === "CLOSED_ROLLED_BACK", JSON.stringify(rbClosed));
+
+    const rbFinalActive = JSON.parse(fs.readFileSync(rbActivePath, "utf8"));
+    check("d2-doc-active-restored-byte-exact-to-pre-adoption-tree", rbFinalActive.tree === rbBaseTree, JSON.stringify(rbFinalActive));
+
+    const rbFileContent = fs.readFileSync(path.join(rbRoot, ".graphsmith", "evolvable", rbBaseTree, "graphsmith.learned.md"), "utf8");
+    check("d2-doc-restored-tree-content-byte-exact", rbFileContent === "alpha\n__GS_SLOT__\n", JSON.stringify(rbFileContent));
+
+    const rbWindowAfter = createStore(rbRoot).window.get();
+    check("d2-doc-window-closed-rolled-back", rbWindowAfter.state === "CLOSED_ROLLED_BACK", JSON.stringify(rbWindowAfter));
+
+    /* --- D2b: close(rolled_back) on a code change REFUSES with
+     * human-forward-recovery — never silently leaves ACTIVE on the adopted
+     * tree while marking the window terminal. */
+    const codeRoot = path.join(base, "rollback-code");
+    makeDocEditFixture(codeRoot);
+    const codeProp = stageDocProposal(codeRoot, "rollback-code", { kind: "code" });
+    const codeAdopted = adopt(codeRoot, codeProp.proposal_id, { confirm: true, windowN: 1 });
+    check("d2-code-adopt-succeeds", codeAdopted.adopted === true, JSON.stringify(codeAdopted));
+
+    const codeActivePath = path.join(codeRoot, ".graphsmith", "evolvable", "ACTIVE");
+    const codeAdoptedActive = JSON.parse(fs.readFileSync(codeActivePath, "utf8"));
+
+    observe(codeRoot, "code-canary-1", codeAdoptedActive.tree);
+    createStore(codeRoot).runRegistry.deregister("code-canary-1", {});
+
+    let codeCloseErr = null;
+    try { close(codeRoot, codeAdopted.txid, "rolled_back"); } catch (e) { codeCloseErr = e; }
+    check("d2-code-rollback-refused-forward-recovery",
+      codeCloseErr !== null && codeCloseErr.code === "FORWARD_RECOVERY_REQUIRED",
+      codeCloseErr ? codeCloseErr.code + ":" + codeCloseErr.message : "did not throw");
+
+    const codeFinalActive = JSON.parse(fs.readFileSync(codeActivePath, "utf8"));
+    check("d2-code-active-not-silently-changed", codeFinalActive.tree === codeAdoptedActive.tree, JSON.stringify(codeFinalActive));
+
+    const codeWindowAfter = createStore(codeRoot).window.get();
+    check("d2-code-window-left-open-for-human", codeWindowAfter.state === "OBSERVING", JSON.stringify(codeWindowAfter));
+
+    /* --- D3: CLI `adopt <id> --yes false` is a usage error (exit 2), never
+     * a silent adopt. --yes is a strict bare boolean flag. --- */
+    const cliRoot = path.join(base, "cli-yes-false");
+    makeDocEditFixture(cliRoot);
+    const cliProp = stageDocProposal(cliRoot, "cli-yes-false");
+    const cliActivePath = path.join(cliRoot, ".graphsmith", "evolvable", "ACTIVE");
+    const cliActiveBefore = fs.readFileSync(cliActivePath, "utf8");
+    const cliResult = require("child_process").spawnSync(process.execPath, [
+      __filename, "adopt", cliProp.proposal_id, "--yes", "false", "--project-root", cliRoot,
+    ], { encoding: "utf8" });
+    check("d3-cli-yes-false-usage-error-exit-2", cliResult.status === 2,
+      "exit=" + cliResult.status + " stdout=" + (cliResult.stdout || "").slice(0, 200) + " stderr=" + (cliResult.stderr || "").slice(0, 200));
+
+    const cliActiveAfter = fs.readFileSync(cliActivePath, "utf8");
+    check("d3-cli-yes-false-did-not-adopt", cliActiveAfter === cliActiveBefore);
+
+    const cliPendingStill = listPending(cliRoot);
+    check("d3-cli-yes-false-proposal-still-pending",
+      cliPendingStill.some((p) => p.proposal_id === cliProp.proposal_id), JSON.stringify(cliPendingStill));
+
+    /* Positive control: bare `--yes` (no stray token) still adopts. */
+    const cliOkResult = require("child_process").spawnSync(process.execPath, [
+      __filename, "adopt", cliProp.proposal_id, "--yes", "--project-root", cliRoot, "--window-n", "1",
+    ], { encoding: "utf8" });
+    let cliOkBody = null;
+    try { cliOkBody = JSON.parse(cliOkResult.stdout); } catch (e) { /* leave null */ }
+    check("d3-cli-bare-yes-still-adopts",
+      cliOkResult.status === 0 && cliOkBody && cliOkBody.adopted === true,
+      "exit=" + cliOkResult.status + " body=" + JSON.stringify(cliOkBody));
+
     return {
       schema_version: SCHEMA_VERSION,
       status: errors.length === 0 ? "pass" : "fail",
@@ -578,7 +822,12 @@ function cli() {
     }
   } else if (cmd === "adopt") {
     const proposalId = positional[0];
-    if (!proposalId) { usage(); process.exit(2); }
+    /* --yes is a strict bare boolean flag — it never consumes a following
+     * token. A stray token after it (e.g. `--yes false`) is NOT the
+     * proposalId (already consumed) and must not be silently swallowed as
+     * confirmation; treat any extra positional as a usage error rather than
+     * proceeding with flags.yes===true from the bare "--yes" alone. */
+    if (!proposalId || positional.length > 1) { usage(); process.exit(2); }
     try {
       const result = adopt(projectRoot, proposalId, {
         confirm: flags.yes === true,
