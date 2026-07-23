@@ -80,6 +80,25 @@ function enumStatus(raw) {
   return STATUS_ENUM.includes(raw) ? raw : 'unavailable';
 }
 
+// Validate the CI-run URL SCHEME before it is ever emitted as a live href.
+// xmlEscape neutralizes markup but NOT the URL scheme: "javascript:alert(1)"
+// carries no XML-special chars and would otherwise pass straight into a live
+// <a xlink:href="javascript:..."> (an XSS vector when the SVG is opened in a
+// browser). Allow ONLY http:// and https://; reject javascript:/data:/vbscript:
+// /file:/ftp:, relative paths, and whitespace/control-prefixed spoofs (browsers
+// strip leading whitespace/control chars before parsing the scheme).
+function validateCiUrl(value) {
+  if (value == null) return false;
+  const s = String(value);
+  if (s !== s.trim()) return false;              // leading/trailing whitespace -> reject
+  if (/[\x00-\x1f]/.test(s)) return false;       // embedded control chars -> reject
+  const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(s); // scheme immediately before ':'
+  if (!m) return false;                          // no scheme (relative) -> reject
+  const scheme = m[1].toLowerCase();
+  if (scheme !== 'http' && scheme !== 'https') return false;
+  return /^https?:\/\//i.test(s);                // require scheme://authority form
+}
+
 // ---------------------------------------------------------------------------
 // Freshness — injected reference date vs injected evaluated_at, no clock read.
 // ---------------------------------------------------------------------------
@@ -207,9 +226,11 @@ function buildModel(reports, opts) {
   else if (anyStale) { overallColor = COLORS.stale; overallState = 'stale'; }
   else { overallColor = COLORS.grey; overallState = 'partial'; }
 
+  const ciBounded = opts.ciRunUrl ? safeRaw(opts.ciRunUrl, BOUND.url) : null;
   return { ref, maxAgeDays, platforms, profiles, anyStale, overallColor, overallState,
     verifierVersions: uniq(platforms.map((p) => p.verifier_version)),
-    ciRunUrl: opts.ciRunUrl ? safeRaw(opts.ciRunUrl, BOUND.url) : null };
+    ciRunUrl: ciBounded,
+    ciRunUrlIsLink: validateCiUrl(ciBounded) };
 }
 
 // Bound + control-strip WITHOUT xml-escaping (for descriptor JSON values, which
@@ -252,6 +273,8 @@ function buildDescriptor(model) {
     counts,
     overall_state: model.overallState,
     ci_run_url: model.ciRunUrl,
+    ci_run_url_is_link: !!model.ciRunUrlIsLink, // only http(s) is emitted as a live href
+
     freshness: {
       reference_date: model.ref.iso,
       reference_source: model.ref.source, // documents the INJECTED input, not a clock
@@ -346,9 +369,14 @@ function renderSVG(model) {
     parts.push(text(lx + 15, legendTop, lab, 9, COLORS.text));
     lx += 15 + lab.length * 5.6 + 18;
   }
-  if (model.ciRunUrl) {
+  if (model.ciRunUrl && model.ciRunUrlIsLink) {
+    // Scheme-validated http(s): safe to emit as a live, xml-escaped href.
     const href = xmlEscape(model.ciRunUrl);
-    parts.push(`<a xlink:href="${href}" target="_blank">${text(padX, legendTop + 22, `CI run: ${href}`, 9, '#58a6ff', 'normal', 'start', 'underline')}</a>`);
+    parts.push(`<a xlink:href="${href}" target="_blank" rel="noopener noreferrer">${text(padX, legendTop + 22, `CI run: ${href}`, 9, '#58a6ff', 'normal', 'start', 'underline')}</a>`);
+  } else if (model.ciRunUrl) {
+    // Present but NOT http(s) (javascript:/data:/relative/...): never a live
+    // href — render the value as inert, xml-escaped text with no <a> wrapper.
+    parts.push(text(padX, legendTop + 22, `CI run (not linked — non-http(s) URL): ${xmlEscape(model.ciRunUrl)}`, 9, COLORS.grey));
   } else {
     parts.push(text(padX, legendTop + 22, 'CI run: (not provided — pass --ci-run-url)', 9, COLORS.grey));
   }
@@ -533,6 +561,37 @@ function selftest() {
   assert(!svg.includes('alert("xss")'), 'unescaped alert("xss") never appears (quotes escaped)', log);
   assert(svg.includes('&lt;script&gt;plat') || svg.includes('&lt;script&gt;'), 'poisoned platform metadata is XML-escaped, not executed', log);
   assert(JSON.stringify(d).indexOf('<script>plat</script>') === -1 || d.generated_from.platforms.every((p) => !/<script>/.test(p)) === false || true, 'descriptor metadata bounded/neutralized', log);
+
+  // Case 5b: CI-run-url SCHEME validation — only http(s) becomes a live href.
+  // A hostile javascript:/data:/vbscript:/file:/relative/whitespace-prefixed URL
+  // has no XML-special chars, so xmlEscape alone would leak it into a live href.
+  const hostileUrls = [
+    'javascript:alert(1)',
+    'JavaScript:alert(1)',
+    ' javascript:alert(1)',      // whitespace-prefixed spoof
+    'data:text/html,<script>alert(1)</script>',
+    'vbscript:msgbox(1)',
+    'file:///etc/passwd',
+    'ftp://example/x',
+    '/relative/runs/42',         // no scheme
+    'runs/42',                   // bare relative
+  ];
+  for (const u of hostileUrls) {
+    const mm = buildModel([mkReport('linux', mixed, FRESH_DATE)], { maxAgeDays: 30, now: REF, ciRunUrl: u });
+    const s = renderSVG(mm);
+    assert(mm.ciRunUrlIsLink === false, `hostile ci-run-url NOT marked linkable: ${JSON.stringify(u)}`, log);
+    assert(!/xlink:href="(?!https?:\/\/)/.test(s), `no non-http(s) xlink:href emitted for ${JSON.stringify(u)}`, log);
+    assert(s.indexOf('xlink:href="javascript:') === -1 && s.indexOf('xlink:href="data:') === -1 && s.indexOf('xlink:href="vbscript:') === -1, `no javascript:/data:/vbscript: href for ${JSON.stringify(u)}`, log);
+    assert(s.indexOf('<a ') === -1, `no <a> wrapper at all for hostile url ${JSON.stringify(u)}`, log);
+  }
+  // A normal https URL still renders as a live, xml-escaped link.
+  const goodUrl = 'https://ci.example/runs/42?x=1&y=2';
+  const mGood = buildModel([mkReport('linux', mixed, FRESH_DATE)], { maxAgeDays: 30, now: REF, ciRunUrl: goodUrl });
+  const sGood = renderSVG(mGood);
+  assert(mGood.ciRunUrlIsLink === true, 'https ci-run-url IS marked linkable', log);
+  assert(sGood.indexOf('<a xlink:href="https://ci.example/runs/42') !== -1, 'https ci-run-url renders as a live link', log);
+  assert(sGood.indexOf('&amp;y=2') !== -1, 'ampersand in href is xml-escaped inside the attribute', log);
+  assert(buildDescriptor(mGood).ci_run_url_is_link === true && buildDescriptor(buildModel([mkReport('linux', mixed, FRESH_DATE)], { maxAgeDays: 30, now: REF, ciRunUrl: 'javascript:alert(1)' })).ci_run_url_is_link === false, 'descriptor ci_run_url_is_link reflects scheme validity', log);
 
   // Case 6: no banned honest-language words in any emitted artifact.
   const bundle = (JSON.stringify(buildDescriptor(buildModel([linuxRep, winRep], { maxAgeDays: 30, now: REF }))) + '\n' +
