@@ -12,5 +12,8 @@ node_modules/
 .plans/
 BUILD-LEDGER.md
 
+# Publication-hygiene local entries — maintainer-only, never commit
+scripts/banned-strings.local.json
+
 # Ephemeral tester run-outputs (regenerated every run)
 tests/**/last-run.json
