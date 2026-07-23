@@ -162,6 +162,15 @@ function adopt(projectRoot, proposalId, opts = {}) {
   const root = path.resolve(projectRoot || ".");
   requiredString(proposalId, "proposalId");
 
+  /* opts must be a plain-ish object to read .confirm/.yes off of. A null,
+   * undefined, or otherwise non-object opts (e.g. a caller forwarding a
+   * missing/blank value) is NOT confirmation — coerce it to {} so this
+   * falls straight into the same fail-closed refusal path as "confirm
+   * omitted", instead of throwing a TypeError while reading .confirm off
+   * null. No security effect either way (nothing is adopted on either
+   * path) — this only makes the refusal shape consistent and non-throwing. */
+  if (!opts || typeof opts !== "object") opts = {};
+
   const confirmed = opts.confirm === true || opts.yes === true;
   if (!confirmed) {
     return {
@@ -227,7 +236,21 @@ function observe(projectRoot, runId, treeId) {
   return gate.gate4Observe({ runId, treeId }, stateStoreAdapter);
 }
 
+/* Gate-4 terminal outcomes per contract 02 (CLOSED_PASS / CLOSED_ROLLED_BACK /
+ * CLOSED_FLAGGED). state-store.js's closeWindow() falls through any outcome
+ * it doesn't recognize to CLOSED_PASS — so an unvalidated caller typo (e.g.
+ * "fail") would silently pass a window that was never actually vetted as a
+ * pass. Reject anything outside this set here, before it ever reaches
+ * state-store, instead of letting it fall through silently. */
+const GATE4_OUTCOMES = new Set(["pass", "rolled_back", "flagged"]);
+
 function close(projectRoot, windowId, outcome) {
+  if (!GATE4_OUTCOMES.has(outcome)) {
+    throw fail(
+      `Invalid close outcome ${JSON.stringify(outcome)} — must be one of: ${Array.from(GATE4_OUTCOMES).join(", ")}`,
+      "INVALID_OUTCOME"
+    );
+  }
   const root = path.resolve(projectRoot || ".");
   if (outcome === "rolled_back") return closeRolledBack(root, windowId);
   const stateStore = createStore(root);
@@ -752,6 +775,59 @@ function selftest() {
     check("d3-cli-bare-yes-still-adopts",
       cliOkResult.status === 0 && cliOkBody && cliOkBody.adopted === true,
       "exit=" + cliOkResult.status + " body=" + JSON.stringify(cliOkBody));
+
+    /* --- Robustness nit 1: adopt(root, id, null) refuses cleanly, never
+     * throws — null/non-object opts is coerced to {} before .confirm is
+     * read, so it falls into the ordinary unconfirmed-refusal path. --- */
+    const nullOptsRoot = path.join(base, "null-opts");
+    makeDocEditFixture(nullOptsRoot);
+    const nullOptsProp = stageDocProposal(nullOptsRoot, "null-opts");
+    const nullOptsActivePath = path.join(nullOptsRoot, ".graphsmith", "evolvable", "ACTIVE");
+    const nullOptsActiveBefore = fs.readFileSync(nullOptsActivePath, "utf8");
+    let nullOptsThrew = null;
+    let nullOptsResult = null;
+    try { nullOptsResult = adopt(nullOptsRoot, nullOptsProp.proposal_id, null); } catch (e) { nullOptsThrew = e; }
+    check("nit1-adopt-null-opts-does-not-throw", nullOptsThrew === null,
+      nullOptsThrew ? nullOptsThrew.message : "");
+    check("nit1-adopt-null-opts-refused-clean-shape",
+      nullOptsResult && nullOptsResult.adopted === false && nullOptsResult.refused === true &&
+        nullOptsResult.reason === "ADOPTION_REQUIRES_HUMAN_CONFIRMATION",
+      JSON.stringify(nullOptsResult));
+    const nullOptsActiveAfter = fs.readFileSync(nullOptsActivePath, "utf8");
+    check("nit1-adopt-null-opts-touched-nothing", nullOptsActiveBefore === nullOptsActiveAfter);
+    check("nit1-adopt-undefined-opts-also-refused-clean",
+      (() => { const r = adopt(nullOptsRoot, nullOptsProp.proposal_id, undefined); return r.adopted === false && r.refused === true; })());
+
+    /* --- Robustness nit 2: close(root, windowId, "fail") — an outcome
+     * literal outside the Gate-4 set {pass, rolled_back, flagged} (contract
+     * 02) — is rejected with a clean INVALID_OUTCOME error instead of
+     * silently falling through to CLOSED_PASS (state-store.js's default
+     * branch for any unrecognized outcome). The window must be left
+     * untouched (still OBSERVING) since validation happens before dispatch. --- */
+    const badOutcomeRoot = path.join(base, "bad-outcome");
+    makeDocEditFixture(badOutcomeRoot);
+    const badOutcomeProp = stageDocProposal(badOutcomeRoot, "bad-outcome");
+    const badOutcomeAdopted = adopt(badOutcomeRoot, badOutcomeProp.proposal_id, { confirm: true, windowN: 1 });
+    check("nit2-bad-outcome-setup-adopt", badOutcomeAdopted.adopted === true, JSON.stringify(badOutcomeAdopted));
+    const badOutcomeActive = JSON.parse(fs.readFileSync(path.join(badOutcomeRoot, ".graphsmith", "evolvable", "ACTIVE"), "utf8"));
+    observe(badOutcomeRoot, "bad-outcome-canary-1", badOutcomeActive.tree);
+    createStore(badOutcomeRoot).runRegistry.deregister("bad-outcome-canary-1", {});
+
+    let badOutcomeThrew = null;
+    try { close(badOutcomeRoot, badOutcomeAdopted.txid, "fail"); } catch (e) { badOutcomeThrew = e; }
+    check("nit2-close-invalid-outcome-throws-clean-code",
+      badOutcomeThrew !== null && badOutcomeThrew.code === "INVALID_OUTCOME",
+      badOutcomeThrew ? badOutcomeThrew.code + ":" + badOutcomeThrew.message : "did not throw");
+
+    const badOutcomeWindowAfter = createStore(badOutcomeRoot).window.get();
+    check("nit2-close-invalid-outcome-window-untouched",
+      badOutcomeWindowAfter.state === "OBSERVING", JSON.stringify(badOutcomeWindowAfter));
+
+    /* Positive control: the same window still closes cleanly with a valid
+     * outcome afterward — the rejection above did not corrupt anything. */
+    const badOutcomeClosed = close(badOutcomeRoot, badOutcomeAdopted.txid, "pass");
+    check("nit2-close-valid-outcome-still-works-after-rejection",
+      badOutcomeClosed && badOutcomeClosed.state === "CLOSED_PASS", JSON.stringify(badOutcomeClosed));
 
     return {
       schema_version: SCHEMA_VERSION,
