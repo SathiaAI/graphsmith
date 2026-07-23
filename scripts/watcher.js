@@ -14,6 +14,7 @@ const path = require("path");
 
 const SCHEMA_VERSION = "1.0";
 const FLAG_LABEL = "advisory, unverified";
+const EVIDENCE_CHARSET = /^[A-Za-z0-9._:\/-]{1,256}$/;
 
 /* ---------------------------------------------------------------------------
  * Closed event types (must match event-compiler.js)
@@ -24,6 +25,22 @@ const EVENT_TYPES = Object.freeze([
   "step_failure", "corrupt_checkpoint", "lock_contention",
   "scenario_fail", "human_correction", "adoption", "rollback",
 ]);
+
+const TYPE_CODES = Object.freeze({
+  run_halt:          ["unresolved_side_effect", "out_of_memory", "signal_termination", "watchdog_timeout", "orphaned_lock", "budget_exhausted", "unknown_halt"],
+  budget_breach:     ["max_wall_time", "max_token_count", "max_api_calls", "max_step_execution", "max_memory", "max_cost"],
+  tripwire:          ["unexpected_output_schema", "production_api_call", "file_access_outside_boundary", "network_access", "privilege_escalation", "env_access"],
+  retry_exhausted:   ["max_retries_step", "max_retries_run"],
+  step_failure:      ["worker_error", "module_not_found", "worker_timeout", "invalid_output", "side_effect_mismatch", "unhandled_exception"],
+  corrupt_checkpoint: ["unreadable_file", "schema_mismatch", "hash_mismatch", "truncated_file", "missing_file"],
+  lock_contention:   ["deadlock_detected", "lease_expired", "lock_file_corrupt", "owner_mismatch", "stale_lock"],
+  scenario_fail:     ["invariant_violation", "expected_outcome_mismatch", "scenario_crash", "infra_fault", "workflow_fault"],
+  human_correction:  ["gate3_prompt_adjustment", "data_correction", "config_update", "manual_override", "knob_tune"],
+  adoption:          ["doc_change", "knob_change", "prompt_change", "code_change", "config_only", "migration"],
+  rollback:          ["hard_failure", "human_decision", "pre_authorized", "flagged", "abandoned_window"],
+});
+
+const ALLOWED_WINDOW_STATES = Object.freeze(["IDLE", "RUNNING", "PAUSED", "ROLLING_BACK", "CLOSED_ROLLED_BACK", "CLOSED_COMPLETE"]);
 
 const SAFETY_TYPES = new Set(["run_halt", "budget_breach", "tripwire", "rollback"]);
 
@@ -73,11 +90,15 @@ function readProposerView(harvestDir) {
   try {
     const raw = fs.readFileSync(filePath, "utf8");
     const lines = raw.split("\n").filter((l) => l.trim());
-    return lines.map((line) => {
+    const records = [];
+    for (const line of lines) {
       const record = JSON.parse(line);
-      validateStructuredEvent(record);
-      return record;
-    });
+      if (!EVENT_TYPES.includes(record.type)) {
+        throw new Error(`Invalid event: unknown type "${record.type}"`);
+      }
+      records.push(record);
+    }
+    return records;
   } catch (err) {
     if (err.code === "ENOENT") return [];
     throw err;
@@ -147,6 +168,11 @@ function validateStructuredEvent(event) {
     throw new Error("Invalid event: missing or invalid code");
   }
 
+  const typeCodeList = TYPE_CODES[event.type];
+  if (!typeCodeList || !typeCodeList.includes(event.code)) {
+    throw new Error(`Invalid event: code "${event.code}" not in closed enum for type "${event.type}"`);
+  }
+
   if (event.counters && typeof event.counters !== "object") {
     throw new Error("Invalid event: counters must be an object");
   }
@@ -166,6 +192,22 @@ function validateStructuredEvent(event) {
   if (!Number.isSafeInteger(event.delta_ms)) {
     throw new Error("Invalid event: missing or invalid delta_ms");
   }
+
+  if (event.evidence_ref && (!EVIDENCE_CHARSET.test(event.evidence_ref) || event.evidence_ref.length < 1 || event.evidence_ref.length > 256)) {
+    throw new Error("Invalid event: evidence_ref fails charset/length check");
+  }
+
+  if (event.fingerprint && (!EVIDENCE_CHARSET.test(event.fingerprint) || event.fingerprint.length < 1 || event.fingerprint.length > 256)) {
+    throw new Error("Invalid event: fingerprint fails charset/length check");
+  }
+
+  if (!EVIDENCE_CHARSET.test(event.run_ref) || event.run_ref.length < 1 || event.run_ref.length > 256) {
+    throw new Error("Invalid event: run_ref fails charset/length check");
+  }
+
+  if (!EVIDENCE_CHARSET.test(event.step_ref) || event.step_ref.length < 1 || event.step_ref.length > 256) {
+    throw new Error("Invalid event: step_ref fails charset/length check");
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -175,23 +217,45 @@ function validateStructuredEvent(event) {
 function createBatch(events, stateRecords, options = {}) {
   const maxBatchSize = Number.isSafeInteger(options.maxBatchSize) ? options.maxBatchSize : 100;
   const selected = events.slice(0, maxBatchSize);
+  const totalEvents = events.length;
+  const overflowDropped = totalEvents > maxBatchSize ? totalEvents - maxBatchSize : 0;
+
+  const validated = [];
+  let validationDropped = 0;
+
+  for (const ev of selected) {
+    try {
+      validateStructuredEvent(ev);
+
+      const sanitizedCounters = {};
+      if (ev.counters && typeof ev.counters === "object") {
+        for (const [key, value] of Object.entries(ev.counters)) {
+          sanitizedCounters[key] = Number.isSafeInteger(value) ? value : 0;
+        }
+      }
+
+      validated.push({
+        type: ev.type,
+        code: ev.code,
+        counters: sanitizedCounters,
+        run_ref: ev.run_ref,
+        step_ref: ev.step_ref,
+        seq: ev.seq,
+        delta_ms: ev.delta_ms,
+        lossy: ev.lossy === true,
+        fingerprint: ev.fingerprint,
+      });
+    } catch (err) {
+      validationDropped++;
+    }
+  }
 
   const batch = {
-    events: selected.map((ev) => ({
-      type: ev.type,
-      code: ev.code,
-      counters: ev.counters || {},
-      run_ref: ev.run_ref,
-      step_ref: ev.step_ref,
-      seq: ev.seq,
-      delta_ms: ev.delta_ms,
-      lossy: ev.lossy === true,
-      fingerprint: ev.fingerprint,
-    })),
+    events: validated,
     state_summary: summarizeState(stateRecords),
   };
 
-  return batch;
+  return { batch, dropped_events: overflowDropped + validationDropped };
 }
 
 function summarizeState(stateRecords) {
@@ -215,7 +279,10 @@ function summarizeState(stateRecords) {
     } else if (record.record_type === "ROLLBACK_RECORDED") {
       summary.rollback_families++;
     } else if (record.state) {
-      summary.window_state = String(record.state);
+      const stateStr = String(record.state);
+      if (ALLOWED_WINDOW_STATES.includes(stateStr)) {
+        summary.window_state = stateStr;
+      }
     }
   }
 
@@ -237,6 +304,7 @@ async function watch(options = {}) {
         events_processed: 0,
         batches_sent: 0,
         flags_generated: 0,
+        dropped_events: 0,
       },
     };
   }
@@ -248,7 +316,7 @@ async function watch(options = {}) {
   const events = readProposerView(harvestDir);
   const stateRecords = readStateRecords(stateDir);
 
-  const batch = createBatch(events, stateRecords, options);
+  const { batch, dropped_events } = createBatch(events, stateRecords, options);
 
   if (batch.events.length === 0) {
     return {
@@ -260,6 +328,7 @@ async function watch(options = {}) {
         events_processed: 0,
         batches_sent: 0,
         flags_generated: 0,
+        dropped_events,
       },
     };
   }
@@ -288,6 +357,7 @@ async function watch(options = {}) {
       events_processed: batch.events.length,
       batches_sent: 1,
       flags_generated: flags.length,
+      dropped_events,
     },
   };
 }
@@ -315,7 +385,8 @@ async function selftest() {
       result1.stats.enabled === false &&
       result1.stats.events_processed === 0 &&
       result1.stats.batches_sent === 0 &&
-      result1.stats.flags_generated === 0;
+      result1.stats.flags_generated === 0 &&
+      result1.stats.dropped_events === 0;
 
     tests.push({
       name: "off-by-default",
@@ -436,7 +507,7 @@ async function selftest() {
           ord: i,
           delta_ms: i * 10,
           type: i % 2 === 0 ? "run_halt" : "step_failure",
-          code: "test_code",
+          code: i % 2 === 0 ? "unknown_halt" : "worker_error",
           counters: { test_counter: i },
           lossy: false,
           evidence_ref: `p${String(i).padStart(2, "0")}`,
@@ -446,20 +517,20 @@ async function selftest() {
     }
     fs.writeFileSync(path.join(harvestDir, "events-proposer.jsonl"), eventLines.join("\n") + "\n");
 
-    const batchedEvents = createBatch(
+    const batchedResult = createBatch(
       eventLines.map((l) => JSON.parse(l)),
       [],
       { maxBatchSize: 100 }
     );
 
-    const batchedOk = batchedEvents.events.length === 100 && batchedEvents.events[0].seq === 0 && batchedEvents.events[99].seq === 99;
+    const batchedOk = batchedResult.batch.events.length === 100 && batchedResult.batch.events[0].seq === 0 && batchedResult.batch.events[99].seq === 99;
 
     tests.push({
       name: "batched",
       status: batchedOk ? "pass" : "fail",
       details: batchedOk
         ? `Batch limited to maxBatchSize (100 events)`
-        : `Batched ${batchedEvents.events.length} events, expected 100`,
+        : `Batched ${batchedResult.batch.events.length} events, expected 100`,
     });
 
     /* --- TEST 5: Stub adapter (no real network in --selftest) --- */
