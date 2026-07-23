@@ -131,7 +131,18 @@
       { "id": "computed-member", "pattern": "(?:\\b[\\w$]+|\\))\\s*\\[\\s*(['\"`]).*?\\1\\s*\\]|(?:\\b[\\w$]+|\\))\\s*\\[\\s*[^\\]0-9\\s][^ \\]]*\\]", "flags": "" },
       { "id": "dynamic-import", "pattern": "\\bimport\\s*\\(", "flags": "" },
       { "id": "globalthis-indirection", "pattern": "\\bglobalThis\\s*[.\\[]", "flags": "" },
-      { "id": "function-constructor", "pattern": "\\bFunction\\s*\\(|\\bReflect\\s*\\.\\s*construct\\s*\\(", "flags": "" }
+      { "id": "function-constructor", "pattern": "\\bFunction\\s*\\(|\\bReflect\\s*\\.\\s*construct\\s*\\(", "flags": "" },
+      { "id": "bare-require-import-identifier", "pattern": "\\b(?:require|import)\\b", "flags": "" },
+      { "id": "bare-fetch-identifier", "pattern": "\\bfetch\\b", "flags": "" },
+      { "id": "bare-exec-family-identifier", "pattern": "\\b(?:exec|execSync|execFile\\w*|spawn\\w*)\\b", "flags": "" },
+      { "id": "bare-child-process-identifier", "pattern": "\\bchild_process\\b", "flags": "" },
+      { "id": "bare-eval-identifier", "pattern": "\\beval\\b", "flags": "" },
+      { "id": "bare-function-identifier", "pattern": "\\bFunction\\b", "flags": "" },
+      { "id": "bare-reflect-construct-identifier", "pattern": "\\bReflect\\s*\\.\\s*construct\\b", "flags": "" },
+      { "id": "bare-globalthis-identifier", "pattern": "\\bglobalThis\\b", "flags": "" },
+      { "id": "bare-xmlhttprequest-identifier", "pattern": "\\bXMLHttpRequest\\b", "flags": "" },
+      { "id": "bare-websocket-identifier", "pattern": "\\bWebSocket\\b", "flags": "" },
+      { "id": "bare-node-net-module-identifier", "pattern": "\\b(?:net|http|https|http2|dns|tls|dgram)\\b", "flags": "" }
     ]
   },
   "bounds": [
