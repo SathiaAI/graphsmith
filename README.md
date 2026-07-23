@@ -2,7 +2,6 @@
 
 <img src="assets/banner.png" alt="GraphSmith — agent workflows that survive" width="820">
 
-#  GraphSmith
 
 **Describe the job. Approve the plan. Get an AI workflow that's *proven* to survive failure — before you ever trust it.**
 
