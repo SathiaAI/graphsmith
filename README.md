@@ -4,7 +4,7 @@
 
 # ⚒️ GraphSmith
 
-**Describe the job. Approve the plan. Get an AI workflow that's *proven* to survive failure — before you ever trust it.**
+**Describe the job. Approve the plan. Get an AI workflow that's *tested* to survive failure — before you ever trust it.**
 
 [![Website](https://img.shields.io/badge/Website-graphsmith.ai-F5A623?labelColor=2B1D18)](https://graphsmith.ai) [![Docs](https://img.shields.io/badge/Docs-graphsmith.wiki-7B2230?labelColor=2B1D18)](https://graphsmith.wiki) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases)
 
@@ -61,8 +61,8 @@ Already have a broken automation? The linter diagnoses it — mapping "it keeps 
 
 | Without this skill | With it |
 |---|---|
-| Crash → restart from zero, paying for every step again | Resumes at the exact step it stopped — **proven by the kill test** |
-| Retry → duplicate emails, charges, posts | Duplicates are detected and stopped — recorded effects run exactly once (**proven by the double-run test**), and a crash inside a send window **halts loudly** instead of silently re-sending, **including after power loss**: the write-ahead intent log is fsync'd, and the harness stages the lost-flush state to prove the halt. True exactly-once delivery additionally needs an idempotency key your external system honors — the worker stubs construct `runId:step` for you ([graduation ladder](references/graduation.md)) |
+| Crash → restart from zero, paying for every step again | Resumes at the exact step it stopped — **tested by the kill test** |
+| Retry → duplicate emails, charges, posts | Duplicates are detected and stopped — recorded effects run once and are re-verified on replay (**tested by the double-run test**), and a crash inside a send window **halts loudly** instead of silently re-sending, **including after power loss**: the write-ahead intent log is fsync'd, and the harness stages the lost-flush state to demonstrate the halt. True end-to-end single-delivery additionally needs an idempotency key your external system honors — the worker stubs construct `runId:step` for you ([graduation ladder](references/graduation.md)) |
 | AI invents APIs and files in your codebase | Every claim cited to a real file, or flagged as inference |
 | Loops that run (and bill) forever | Hard stop rules and capped retries, agreed in the blueprint |
 | Debugging = reading the AI's mind | One structured log line per step: what ran, what happened, how long |
@@ -102,7 +102,7 @@ The skill takes over: blueprint → your approval → working project → chaos-
 | `SKILL.md` | The instructions your AI follows — blueprint gate, build rules, verification |
 | `scripts/install.js` | One command installs the skill into every agent on your machine |
 | `scripts/scaffold.js` | Generates a runnable, zero-dependency project: manager, workers, save points, resume, retries, logs |
-| `scripts/chaos.js` | Kills the workflow provably mid-flight, restarts it, and asserts recovery + exactly-once *recorded* effects; stages power-loss state, same-run lock contention, and pid-reuse/lease-expiry (a recycled pid can't block a resumable run); a safety-halt counts as a pass only when the on-disk state earns it — a forged halt FAILS |
+| `scripts/chaos.js` | Kills the workflow provably mid-flight, restarts it, and asserts recovery + once-and-replay-verified *recorded* effects; stages power-loss state, same-run lock contention, and pid-reuse/lease-expiry (a recycled pid can't block a resumable run); a safety-halt counts as a pass only when the on-disk state earns it — a forged halt FAILS |
 | `scripts/graphlint.js` | Project-aware scan of existing agent code (JS/TS/Python) for the classic failure patterns — cross-file import-graph analysis, ranked severity, self-tested via `--selftest` against a bundled corpus |
 | `scripts/knosky-sync.js` | Prepares pinned KnoSky grounding via `npx` — version AND content hash baked in (refuses on registry mismatch), never a silent global install; `GRAPHSMITH_OFFLINE=1` skips all network |
 | `references/graduation.md` | When to upgrade persistence/orchestration tiers — and when not to |
@@ -116,7 +116,7 @@ The skill takes over: blueprint → your approval → working project → chaos-
 2. Approve the one-screen blueprint (workers, handoffs, save points, stop rules).
 3. It generates the project. Run it: `cd your-project && node manager.js`
 4. Replace the stub workers in `workers/` with your real logic — AI/API calls live here, and each stub's comments say exactly what to preserve and why.
-5. Prove it: `node scripts/chaos.js your-project` — green verifies crash recovery and exactly-once *recorded* effects (a safety-halt on an uncertain send also counts as a pass — that is the guard working).
+5. Prove it: `node scripts/chaos.js your-project` — green verifies crash recovery and once-and-replay-verified *recorded* effects (a safety-halt on an uncertain send also counts as a pass — that is the guard working).
 
 ### Path B — "My automation keeps breaking"
 Tell your agent the symptom (*forgets where it left off / sent it three times / loops forever*). The skill runs the linter, maps each finding to the broken rule with file and line, and proposes the smallest fix — it will not rewrite what works. With a repo present, KnoSky grounds every diagnostic claim in your actual files.
@@ -150,7 +150,7 @@ The moment two or more agents (or sessions) build against the same repo, individ
 Read these before trusting the output with anything that matters:
 
 - **Templates and guardrails are starting points, not substitutes** for product discovery, security review, legal advice, or experienced engineering judgment. Increase depth — and keep human gates wide — for anything handling money, health, identity, personal data, or regulated activity.
-- **The linter is heuristic — and measured.** It is project-aware (import-graph based) but AST-free by design; `node scripts/graphlint.js --selftest` runs it against a bundled corpus of known-bad and known-clean files (including every probe from our published adversarial review) and fails on any precision/recall regression. Absence of findings is still not proof of correctness; known blind spots are documented in the script header. The chaos harness provides proof only for the two properties it tests (crash recovery, exactly-once *recorded* effects) on projects following its conventions.
+- **The linter is heuristic — and measured.** It is project-aware (import-graph based) but AST-free by design; `node scripts/graphlint.js --selftest` runs it against a bundled corpus of known-bad and known-clean files (including every probe from our published adversarial review) and fails on any precision/recall regression. Absence of findings is still not proof of correctness; known blind spots are documented in the script header. The chaos harness provides evidence only for the two properties it tests (crash recovery, once-and-replay-verified *recorded* effects) on projects following its conventions.
 - **Human gates are load-bearing.** The skill defaults to halting for approval on irreversible or sensitive changes. Removing those gates is your decision and your risk — autonomy should be earned by track record, never assumed, and should narrow again when quality slips.
 - **Verification by the author is not verification.** If you scale to multiple agents, keep the no-self-certification rule intact; an agent reviewing its own work is the single most common way bad changes reach production.
 - **Never put real production data in test environments,** and never paste live secrets into documents, prompts, or indexes — agents read secrets from the environment, never from files they can echo back.
@@ -160,10 +160,10 @@ Read these before trusting the output with anything that matters:
 
 Equally important to state explicitly:
 
-- **It does not replace orchestration frameworks or durable execution engines.** LangGraph, Temporal, Inngest and peers solve distributed, long-running, exactly-once workloads at scale. GraphSmith is the disciplined on-ramp; the graduation ladder tells you when to move up, and the checkpoint seam in generated code is built for that migration.
+- **It does not replace orchestration frameworks or durable execution engines.** LangGraph, Temporal, Inngest and peers solve distributed, long-running, at-scale delivery-guarantee workloads. GraphSmith is the disciplined on-ramp; the graduation ladder tells you when to move up, and the checkpoint seam in generated code is built for that migration.
 - **It does not run or host anything.** No cloud service, no runtime, no daemon. Everything is local files and local scripts you can read in minutes.
 - **It does not write your business logic.** The scaffold gives you the reliable skeleton; the workers' actual jobs — your API calls, your model calls, your rules — are yours to fill in.
-- **It does not prove your logic is correct — or true exactly-once to external systems.** The chaos harness proves exactly two properties: crash recovery, and exactly-once execution of *recorded* effects (with loud halts when an external send's outcome is uncertain). Exactly-once delivery to an external system requires an idempotency key that system honors — the graduation ladder tells you when and how. A workflow can pass both and still compute the wrong answer — that's what your acceptance criteria and tests are for.
+- **It does not show your logic is correct — or true single-delivery to external systems.** The chaos harness tests exactly two properties: crash recovery, and single, replay-verified execution of *recorded* effects (with loud halts when an external send's outcome is uncertain). Single-delivery to an external system requires an idempotency key that system honors — the graduation ladder tells you when and how. A workflow can pass both and still compute the wrong answer — that's what your acceptance criteria and tests are for.
 - **It is not a security scanner or supply-chain audit.** The linter finds architecture violations, not vulnerabilities. Use dedicated security tooling for that; the full build system (`references/full-build-system.md`) shows where such gates belong.
 - **It does not manage secrets or credentials.** Agents read secrets from the environment — never from files, prompts, or indexes — and this skill never asks for them.
 - **It does not phone home.** No telemetry, no analytics. The one network exception is explicit and inspectable: `knosky-sync.js` contacts the npm registry to verify the pinned KnoSky version against a baked-in content hash (refusing on mismatch), and `npx` downloads that package on first use — `GRAPHSMITH_OFFLINE=1` disables all of it. Nothing else touches the network; your code and indexes stay on your machine (note: running knosky writes its index to a local `.knosky/` folder in your repo).
@@ -208,7 +208,7 @@ That's the tool working: the message names the broken rule and the fix pattern. 
 Because that's the most documented failure pattern in the space. It proposes the split version and explains the tradeoff; you can overrule it, but it won't hide the risk.
 
 **Can multiple agents work on the same project at once?**
-Yes — that's Path D. The skill applies lanes, atomic task claims with leases, and frozen interface contracts so parallel agents never edit the same files or build against moving targets. See `references/multi-agent-coordination.md`.
+Yes — that's Path D. The skill applies lanes, single-commit task claims with leases, and frozen interface contracts so parallel agents never edit the same files or build against moving targets. See `references/multi-agent-coordination.md`.
 
 **Is there a full methodology for production teams?**
 Yes — `references/full-build-system.md` contains the complete 11-Document Build System: registry, PRD, technical design, task graph, adversarial QA, release operations, agent operating protocol, and evals. It's included as an optional deep resource; the skill's defaults are the distilled minimum most projects need.

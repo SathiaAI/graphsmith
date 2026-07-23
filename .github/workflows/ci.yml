@@ -154,3 +154,32 @@ jobs:
         run: |
           set -euo pipefail
           git diff --name-status --no-renames "$BASE_SHA" "$HEAD_SHA" | node "$RUNNER_TEMP/trusted-guard/ci-check-pr-separation.js"
+
+  docs-hygiene:
+    name: "Publication hygiene — honest-language + banned-strings lint"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+      - name: List A — honest-language lint (contract 10)
+        run: node scripts/docs-lint.js
+      - name: List B — publication-hygiene scan (trusted context only; never fork-PR)
+        if: github.event_name != 'pull_request'
+        env:
+          HYGIENE_HMAC_KEY: ${{ secrets.HYGIENE_HMAC_KEY }}
+          HYGIENE_DIGESTS: ${{ secrets.HYGIENE_DIGESTS }}
+        run: node scripts/hygiene-scan.js --ci
+
+  dogfood-graphsmith-action:
+    name: "Dogfood — run GraphSmith's own verify action on this repo"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Run the local GraphSmith verify action
+        uses: ./

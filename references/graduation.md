@@ -7,7 +7,7 @@ The scaffold's JSON-file checkpoints are the correct choice for its tier. Upgrad
 | 1 | JSON file per step (scaffold default) | Single machine, one run at a time, ≤ low thousands of steps | Concurrent runs corrupting state, or you need to query run history |
 | 2 | SQLite (one table: run_id, step, output, status, ts) | Single machine, concurrent runs, queryable history | Multiple machines/containers need shared state |
 | 3 | Framework checkpointer (e.g., LangGraph + Postgres saver) | Distributed workers, cyclic/branching graphs, human-in-the-loop interrupts | Runs span hours–weeks, survive deploys, or money moves on retries |
-| 4 | Durable execution engine (Temporal, Inngest, Restate, DBOS) | Long-running, exactly-once semantics, replay/audit requirements | — (top rung) |
+| 4 | Durable execution engine (Temporal, Inngest, Restate, DBOS) | Long-running, delivery-guarantee semantics, replay/audit requirements | — (top rung) |
 
 Rules of thumb:
 - Each rung adds real operational cost. Rung 4 for a 5-step script is as wrong as rung 1 for a payments workflow.
