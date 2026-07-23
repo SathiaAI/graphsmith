@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 /**
- * hygiene-scan.js — Contract 10 List B publication-hygiene scanner (v2 rebuild).
+ * hygiene-scan.js — Contract 10 List B publication-hygiene scanner (v3 rebuild).
  *
  * Two mechanisms:
  *   1. LOCAL PREVENTION (primary): reads the raw private identifier list
  *      .plans/hygiene/banned-identifiers.txt (git-ignored, maintainer-supplied)
  *      and blocks the commit/release if any identifier appears in the
- *      shippable docs fileset.
+ *      shippable docs fileset.  FAIL-CLOSED: missing or unreadable list →
+ *      exit non-zero with a clear (identifier-free) error.  An EMPTY but
+ *      PRESENT list is legit (nothing configured → pass).
  *   2. CI DETECTION (secondary, --ci mode): receives HYGIENE_HMAC_KEY and
  *      HYGIENE_DIGESTS as CI secrets; scans HMAC-SHA256(key, normalized
  *      n-gram) per token n-gram against the digest set. NO cleartext
  *      identifiers are shipped in the repo. NO unsalted hashes.
  *
- * Normalization (applied to file contents AND filenames):
- *   NFKC + confusable-fold + lowercase + strip-non-alphanumeric +
- *   decode %-encodings / URLs.
+ * Normalization (applied to file contents AND filenames) via norm-core.js:
+ *   NFKC + strip ZW + fold fullwidth + fold Cyrillic/Greek homoglyphs +
+ *   decode %-encodings loop-to-stable + collapse whitespace + strip non-alnum.
+ *
+ * Confusable map: PRAGMATIC, not full Unicode TR39.  Documented in norm-core.js.
  *
  * Failure messages: file:line ONLY — NEVER the matched identifier.
  * Uses Node built-in crypto (HMAC-SHA256). Zero external deps.
@@ -32,6 +36,10 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const normCore = require("./norm-core.js");
+
+const baseNormalize = normCore.baseNormalize;
+const normalizeFilename = normCore.normalizeFilename;
 
 const MAX_NGRAM_LEN = 128;
 
@@ -58,58 +66,16 @@ const EXCLUDED_PREFIXES = [
 
 const BANNED_IDENTIFIERS_PATH = ".plans/hygiene/banned-identifiers.txt";
 
-// --- confusable folding -------------------------------------------------------
-
-// Characters that NFKC may miss or that are common in obfuscation attempts.
-// Map confusable Unicode chars to ASCII equivalents.
-const CONFUSABLE_MAP = {
-  "\uFF10": "0", "\uFF11": "1", "\uFF12": "2", "\uFF13": "3", "\uFF14": "4",
-  "\uFF15": "5", "\uFF16": "6", "\uFF17": "7", "\uFF18": "8", "\uFF19": "9",
-  "\uFF21": "A", "\uFF22": "B", "\uFF23": "C", "\uFF24": "D", "\uFF25": "E",
-  "\uFF26": "F", "\uFF27": "G", "\uFF28": "H", "\uFF29": "I", "\uFF2A": "J",
-  "\uFF2B": "K", "\uFF2C": "L", "\uFF2D": "M", "\uFF2E": "N", "\uFF2F": "O",
-  "\uFF30": "P", "\uFF31": "Q", "\uFF32": "R", "\uFF33": "S", "\uFF34": "T",
-  "\uFF35": "U", "\uFF36": "V", "\uFF37": "W", "\uFF38": "X", "\uFF39": "Y",
-  "\uFF3A": "Z",
-  "\uFF41": "a", "\uFF42": "b", "\uFF43": "c", "\uFF44": "d", "\uFF45": "e",
-  "\uFF46": "f", "\uFF47": "g", "\uFF48": "h", "\uFF49": "i", "\uFF4A": "j",
-  "\uFF4B": "k", "\uFF4C": "l", "\uFF4D": "m", "\uFF4E": "n", "\uFF4F": "o",
-  "\uFF50": "p", "\uFF51": "q", "\uFF52": "r", "\uFF53": "s", "\uFF54": "t",
-  "\uFF55": "u", "\uFF56": "v", "\uFF57": "w", "\uFF58": "x", "\uFF59": "y",
-  "\uFF5A": "z",
-  // Zero-width characters stripped
-  "\u200B": "", "\u200C": "", "\u200D": "", "\u200E": "", "\u200F": "",
-  "\uFEFF": "", "\u00AD": "",
-};
-
-const CONFUSABLE_RE = /[\uFF10-\uFF19\uFF21-\uFF3A\uFF41-\uFF5A\u200B-\u200F\uFEFF\u00AD]/g;
-
-function confusableFold(s) {
-  return s.replace(CONFUSABLE_RE, function (ch) { return CONFUSABLE_MAP[ch] || ""; });
-}
-
 // --- normalization pipeline ---------------------------------------------------
 
+/**
+ * Full normalization for n-gram matching.
+ * baseNormalize already does NFKC + ZW strip + fullwidth fold + homoglyph fold +
+ * %-decode loop-to-stable + collapse whitespace + lowercase.
+ * We then strip non-alphanumeric characters.
+ */
 function normalize(s) {
-  var t = s.normalize("NFKC");
-  t = confusableFold(t);
-  t = t.toLowerCase();
-  // Decode %-encodings (recursive to handle double-encoding)
-  var prev = "";
-  while (prev !== t) {
-    prev = t;
-    try { t = decodeURIComponent(t); } catch (e) { break; }
-  }
-  // Strip non-alphanumeric, keep only [a-z0-9]
-  t = t.replace(/[^a-z0-9]/g, "");
-  return t;
-}
-
-function normalizeFilename(s) {
-  var t = s.normalize("NFKC");
-  t = confusableFold(t);
-  t = t.toLowerCase();
-  try { t = decodeURIComponent(t); } catch (e) {}
+  var t = baseNormalize(s);
   t = t.replace(/[^a-z0-9]/g, "");
   return t;
 }
@@ -213,18 +179,24 @@ function walkDir(abspath, cwd, out) {
 
 // --- local prevention mode ----------------------------------------------------
 
+/**
+ * Load the banned identifiers list.
+ * Returns the parsed array of normalized identifiers on success.
+ * Returns null if the file is missing or unreadable (FAIL-CLOSED: caller must error).
+ * Returns an empty array if the file exists but has no identifiers (legit: nothing configured).
+ */
 function loadBannedIdentifiers(cwd) {
   var p = path.join(cwd, BANNED_IDENTIFIERS_PATH);
   if (!fs.existsSync(p)) {
-    process.stderr.write("hygiene-scan: local list not found at " + BANNED_IDENTIFIERS_PATH + "\n");
-    return [];
+    process.stderr.write("hygiene-scan: FATAL — local list not found at " + BANNED_IDENTIFIERS_PATH + "\n");
+    return null;
   }
   var raw;
   try {
     raw = fs.readFileSync(p, "utf8");
   } catch (e) {
-    process.stderr.write("hygiene-scan: cannot read " + BANNED_IDENTIFIERS_PATH + ": " + e.message + "\n");
-    return [];
+    process.stderr.write("hygiene-scan: FATAL — cannot read " + BANNED_IDENTIFIERS_PATH + ": " + e.message + "\n");
+    return null;
   }
   var lines = raw.split(/\r?\n/);
   var ids = [];
@@ -242,8 +214,15 @@ function loadBannedIdentifiers(cwd) {
  * Returns array of { file, line } (no identifier text in output).
  */
 function scanLocal(cwd, identifiers) {
-  if (identifiers.length === 0) return [];
-  var identSet = new Set(identifiers);
+  if (!identifiers || identifiers.length === 0) return [];
+  // Normalize identifiers defensively (callers like loadBannedIdentifiers pre-normalize,
+  // but direct API callers may pass raw strings).
+  var identSet = new Set();
+  for (var j = 0; j < identifiers.length; j++) {
+    var nid = normalize(identifiers[j]);
+    if (nid.length > 0) identSet.add(nid);
+  }
+  if (identSet.size === 0) return [];
   var fileList = buildFileList(cwd);
   var results = [];
 
@@ -417,16 +396,16 @@ function selftest() {
     fs.mkdirSync(path.join(root, "docs"));
     fs.mkdirSync(path.join(root, "references"));
 
-    // --- 1. normalization: NFKC folds fullwidth to ASCII -------------------
+    // --- 1. normalization: NFKC + fullwidth -> ASCII -----------------------
     {
       var result = normalize("\uFF30\uFF52\uFF4F\uFF4A\uFF45\uFF43\uFF54"); // fullwidth "Project"
       assert("NFKC: fullwidth -> ASCII", result === "project", "got: " + result);
     }
 
-    // --- 2. normalization: confusable fold + lowercase ---------------------
+    // --- 2. normalization: ZW chars + soft hyphen stripped ------------------
     {
-      var result = normalize("P\u200Br\u200Co\u200Dj\u200Be\u200Fc\uFEFFt");
-      assert("ZW chars stripped", result === "project", "got: " + result);
+      var result = normalize("P\u200Br\u200Co\u200Dj\u200Be\u200Fc\uFEFFt\u00ADx");
+      assert("ZW chars + soft hyphen stripped", result === "projectx", "got: " + result);
     }
 
     // --- 3. normalization: strip non-alphanumeric --------------------------
@@ -439,6 +418,26 @@ function selftest() {
     {
       var result = normalize("hello%20world");
       assert("decode %%", result === "helloworld", "got: " + result);
+    }
+
+    // --- 4b. normalization: double %-encoding ------------------------------
+    {
+      var result = normalize("test%252Dx"); // %25 → %, then %2D → -
+      assert("double %% decode", result === "testx", "got: " + result);
+    }
+
+    // --- 4c. normalization: Cyrillic homoglyphs ----------------------------
+    {
+      // Cyrillic 'е' (U+0435) → 'e'
+      var result = normalize("proj\u0435ctx");
+      assert("Cyrillic e fold", result === "projectx", "got: " + result);
+    }
+
+    // --- 4d. normalization: mixed homoglyphs -------------------------------
+    {
+      // Cyrillic: i(н)te(е)r(н)na(а)l, Greek omicron, etc.
+      var result = normalize("int\u0435rn\u0430l");
+      assert("mixed Cyrillic fold", result === "internal", "got: " + result);
     }
 
     // --- 5. local prevention: planted identifier flagged -------------------
@@ -456,7 +455,8 @@ function selftest() {
       );
 
       var identifiers = loadBannedIdentifiers(root);
-      assert("local: identifiers loaded", identifiers.length === 2, "got " + identifiers.length);
+      assert("local: identifiers loaded", identifiers !== null && identifiers.length === 2,
+        identifiers === null ? "null" : "got " + identifiers.length);
 
       var results = scanLocal(root, identifiers);
       assert("local: planted identifier flagged", results.length > 0, "got " + results.length + " results");
@@ -466,9 +466,6 @@ function selftest() {
 
     // --- 5b. local prevention: normalized identifier matches after folding
     {
-      // The identifier "internal-project-alpha" normalizes to "internalprojectalpha"
-      // and text "internal-project-alpha" also normalizes to "internalprojectalpha"
-      // So it should match even with different formatting.
       var normId = normalize("internal-project-alpha");
       assert("normalized id matches expected", normId === "internalprojectalpha", "got: " + normId);
 
@@ -478,7 +475,6 @@ function selftest() {
 
     // --- 6. local prevention: clean file NOT flagged -----------------------
     {
-      // Remove old README.md and create a clean one
       fs.unlinkSync(path.join(root, "README.md"));
       fs.writeFileSync(path.join(root, "SKILL.md"), "# Clean\n\nNothing to see here.\n", "utf8");
       fs.writeFileSync(path.join(root, "README.md"), "# Clean\n\nSafe content.\n", "utf8");
@@ -489,7 +485,6 @@ function selftest() {
 
     // --- 7. output sanitized — never contains the identifier ---------------
     {
-      // Main README from step 5 still has the identifier
       fs.writeFileSync(path.join(root, "README.md"),
         "# Project\n\nWe mention internal-project-alpha in the docs.\n",
         "utf8"
@@ -510,6 +505,33 @@ function selftest() {
     {
       var results = scanLocal(root, []);
       assert("empty list: no findings", results.length === 0, "got " + results.length);
+    }
+
+    // --- 8b. empty-but-present file -> pass (no identifiers configured) ----
+    {
+      fs.writeFileSync(path.join(hygieneDir, "banned-identifiers.txt"),
+        "# only comments here\n\n",
+        "utf8"
+      );
+      var ids = loadBannedIdentifiers(root);
+      assert("empty file: identifiers loaded as []", ids !== null && ids.length === 0,
+        ids === null ? "null" : "got length " + ids.length);
+    }
+
+    // --- 8c. missing file -> fail-closed (returns null) --------------------
+    {
+      fs.unlinkSync(path.join(hygieneDir, "banned-identifiers.txt"));
+      var ids = loadBannedIdentifiers(root);
+      assert("missing file: load returns null (fail-closed)", ids === null,
+        "expected null, got " + JSON.stringify(ids));
+
+      // Restore the file for later tests
+      fs.writeFileSync(path.join(hygieneDir, "banned-identifiers.txt"),
+        "# Test identifiers\n" +
+        "internal-project-alpha\n" +
+        "confidential-2026\n",
+        "utf8"
+      );
     }
 
     // --- 9. HMAC round-trip: known key+identifier -> digest -> match ------
@@ -572,8 +594,6 @@ function selftest() {
     // --- 12. Filename check in local mode ----------------------------------
     {
       var fileIdentifiers = loadBannedIdentifiers(root);
-      // Already have "internal-project-alpha" -> "internalprojectalpha"
-      // Create a file whose normalized name matches
       var absDir = path.join(root, "docs");
       fs.writeFileSync(path.join(absDir, "internal-project-alpha.md"),
         "# Clean doc\n\nNothing here.\n",
@@ -585,7 +605,48 @@ function selftest() {
       assert("local: filename match flagged (line=0)", fnameMatch);
     }
 
-    // --- 13. Exit code logic (smoke test) ----------------------------------
+    // --- 13. Normalization evasion: Cyrillic homoglyphs caught ------------
+    {
+      fs.writeFileSync(path.join(hygieneDir, "banned-identifiers.txt"),
+        "projectx\n",
+        "utf8"
+      );
+      var ids = loadBannedIdentifiers(root);
+      // Write Cyrillic-е evasion in content
+      fs.writeFileSync(path.join(root, "README.md"),
+        "see proj\u0435ctx in the wild\n",
+        "utf8"
+      );
+      var results = scanLocal(root, ids);
+      assert("evasion: Cyrillic homoglyph caught", results.length > 0,
+        "got " + results.length + " results");
+    }
+
+    // --- 13b. Normalization evasion: fullwidth filename caught -------------
+    {
+      var ids = loadBannedIdentifiers(root);
+      var fname = "\uFF50\uFF52\uFF4F\uFF4A\uFF45\uFF43\uFF54\uFF58.md";
+      fs.writeFileSync(path.join(absDir, fname), "# x\n", "utf8");
+      var results = scanLocal(root, ids);
+      // The normalized filename should match the normalized identifier
+      var fnameHits = results.filter(function (r) { return r.line === 0; });
+      assert("evasion: fullwidth filename caught", fnameHits.length > 0,
+        "got " + fnameHits.length + " filename hits");
+    }
+
+    // --- 13c. Evasion: %-encoding in content caught ------------------------
+    {
+      var ids = loadBannedIdentifiers(root);
+      fs.writeFileSync(path.join(root, "README.md"),
+        "see project%78\n",
+        "utf8"
+      );
+      var results = scanLocal(root, ids);
+      assert("evasion: %-encoding caught", results.length > 0,
+        "got " + results.length + " results");
+    }
+
+    // --- 14. Exit code logic (smoke test) ----------------------------------
     {
       assert("selftest exit code assertion", true);
     }
@@ -649,8 +710,14 @@ function main() {
     }
   } else {
     var identifiers = loadBannedIdentifiers(cwd);
+    // FAIL-CLOSED: null means missing or unreadable file → error
+    if (identifiers === null) {
+      process.exit(1);
+    }
+    // Empty but present list → nothing configured, clean pass
     if (identifiers.length === 0) {
-      process.stderr.write("hygiene-scan: no identifiers loaded (create " + BANNED_IDENTIFIERS_PATH + ")\n");
+      process.stderr.write("hygiene-scan: no identifiers configured (empty list at " + BANNED_IDENTIFIERS_PATH + ")\n");
+      process.stderr.write("hygiene-scan: clean — no banned identifiers to enforce\n");
       process.exit(0);
     }
     var results = scanLocal(cwd, identifiers);
@@ -668,4 +735,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { normalize, normalizeFilename, extractNgrams, hmacDigest, scanLocal, scanCI, selftest };
+module.exports = { normalize, normalizeFilename, extractNgrams, hmacDigest, scanLocal, scanCI, selftest, loadBannedIdentifiers };

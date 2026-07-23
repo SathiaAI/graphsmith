@@ -1,16 +1,26 @@
 #!/usr/bin/env node
 /**
- * docs-lint.js — Contract 10 List A honest-language lint (v2 rebuild).
+ * docs-lint.js — Contract 10 List A honest-language lint (v3 rebuild).
  *
- * Enforces the full required-form table for ~11 over-claim terms.
+ * Enforces the full required-form table for ~14 over-claim terms.
  * Context-aware: skips code blocks (```fences), inline code (backticks),
- * code identifiers, and lines/blocks carrying the escape marker
- * <!-- lint-allow: honest-language (reason) -->.
+ * code identifiers, HTML comments (single and multiline), and lines/blocks
+ * carrying the escape marker <!-- lint-allow: honest-language (reason) -->.
+ *
+ * lint-allow supports ONLY (a) single-line escape (marker on same line as
+ * flagged content) and (b) explicitly-closed block with <!-- /lint-allow -->.
+ * An unclosed block at EOF is an ERROR (fail non-zero), never a silent
+ * whole-file suppress.
+ *
+ * Normalization (via norm-core.js): NFKC + strip ZW + fold fullwidth +
+ * fold Cyrillic/Greek homoglyphs + decode %-encodings loop-to-stable +
+ * neutralize intra-token md emphasis/hyphen/underscore + collapse whitespace.
  *
  * Scans the shippable docs fileset. Failure messages report
  * file:line: <rule-id> only — NEVER the banned term.
  *
- * Zero deps. CommonJS. Node >= 18. Deterministic, no network, fail-closed.
+ * Zero deps (Node built-in crypto). CommonJS. Node >= 18. Deterministic,
+ * no network, fail-closed.
  *
  * Usage:
  *   node scripts/docs-lint.js               scan the shippable docs fileset
@@ -22,12 +32,16 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const normCore = require("./norm-core.js");
+
+const normalizeForDocsLint = normCore.normalizeForDocsLint;
 
 // --- rule definitions (contract 10 List A) -----------------------------------
 
 /**
  * Each rule:
- *   id             — rule identifier (emitted in output, never the banned term)
+ *   id             — internal rule identifier (NOT emitted in CLI output)
+ *   displayId      — opaque output ID (emitted in CLI output, never the banned term)
  *   bannedPattern  — regex to detect the bare over-claim term
  *   negationPatterns — array of regexes; if any matches the line, skip
  *   requiredFormPatterns — array of regexes; if any matches nearby prose, skip
@@ -36,6 +50,7 @@ const os = require("os");
 const RULES = [
   {
     id: "R1-proven",
+    displayId: "H01",
     bannedPattern: /\bproven\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+)(?:\S+\s+){0,4}proven\b/gi,
@@ -51,6 +66,7 @@ const RULES = [
   },
   {
     id: "R2-immutable",
+    displayId: "H02",
     bannedPattern: /\bimmutable\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+)(?:\S+\s+){0,4}immutable\b/gi,
@@ -63,6 +79,7 @@ const RULES = [
   },
   {
     id: "R3-certified",
+    displayId: "H03",
     bannedPattern: /\bcertified\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+)(?:\S+\s+){0,4}certified\b/gi,
@@ -77,6 +94,7 @@ const RULES = [
   },
   {
     id: "R4-sandboxed",
+    displayId: "H04",
     bannedPattern: /\bsandboxed\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+|isn['\u2019]t\s+)(?:\S+\s+){0,3}sandboxed\b/gi,
@@ -89,12 +107,13 @@ const RULES = [
   },
   {
     id: "R5-exactly-once",
-    bannedPattern: /\bexactly[-\s]once\b/gi,
+    displayId: "H05",
+    bannedPattern: /\bexactly(?:[-\s_]+once|once)\b/gi,
     negationPatterns: [
-      /\b(?:not?\s+|never\s+|no\s+|doesn['\u2019]t\s+)(?:\S+\s+){0,4}exactly[-\s]once\b/gi,
-      /\bexactly[-\s]once\b(?:\s+\S+){0,4}\s+(?:false|wrong|incorrect|misleading)\b/gi,
-      /\bmakes?\s+no\s+(?:\S+\s+){0,2}exactly[-\s]once\b/gi,
-      /\bdoes?\s+not\s+provide\s+exactly[-\s]once\b/gi,
+      /\b(?:not?\s+|never\s+|no\s+|doesn['\u2019]t\s+)(?:\S+\s+){0,4}exactly(?:[-\s_]+once|once)\b/gi,
+      /\bexactly(?:[-\s_]+once|once)\b(?:\s+\S+){0,4}\s+(?:false|wrong|incorrect|misleading)\b/gi,
+      /\bmakes?\s+no\s+(?:\S+\s+){0,2}exactly(?:[-\s_]+once|once)\b/gi,
+      /\bdoes?\s+not\s+provide\s+exactly(?:[-\s_]+once|once)\b/gi,
     ],
     requiredFormPatterns: [
       /\bcapability\s+class\b/gi,
@@ -104,6 +123,7 @@ const RULES = [
   },
   {
     id: "R6-constant-monitoring",
+    displayId: "H06",
     bannedPattern: /\bconstant\s+monitoring\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+|without\s+)(?:\S+\s+){0,3}constant\s+monitoring\b/gi,
@@ -114,19 +134,21 @@ const RULES = [
   },
   {
     id: "R7-tamper-proof",
-    bannedPattern: /\btamper-proof\b/gi,
+    displayId: "H07",
+    bannedPattern: /\b(?:tamper-proof|tamperproof)\b/gi,
     negationPatterns: [
-      /\b(?:not?\s+|never\s+|no\s+)(?:\S+\s+){0,3}tamper-proof\b/gi,
-      /\btamper-proof\b(?:\s+\S+){0,4}\s+(?:false|wrong|incorrect|misleading)\b/gi,
+      /\b(?:not?\s+|never\s+|no\s+)(?:\S+\s+){0,3}(?:tamper-proof|tamperproof)\b/gi,
+      /(?:tamper-proof|tamperproof)\b(?:\s+\S+){0,4}\s+(?:false|wrong|incorrect|misleading)\b/gi,
     ],
     requiredFormPatterns: [
-      /\btamper-evident\s+vs\s+anchored\s+head\b/gi,
-      /\btamper[- ]?evident\b/gi,
+      /\b(?:tamper-evident|tamperevident)\s+vs\s+anchored\s+head\b/gi,
+      /\b(?:tamper[- ]?evident|tamperevident)\b/gi,
     ],
   },
   {
     id: "R8-pen-test",
-    bannedPattern: /\bpen[-\s]?test(?:ing|ed|s)?\b/gi,
+    displayId: "H08",
+    bannedPattern: /\b(?:pen[-\s]?test(?:ing|ed|s)?|pentest(?:ing|ed|s)?)\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+|without\s+)(?:\S+\s+){0,3}pen[-\s]?test/gi,
     ],
@@ -137,18 +159,21 @@ const RULES = [
   },
   {
     id: "R9a-certified-secure",
+    displayId: "H09",
     bannedPattern: /\bcertified\s+secure\b/gi,
     negationPatterns: [],
     requiredFormPatterns: [],
   },
   {
     id: "R9b-security-guaranteed",
+    displayId: "H10",
     bannedPattern: /\bsecurity\s+guaranteed\b/gi,
     negationPatterns: [],
     requiredFormPatterns: [],
   },
   {
     id: "R9c-guaranteed",
+    displayId: "H11",
     bannedPattern: /\bguaranteed\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+|isn['\u2019]t\s+|without\s+)(?:\S+\s+){0,3}guaranteed\b/gi,
@@ -162,6 +187,7 @@ const RULES = [
   },
   {
     id: "R9d-cannot-fail",
+    displayId: "H12",
     bannedPattern: /\bcannot\s+fail\b/gi,
     negationPatterns: [
       /\b(?:does?\s+not\s+(?:say|claim|mean|imply))\s+(?:\S+\s+){0,2}cannot\s+fail\b/gi,
@@ -173,6 +199,7 @@ const RULES = [
   },
   {
     id: "R10-atomic",
+    displayId: "H13",
     bannedPattern: /\batomic\b/gi,
     negationPatterns: [
       /\b(?:not?\s+|never\s+|no\s+)(?:\S+\s+){0,3}atomic\b/gi,
@@ -184,6 +211,7 @@ const RULES = [
   },
   {
     id: "R11-cannot-reach-network",
+    displayId: "H14",
     bannedPattern: /\bcannot\s+reach\s+the\s+network\b/gi,
     negationPatterns: [],
     requiredFormPatterns: [
@@ -231,8 +259,8 @@ const LINK_TEXT_RE = /\[([^\]]*)\]\([^)]*\)/g;
 
 /**
  * Strip rendered-prose-irrelevant syntax from a doc line.
- * Removes: inline code, HTML comments, markdown link URLs, images, HTML tags.
- * Handles lint-allow markers separately.
+ * Removes: inline code, markdown link URLs, images, HTML tags.
+ * HTML comments are handled separately (multiline tracking in scanFile).
  */
 function cleanLine(line) {
   let s = line;
@@ -241,9 +269,35 @@ function cleanLine(line) {
   s = s.replace(MD_LINK_REF_RE, "");           // link references
   s = s.replace(LINK_TEXT_RE, "$1");           // convert [text](url) -> text
   s = s.replace(INLINE_CODE_RE, "");           // inline code
-  s = s.replace(HTML_COMMENT_RE, "");          // HTML comments (after lint-allow checked)
   s = s.replace(TAG_STRIP_RE, "");             // HTML tags
   return s;
+}
+
+/**
+ * Strip multiline HTML comments from raw text, preserving line structure
+ * (line numbers stay accurate by preserving newlines).
+ */
+function stripMultilineHtmlComments(raw) {
+  let result = "";
+  let i = 0;
+  while (i < raw.length) {
+    const commentStart = raw.indexOf("<!--", i);
+    if (commentStart === -1) {
+      result += raw.substring(i);
+      break;
+    }
+    result += raw.substring(i, commentStart);
+    const commentEnd = raw.indexOf("-->", commentStart + 4);
+    if (commentEnd === -1) {
+      break;
+    }
+    // Replace comment content with spaces, keeping \r\n for line counting
+    const commentBody = raw.substring(commentStart, commentEnd + 3);
+    const repl = commentBody.replace(/[^\r\n]/g, " ");
+    result += repl;
+    i = commentEnd + 3;
+  }
+  return result;
 }
 
 // --- file list building -------------------------------------------------------
@@ -296,6 +350,8 @@ function walkDir(abspath, cwd, out) {
 
 /**
  * Scan one file. Returns array of { file, line, ruleId }.
+ * Two-pass: first detect lint-allow blocks on ORIGINAL text,
+ * then strip HTML comments and scan prose on stripped text.
  */
 function scanFile(fileRel, fileAbs) {
   let raw;
@@ -304,18 +360,94 @@ function scanFile(fileRel, fileAbs) {
   } catch (e) {
     return [];
   }
-  const results = [];
+
+  const origLines = raw.split(/\r?\n/);
+
+  // --- Pass 1: detect lint-allow blocks on ORIGINAL text (before HTML stripping) ---
+
+  const lintAllowSkipLines = new Set();
+  const lintAllowErrorLines = [];
+
+  let inLintAllowBlock = false;
+
+  for (let i = 0; i < origLines.length; i++) {
+    const line = origLines[i];
+
+    // Lint-allow close
+    if (LINT_ALLOW_CLOSE_RE.test(line)) {
+      if (inLintAllowBlock) {
+        inLintAllowBlock = false;
+      }
+      lintAllowSkipLines.add(i);
+      continue;
+    }
+    if (inLintAllowBlock) {
+      lintAllowSkipLines.add(i);
+      continue;
+    }
+
+    // Lint-allow open
+    if (LINT_ALLOW_OPEN_RE.test(line)) {
+      const withoutComment = line.replace(HTML_COMMENT_RE, "").trim();
+      if (withoutComment.length === 0) {
+        // Block open — scan ahead for close marker
+        let foundClose = false;
+        for (let j = i + 1; j < origLines.length; j++) {
+          if (LINT_ALLOW_CLOSE_RE.test(origLines[j])) {
+            foundClose = true;
+            break;
+          }
+        }
+        if (foundClose) {
+          inLintAllowBlock = true;
+          lintAllowSkipLines.add(i);
+        } else {
+          // UNCLOSED block — record error, do NOT suppress
+          lintAllowErrorLines.push(i + 1);
+        }
+      } else {
+        // Line-level escape — skip this line only
+        lintAllowSkipLines.add(i);
+      }
+      continue;
+    }
+  }
+
+  // If unclosed block(s) found, report in stderr
+  if (lintAllowErrorLines.length > 0) {
+    process.stderr.write(
+      fileRel + ": ERROR — unclosed lint-allow block at line " + lintAllowErrorLines.join(",") + ", not suppressing\n"
+    );
+  }
+
+  // --- Pass 2: strip HTML comments and scan prose ---
+
+  raw = stripMultilineHtmlComments(raw);
   const lines = raw.split(/\r?\n/);
+  const results = [];
+
+  for (const errLine of lintAllowErrorLines) {
+    results.push({
+      file: fileRel,
+      line: errLine,
+      ruleId: "__ERR_UNCLOSED_LINT_ALLOW__",
+    });
+  }
 
   let inCodeFence = false;
   let fenceIndent = 0;
   let fenceChar = "";
-  let inLintAllowBlock = false;
   let inYamlFrontmatter = false;
   let sawYamlStart = false;
+  let prevProse = "";  // previous line's cleaned prose for cross-line phrase join
+  let prevLineNum = 0; // line number of prevProse (for attribution)
 
   for (let i = 0; i < lines.length; i++) {
     const lineNum = i + 1;
+
+    // Skip lint-allow lines (including properly closed blocks and line-level escapes)
+    if (lintAllowSkipLines.has(i)) continue;
+
     const rawLine = lines[i];
 
     // YAML frontmatter detection (only at file start)
@@ -344,50 +476,59 @@ function scanFile(fileRel, fileAbs) {
     }
     if (inCodeFence) continue;
 
-    // Lint-allow block close
-    if (LINT_ALLOW_CLOSE_RE.test(rawLine)) {
-      inLintAllowBlock = false;
-      continue;
-    }
-    if (inLintAllowBlock) continue;
-
-    // Lint-allow line or block open
-    if (LINT_ALLOW_OPEN_RE.test(rawLine)) {
-      // Check if this is a block open (assume block if /lint-allow close appears later)
-      // For safety, just skip this line and any subsequent lines until close.
-      // But we only know it's a block if there's a close marker.
-      // Strategy: if line has only lint-allow open, it's potentially a block open.
-      // If line has prose before/after lint-allow, it's a line-level skip.
-      // For simplicity: if the line has a lint-allow open comment, check if it's
-      // the only significant content. If so → block open. Otherwise → line skip.
-      const withoutComment = rawLine.replace(HTML_COMMENT_RE, "").trim();
-      if (withoutComment.length === 0) {
-        inLintAllowBlock = true;
-      }
-      continue;
-    }
-
-    // Clean the line for prose scanning (do THIS before any HTML comment stripping
-    // that was already done via the regex — but we need to also clean the lint-allow
-    // detection. Actually, cleanLine uses HTML_COMMENT_RE which strips all comments.
-    // But we already detected lint-allow above, so now we can safely clean.)
+    // Clean the line for prose scanning
     const prose = cleanLine(rawLine);
 
     // Skip empty lines after cleaning
     if (prose.trim().length === 0) continue;
 
-    // Collect all candidate matches for this line, then resolve overlaps:
-    // longer/compound rules take precedence over shorter/single-word rules.
+    // Apply docs-lint normalization (NFKC + homoglyph + neutralization + collapse whitespace)
+    const normalized = normalizeForDocsLint(prose);
+    if (normalized.length === 0) continue;
+
+    // Collect all candidate matches for this line, then resolve overlaps
     const candidates = [];
     for (const rule of RULES) {
       rule.bannedPattern.lastIndex = 0;
       let m;
-      while ((m = rule.bannedPattern.exec(prose)) !== null) {
-        if (isNegated(prose, rule)) continue;
-        if (isRequiredForm(prose, rule)) continue;
+      while ((m = rule.bannedPattern.exec(normalized)) !== null) {
+        if (isNegated(normalized, rule)) continue;
+        if (isRequiredForm(normalized, rule)) continue;
         candidates.push({ ruleId: rule.id, start: m.index, end: m.index + m[0].length });
       }
     }
+
+    // Cross-line phrase join: join previous line's prose with this line (space-separated)
+    // to catch multi-word banned phrases split across lines (e.g., "certified\nsecure").
+    if (prevProse.length > 0 && prevLineNum > 0) {
+      const joined = normalizeForDocsLint(cleanLine(prevProse + " " + prose));
+      if (joined.length > 0) {
+        for (const rule of RULES) {
+          // Only check rules that require multiple words (patterns with \s or - in them)
+          rule.bannedPattern.lastIndex = 0;
+          let m;
+          while ((m = rule.bannedPattern.exec(joined)) !== null) {
+            // Only attribute to current line if the match overlaps the boundary
+            // (i.e., it wasn't already found entirely within the current line)
+            const midPoint = cleanLine(prevProse).length + 1; // position of space separator
+            if (m.index < midPoint && m.index + m[0].length > midPoint) {
+              if (isNegated(joined, rule)) continue;
+              if (isRequiredForm(joined, rule)) continue;
+              // Check if not already found by single-line scan
+              var alreadyFound = false;
+              for (var ca = 0; ca < candidates.length; ca++) {
+                if (candidates[ca].ruleId === rule.id) alreadyFound = true;
+              }
+              if (!alreadyFound) {
+                candidates.push({ ruleId: rule.id, start: -1, end: -1, crossLine: true });
+              }
+            }
+          }
+        }
+      }
+    }
+    prevProse = prose;
+    prevLineNum = lineNum;
     // Sort by length descending, then by start position
     candidates.sort(function (a, b) {
       const lenA = a.end - a.start;
@@ -447,29 +588,33 @@ function scanAll(cwd) {
   return allResults;
 }
 
+// --- opaque output ID mapping (contract 10: output never contains banned term) ---
+
+const RULE_DISPLAY_MAP = {};
+for (const rule of RULES) {
+  RULE_DISPLAY_MAP[rule.id] = rule.displayId;
+}
+RULE_DISPLAY_MAP["__ERR_UNCLOSED_LINT_ALLOW__"] = "E-UNCLOSED-LINT-ALLOW";
+
+function displayRuleId(internalId) {
+  return RULE_DISPLAY_MAP[internalId] || internalId;
+}
+
 // --- output -------------------------------------------------------------------
 
 function reportResults(results) {
   for (const r of results) {
-    process.stdout.write(r.file + ":" + r.line + ": " + r.ruleId + "\n");
+    process.stdout.write(r.file + ":" + r.line + ": " + displayRuleId(r.ruleId) + "\n");
   }
   if (results.length > 0) {
+    const errCount = results.filter(function (r) { return r.ruleId === "__ERR_UNCLOSED_LINT_ALLOW__"; }).length;
+    const violationCount = results.length - errCount;
     process.stderr.write(
-      "\ndocs-lint: " + results.length + " violation(s) found in " +
-      new Set(results.map(function (r) { return r.file; })).size + " file(s)\n"
+      "\ndocs-lint: " + violationCount + " violation(s) found in " +
+      new Set(results.map(function (r) { return r.file; })).size + " file(s)" +
+      (errCount > 0 ? " (" + errCount + " unclosed lint-allow block(s))" : "") + "\n"
     );
   }
-}
-
-// --- governance: output MUST never contain raw matched text from documents ---
-
-function outputLineSafe(outputLine) {
-  // output line is in format "file:line: ruleId" — the ruleId may reference
-  // the banned term as a rule label (e.g. "R1-proven") which is BY DESIGN.
-  // We only need to ensure the line doesn't contain extra context that would
-  // reproduce the full matched phrase from the source document.
-  // Since our output is always exactly "file:line: ruleId", it's safe by construction.
-  return true;
 }
 
 // --- selftest -----------------------------------------------------------------
@@ -561,6 +706,76 @@ function selftest() {
     assertCount("README.md", "R9d-cannot-fail", 1, "TP: cannot fail flagged");
     assertCount("README.md", "R10-atomic", 1, "TP: atomic flagged");
     assertCount("README.md", "R11-cannot-reach-network", 1, "TP: cannot reach network flagged");
+
+    // --- TP: normalized evasion caught -----------------------------------------
+
+    fs.writeFileSync(path.join(root, "docs", "normalized.md"),
+      // Homoglyph: Greek omicron in "proven"
+      "This is pr\u03BFven in production.\n" +
+      // Zero-width in "proven"
+      "Totally pr\u200Boven reliable.\n" +
+      // Zero-width joiner in "certified"
+      "Results are cert\u200Dified.\n" +
+      // Hyphenation "pro-ven"
+      "Behavior is pro-ven by customers.\n" +
+      // Markdown emphasis split
+      "Claims are pr*oven* daily.\n" +
+      "We ship **proven** results here too.\n" +
+      // Soft hyphen
+      "Marked pro\u00ADven by partners.\n" +
+      // Fullwidth Latin
+      "Status: \uFF50\uFF52\uFF4F\uFF56\uFF45\uFF4E under SLA.\n" +
+      // exactly_once underscore
+      "Semantics are exactly_once always.\n" +
+      // Double-spaced exactly once
+      "This provides exactly  once delivery.\n" +
+      // Casing
+      "This release is PROVEN under load.\n" +
+      "It is Certified for enterprise.\n" +
+      "Delivery is Exactly-Once.\n",
+      "utf8"
+    );
+    assertCount("docs/normalized.md", "R1-proven", 8, "TP: all normalized proven evasions caught");
+    assertCount("docs/normalized.md", "R3-certified", 2, "TP: normalized certified evasions caught");
+    assertCount("docs/normalized.md", "R5-exactly-once", 3, "TP: normalized exactly-once evasions caught (underscore, casing, double space)");
+
+    // --- TP: unclosed lint-allow → error (not suppress) ------------------------
+
+    fs.writeFileSync(path.join(root, "docs", "unclosed.md"),
+      "<!-- lint-allow: honest-language (oops forgot close) -->\n" +
+      "Smuggled proven claim one.\n" +
+      "Smuggled certified claim two.\n" +
+      "Smuggled guaranteed claim three.\n",
+      "utf8"
+    );
+    const unclosedFindings = findings("docs/unclosed.md");
+    const unclosedErr = unclosedFindings.filter(function (r) { return r.ruleId === "__ERR_UNCLOSED_LINT_ALLOW__"; });
+    const unclosedProven = unclosedFindings.filter(function (r) { return r.ruleId === "R1-proven"; });
+    assert("LA-UNCLOSED: error reported", unclosedErr.length === 1, "got " + unclosedErr.length + " error items");
+    assert("LA-UNCLOSED: proven NOT suppressed", unclosedProven.length === 1, "got " + unclosedProven.length);
+    assert("LA-UNCLOSED: certified NOT suppressed",
+      unclosedFindings.filter(function (r) { return r.ruleId === "R3-certified"; }).length === 1);
+    assert("LA-UNCLOSED: guaranteed NOT suppressed",
+      unclosedFindings.filter(function (r) { return r.ruleId === "R9c-guaranteed"; }).length === 1);
+
+    // --- TP: multiline HTML comment NOT flagged --------------------------------
+
+    fs.writeFileSync(path.join(root, "docs", "mlcomment.md"),
+      "Before comment.\n" +
+      "<!--\n" +
+      "This is proven inside a comment.\n" +
+      "This is certified inside a comment.\n" +
+      "-->\n" +
+      "After comment: this is proven.\n",
+      "utf8"
+    );
+    const mlFindings = findings("docs/mlcomment.md");
+    assert("FP: multiline comment proven not flagged",
+      !mlFindings.some(function (r) { return r.ruleId === "R1-proven" && r.line >= 3 && r.line <= 4; }));
+    assert("FP: multiline comment certified not flagged",
+      !mlFindings.some(function (r) { return r.ruleId === "R3-certified" && r.line >= 3 && r.line <= 4; }));
+    assert("TP: after comment, proven IS flagged",
+      mlFindings.some(function (r) { return r.line === 6 && r.ruleId === "R1-proven"; }));
 
     // --- FP: negated use NOT flagged -------------------------------------------
 
@@ -694,18 +909,16 @@ function selftest() {
     assert("FP: inline code `certified` not flagged", !inlineFindings.some(function (r) { return r.line === 3 && r.ruleId === "R3-certified"; }));
     assert("TP: plain text proven IS flagged", inlineFindings.some(function (r) { return r.line === 4 && r.ruleId === "R1-proven"; }));
 
-    // --- OUTPUT SANITIZED: output lines must be in "file:line: ruleId" format ----
+    // --- OUTPUT SANITIZED: output lines must use opaque IDs --------------------
 
     function allOutputLines(findingsArr) {
       const out = [];
       for (const f of findingsArr) {
-        out.push(f.file + ":" + f.line + ": " + f.ruleId);
+        out.push(f.file + ":" + f.line + ": " + displayRuleId(f.ruleId));
       }
       return out;
     }
 
-    // Verify output format is clean — rule IDs like "R1-proven" reference
-    // the rule label, not the matched document text.
     fs.writeFileSync(path.join(root, "docs", "sanitize-test.md"),
       "The system is proven.\n" +
       "It is immutable.\n" +
@@ -719,10 +932,15 @@ function selftest() {
       var rulePart = parts[parts.length - 1].trim();
       assert(
         "SANITIZED output format: " + JSON.stringify(line),
-        parts.length >= 3 && /^\d+$/.test(parts[parts.length - 2].trim()) && rulePart.startsWith("R"),
+        parts.length >= 3 && /^\d+$/.test(parts[parts.length - 2].trim()) && /^H\d/.test(rulePart),
         "malformed output line"
       );
     }
+    // Output must NOT contain the banned term as bare word
+    const combinedOut = lines.join("\n");
+    assert("SANITIZED: no 'proven' in output", !/\bproven\b/i.test(combinedOut));
+    assert("SANITIZED: no 'certified' in output", !/\bcertified\b/i.test(combinedOut));
+    assert("SANITIZED: no 'immutable' in output", !/\bimmutable\b/i.test(combinedOut));
 
     // --- Edge: YAML frontmatter skipped ---------------------------------------
 
@@ -846,4 +1064,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { scanFile, scanAll, RULES, selftest };
+module.exports = { scanFile, scanAll, RULES, selftest, displayRuleId };
