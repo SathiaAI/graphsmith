@@ -1076,6 +1076,32 @@ function classifyBudgetHalt(halt) {
   return { status: ok ? "verified" : "failed", ok };
 }
 function classifyGatedLearning(o) {
+  // Absence-of-evidence guard (contract 10: unavailable ≠ green). The equality
+  // check below reads "before === after" as "ACTIVE unchanged" — but if the
+  // ACTIVE-hash computation silently FAILED (readFileSync/sha256 swallowed),
+  // both sides can be `undefined` (or `null`, or any non-string), and
+  // `undefined === undefined` would sail through and report "verified" on an
+  // ACTIVE that was never actually hashed/compared. That absence is the exact
+  // HIGH the cross-family tester flagged. Require BOTH sides to be actual
+  // strings FIRST; a nullish/non-string operand means the hash was never
+  // produced, so the propose-only guarantee is unverifiable — never verified.
+  //
+  // Note on the guard's strength: the shipped adversarial suite exercises this
+  // classifier with SHORT stand-in hashes ("a", "ab", "") that it expects to be
+  // treated as valid equal digests and ruled by the refused/gate3/listed
+  // conditions below — so a strict /^[0-9a-f]{64}$/ shape check cannot be used
+  // here without contradicting that suite. The absence hole this fix must close
+  // is a MISSING hash (undefined/null/non-string), which the string-operand
+  // guard closes precisely. In production, activeBefore/activeAfter always come
+  // from sha256Hex(...) (a 64-hex string) or the whole profile fails via throw,
+  // so a non-string operand can only arise from an absence/error path.
+  if (typeof o.activeBefore !== "string" || typeof o.activeAfter !== "string") {
+    return {
+      status: "unavailable",
+      reason:
+        "ACTIVE state could not be hashed/compared (before/after are not both strings — the hash was never produced) — the propose-only guarantee is unverifiable, reported unavailable rather than green (contract 10)",
+    };
+  }
   if (o.activeBefore !== o.activeAfter) {
     return { status: "failed", reason: "ACTIVE was mutated by the propose-only path — a staged proposal auto-adopted (Gate-3 must be propose-only)" };
   }
@@ -1083,6 +1109,32 @@ function classifyGatedLearning(o) {
   if (!o.gate3Packet) return { status: "failed", reason: "Gate-1/Gate-3 did not produce a propose-only adoption packet" };
   if (!o.listedPending) return { status: "failed", reason: "the staged proposal did not surface in adopt.listPending (propose-only queue)" };
   return { status: "verified" };
+}
+
+// Pure ruling for X from a redteam report. Absence-of-evidence guard
+// (contract 10: never claim a check not actually run): a report whose checks[]
+// contains NO arch.sandbox-open entry (e.g. a bare {status:"pass", checks:[]})
+// leaves the I3 sandbox UNCONFIRMED — that must NOT pass as "verified". The
+// sandbox-open evidence must be PRESENT before any pass/fail ruling; only a
+// present-and-not-"unavailable" sandbox-open lets a pass/fail ruling stand.
+function classifyAdversarial(report) {
+  const checks = report && Array.isArray(report.checks) ? report.checks : [];
+  const sandboxOpen = checks.find((c) => c && c.id === "arch.sandbox-open");
+  if (!sandboxOpen) {
+    return {
+      status: "unavailable",
+      reason:
+        "sandbox-open check absent from the redteam report — the I3 sandbox was never confirmed open, so adversarial isolation is unproven; reported unavailable rather than green (contract 10)",
+    };
+  }
+  if (sandboxOpen.status === "unavailable") {
+    return {
+      status: "unavailable",
+      reason: "the I3 sandbox could not be opened on this platform — adversarial isolation is unproven, reported unavailable rather than green",
+    };
+  }
+  const ok = report && report.status === "pass";
+  return { status: ok ? "verified" : "failed", ...(ok ? {} : { reason: "redteam battery failed: " + ((report && report.failed_ids) || []).join(", ") }) };
 }
 
 // Wrap a profile check so one thrown check can never crash the whole report,
@@ -1480,7 +1532,7 @@ function profileAdversariallyTested(rootDir) {
   }
   const redteam = require("./redteam");
   const report = redteam.runRedteam({ project: rootDir });
-  const sandboxOpen = report.checks.find((c) => c.id === "arch.sandbox-open");
+  const sandboxOpen = (report.checks || []).find((c) => c && c.id === "arch.sandbox-open");
   const evidence = [
     {
       check: "redteam.architecture-battery",
@@ -1488,21 +1540,15 @@ function profileAdversariallyTested(rootDir) {
       summary: report.summary,
       failed_ids: report.failed_ids,
       report_sha256: report.report_sha256,
-      sandbox: sandboxOpen ? sandboxOpen.status : null,
+      sandbox: sandboxOpen ? sandboxOpen.status : "absent",
       model_family_diversity: "not-applicable (architecture battery is model-independent)",
     },
   ];
-  if (sandboxOpen && sandboxOpen.status === "unavailable") {
-    return {
-      status: "unavailable",
-      evidence,
-      assumptions,
-      phase: "C",
-      reason: "the I3 sandbox could not be opened on this platform — adversarial isolation is unproven, reported unavailable rather than green",
-    };
-  }
-  const ok = report.status === "pass";
-  return { status: ok ? "verified" : "failed", evidence, assumptions, phase: "C", ...(ok ? {} : { reason: "redteam battery failed: " + (report.failed_ids || []).join(", ") }) };
+  // Ruling delegated to the pure classifier, which enforces the absence-of-
+  // evidence guard: a report missing the arch.sandbox-open check is
+  // "unavailable" (isolation unconfirmed), never "verified".
+  const ruling = classifyAdversarial(report);
+  return { status: ruling.status, evidence, assumptions, phase: "C", ...(ruling.reason ? { reason: ruling.reason } : {}) };
 }
 
 function buildProfileString(profiles) {
@@ -2226,6 +2272,18 @@ function runSelftest() {
       const failed = classifyGatedLearning({ activeBefore: "aaaa", activeAfter: "bbbb", refused: true, gate3Packet: true, listedPending: true });
       record("profile-G/honest-negative-auto-adopt-failed", failed.status === "failed" && /auto-?adopt/i.test(failed.reason));
     }
+    // G honest-negative (absence-of-evidence, cross-family HIGH): if the ACTIVE
+    // hash was never produced (undefined/null/non-string), the classifier must
+    // NOT report verified — even when before===after — because the equality is
+    // meaningless without real operands (contract 10: absence ≠ green).
+    {
+      const undefBoth = classifyGatedLearning({ activeBefore: undefined, activeAfter: undefined, refused: true, gate3Packet: true, listedPending: true });
+      const nullBoth = classifyGatedLearning({ activeBefore: null, activeAfter: null, refused: true, gate3Packet: true, listedPending: true });
+      const nonStr = classifyGatedLearning({ activeBefore: 0, activeAfter: 0, refused: true, gate3Packet: true, listedPending: true });
+      record("profile-G/honest-negative-undefined-hash-not-verified", undefBoth.status !== "verified" && undefBoth.status === "unavailable");
+      record("profile-G/honest-negative-null-hash-not-verified", nullBoth.status !== "verified" && nullBoth.status === "unavailable");
+      record("profile-G/honest-negative-nonstring-hash-not-verified", nonStr.status !== "verified" && nonStr.status === "unavailable");
+    }
 
     // Q: verified on a good workflow fixture (test + clean lint); unavailable
     // on a non-workflow target.
@@ -2273,6 +2331,20 @@ function runSelftest() {
       } finally {
         fs.rmSync(bareRoot, { recursive: true, force: true });
       }
+    }
+    // X honest-negative (absence-of-evidence, cross-family HIGH): a redteam
+    // report whose checks[] lacks arch.sandbox-open must NOT pass as verified —
+    // the I3 sandbox was never confirmed open (contract 10: never claim a check
+    // not actually run). Tested directly via the pure classifier.
+    {
+      const noSandbox = classifyAdversarial({ status: "pass", checks: [], failed_ids: [] });
+      const sandboxUnavail = classifyAdversarial({ status: "pass", checks: [{ id: "arch.sandbox-open", status: "unavailable" }], failed_ids: [] });
+      const sandboxOk = classifyAdversarial({ status: "pass", checks: [{ id: "arch.sandbox-open", status: "pass" }], failed_ids: [] });
+      const sandboxOkFail = classifyAdversarial({ status: "fail", checks: [{ id: "arch.sandbox-open", status: "pass" }], failed_ids: ["arch.injection-control-flow"] });
+      record("profile-X/honest-negative-sandbox-absent-unavailable", noSandbox.status === "unavailable" && /absent/i.test(noSandbox.reason));
+      record("profile-X/sandbox-unavailable-unavailable", sandboxUnavail.status === "unavailable");
+      record("profile-X/sandbox-present-pass-verified", sandboxOk.status === "verified");
+      record("profile-X/sandbox-present-fail-failed", sandboxOkFail.status === "failed");
     }
 
     // T + envelope: independent axes never collapsed; evaluated_at is injected,
@@ -2408,5 +2480,6 @@ module.exports = {
   resolveEvaluatedAt,
   classifyBudgetHalt,
   classifyGatedLearning,
+  classifyAdversarial,
   isWorkflowProject,
 };
