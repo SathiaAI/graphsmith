@@ -118,12 +118,27 @@ const DEFAULT_ALLOWLIST = Object.freeze([
   "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
 ]);
 
+// Module-resolution-affecting vars (contract 04 B14): these can redirect a
+// child process's module resolution back into the real/host tree, which
+// would defeat the copy's isolation entirely. They are HARD-DENIED here --
+// stripped unconditionally from sourceEnv, and never addable via
+// options.allowEnv -- the allowlist mechanism is a default-DENY that grants
+// exceptions; it may not override this isolation floor. NODE_OPTIONS is
+// included because evalenv itself owns that var in the copy's env (it is
+// how the effect-mocking stub is wired in below); a caller-supplied
+// NODE_OPTIONS from the host must never be spliced onto it.
+const HARD_DENY_ENV = Object.freeze(["NODE_PATH", "NODE_OPTIONS"]);
+
 function scrubEnv(sourceEnv, extraAllow) {
+  const deny = new Set(HARD_DENY_ENV.map((n) => n.toUpperCase()));
   const allow = new Set(DEFAULT_ALLOWLIST.map((n) => n.toUpperCase()));
   for (const n of extraAllow || []) allow.add(String(n).toUpperCase());
+  for (const n of deny) allow.delete(n);
   const out = {};
   for (const key of Object.keys(sourceEnv)) {
-    if (allow.has(key.toUpperCase())) out[key] = sourceEnv[key];
+    const upper = key.toUpperCase();
+    if (deny.has(upper)) continue;
+    if (allow.has(upper)) out[key] = sourceEnv[key];
   }
   return out;
 }
@@ -146,7 +161,7 @@ const EVALENV_TUNABLE_DEFS = Object.freeze([
   { key: "max_disk_mb", default: 2048, min: 1, max: 1000000, unit: "megabytes",
     semantics: "maximum bytes copied into one disposable evaluation directory" },
   { key: "max_files", default: 200000, min: 1, max: 10000000, unit: "count",
-    semantics: "maximum files copied into one disposable evaluation directory" },
+    semantics: "maximum filesystem entries (files AND directories, so an arbitrary-depth empty-directory tree cannot bypass the cap) copied into one disposable evaluation directory" },
 ]);
 
 function defaultBudgetValues() {
@@ -175,7 +190,13 @@ function resolveBudgetValues(overrides) {
 // the human-readable timestamp attached to a halt/evidence record below.
 function createBudget(values) {
   let bytes = 0;
-  let files = 0;
+  // "entries" counts BOTH files and directories against max_files -- an
+  // arbitrary-depth tree of empty directories has zero bytes and zero
+  // files, but each directory is still an entry the copy must walk and
+  // create, so it must still count toward the budget (defect D5: an
+  // unbounded empty-directory tree previously bypassed max_files entirely
+  // since only file copies were counted).
+  let entries = 0;
   const startHr = process.hrtime.bigint();
 
   function elapsedMs() {
@@ -191,22 +212,30 @@ function createBudget(values) {
     throw err;
   }
 
+  function checkAfterEntry() {
+    if (bytes > values.max_disk_mb * 1024 * 1024) {
+      haltBudget("max_disk_mb", { bytes_copied: bytes, limit_mb: values.max_disk_mb });
+    }
+    if (entries > values.max_files) {
+      haltBudget("max_files", { entries_copied: entries, limit: values.max_files });
+    }
+    if (elapsedMs() > values.max_wall_time_ms) {
+      haltBudget("max_wall_time_ms", { elapsed_ms: elapsedMs(), limit_ms: values.max_wall_time_ms });
+    }
+  }
+
   return {
     recordFile(size) {
       bytes += size;
-      files += 1;
-      if (bytes > values.max_disk_mb * 1024 * 1024) {
-        haltBudget("max_disk_mb", { bytes_copied: bytes, limit_mb: values.max_disk_mb });
-      }
-      if (files > values.max_files) {
-        haltBudget("max_files", { files_copied: files, limit: values.max_files });
-      }
-      if (elapsedMs() > values.max_wall_time_ms) {
-        haltBudget("max_wall_time_ms", { elapsed_ms: elapsedMs(), limit_ms: values.max_wall_time_ms });
-      }
+      entries += 1;
+      checkAfterEntry();
+    },
+    recordDir() {
+      entries += 1;
+      checkAfterEntry();
     },
     snapshot() {
-      return { schema_version: SCHEMA_VERSION, bytes_copied: bytes, files_copied: files, elapsed_ms: elapsedMs(), values };
+      return { schema_version: SCHEMA_VERSION, bytes_copied: bytes, files_copied: entries, elapsed_ms: elapsedMs(), values };
     },
   };
 }
@@ -226,14 +255,20 @@ function createBudget(values) {
 const DEFAULT_EXCLUDE = Object.freeze([".git", ".graphsmith", "node_modules", ".evalenv"]);
 
 function copyTreeExcluding(srcDir, destDir, excludeNames, budget) {
-  const exclude = new Set(excludeNames);
+  // Case-INSENSITIVE exclusion match (defect D1): both Windows and macOS
+  // default to case-insensitive filesystems, so ".GIT" / ".Graphsmith" /
+  // "NODE_MODULES" are the SAME on-disk path as the lower-case protected
+  // name on those hosts and must be excluded exactly as the canonical
+  // spelling is -- matching only the exact-case name would let a
+  // case-variant slip through untouched into the eval tree.
+  const exclude = new Set(excludeNames.map((n) => n.toLowerCase()));
   const symlinksSkipped = [];
 
   function walk(src, dest) {
     fs.mkdirSync(dest, { recursive: true });
     const entries = fs.readdirSync(src, { withFileTypes: true });
     for (const entry of entries) {
-      if (exclude.has(entry.name)) continue;
+      if (exclude.has(entry.name.toLowerCase())) continue;
       const srcPath = path.join(src, entry.name);
       const destPath = path.join(dest, entry.name);
       if (entry.isSymbolicLink()) {
@@ -241,6 +276,10 @@ function copyTreeExcluding(srcDir, destDir, excludeNames, budget) {
         continue;
       }
       if (entry.isDirectory()) {
+        // Count the directory itself toward the entry budget BEFORE
+        // recursing (D5): an arbitrary-depth tree of empty directories must
+        // still hit the cap even though it copies zero files/bytes.
+        budget.recordDir();
         walk(srcPath, destPath);
       } else if (entry.isFile()) {
         fs.copyFileSync(srcPath, destPath);
@@ -261,9 +300,16 @@ function copyTreeExcluding(srcDir, destDir, excludeNames, budget) {
 // that monkey-patches Node's http/https request/get and the global fetch
 // (when present) to throw a clearly-labeled refusal instead of performing
 // any real network call. Wired in via NODE_OPTIONS="--require <stub>" in
-// the copy's OWN env object (never process.env's NODE_OPTIONS, which is not
-// on the allowlist and is stripped) so any `node` process the caller spawns
+// the copy's OWN env object (never process.env's NODE_OPTIONS, which is
+// hard-denied by scrubEnv above) so any `node` process the caller spawns
 // using this env automatically gets the stub loaded first.
+//
+// Honest naming (defect D4): this is EFFECT-MOCKING of the common Node HTTP
+// client surfaces, NOT network containment. It does not touch net/tls/dns/
+// dgram or any lower-level/native networking path, so it must never be
+// described as making the candidate unable to reach the network. The
+// standard profile's `claims.network_containment` is `false` and stays
+// false; real network denial (--network none) is CONTAINER-profile-only.
 // ---------------------------------------------------------------------------
 
 const STUB_DIR_NAME = ".evalenv";
@@ -271,16 +317,20 @@ const STUB_FILE_NAME = "network-stub.js";
 
 const STUB_FILE_CONTENT =
   '"use strict";\n' +
-  "/* GraphSmith evaluation-copy network stub (I3 standard profile).\n" +
+  "/* GraphSmith evaluation-copy effect-mocking stub (I3 standard profile).\n" +
   " * Loaded via NODE_OPTIONS=--require by any process spawned with this\n" +
-  " * copy's scrubbed env. Refuses every real network/external effect --\n" +
-  " * the standard profile makes NO network-containment claim on its own\n" +
-  " * (no OS-level firewall here), so this in-process stub is the actual\n" +
-  " * control: a candidate evaluated in this copy cannot reach the network\n" +
-  " * even though the process itself is not namespaced. */\n" +
+  " * copy's scrubbed env. This is EFFECT-MOCKING, not network containment:\n" +
+  " * it replaces the http/https request/get functions and the global\n" +
+  " * fetch (when present) with a refusal, so common HTTP-client code paths\n" +
+  " * do not accidentally reach a real external service during an eval run.\n" +
+  " * It does NOT block net/tls/dns/dgram or any other lower-level or\n" +
+  " * native networking path -- the standard profile makes NO\n" +
+  " * network-containment claim (see the returned handle's\n" +
+  " * claims.network_containment, which stays false). Real network denial\n" +
+  " * is enforced only by the container profile (--network none). */\n" +
   "function refuse(name) {\n" +
   "  return function () {\n" +
-  '    const e = new Error(name + " is stubbed in the GraphSmith I3 evaluation copy -- no real network or external effect is permitted here.");\n' +
+  '    const e = new Error(name + " is mocked in the GraphSmith I3 evaluation copy -- this is effect-mocking of common HTTP-client adapters, not a network-containment guarantee.");\n' +
   '    e.code = "EVALENV_STUBBED_EFFECT";\n' +
   "    throw e;\n" +
   "  };\n" +
@@ -301,6 +351,64 @@ function writeStubs(copyDir) {
   const stubPath = path.join(stubDir, STUB_FILE_NAME);
   fs.writeFileSync(stubPath, STUB_FILE_CONTENT);
   return { dir: stubDir, file: stubPath };
+}
+
+// Defect D3: NODE_OPTIONS is tokenized by Node's OWN parser (not a shell),
+// and that parser treats a bare space as a token boundary -- an unquoted
+// "--require <path with spaces>" silently truncates at the first space,
+// Node reports "Cannot find module", and if that spawn error goes
+// unchecked the candidate runs WITHOUT the stub (fail-OPEN on effects).
+// Quoting fixes the tokenization, but Node's quoted-string parsing is
+// itself backslash-escape-aware (like a C string), so a literal Windows
+// backslash inside a quoted value must be doubled or it gets silently
+// eaten and the path is mangled just as badly. Verified empirically against
+// this runtime: `--require "C:\foo"` mangles to `C:foo`; `--require
+// "C:\\foo"` resolves correctly.
+function quoteForNodeOptions(p) {
+  if (!/\s/.test(p)) return p;
+  return '"' + p.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+// Defect D3 (fail-closed half): quoting can only be verified empirically --
+// spawn a real child process using the copy's OWN env (the same env a
+// caller will use) and confirm the stub actually loaded by observing the
+// synchronous EVALENV_STUBBED_EFFECT refusal. If the stub does not load for
+// ANY reason (bad quoting, missing file, platform quirk), this copy must
+// never be handed back -- the caller would otherwise silently run
+// unstubbed. No network is actually attempted: the stub throws
+// synchronously before any connection is opened.
+function verifyStubLoaded(copyDir, env) {
+  const probePath = path.join(copyDir, STUB_DIR_NAME, "verify-stub-probe.js");
+  const probeSrc =
+    '"use strict";\n' +
+    "try {\n" +
+    '  require("http").get("http://127.0.0.1:1/");\n' +
+    '  process.stdout.write("UNSTUBBED");\n' +
+    "} catch (e) {\n" +
+    '  process.stdout.write(e && e.code === "EVALENV_STUBBED_EFFECT" ? "STUBBED" : "ERROR:" + (e && e.message));\n' +
+    "}\n";
+  fs.writeFileSync(probePath, probeSrc);
+  let res;
+  try {
+    res = spawnSync(process.execPath, [probePath], { cwd: copyDir, env, encoding: "utf8", shell: false, timeout: 10000 });
+  } finally {
+    try {
+      fs.unlinkSync(probePath);
+    } catch (cleanupErr) {
+      /* best-effort */
+    }
+  }
+  const stdout = (res && res.stdout ? res.stdout : "").trim();
+  const ok = !!res && !res.error && res.status === 0 && stdout === "STUBBED";
+  return {
+    ok,
+    detail: {
+      status: res ? res.status : null,
+      stdout,
+      stderr: res && res.stderr ? String(res.stderr).slice(0, 2000) : "",
+      spawn_error: res && res.error ? res.error.message : null,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +553,27 @@ function createStandard(options) {
 
   const env = scrubEnv(process.env, options.allowEnv);
   const stubs = writeStubs(dir);
-  env.NODE_OPTIONS = ((env.NODE_OPTIONS ? env.NODE_OPTIONS + " " : "") + "--require " + stubs.file).trim();
+  // NODE_OPTIONS is hard-denied by scrubEnv (D2), so env.NODE_OPTIONS is
+  // always empty here -- this is evalenv's own value, never spliced with a
+  // caller/host-supplied NODE_OPTIONS.
+  env.NODE_OPTIONS = ((env.NODE_OPTIONS ? env.NODE_OPTIONS + " " : "") + "--require " + quoteForNodeOptions(stubs.file)).trim();
+
+  // FAIL-CLOSED (D3): never hand back a copy whose stub did not actually
+  // load in a real child process using this exact env -- refuse instead of
+  // silently letting the caller run unstubbed.
+  const stubVerification = verifyStubLoaded(dir, env);
+  if (!stubVerification.ok) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      /* best-effort cleanup; original error still wins */
+    }
+    throw fail(
+      "FAIL-CLOSED: the evaluation-copy effect-mocking stub could not be verified to load in a child process using this copy's " +
+        "env -- refusing to return an evaluation copy that would run unstubbed. detail=" + JSON.stringify(stubVerification.detail),
+      "STUB_VERIFY_FAILED"
+    );
+  }
 
   const permissionModel = detectPermissionModel(dir);
   const isolation = checkIsolation(dir, env, copyReport.symlinks_skipped);
@@ -796,6 +924,132 @@ function runSelftest() {
       }
       record("requireContainer/refuses-standard-profile", threw);
       std2.destroy();
+    }
+
+    // ---- D1: case-variant protected dirs (.GIT/.Graphsmith/NODE_MODULES) excluded ----
+    {
+      const probeDir = path.join(root, "d1-case-probe");
+      fs.mkdirSync(probeDir, { recursive: true });
+      fs.writeFileSync(path.join(probeDir, "MiXeD"), "x");
+      const caseInsensitiveHost = fs.existsSync(path.join(probeDir, "mixed"));
+      if (!caseInsensitiveHost) {
+        record("standard/D1-case-variant-protected-dirs-excluded", true, "skipped: host filesystem is case-sensitive");
+      } else {
+        const srcD1 = path.join(root, "d1-source");
+        fs.mkdirSync(path.join(srcD1, ".GIT"), { recursive: true });
+        fs.writeFileSync(path.join(srcD1, ".GIT", "HEAD"), "x\n");
+        fs.mkdirSync(path.join(srcD1, ".Graphsmith", "evolvable"), { recursive: true });
+        fs.writeFileSync(path.join(srcD1, ".Graphsmith", "evolvable", "ACTIVE"), "{}\n");
+        fs.mkdirSync(path.join(srcD1, "Node_Modules", "dep"), { recursive: true });
+        fs.writeFileSync(path.join(srcD1, "Node_Modules", "dep", "index.js"), "module.exports = {};\n");
+        fs.writeFileSync(path.join(srcD1, "app.txt"), "ok\n");
+        const stdD1 = create("standard", { sourceDir: srcD1, tmpRoot: root });
+        const ok =
+          !fs.existsSync(path.join(stdD1.dir, ".GIT")) &&
+          !fs.existsSync(path.join(stdD1.dir, ".Graphsmith")) &&
+          !fs.existsSync(path.join(stdD1.dir, "Node_Modules")) &&
+          fs.existsSync(path.join(stdD1.dir, "app.txt")) &&
+          stdD1.isolation.isolated === true;
+        record("standard/D1-case-variant-protected-dirs-excluded", ok, JSON.stringify(stdD1.isolation));
+        stdD1.destroy();
+      }
+    }
+
+    // ---- D2: NODE_PATH cannot be re-allowed via allowEnv (hard-deny wins) ----
+    {
+      const prevNodePath = process.env.NODE_PATH;
+      process.env.NODE_PATH = path.join(root, "d2-real-tree-modules");
+      try {
+        const srcD2 = path.join(root, "d2-source");
+        fs.mkdirSync(srcD2, { recursive: true });
+        fs.writeFileSync(path.join(srcD2, "app.txt"), "ok\n");
+        const stdD2 = create("standard", { sourceDir: srcD2, tmpRoot: root, allowEnv: ["NODE_PATH"] });
+        const leaked = Object.keys(stdD2.env).some((k) => k.toUpperCase() === "NODE_PATH");
+        record(
+          "standard/D2-NODE_PATH-not-reallowable-via-allowEnv",
+          !leaked && stdD2.isolation.node_path_stripped === true && stdD2.isolation.isolated === true,
+          JSON.stringify({ leaked, isolation: stdD2.isolation })
+        );
+        stdD2.destroy();
+      } finally {
+        if (prevNodePath === undefined) delete process.env.NODE_PATH;
+        else process.env.NODE_PATH = prevNodePath;
+      }
+    }
+
+    // ---- D3: copy path with spaces loads the stub, or create() FAILS CLOSED ----
+    {
+      const spacedRoot = path.join(root, "d3 space path root");
+      fs.mkdirSync(spacedRoot, { recursive: true });
+      const srcD3 = path.join(root, "d3-source");
+      fs.mkdirSync(srcD3, { recursive: true });
+      fs.writeFileSync(path.join(srcD3, "app.txt"), "ok\n");
+      let stdD3 = null;
+      let threwD3 = null;
+      try {
+        stdD3 = create("standard", { sourceDir: srcD3, tmpRoot: spacedRoot });
+      } catch (e) {
+        threwD3 = e;
+      }
+      if (stdD3) {
+        const probeFile = path.join(stdD3.dir, "d3-probe.js");
+        const outFile = path.join(stdD3.dir, "d3-out.txt");
+        fs.writeFileSync(
+          probeFile,
+          "try { require('http').get('http://127.0.0.1:1/'); require('fs').writeFileSync(" +
+            JSON.stringify(outFile) +
+            ", 'UNSTUBBED'); } catch (e) { require('fs').writeFileSync(" +
+            JSON.stringify(outFile) +
+            ", (e && e.code) || 'ERROR'); }\n"
+        );
+        const child = spawnSync(process.execPath, [probeFile], { cwd: stdD3.dir, env: stdD3.env, encoding: "utf8", timeout: 10000 });
+        const out = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : null;
+        record(
+          "standard/D3-space-in-path-stub-loads-or-fails-closed",
+          child.status === 0 && out === "EVALENV_STUBBED_EFFECT",
+          JSON.stringify({ dir: stdD3.dir, status: child.status, out })
+        );
+        stdD3.destroy();
+      } else {
+        record(
+          "standard/D3-space-in-path-stub-loads-or-fails-closed",
+          !!threwD3 && threwD3.code === "STUB_VERIFY_FAILED",
+          threwD3 && threwD3.message
+        );
+      }
+    }
+
+    // ---- D4: stub claim is honest effect-mocking, not a network-block claim ----
+    {
+      const claimsCannotReach = /cannot reach the network/i.test(STUB_FILE_CONTENT);
+      const coversRawNetwork = /require\(["'](?:node:)?(?:net|tls|dns|dgram)["']\)/.test(STUB_FILE_CONTENT);
+      record("standard/D4-stub-claim-is-effect-mocking-not-network-block", !claimsCannotReach && !coversRawNetwork);
+    }
+
+    // ---- D5: a deep tree of empty directories still hits the entry cap ----
+    {
+      const srcD5 = path.join(root, "d5-source");
+      fs.mkdirSync(srcD5, { recursive: true });
+      let cursor = srcD5;
+      for (let i = 0; i < 50; i++) {
+        cursor = path.join(cursor, "empty" + i);
+        fs.mkdirSync(cursor);
+      }
+      let breached = false;
+      let breachCode = null;
+      try {
+        const stdD5 = create("standard", { sourceDir: srcD5, tmpRoot: root, budgets: { max_files: 5 } });
+        stdD5.destroy();
+      } catch (e) {
+        breached = true;
+        breachCode = e.code;
+      }
+      const leftovers = fs.readdirSync(root).filter((n) => n.startsWith("graphsmith-evalenv-"));
+      record(
+        "standard/D5-deep-empty-dir-tree-hits-entry-cap",
+        breached && breachCode === "BUDGET_BREACH" && leftovers.length === 0,
+        JSON.stringify({ breached, breachCode, leftovers })
+      );
     }
   } finally {
     if (previousFakeSecret === undefined) delete process.env.GRAPHSMITH_SELFTEST_FAKE_SECRET;
