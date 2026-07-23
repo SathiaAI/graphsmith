@@ -51,6 +51,14 @@
  *   more than 2× the poll interval), the watchdog is dead and the manager
  *   should take defensive action (e.g., self-halt or alert).
  *   Interface: scaffold.js wires the detection at integration time.
+ *
+ * Orphan marker (<halt-file>.orphan):
+ *   When the watchdog detects its manager died WITHOUT a blocked-loop breach
+ *   (orphan case), it writes an orphan marker file and deletes the dead-man
+ *   halt file. On resume, the presence of the orphan marker indicates the
+ *   previous watchdog was orphaned and cleaned up — NOT a real HALT. The
+ *   absence of the orphan marker combined with a persistent dead-man halt
+ *   file indicates a genuine watchdog crash (D4 guarantee preserved).
  */
 "use strict";
 
@@ -64,6 +72,7 @@ const MONO_NS = () => Number(process.hrtime.bigint() / 1000000n);
 const MAX_LEGACY_INCREMENT = 10;
 const MAX_FIRST_COUNTER = 100;
 const STALE_THRESHOLD_MS = 30000;
+const ORPHAN_POLL_CADENCE_MS = 500;
 
 function parseArgs(argv) {
   const args = {};
@@ -189,11 +198,25 @@ function runWatchdog(opts) {
   } catch {}
 
   const watchdogHbFile = haltFile + ".watchdog-hb";
+  const orphanFile = haltFile + ".orphan";
 
   let lastAcceptedCounter = null;
   let lastChangeMonoMs = MONO_NS();
   let lastHeartbeatValue = null;
   let managerExited = false;
+
+  const writeOrphanMarker = () => {
+    try {
+      fs.writeFileSync(orphanFile, JSON.stringify({
+        orphan: true,
+        watchdog_pid: process.pid,
+        watched_pid: pid,
+        reason: "manager_died_without_blocked_loop_breach",
+        detected_at_mono_ms: MONO_NS(),
+        detected_at_wall_ms: Date.now(),
+      }));
+    } catch {}
+  };
 
   return new Promise((resolve) => {
     const reverseHb = setInterval(() => {
@@ -207,7 +230,8 @@ function runWatchdog(opts) {
     }, pollIntervalMs);
     reverseHb.unref();
 
-    const cleanupNormal = () => {
+    const cleanupOrphan = () => {
+      writeOrphanMarker();
       try { fs.unlinkSync(haltFile); } catch {}
       try { fs.unlinkSync(nonceFile); } catch {}
       try { fs.unlinkSync(watchdogHbFile); } catch {}
@@ -219,10 +243,10 @@ function runWatchdog(opts) {
         clearInterval(checkPid);
         clearInterval(poll);
         clearInterval(reverseHb);
-        cleanupNormal();
+        cleanupOrphan();
         resolve({ halted: false, reason: "manager_exited" });
       }
-    }, Math.max(50, Math.floor(budgetMs / 4)));
+    }, ORPHAN_POLL_CADENCE_MS);
     checkPid.unref();
 
     const poll = setInterval(() => {
@@ -233,7 +257,7 @@ function runWatchdog(opts) {
         clearInterval(poll);
         clearInterval(checkPid);
         clearInterval(reverseHb);
-        cleanupNormal();
+        cleanupOrphan();
         resolve({ halted: false, reason: "manager_exited" });
         return;
       }
@@ -320,6 +344,7 @@ function runWatchdog(opts) {
 
         try { fs.unlinkSync(nonceFile); } catch {}
         try { fs.unlinkSync(watchdogHbFile); } catch {}
+        try { fs.unlinkSync(orphanFile); } catch {}
 
         process.stdout.write(JSON.stringify(haltEvidence) + "\n");
         resolve({ halted: true, evidence: haltEvidence });
@@ -857,6 +882,222 @@ async function selftest() {
       fail(name, "reverse heartbeat file not found during watchdog run");
     } else {
       pass(name, "dead man's switch written at startup, overwritten by real halt evidence, reverse heartbeat active");
+    }
+  }
+
+  // Orphan selftest: manager SIGKILLed → detected within short cadence
+  {
+    const name = "orphan-manager-detected-within-short-cadence";
+    const runDir = path.join(tmpDir, "run-orphan-cadence");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+    const orphanFile = haltFile + ".orphan";
+
+    fs.writeFileSync(capabilityFile, JSON.stringify({ capability: null }));
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 0;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+      }, 50);
+      setTimeout(() => {}, 60000);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 150));
+
+    const t0 = MONO_NS();
+    const watchdogPromise = runWatchdog({
+      pid: manager.pid,
+      budgetMs: 30000,
+      heartbeatFile,
+      capabilityFile,
+      haltFile,
+    });
+
+    await new Promise((r) => setTimeout(r, 200));
+    try { manager.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+
+    const watchdogResult = await watchdogPromise;
+    const detectionMs = MONO_NS() - t0;
+    await new Promise((r) => manager.on("close", r));
+
+    if (watchdogResult.halted) {
+      fail(name, "watchdog should NOT halt on orphan — manager died externally, no blocked-loop breach");
+    } else if (watchdogResult.reason !== "manager_exited") {
+      fail(name, `unexpected reason: ${watchdogResult.reason}`);
+    } else if (detectionMs > ORPHAN_POLL_CADENCE_MS + 500) {
+      fail(name, `orphan detection too slow: ${detectionMs}ms (cadence ${ORPHAN_POLL_CADENCE_MS}ms + 500ms slack)`);
+    } else {
+      pass(name, `orphan detected in ${detectionMs}ms (cadence ${ORPHAN_POLL_CADENCE_MS}ms)`);
+    }
+  }
+
+  // Orphan selftest: stale dead-man file not mistaken for real halt on resume
+  {
+    const name = "orphan-stale-dead-man-not-real-halt";
+    const runDir = path.join(tmpDir, "run-orphan-stale");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+    const orphanFile = haltFile + ".orphan";
+
+    fs.writeFileSync(capabilityFile, JSON.stringify({ capability: null }));
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 0;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+      }, 50);
+      setTimeout(() => {}, 60000);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const watchdogPromise = runWatchdog({
+      pid: manager.pid,
+      budgetMs: 30000,
+      heartbeatFile,
+      capabilityFile,
+      haltFile,
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    let deadManExistedDuringRun = false;
+    try {
+      const d = JSON.parse(fs.readFileSync(haltFile, "utf8"));
+      deadManExistedDuringRun = !!d.dead_man_switch;
+    } catch {}
+
+    try { manager.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+
+    await watchdogPromise;
+    await new Promise((r) => manager.on("close", r));
+
+    const haltExistsAfterOrphan = fs.existsSync(haltFile);
+    const orphanExistsAfterOrphan = fs.existsSync(orphanFile);
+
+    let orphanData = null;
+    if (orphanExistsAfterOrphan) {
+      try { orphanData = JSON.parse(fs.readFileSync(orphanFile, "utf8")); } catch {}
+    }
+
+    if (!deadManExistedDuringRun) {
+      fail(name, "dead-man switch file was not written at startup");
+    } else if (haltExistsAfterOrphan) {
+      fail(name, "halt file still exists after orphan cleanup — would be mistaken for a real HALT on resume");
+    } else if (!orphanExistsAfterOrphan) {
+      fail(name, "orphan marker file missing — cannot distinguish orphan from watchdog crash");
+    } else if (!orphanData || !orphanData.orphan) {
+      fail(name, "orphan marker file has invalid content");
+    } else {
+      pass(name, "dead-man file cleaned on orphan; orphan marker present for resume disambiguation");
+    }
+  }
+
+  // Orphan selftest: genuine watchdog crash still detectable (D4 preserved)
+  {
+    const name = "genuine-crash-dead-man-persists";
+    const runDir = path.join(tmpDir, "run-genuine-crash");
+    fs.mkdirSync(runDir, { recursive: true });
+    const heartbeatFile = path.join(runDir, "heartbeat");
+    const capabilityFile = path.join(runDir, "capability.json");
+    const haltFile = path.join(runDir, "halt.json");
+    const orphanFile = haltFile + ".orphan";
+
+    fs.writeFileSync(capabilityFile, JSON.stringify({ capability: null }));
+    fs.writeFileSync(heartbeatFile, "1");
+
+    const mockManagerScript = `
+      "use strict";
+      const fs = require("fs");
+      const hb = ${JSON.stringify(heartbeatFile)};
+      let c = 1;
+      const iv = setInterval(() => {
+        c++;
+        fs.writeFileSync(hb, String(c));
+      }, 50);
+      setTimeout(() => {}, 60000);
+    `;
+    const mockManagerPath = path.join(runDir, "mock-manager.js");
+    fs.writeFileSync(mockManagerPath, mockManagerScript);
+
+    const manager = spawn(process.execPath, [mockManagerPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const watchdogScript = path.join(__dirname, "watchdog.js");
+    const watchdogProc = spawn(process.execPath, [
+      watchdogScript,
+      "--pid", String(manager.pid),
+      "--budget-ms", "30000",
+      "--heartbeat-file", heartbeatFile,
+      "--capability-file", capabilityFile,
+      "--halt-file", haltFile,
+    ], { stdio: "ignore", windowsHide: true });
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    let deadManExistedBeforeKill = false;
+    try {
+      const d = JSON.parse(fs.readFileSync(haltFile, "utf8"));
+      deadManExistedBeforeKill = !!d.dead_man_switch;
+    } catch {}
+
+    try { process.kill(watchdogProc.pid, "SIGKILL"); } catch {}
+    await new Promise((r) => watchdogProc.on("close", r));
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const haltExistsAfterCrash = fs.existsSync(haltFile);
+    const orphanExistsAfterCrash = fs.existsSync(orphanFile);
+
+    let haltData = null;
+    if (haltExistsAfterCrash) {
+      try { haltData = JSON.parse(fs.readFileSync(haltFile, "utf8")); } catch {}
+    }
+
+    try { manager.kill("SIGKILL"); } catch {}
+    try { if (process.platform !== "win32") process.kill(-manager.pid, "SIGKILL"); } catch {}
+    await new Promise((r) => manager.on("close", r));
+
+    if (!deadManExistedBeforeKill) {
+      fail(name, "dead-man switch file was not written before watchdog crash");
+    } else if (!haltExistsAfterCrash) {
+      fail(name, "dead-man halt file missing after watchdog crash — D4 guarantee broken");
+    } else if (!haltData || !haltData.dead_man_switch) {
+      fail(name, "dead-man halt file lost dead_man_switch flag after crash");
+    } else if (orphanExistsAfterCrash) {
+      fail(name, "orphan marker should NOT exist after genuine watchdog crash");
+    } else {
+      pass(name, "dead-man halt file persists with dead_man_switch=true; no orphan marker — D4 preserved");
     }
   }
 
