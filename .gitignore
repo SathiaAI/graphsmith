@@ -17,3 +17,8 @@ scripts/banned-strings.local.json
 
 # Ephemeral tester run-outputs (regenerated every run)
 tests/**/last-run.json
+
+# test-run temp dirs (audit)
+.tmp/
+tmp-e/
+tmp-proj/
