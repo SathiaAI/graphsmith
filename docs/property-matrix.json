@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-07-23T19:51:31.815Z",
+  "scope": "Tier-0 (agentless) capability profiles",
+  "note": "Agent-family matrix rows are added separately by the maintainer (plan §16)",
+  "platforms": [
+    "Windows"
+  ],
+  "properties": [
+    "R",
+    "E",
+    "B",
+    "T",
+    "G",
+    "Q",
+    "X"
+  ],
+  "metadata": {
+    "platforms": [
+      "Windows"
+    ],
+    "verifier_versions": [
+      "1.0"
+    ],
+    "evaluated_at": [
+      "unavailable"
+    ]
+  },
+  "matrix": {
+    "Windows": {
+      "R": {
+        "status": "verified",
+        "ci_url": null
+      },
+      "E": {
+        "status": "unavailable",
+        "ci_url": null
+      },
+      "B": {
+        "status": "verified",
+        "ci_url": null
+      },
+      "T": {
+        "status": "unavailable",
+        "ci_url": null
+      },
+      "G": {
+        "status": "verified",
+        "ci_url": null
+      },
+      "Q": {
+        "status": "unavailable",
+        "ci_url": null
+      },
+      "X": {
+        "status": "unavailable",
+        "ci_url": null
+      }
+    }
+  }
+}

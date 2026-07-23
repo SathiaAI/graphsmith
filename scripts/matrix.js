@@ -151,7 +151,7 @@ function generateMarkdown(matrix, metadata) {
   lines.push("| Status | Meaning |");
   lines.push("|--------|---------|");
   lines.push("| verified | Capability is verified on this platform |");
-  lines.push("| unavailable | Capability cannot be proven on this platform (not a pass — honest gap) |");
+  lines.push("| unavailable | Capability cannot be established on this platform (not a pass — honest gap) |");
   lines.push("| failed | Capability verification failed |");
   lines.push("| not-applicable | Capability does not apply to this platform |");
   lines.push("");
