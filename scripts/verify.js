@@ -978,15 +978,539 @@ function integrityExitCode(report) {
   return 0;
 }
 
+// ===========================================================================
+// --profiles: evidence-carrying R/E/B/T/G + Q/X capability profiles
+// (plan §8 protocol surface — replaces the L1–L5 ladder, F18; §17 adds Q/X).
+//
+// Each profile returns { status, evidence[], assumptions[], phase? } where
+//   status ∈ { verified, unavailable, failed, not-applicable }
+// — NEVER a bare boolean/green (contract 10). A profile a platform cannot
+// prove renders "unavailable" with a reason; it is never "verified".
+// Independent axes are never collapsed into one score (contract 09).
+//
+// Two kinds of profile, stated explicitly so a reader knows what each proves:
+//   • CAPABILITY attestations (R, B, G): does THIS installation's machinery
+//     actually work? Proven by exercising the real, TEST-PASSED module against
+//     an EPHEMERAL fixture under the OS temp dir — never the target project's
+//     live state (a passive sentinel must not take the state-store write lock
+//     or mutate a live project; same posture as this file's header). The
+//     evidence is a freshly-produced real recover/halt/refusal from the
+//     installed modules — that is the attestation.
+//   • TARGET attestations (E, T, Q, X): does the project AT THE ROOT satisfy
+//     the axis? Proven by inspecting/testing rootDir. On a plain dev checkout
+//     these are legitimately "unavailable" (no adapters / no release trust
+//     root / not a workflow project) — honest gaps, never green.
+//
+// NO clock/randomness in any DECISION path: the report-envelope `evaluated_at`
+// is INJECTED (opts/env), never read from a clock; crypto.randomBytes appears
+// only in ephemeral-fixture construction, never in a pass/fail branch.
+// Every existing module is CALLED, never reimplemented (task E-verify lane).
+// ===========================================================================
+
+// Contract 06 §GPT-19 (kill/resume derivation) — the STATIC declaration table
+// mapping a declared capability variant to its reconciliation class. This is a
+// declaration-shape check, NOT the runtime reconciliation state machine (which
+// needs a live status_check call); "status-checkable" is therefore classified
+// conservatively as reconciliation-required until a runtime authoritative
+// status check upgrades it (contract 06 §GPT-19 step 3).
+const RECONCILIATION_BY_VARIANT = {
+  "read-only": "no-external-effects",
+  "local-transactional": "safe-to-resume",
+  "idempotent-by-key": "safe-to-resume",
+  "status-checkable": "reconciliation-required",
+  none: "reconciliation-required",
+};
+
+function reconciliationClassForEffect(effect) {
+  if (!effect || typeof effect !== "object") return { class: null, note: "effect entry is not an object" };
+  if (effect.effect_type === "read") return { class: "no-external-effects", effect_type: "read" };
+  const variant = effect.capability && typeof effect.capability.variant === "string" ? effect.capability.variant : null;
+  if (variant && Object.prototype.hasOwnProperty.call(RECONCILIATION_BY_VARIANT, variant)) {
+    let note = null;
+    if (variant === "idempotent-by-key") {
+      note = "safe-to-resume ASSUMING the remote honors the declared idempotency key (adapter-author declaration, not verified by GraphSmith — contract 06 §GPT-19 step 4)";
+    } else if (variant === "status-checkable") {
+      note = "reconciliation-required statically; a runtime authoritative status_check may upgrade to safe-to-resume (contract 06 §GPT-19 step 3)";
+    }
+    return { class: RECONCILIATION_BY_VARIANT[variant], variant, note };
+  }
+  return {
+    class: null,
+    variant,
+    note: "no known capability variant declared for this effect — unmappable (contract 06 requires one of read-only/local-transactional/idempotent-by-key/status-checkable/none)",
+  };
+}
+
+// evaluated_at: envelope-only, INJECTED — never a clock in a decision path
+// (contract 10 / F19). Order: --evaluated-at opt, then GRAPHSMITH_EVALUATED_AT,
+// then SOURCE_DATE_EPOCH (reproducible-build convention). Absent => "unavailable"
+// with a reason — NEVER fabricated from Date.now().
+function resolveEvaluatedAt(opts) {
+  const fromOpts = opts && typeof opts.evaluatedAt === "string" && opts.evaluatedAt ? opts.evaluatedAt : null;
+  let fromEnv = null;
+  let envSource = null;
+  if (process.env.GRAPHSMITH_EVALUATED_AT) {
+    fromEnv = process.env.GRAPHSMITH_EVALUATED_AT;
+    envSource = "env:GRAPHSMITH_EVALUATED_AT";
+  } else if (process.env.SOURCE_DATE_EPOCH && /^[0-9]+$/.test(process.env.SOURCE_DATE_EPOCH)) {
+    // Deterministic conversion FROM an injected epoch — not a read of the
+    // current clock (no Date.now()); the input is caller-supplied.
+    fromEnv = new Date(Number(process.env.SOURCE_DATE_EPOCH) * 1000).toISOString();
+    envSource = "env:SOURCE_DATE_EPOCH";
+  }
+  if (fromOpts) return { value: fromOpts, source: "opts:--evaluated-at" };
+  if (fromEnv) return { value: fromEnv, source: envSource };
+  return {
+    value: "unavailable",
+    source: "none",
+    reason:
+      "no evaluation timestamp injected via --evaluated-at / GRAPHSMITH_EVALUATED_AT / SOURCE_DATE_EPOCH; a decision-path clock call is forbidden (contract 10, anti-F19), so the report envelope declares evaluated_at unavailable rather than fabricating one from the wall clock",
+  };
+}
+
+// Pure classifiers (shared by the live check AND --selftest's honest-negative
+// cases, so both branches are directly testable without contriving a live
+// failure of a correct module).
+function classifyBudgetHalt(halt) {
+  const ok = !!(halt && halt.kind === "budget" && typeof halt.rule === "string" && halt.evidence && typeof halt.evidence === "object");
+  return { status: ok ? "verified" : "failed", ok };
+}
+function classifyGatedLearning(o) {
+  if (o.activeBefore !== o.activeAfter) {
+    return { status: "failed", reason: "ACTIVE was mutated by the propose-only path — a staged proposal auto-adopted (Gate-3 must be propose-only)" };
+  }
+  if (!o.refused) return { status: "failed", reason: "adopt did not refuse without explicit human confirmation" };
+  if (!o.gate3Packet) return { status: "failed", reason: "Gate-1/Gate-3 did not produce a propose-only adoption packet" };
+  if (!o.listedPending) return { status: "failed", reason: "the staged proposal did not surface in adopt.listPending (propose-only queue)" };
+  return { status: "verified" };
+}
+
+// Wrap a profile check so one thrown check can never crash the whole report,
+// and a throw is reported "failed" (never silently green) — contract 10.
+function safeProfile(fn) {
+  try {
+    return fn();
+  } catch (e) {
+    return {
+      status: "failed",
+      evidence: [{ check: "profile-exec", error: e && e.message ? e.message : String(e) }],
+      assumptions: ["This profile's check threw before completing; reported 'failed' rather than green (contract 10)."],
+    };
+  }
+}
+
+// A light evolvable-surface fixture: just enough real ACTIVE pointer + tree for
+// the G capability check to hash ACTIVE and drive gate/adopt. Uses manifest.js
+// to generate the tree manifest and loaders.js's pointer schema version — the
+// same real modules; randomBytes here is fixture identity only, never a
+// decision input.
+function buildActivePointerFixture(root) {
+  const evolvableDir = path.join(root, ".graphsmith", "evolvable");
+  const treeId = "v-" + crypto.randomBytes(8).toString("hex");
+  const treeDir = path.join(evolvableDir, treeId);
+  fs.mkdirSync(path.join(treeDir, "workers"), { recursive: true });
+  fs.writeFileSync(path.join(treeDir, "graphsmith.learned.md"), "# Learned appendix\n\nA clean fixture appendix.\n");
+  fs.writeFileSync(path.join(treeDir, "tunables.json"), JSON.stringify({ schema_version: "1.0" }) + "\n");
+  const treeManifest = manifestLib.generate("tree", { rootDir: treeDir });
+  const tmPath = path.join(treeDir, "tree.manifest.json");
+  fs.writeFileSync(tmPath, JSON.stringify(treeManifest, null, 2));
+  const activePath = path.join(evolvableDir, "ACTIVE");
+  fs.writeFileSync(
+    activePath,
+    JSON.stringify(
+      {
+        schema_version: loadersLib.ACTIVE_POINTER_SCHEMA_VERSION,
+        txid: crypto.randomBytes(8).toString("hex"),
+        tree: treeId,
+        tree_manifest_sha256: sha256Hex(fs.readFileSync(tmPath)),
+      },
+      null,
+      2
+    )
+  );
+  return { activePointerPath: activePath, treeDir };
+}
+
+function isWorkflowProject(rootDir) {
+  try {
+    return (
+      fs.existsSync(path.join(rootDir, "manager.js")) &&
+      fs.statSync(path.join(rootDir, "manager.js")).isFile() &&
+      fs.existsSync(path.join(rootDir, "pipeline.json")) &&
+      fs.statSync(path.join(rootDir, "pipeline.json")).isFile()
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
-// --profiles: R/E/B/T/G capability profiles (plan §2-I5, F18). Stub
-// acceptable in Phase A per task A-verify; the T axis is NOT a stub — it is
-// computed live from --integrity, since that already exists. R/E/B/G report
-// their honest not-yet-implemented phase rather than fabricating a status
-// (contract 10: never claim a check that was not actually run).
+// R — resumable local state (CAPABILITY): a real checkpoint/journal round-trip
+// plus a real kill-and-recover on an ephemeral state-store, calling
+// state-store.js's own recovery path (run in the StateStore constructor).
+// Evidence = the recovered state hash matches pre-kill, and a torn mutation
+// rolls forward on recovery.
 // ---------------------------------------------------------------------------
+function profileResumableState() {
+  const stateStore = require("./state-store");
+  const assumptions = [
+    "R is a CAPABILITY attestation of THIS installation's state-store: it exercises a real checkpoint/journal round-trip and a real kill-and-recover on an ephemeral fixture under the OS temp dir — never the target project's live .graphsmith/state (a passive sentinel must not take the state-store write lock on a live project).",
+    "The simulated kill uses state-store's own GRAPHSMITH_TEST_MODE crash hook (_testing.crashNextMutationAfter); the RECOVERY exercised is the real, un-mocked journal roll-forward run in the StateStore constructor. State hashes cover clock-free identity fields (run_id/status slots), not lease timestamps.",
+  ];
+  const evidence = [];
+  const prevMode = process.env.GRAPHSMITH_TEST_MODE;
+  // Two independent ephemeral fixtures so the round-trip demonstration cannot
+  // consume the admitted window slot the roll-forward demonstration needs.
+  const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-R1-"));
+  const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-R2-"));
+  const slotProjection = (store) =>
+    store.window
+      .get()
+      .window.slots.map((s) => ({ run_id: s.run_id, status: s.status, disposition: s.disposition }))
+      .sort((a, b) => String(a.run_id).localeCompare(String(b.run_id)));
+  try {
+    process.env.GRAPHSMITH_TEST_MODE = "1";
+
+    // (1) Clean checkpoint round-trip: a committed state survives a restart
+    // byte-identically (recovery is a no-op on clean state — no phantom writes,
+    // no loss).
+    const storeA = stateStore.createStore(rootA, { leaseMs: 40, heartbeatMs: 10 });
+    storeA.window.admitPending({ txid: "tx-R", fingerprint: "fp-R", tree_id: "tree-R", n: 1 });
+    storeA.window.finalize("tx-R");
+    storeA.runRegistry.register("run-clean", "tree-R");
+    const hashBefore = sha256Hex(Buffer.from(JSON.stringify(slotProjection(storeA))));
+    const restarted = stateStore.createStore(rootA, { leaseMs: 40, heartbeatMs: 10 });
+    const hashAfter = sha256Hex(Buffer.from(JSON.stringify(slotProjection(restarted))));
+    const roundTripMatch = hashBefore === hashAfter;
+    evidence.push({ check: "clean-restart-round-trip", state_hash_pre_restart: hashBefore, state_hash_post_restart: hashAfter, match: roundTripMatch });
+
+    // (2) Kill-and-recover: a mutation torn by a mid-write crash is rolled
+    // forward on the next recovery — the exact sequence state-store.js's own
+    // --selftest proves, driven through the real constructor recovery.
+    const storeB = stateStore.createStore(rootB, { leaseMs: 40, heartbeatMs: 10 });
+    storeB.window.admitPending({ txid: "tx-R", fingerprint: "fp-R", tree_id: "tree-R", n: 1 });
+    storeB.window.finalize("tx-R");
+    storeB._testing.crashNextMutationAfter(1);
+    let crashSimulated = false;
+    try {
+      storeB.runRegistry.register("run-torn", "tree-R");
+    } catch (e) {
+      crashSimulated = e.code === "SIMULATED_CRASH";
+    }
+    const recovered = stateStore.createStore(rootB, { leaseMs: 40, heartbeatMs: 10 });
+    const rolledForward = recovered.window.get().window.slots.some((s) => s.run_id === "run-torn");
+    evidence.push({ check: "kill-and-recover-journal-roll-forward", crash_simulated: crashSimulated, torn_run_present_after_recovery: rolledForward });
+
+    const ok = roundTripMatch && crashSimulated && rolledForward;
+    return {
+      status: ok ? "verified" : "failed",
+      evidence,
+      assumptions,
+      phase: "B",
+      ...(ok ? {} : { reason: "state-store did not round-trip a committed state and roll a torn mutation forward to the same state" }),
+    };
+  } finally {
+    if (prevMode === undefined) delete process.env.GRAPHSMITH_TEST_MODE;
+    else process.env.GRAPHSMITH_TEST_MODE = prevMode;
+    try {
+      fs.rmSync(rootA, { recursive: true, force: true });
+    } catch (_) {}
+    try {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    } catch (_) {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// E — effect-reconciled external calls (TARGET): adapter capability
+// declarations present + each declared effect maps to a reconciliation class
+// per contract 06 §GPT-19. Zero adapters => "unavailable" (NOT failed), stated
+// explicitly. Reuses this file's verifyAdapterDeclarations for the presence/
+// shape gate, then maps each declared effect's variant.
+// ---------------------------------------------------------------------------
+function profileEffectReconciliation(rootDir) {
+  const assumptions = [
+    "E depends entirely on adapter capability declarations (contract 06, adapters/<name>.capability.json). A project that declares zero adapters has no external effects to reconcile — reported 'unavailable', never 'verified'.",
+    "E is a STATIC declaration check: it maps each declared effect's capability variant to its kill/resume reconciliation class per contract 06 §GPT-19. It does NOT run the runtime reconciliation state machine (e.g. a live status_check); 'status-checkable' is classified conservatively as reconciliation-required until a runtime authoritative status check upgrades it.",
+  ];
+  const adapters = verifyAdapterDeclarations(rootDir);
+  if (adapters.status === "unavailable") {
+    return {
+      status: "unavailable",
+      evidence: [{ check: "adapter-declarations", present: false, detail: adapters.reason || "no adapters declared" }],
+      assumptions,
+      phase: "B",
+    };
+  }
+  if (adapters.status === "unreadable") {
+    return { status: "failed", evidence: [{ check: "adapter-declarations", detail: adapters.detail }], assumptions, phase: "B" };
+  }
+  // Read effect variants directly (read-only) to map reconciliation classes —
+  // verifyAdapterDeclarations validated shape but only counts effects.
+  const adaptersDir = adaptersDirPath(rootDir);
+  const perAdapter = [];
+  let unmapped = 0;
+  let invalid = adapters.status === "invalid";
+  for (const r of adapters.results || []) {
+    if (r.status !== "ok") {
+      perAdapter.push({ file: r.file, status: r.status, errors: r.errors });
+      continue;
+    }
+    const parsed = readJsonFile(path.join(adaptersDir, r.file));
+    const effects = parsed.ok && Array.isArray(parsed.value.effects) ? parsed.value.effects : [];
+    const mapped = effects.map((eff) => {
+      const cls = reconciliationClassForEffect(eff);
+      if (!cls.class) unmapped++;
+      return { effect_id: eff && eff.effect_id, effect_type: eff && eff.effect_type, reconciliation_class: cls.class, note: cls.note };
+    });
+    perAdapter.push({ file: r.file, adapter_id: r.adapter_id, effects: mapped });
+  }
+  const evidence = [
+    { check: "adapter-declarations", present: true, count: adapters.count, shape_status: adapters.status },
+    { check: "effect-reconciliation-mapping", adapters: perAdapter, unmapped_effects: unmapped },
+  ];
+  let status;
+  let reason;
+  if (invalid) {
+    status = "failed";
+    reason = "one or more adapter capability declarations are structurally invalid (contract 06)";
+  } else if (unmapped > 0) {
+    status = "failed";
+    reason = `${unmapped} declared effect(s) have no mappable reconciliation class (contract 06 requires a capability variant per external effect)`;
+  } else {
+    status = "verified";
+  }
+  return { status, evidence, assumptions, phase: "B", ...(reason ? { reason } : {}) };
+}
+
+// ---------------------------------------------------------------------------
+// B — budget-enforced (CAPABILITY): scaffold an ephemeral supervised project,
+// load its generated supervisor (scaffold.js), and drive a real budget breach
+// — proving the supervisor trips a HALT with recorded evidence. Evidence = the
+// recorded halt from the real supervisor.
+// ---------------------------------------------------------------------------
+function profileBudgetEnforced() {
+  const scaffold = require("./scaffold");
+  const assumptions = [
+    "B is a CAPABILITY attestation: it scaffolds an ephemeral supervised project under the OS temp dir, loads its generated supervisor (scaffold.js's supervisor.js), and drives a real budget breach — proving THIS installation's supervisor trips a HALT with recorded evidence. It does not run against the target project.",
+    "One representative budget (max_steps) is breached here; scaffold.js's own --selftest exercises the full plan-§7 budget + tripwire matrix.",
+  ];
+  const evidence = [];
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-B-"));
+  let supPath = null;
+  try {
+    const proj = path.join(root, "proj");
+    scaffold.scaffoldProject(proj, "proj");
+    supPath = path.join(proj, "supervisor.js");
+    const supervisor = require(supPath);
+    const values = Object.assign({}, JSON.parse(fs.readFileSync(path.join(proj, "tunables.json"), "utf8")).values, { max_steps: 1 });
+    const runDir = path.join(proj, ".runs", "verify-B");
+    fs.mkdirSync(runDir, { recursive: true });
+    let halt = null;
+    try {
+      const sup = supervisor.createSupervisor({ root: proj, runDir, values, acknowledgeBudget: false });
+      sup.beginStep("a", 0);
+      sup.beginStep("b", 1);
+    } catch (e) {
+      halt = e.halt || null;
+    }
+    const cls = classifyBudgetHalt(halt);
+    evidence.push({
+      check: "budget-breach-trips-halt",
+      budget: "max_steps",
+      limit: 1,
+      recorded_halt: halt ? { kind: halt.kind, rule: halt.rule, evidence: halt.evidence } : null,
+    });
+    return {
+      status: cls.status,
+      evidence,
+      assumptions,
+      phase: "B",
+      ...(cls.ok ? {} : { reason: "supervisor did not HALT with budget evidence on a max_steps breach" }),
+    };
+  } finally {
+    if (supPath) {
+      try {
+        delete require.cache[require.resolve(supPath)];
+      } catch (_) {}
+    }
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch (_) {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G — gated learning enabled (CAPABILITY): a staged proposal flows through
+// gate.js (Gate-1 static + Gate-3 propose-only packet) and surfaces in
+// adopt.listPending WITHOUT auto-adoption; adopt.js refuses without explicit
+// human confirmation. Evidence = the staged proposal did NOT mutate ACTIVE.
+// ---------------------------------------------------------------------------
+function profileGatedLearning() {
+  const gate = require("./gate");
+  const adopt = require("./adopt");
+  const assumptions = [
+    "G is a CAPABILITY attestation: it stages a real proposal through gate.js and adopt.js against an ephemeral evolvable fixture — proving Gate-3 is propose-only and adoption requires explicit human confirmation. It does not touch the target project's ACTIVE pointer.",
+    "The failure condition is asymmetric and honest: ACTIVE changing after a no-confirm adopt (auto-adoption) is 'failed'; a refusal that leaves ACTIVE byte-identical is 'verified'.",
+  ];
+  const evidence = [];
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-G-"));
+  try {
+    const fx = buildActivePointerFixture(root);
+    const activeBefore = sha256Hex(fs.readFileSync(fx.activePointerPath));
+
+    const candidate = {
+      id: "verify-G",
+      kind: "doc",
+      fingerprint: sha256Hex(Buffer.from("verify-G")),
+      edits: [{ file: "graphsmith.learned.md", anchor: null, op: "insert", payload: "a staged learned-appendix note", schema_ref: "learned/v1" }],
+    };
+    const g1 = gate.gate1Static(candidate, { aliasesResolved: true });
+    const g3 = gate.gate3Prepare(candidate.id, { candidate });
+
+    // Stage the propose-only proposal into adopt.js's pending queue (the same
+    // file adopt.listPending/adopt read), then confirm it is queued but NOT
+    // adopted.
+    const pendingRecord = {
+      schema_version: "1.0",
+      proposal_id: candidate.id,
+      status: "PENDING_HUMAN_REVIEW",
+      fingerprint: candidate.fingerprint,
+      kind: candidate.kind,
+      edits: candidate.edits,
+      gate3: { reversible: g3.reversible, autoRollbackEligible: g3.autoRollbackEligible },
+    };
+    const ppPath = adopt.pendingProposalsPath(root);
+    fs.mkdirSync(path.dirname(ppPath), { recursive: true });
+    fs.writeFileSync(ppPath, JSON.stringify(pendingRecord) + "\n");
+
+    const pending = adopt.listPending(root);
+    const listed = pending.some((p) => p.proposal_id === candidate.id);
+    const refusal = adopt.adopt(root, candidate.id, { confirm: false });
+    const activeAfter = sha256Hex(fs.readFileSync(fx.activePointerPath));
+
+    const cls = classifyGatedLearning({
+      activeBefore,
+      activeAfter,
+      refused: refusal.refused === true && refusal.adopted === false,
+      gate3Packet: g1.pass === true && !!g3 && typeof g3.plainEnglish === "string",
+      listedPending: listed,
+    });
+    evidence.push({ check: "gate1-static-pass", pass: g1.pass });
+    evidence.push({ check: "gate3-propose-only-packet", reversible: g3.reversible, auto_rollback_eligible: g3.autoRollbackEligible });
+    evidence.push({ check: "listPending-shows-staged-proposal", listed });
+    evidence.push({ check: "adopt-without-confirm-refused", refused: refusal.refused === true, reason: refusal.reason });
+    evidence.push({ check: "active-pointer-unchanged", active_sha256_before: activeBefore, active_sha256_after: activeAfter, unchanged: activeBefore === activeAfter });
+    return { status: cls.status, evidence, assumptions, phase: "C", ...(cls.reason ? { reason: cls.reason } : {}) };
+  } finally {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch (_) {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Q — assurance-tested (TARGET, §17): test (unit + scenario-regression +
+// smoke, via test.js) + clean architectural lint (via assure.js's runLint ->
+// graphlint) on the target workflow. "unavailable" when the target ships no
+// test workflow.
+// ---------------------------------------------------------------------------
+function profileAssuranceTested(rootDir) {
+  const assumptions = [
+    "Q inspects the TARGET workflow at the project root. 'unavailable' (never 'verified') when the target ships no test workflow (no manager.js + pipeline.json).",
+    "A passing battery is a FLOOR of tested discipline checks, not proof of correctness (§17 honest-scope boundary).",
+    "Q is 'verified' only when BOTH the test battery passes AND architectural lint is clean; if lint is unavailable (graphlint absent) Q is 'unavailable', not green.",
+  ];
+  if (!isWorkflowProject(rootDir)) {
+    return {
+      status: "unavailable",
+      evidence: [{ check: "workflow-present", present: false, detail: "no manager.js + pipeline.json at the project root; nothing to assurance-test" }],
+      assumptions,
+      phase: "C",
+    };
+  }
+  const testMod = require("./test");
+  const assure = require("./assure");
+  const testReport = testMod.runSuite(rootDir, { includeScenario: true, smokeRunId: "verify-Q" });
+  const lintReport = assure.runLint(rootDir);
+  const evidence = [
+    { check: "test.runSuite", status: testReport.status, summary: testReport.summary, failed_ids: testReport.failed_ids, report_sha256: testReport.report_sha256 },
+    { check: "lint", status: lintReport.status, findings_count: lintReport.findings_count },
+  ];
+  const testPass = testReport.status === "pass";
+  if (lintReport.status === "unavailable") {
+    return {
+      status: "unavailable",
+      evidence,
+      assumptions,
+      phase: "C",
+      reason: "architectural lint is unavailable (graphlint absent) — cannot attest a clean lint, so Q is unavailable, never green",
+    };
+  }
+  const lintClean = lintReport.status === "pass";
+  const ok = testPass && lintClean;
+  let reason;
+  if (!ok) {
+    reason = !testPass
+      ? "test battery failed: " + (testReport.failed_ids || []).join(", ")
+      : "architectural lint not clean: " + JSON.stringify(lintReport.findings_count);
+  }
+  return { status: ok ? "verified" : "failed", evidence, assumptions, phase: "C", ...(reason ? { reason } : {}) };
+}
+
+// ---------------------------------------------------------------------------
+// X — adversarially-tested (TARGET, §17): redteam.js injection/prompt-
+// architecture battery run in the I3 sandbox against the target workflow.
+// "unavailable" when the target ships no workflow / the sandbox cannot open.
+// ---------------------------------------------------------------------------
+function profileAdversariallyTested(rootDir) {
+  const assumptions = [
+    "X runs GraphSmith's discipline/injection ARCHITECTURE battery in the redteam I3 sandbox against the target workflow. It tests whether injected content can reach control flow / evolution paths — it does NOT test model-level jailbreak resistance (that belongs to dedicated LLM red-team tools via the §17 external-tool seam).",
+    "Model-family diversity is NOT applicable to this architecture battery: the cases are deterministic and model-independent. Model-family-diversity reporting applies only to model-level suites plugged in via the seam.",
+    "'unavailable' (never 'verified') when the target ships no workflow to adversarially test, or when the I3 sandbox cannot be opened on this platform.",
+    "A passing battery is a FLOOR: the architecture resisted the shipped/planted cases. Not proof of security (§17 honest-scope boundary).",
+  ];
+  if (!isWorkflowProject(rootDir)) {
+    return {
+      status: "unavailable",
+      evidence: [{ check: "workflow-present", present: false, detail: "no manager.js + pipeline.json at the project root; no red-team battery declared for a non-workflow target" }],
+      assumptions,
+      phase: "C",
+    };
+  }
+  const redteam = require("./redteam");
+  const report = redteam.runRedteam({ project: rootDir });
+  const sandboxOpen = report.checks.find((c) => c.id === "arch.sandbox-open");
+  const evidence = [
+    {
+      check: "redteam.architecture-battery",
+      status: report.status,
+      summary: report.summary,
+      failed_ids: report.failed_ids,
+      report_sha256: report.report_sha256,
+      sandbox: sandboxOpen ? sandboxOpen.status : null,
+      model_family_diversity: "not-applicable (architecture battery is model-independent)",
+    },
+  ];
+  if (sandboxOpen && sandboxOpen.status === "unavailable") {
+    return {
+      status: "unavailable",
+      evidence,
+      assumptions,
+      phase: "C",
+      reason: "the I3 sandbox could not be opened on this platform — adversarial isolation is unproven, reported unavailable rather than green",
+    };
+  }
+  const ok = report.status === "pass";
+  return { status: ok ? "verified" : "failed", evidence, assumptions, phase: "C", ...(ok ? {} : { reason: "redteam battery failed: " + (report.failed_ids || []).join(", ") }) };
+}
+
+function buildProfileString(profiles) {
+  return ["R", "E", "B", "T", "G", "Q", "X"].map((k) => `${k}:${profiles[k] ? profiles[k].status : "missing"}`).join(" ");
+}
 
 function runProfiles(rootDir, opts) {
+  opts = opts || {};
   const integrity = runIntegrity(rootDir, opts);
   const tStatus =
     integrity.release_verified === "yes" && integrity.self_consistent === "yes"
@@ -994,25 +1518,51 @@ function runProfiles(rootDir, opts) {
       : integrity.release_verified === "unavailable"
       ? "unavailable"
       : "failed";
+  const T = {
+    status: tStatus,
+    evidence: [
+      {
+        check: "trust-root",
+        release_verified: integrity.release_verified,
+        self_consistent: integrity.self_consistent,
+        failure_domain: integrity.failure_domain,
+      },
+    ],
+    assumptions: [
+      "T depends on the release trust root: release-verified anchors to the release manifest, self-consistent to the project manifest. These are INDEPENDENT axes (contract 09) and are never collapsed into one score.",
+      "'unavailable' when this checkout was never installed from a release artifact (no release manifest to anchor to) — an honest gap, never green.",
+    ],
+    // Independent axes surfaced verbatim, never collapsed (contract 09).
+    release_verified: integrity.release_verified,
+    self_consistent: integrity.self_consistent,
+  };
+
+  const profiles = {
+    R: safeProfile(profileResumableState),
+    E: safeProfile(() => profileEffectReconciliation(rootDir)),
+    B: safeProfile(profileBudgetEnforced),
+    T,
+    G: safeProfile(profileGatedLearning),
+    Q: safeProfile(() => profileAssuranceTested(rootDir)),
+    X: safeProfile(() => profileAdversariallyTested(rootDir)),
+  };
+
+  const evalAt = resolveEvaluatedAt(opts);
   return {
     schema_version: SENTINEL_SCHEMA_VERSION,
     command: "profiles",
     verifier_version: SENTINEL_SCHEMA_VERSION,
     platform: process.platform,
-    profiles: {
-      R: { status: "not-yet-implemented", phase: "B", note: "resumable local state — needs the run/checkpoint machinery (plan phase B)" },
-      E: { status: "not-yet-implemented", phase: "B", note: "effect-reconciled external calls — needs adapter declarations wired to a manager (plan phase B)" },
-      B: { status: "not-yet-implemented", phase: "B", note: "budget-enforced — needs the run supervisor (plan phase B, contract 07)" },
-      T: {
-        status: tStatus,
-        release_verified: integrity.release_verified,
-        self_consistent: integrity.self_consistent,
-        note: "trust-root verified — computed live from --integrity; independent axes stated per contract 09, never collapsed",
-      },
-      G: { status: "not-yet-implemented", phase: "C", note: "gated learning enabled — needs Gates 1-4 wired (plan phase C)" },
-    },
+    node_version: process.version,
+    root: rootDir,
+    // Envelope timestamp — INJECTED, never a clock in a decision path.
+    evaluated_at: evalAt.value,
+    evaluated_at_source: evalAt.source,
+    ...(evalAt.reason ? { evaluated_at_note: evalAt.reason } : {}),
+    profiles,
+    profile_string: buildProfileString(profiles),
     note:
-      'Phase A stub per task A-verify ("--profiles: stub acceptable in Phase A; full in Phase E"). R/E/B/G report their honest not-yet-implemented phase; T is real because --integrity already exists.',
+      "Evidence-carrying capability profiles (plan §8, §17). Each profile carries {status ∈ verified|unavailable|failed|not-applicable, evidence[], assumptions}. R/B/G attest THIS installation's machinery via ephemeral fixtures; E/T/Q/X attest the target at the project root. Independent axes are never collapsed (contract 09); 'unavailable' is never green (contract 10).",
   };
 }
 
@@ -1220,6 +1770,119 @@ function buildFixture(root) {
     appendixPath: path.join(treeDir, "graphsmith.learned.md"),
     adoptionLogPath: logPath,
   };
+}
+
+// A minimal, lint-clean, runnable workflow fixture (unit + smoke + clean
+// graphlint) — mirrors the shape test.js's own good fixture uses, so the Q
+// profile reaches "verified" and X's architecture battery passes on it. This
+// is selftest DATA construction, not a reimplementation of any module.
+function writeWorkflowFixture(dir) {
+  fs.mkdirSync(path.join(dir, "workers"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "pipeline.json"),
+    JSON.stringify([{ step: "01-collect", worker: "collect.js" }, { step: "02-process", worker: "process.js" }], null, 2) + "\n"
+  );
+  const workerBody = (label) =>
+    [
+      '"use strict";',
+      'const fs = require("fs");',
+      'const path = require("path");',
+      "function appendDurable(file, line) {",
+      '  const fd = fs.openSync(file, "a");',
+      '  try { fs.writeSync(fd, line + "\\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }',
+      "}",
+      'const readLines = (p) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8").split("\\n").filter(Boolean) : []);',
+      "module.exports.run = async function (input, ctx) {",
+      '  const intents = path.join(ctx.runDir, "intents.log");',
+      '  const effects = path.join(ctx.runDir, "effects.log");',
+      "  if (readLines(effects).indexOf(ctx.step) !== -1) return input || { ok: true };",
+      "  if (readLines(intents).indexOf(ctx.step) !== -1) {",
+      '    const e = new Error("UNRESOLVED SIDE EFFECT for step " + ctx.step);',
+      "    e.unresolvedSideEffect = true;",
+      "    throw e;",
+      "  }",
+      "  appendDurable(intents, ctx.step);",
+      "  appendDurable(effects, ctx.step);",
+      "  return Object.assign({}, input || {}, { " + JSON.stringify(label) + ": true });",
+      "};",
+      "",
+    ].join("\n");
+  fs.writeFileSync(path.join(dir, "workers", "collect.js"), workerBody("collect"));
+  fs.writeFileSync(path.join(dir, "workers", "process.js"), workerBody("process"));
+  fs.writeFileSync(
+    path.join(dir, "manager.js"),
+    [
+      '"use strict";',
+      'const fs = require("fs");',
+      'const path = require("path");',
+      'const PIPELINE = JSON.parse(fs.readFileSync(path.join(__dirname, "pipeline.json"), "utf8"));',
+      'const runId = process.argv[2] || "default";',
+      'const runDir = path.join(__dirname, ".runs", runId);',
+      "fs.mkdirSync(runDir, { recursive: true });",
+      'function log(obj) { process.stdout.write(JSON.stringify(obj) + "\\n"); }',
+      "(async () => {",
+      "  let input = {};",
+      "  for (const step of PIPELINE) {",
+      '    const cp = path.join(runDir, step.step + ".json");',
+      "    if (fs.existsSync(cp)) {",
+      '      input = JSON.parse(fs.readFileSync(cp, "utf8")).output;',
+      '      log({ step: step.step, status: "skipped" });',
+      "      continue;",
+      "    }",
+      '    const wName = step.worker.endsWith(".js") ? step.worker : step.worker + ".js";',
+      '    const worker = require(path.join(__dirname, "workers", wName));',
+      "    const output = await worker.run(input, { runId, step: step.step, runDir });",
+      '    fs.writeFileSync(cp, JSON.stringify({ step: step.step, status: "ok", output }, null, 2));',
+      '    log({ step: step.step, status: "ok" });',
+      "    input = output;",
+      "  }",
+      '  process.stdout.write("__done__\\n");',
+      "})().catch((e) => { console.error(e && e.message ? e.message : e); process.exit(1); });",
+      "",
+    ].join("\n")
+  );
+}
+
+// Adapter capability declarations fixture for the E profile. `mode`:
+//   "good"    -> two effects, both with a mappable capability variant
+//   "unmapped"-> an external effect with NO capability variant (contract-06
+//                invalid) so E must report "failed"
+function writeAdaptersFixture(dir, mode) {
+  const adaptersDir = path.join(dir, "adapters");
+  fs.mkdirSync(adaptersDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(adaptersDir, "reader.capability.json"),
+    JSON.stringify(
+      { schema_version: "1.0", adapter_id: "reader", version: "1.0.0", effects: [{ effect_id: "read-x", effect_type: "read", capability: { variant: "read-only" } }] },
+      null,
+      2
+    )
+  );
+  if (mode === "unmapped") {
+    fs.writeFileSync(
+      path.join(adaptersDir, "sender.capability.json"),
+      JSON.stringify(
+        { schema_version: "1.0", adapter_id: "sender", version: "1.0.0", effects: [{ effect_id: "send-x", effect_type: "external", capability: {} }] },
+        null,
+        2
+      )
+    );
+  } else {
+    fs.writeFileSync(
+      path.join(adaptersDir, "sender.capability.json"),
+      JSON.stringify(
+        {
+          schema_version: "1.0",
+          adapter_id: "sender",
+          version: "1.0.0",
+          effects: [{ effect_id: "send-x", effect_type: "external", capability: { variant: "idempotent-by-key", idempotency_key_param: "runId:step" } }],
+        },
+        null,
+        2
+      )
+    );
+  }
+  return adaptersDir;
 }
 
 function runSelftest() {
@@ -1460,6 +2123,186 @@ function runSelftest() {
       record("diff-destinations/clean-ok", clean.ok === true && clean.undeclared.length === 0);
       record("diff-destinations/undeclared-caught", dirty.ok === false && dirty.undeclared.includes("https://evil.example.com/y"));
     }
+
+    // J) PROFILE ENGINE (Phase E) — each of R/E/B/G/Q/X must reach "verified"
+    // on a good fixture AND its honest negative (unavailable/failed). These
+    // CALL the real TEST-PASSED modules (state-store, scaffold, gate, adopt,
+    // test, assure, redteam); the negatives are honest, not contrived greens.
+
+    // R: verified via real state-store round-trip + kill-and-recover.
+    {
+      const r = profileResumableState();
+      record("profile-R/verified", r.status === "verified", r.status + " " + (r.reason || ""));
+      record("profile-R/carries-evidence-and-assumptions", Array.isArray(r.evidence) && r.evidence.length >= 2 && Array.isArray(r.assumptions) && r.assumptions.length >= 1);
+    }
+    // R honest-negative: a corrupted local state is refused on read (fail-
+    // closed), never silently passed — exercises the same real module.
+    {
+      const prevMode = process.env.GRAPHSMITH_TEST_MODE;
+      const rRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Rneg-"));
+      try {
+        process.env.GRAPHSMITH_TEST_MODE = "1";
+        const ss = require("./state-store");
+        const store = ss.createStore(rRoot, { leaseMs: 40, heartbeatMs: 10 });
+        store.window.admitPending({ txid: "tx", fingerprint: "fp", tree_id: "t", n: 1 });
+        store.window.finalize("tx");
+        store.runRegistry.register("run-x", "t");
+        const winPath = path.join(rRoot, ".graphsmith", "state", "window.json");
+        const raw = fs.readFileSync(winPath, "utf8");
+        const hostile = JSON.parse(raw);
+        hostile.unexpected_hostile_key = true;
+        fs.writeFileSync(winPath, JSON.stringify(hostile));
+        let refused = false;
+        try {
+          ss.createStore(rRoot, { leaseMs: 40, heartbeatMs: 10 }).window.get();
+        } catch (e) {
+          refused = e.code === "CORRUPT_STATE";
+        }
+        record("profile-R/honest-negative-corrupt-state-refused", refused);
+      } finally {
+        if (prevMode === undefined) delete process.env.GRAPHSMITH_TEST_MODE;
+        else process.env.GRAPHSMITH_TEST_MODE = prevMode;
+        fs.rmSync(rRoot, { recursive: true, force: true });
+      }
+    }
+
+    // E: unavailable on a zero-adapter project (the given honest case).
+    {
+      const bareRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Enone-"));
+      try {
+        const e = profileEffectReconciliation(bareRoot);
+        record("profile-E/zero-adapter-unavailable", e.status === "unavailable", e.status);
+      } finally {
+        fs.rmSync(bareRoot, { recursive: true, force: true });
+      }
+    }
+    // E: verified when every declared effect maps to a reconciliation class.
+    {
+      const eRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Egood-"));
+      try {
+        writeAdaptersFixture(eRoot, "good");
+        const e = profileEffectReconciliation(eRoot);
+        record("profile-E/verified", e.status === "verified", e.status + " " + (e.reason || ""));
+      } finally {
+        fs.rmSync(eRoot, { recursive: true, force: true });
+      }
+    }
+    // E: failed when an external effect declares no mappable capability variant.
+    {
+      const eRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Ebad-"));
+      try {
+        writeAdaptersFixture(eRoot, "unmapped");
+        const e = profileEffectReconciliation(eRoot);
+        record("profile-E/unmappable-effect-failed", e.status === "failed", e.status + " " + (e.reason || ""));
+      } finally {
+        fs.rmSync(eRoot, { recursive: true, force: true });
+      }
+    }
+
+    // B: verified via a real supervisor budget breach producing a recorded halt.
+    {
+      const b = profileBudgetEnforced();
+      record("profile-B/verified-via-recorded-halt", b.status === "verified", b.status + " " + (b.reason || ""));
+      const halt = b.evidence && b.evidence[0] && b.evidence[0].recorded_halt;
+      record("profile-B/halt-is-budget-kind-with-evidence", !!(halt && halt.kind === "budget" && halt.evidence), JSON.stringify(halt));
+    }
+    // B honest-negative (pure classifier): a missing/non-budget halt is "failed".
+    {
+      record("profile-B/honest-negative-null-halt-failed", classifyBudgetHalt(null).status === "failed");
+      record("profile-B/honest-negative-nonbudget-halt-failed", classifyBudgetHalt({ kind: "tripwire" }).status === "failed");
+    }
+
+    // G: verified — a staged proposal reaches Gate-3 propose-only and adopt
+    // refuses without confirmation, leaving ACTIVE unchanged.
+    {
+      const g = profileGatedLearning();
+      record("profile-G/verified", g.status === "verified", g.status + " " + (g.reason || ""));
+      const activeCheck = (g.evidence || []).find((c) => c.check === "active-pointer-unchanged");
+      record("profile-G/active-unchanged-evidence", !!(activeCheck && activeCheck.unchanged === true), JSON.stringify(activeCheck));
+    }
+    // G honest-negative (pure classifier): a staged proposal that DID mutate
+    // ACTIVE (auto-adopted) is "failed".
+    {
+      const failed = classifyGatedLearning({ activeBefore: "aaaa", activeAfter: "bbbb", refused: true, gate3Packet: true, listedPending: true });
+      record("profile-G/honest-negative-auto-adopt-failed", failed.status === "failed" && /auto-?adopt/i.test(failed.reason));
+    }
+
+    // Q: verified on a good workflow fixture (test + clean lint); unavailable
+    // on a non-workflow target.
+    {
+      const qRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Qgood-"));
+      try {
+        writeWorkflowFixture(qRoot);
+        const q = profileAssuranceTested(qRoot);
+        record("profile-Q/verified", q.status === "verified", q.status + " " + (q.reason || JSON.stringify(q.evidence)));
+      } finally {
+        fs.rmSync(qRoot, { recursive: true, force: true });
+      }
+    }
+    {
+      const bareRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Qnone-"));
+      try {
+        const q = profileAssuranceTested(bareRoot);
+        record("profile-Q/no-workflow-unavailable", q.status === "unavailable", q.status);
+      } finally {
+        fs.rmSync(bareRoot, { recursive: true, force: true });
+      }
+    }
+
+    // X: verified on a clean workflow; failed when project state shows
+    // injection reached control flow; unavailable on a non-workflow target.
+    {
+      const xRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Xgood-"));
+      try {
+        writeWorkflowFixture(xRoot);
+        const x = profileAdversariallyTested(xRoot);
+        record("profile-X/verified", x.status === "verified", x.status + " " + (x.reason || ""));
+        // Honest negative: plant control-state showing injection reached control flow.
+        fs.writeFileSync(path.join(xRoot, "control-state.json"), JSON.stringify({ injection_reached_control_flow: true, actual_next: "__admin__" }));
+        const xf = profileAdversariallyTested(xRoot);
+        record("profile-X/injection-reached-control-flow-failed", xf.status === "failed", xf.status + " " + (xf.reason || ""));
+      } finally {
+        fs.rmSync(xRoot, { recursive: true, force: true });
+      }
+    }
+    {
+      const bareRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-selftest-Xnone-"));
+      try {
+        const x = profileAdversariallyTested(bareRoot);
+        record("profile-X/no-workflow-unavailable", x.status === "unavailable", x.status);
+      } finally {
+        fs.rmSync(bareRoot, { recursive: true, force: true });
+      }
+    }
+
+    // T + envelope: independent axes never collapsed; evaluated_at is injected,
+    // never a clock; a full --profiles report is well-formed.
+    {
+      const report = runProfiles(root, { evaluatedAt: "2026-07-23T00:00:00.000Z" });
+      record("profile-report/has-verifier-version", report.verifier_version === SENTINEL_SCHEMA_VERSION);
+      record("profile-report/has-platform", report.platform === process.platform);
+      record("profile-report/evaluated-at-injected", report.evaluated_at === "2026-07-23T00:00:00.000Z" && report.evaluated_at_source === "opts:--evaluated-at");
+      record(
+        "profile-report/T-axes-independent",
+        report.profiles.T.release_verified !== undefined && report.profiles.T.self_consistent !== undefined && report.profiles.T.status !== undefined
+      );
+      record("profile-report/all-seven-present", ["R", "E", "B", "T", "G", "Q", "X"].every((k) => report.profiles[k] && typeof report.profiles[k].status === "string"));
+      record("profile-report/profile-string", typeof report.profile_string === "string" && report.profile_string.startsWith("R:"));
+    }
+    // Envelope honest-negative: with no injection, evaluated_at is "unavailable",
+    // never fabricated from a clock.
+    {
+      const prev = { a: process.env.GRAPHSMITH_EVALUATED_AT, b: process.env.SOURCE_DATE_EPOCH };
+      delete process.env.GRAPHSMITH_EVALUATED_AT;
+      delete process.env.SOURCE_DATE_EPOCH;
+      try {
+        const ea = resolveEvaluatedAt({});
+        record("profile-report/evaluated-at-unavailable-without-injection", ea.value === "unavailable" && ea.source === "none");
+      } finally {
+        if (prev.a !== undefined) process.env.GRAPHSMITH_EVALUATED_AT = prev.a;
+        if (prev.b !== undefined) process.env.SOURCE_DATE_EPOCH = prev.b;
+      }
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1477,6 +2320,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--root" && argv[i + 1]) opts.root = path.resolve(argv[++i]);
     else if (argv[i] === "--release-manifest" && argv[i + 1]) opts.releaseManifestPath = path.resolve(argv[++i]);
+    else if (argv[i] === "--evaluated-at" && argv[i + 1]) opts.evaluatedAt = argv[++i];
   }
   return opts;
 }
@@ -1503,7 +2347,14 @@ function main() {
       return;
     }
     if (argv.includes("--profiles")) {
-      process.stdout.write(JSON.stringify(runProfiles(opts.root, opts), null, 2) + "\n");
+      const report = runProfiles(opts.root, opts);
+      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      // Exit code preserved at 0 for existing callers; the evidence-carrying
+      // status lives in the JSON. A one-line profile string goes to stderr for
+      // the badge/CI to scrape without parsing JSON.
+      process.stderr.write(
+        `verify --profiles: ${report.profile_string}  (verifier ${report.verifier_version}, ${report.platform}, evaluated_at=${report.evaluated_at})\n`
+      );
       process.exit(0);
       return;
     }
@@ -1546,4 +2397,16 @@ module.exports = {
   verifyAdoptionEntryDigest,
   diffDestinations,
   sha256Hex,
+  // Profile engine (Phase E, evidence-carrying R/E/B/T/G + Q/X)
+  profileResumableState,
+  profileEffectReconciliation,
+  profileBudgetEnforced,
+  profileGatedLearning,
+  profileAssuranceTested,
+  profileAdversariallyTested,
+  reconciliationClassForEffect,
+  resolveEvaluatedAt,
+  classifyBudgetHalt,
+  classifyGatedLearning,
+  isWorkflowProject,
 };

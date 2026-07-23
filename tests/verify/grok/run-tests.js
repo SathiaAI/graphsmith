@@ -873,7 +873,7 @@ function attack_extra() {
   {
     const fx = buildFixture("prof");
     const p = verify.runProfiles(fx.root, {});
-    if (p.profiles.T && p.profiles.T.release_verified && p.profiles.T.self_consistent && p.profiles.T.note) {
+    if (p.profiles.T && p.profiles.T.release_verified && p.profiles.T.self_consistent && (p.profiles.T.assumptions || p.profiles.T.note)) {
       pass("XTRA/profiles-T-independent-axes", `status=${p.profiles.T.status}`);
     } else {
       fail("XTRA/profiles-T-independent-axes", JSON.stringify(p.profiles && p.profiles.T));
