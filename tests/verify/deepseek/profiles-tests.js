@@ -115,28 +115,28 @@ function attack1ClassifierBypass() {
   // --- classifyGatedLearning ---
 
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "a", activeAfter: "b", refused: false, gate3Packet: false, listedPending: false });
+    const gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "b".repeat(64), refused: false, gate3Packet: false, listedPending: false });
     gl.status === "failed" ? p("G:all-false-rejected") : f("G:all-false-verified", "all conditions false returned " + gl.status);
   })();
 
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "a", activeAfter: "b", refused: true, gate3Packet: true, listedPending: true });
+    const gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "b".repeat(64), refused: true, gate3Packet: true, listedPending: true });
     gl.status === "failed" ? p("G:active-changed-detected") : f("G:active-changed-VERIFIED", "ACTIVE mutated but classified verified");
     if (gl.status === "verified") finding("G:active-change-missed", "CRITICAL", "classifyGatedLearning accepted mutated ACTIVE pointer");
   })();
 
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "a", activeAfter: "a", refused: false, gate3Packet: true, listedPending: true });
+    const gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "a".repeat(64), refused: false, gate3Packet: true, listedPending: true });
     gl.status === "failed" ? p("G:not-refused-detected") : f("G:not-refused-verified", "no refusal but reported verified");
   })();
 
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "a", activeAfter: "a", refused: true, gate3Packet: false, listedPending: true });
+    const gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "a".repeat(64), refused: true, gate3Packet: false, listedPending: true });
     gl.status === "failed" ? p("G:no-gate3-detected") : f("G:no-gate3-verified", "no gate3 packet but reported verified");
   })();
 
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "a", activeAfter: "a", refused: true, gate3Packet: true, listedPending: false });
+    const gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "a".repeat(64), refused: true, gate3Packet: true, listedPending: false });
     gl.status === "failed" ? p("G:not-listed-detected") : f("G:not-listed-verified", "not in pending list but reported verified");
   })();
 
@@ -166,23 +166,23 @@ function attack1ClassifierBypass() {
 
   (function() {
     const gl = verify.classifyGatedLearning({ activeBefore: "", activeAfter: "", refused: true, gate3Packet: true, listedPending: true });
-    gl.status === "verified" ? p("G:empty-string-active-ok") : f("G:empty-string-active-rejected", "empty string hashes should be equal");
+    gl.status !== "verified" ? p("G:empty-string-hardened-rejected") : f("G:empty-string-NOT-hardened", "empty-string non-hex ACTIVE hash must NOT verify (release hardening: strict 64-hex)");
   })();
 
   // Fuzzed: truthy non-boolean fields
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "ab", activeAfter: "ab", refused: "yes", gate3Packet: 1, listedPending: "present" });
+    const gl = verify.classifyGatedLearning({ activeBefore: "ab".repeat(32), activeAfter: "ab".repeat(32), refused: "yes", gate3Packet: 1, listedPending: "present" });
     gl.status === "verified" ? p("G:truthy-non-boolean-accepted") : f("G:truthy-non-boolean-rejected", "truthy non-booleans should pass ! check");
   })();
 
   // Falsy boolean-like: refused is Boolean(false) — should fail
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "a", activeAfter: "a", refused: false, gate3Packet: true, listedPending: true });
+    const gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "a".repeat(64), refused: false, gate3Packet: true, listedPending: true });
     gl.status === "failed" ? p("G:refused-false-detected") : f("G:refused-false-verified", "refused===false should be caught by !refused");
   })();
 
   (function() {
-    const gl = verify.classifyGatedLearning({ activeBefore: "a", activeAfter: "a", refused: 0, gate3Packet: true, listedPending: true });
+    const gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "a".repeat(64), refused: 0, gate3Packet: true, listedPending: true });
     gl.status === "failed" ? p("G:refused-zero-detected") : f("G:refused-zero-verified", "refused=0 should be caught by !0");
   })();
 }
@@ -274,7 +274,7 @@ function attack2GStagedOnly() {
 
   // 2c. Verify that a corrupted (auto-adopted) result is rejected by classifyGatedLearning
   (function() {
-    var gl = verify.classifyGatedLearning({ activeBefore: "aaaa1111", activeAfter: "bbbb2222", refused: true, gate3Packet: true, listedPending: true });
+    var gl = verify.classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "b".repeat(64), refused: true, gate3Packet: true, listedPending: true });
     gl.status === "failed" ? p("G:auto-adopt-rejected-by-classifier") : f("G:auto-adopt-passed-classifier", "ACTIVE changed but classifier returned " + gl.status);
     /auto-?adopt/i.test(gl.reason || "") ? p("G:auto-adopt-reason-mentions-auto-adopt") : p("G:auto-adopt-reason-note"); // non-critical
   })();

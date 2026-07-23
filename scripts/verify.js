@@ -1086,20 +1086,20 @@ function classifyGatedLearning(o) {
   // strings FIRST; a nullish/non-string operand means the hash was never
   // produced, so the propose-only guarantee is unverifiable — never verified.
   //
-  // Note on the guard's strength: the shipped adversarial suite exercises this
-  // classifier with SHORT stand-in hashes ("a", "ab", "") that it expects to be
-  // treated as valid equal digests and ruled by the refused/gate3/listed
-  // conditions below — so a strict /^[0-9a-f]{64}$/ shape check cannot be used
-  // here without contradicting that suite. The absence hole this fix must close
-  // is a MISSING hash (undefined/null/non-string), which the string-operand
-  // guard closes precisely. In production, activeBefore/activeAfter always come
-  // from sha256Hex(...) (a 64-hex string) or the whole profile fails via throw,
-  // so a non-string operand can only arise from an absence/error path.
-  if (typeof o.activeBefore !== "string" || typeof o.activeAfter !== "string") {
+  // Release-hardening (gauntlet, 2026-07-23): require BOTH operands to be REAL
+  // 64-hex SHA-256 digests. This closes the absence hole (undefined/null/non-
+  // string → the hash was never produced) AND the equal-but-bogus-hash case a
+  // fresh adversarial model flagged (e.g. ""==="" or "notahash"==="notahash"
+  // sailing through to "verified"). In production these always come from
+  // sha256Hex(...) (a 64-hex string) or the profile throws, so a non-hex operand
+  // can only arise from an absence/error/tamper path — never a real ACTIVE.
+  const HEX64 = /^[0-9a-f]{64}$/;
+  if (typeof o.activeBefore !== "string" || typeof o.activeAfter !== "string" ||
+      !HEX64.test(o.activeBefore) || !HEX64.test(o.activeAfter)) {
     return {
       status: "unavailable",
       reason:
-        "ACTIVE state could not be hashed/compared (before/after are not both strings — the hash was never produced) — the propose-only guarantee is unverifiable, reported unavailable rather than green (contract 10)",
+        "ACTIVE state could not be hashed/compared (before/after are not both valid 64-hex SHA-256 digests — the hash was never produced or is malformed) — the propose-only guarantee is unverifiable, reported unavailable rather than green (contract 10)",
     };
   }
   if (o.activeBefore !== o.activeAfter) {
@@ -2269,7 +2269,7 @@ function runSelftest() {
     // G honest-negative (pure classifier): a staged proposal that DID mutate
     // ACTIVE (auto-adopted) is "failed".
     {
-      const failed = classifyGatedLearning({ activeBefore: "aaaa", activeAfter: "bbbb", refused: true, gate3Packet: true, listedPending: true });
+      const failed = classifyGatedLearning({ activeBefore: "a".repeat(64), activeAfter: "b".repeat(64), refused: true, gate3Packet: true, listedPending: true });
       record("profile-G/honest-negative-auto-adopt-failed", failed.status === "failed" && /auto-?adopt/i.test(failed.reason));
     }
     // G honest-negative (absence-of-evidence, cross-family HIGH): if the ACTIVE
