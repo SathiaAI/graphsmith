@@ -1,0 +1,380 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/lesson-event.schema.json",
+  "title": "GraphSmith lesson-event records (contract 07)",
+  "oneOf": [
+    { "$ref": "#/$defs/eventRecord" },
+    { "$ref": "#/$defs/compilerStats" },
+    { "$ref": "#/$defs/evidenceMapEntry" },
+    { "$ref": "#/$defs/proposerViewEnvelope" }
+  ],
+  "$defs": {
+    "schemaVersion": { "const": "1.0" },
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "finiteInt": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 },
+
+    "runRef": { "type": "string", "pattern": "^r[0-9]{2,6}$" },
+    "stepRef": { "type": "string", "pattern": "^s[0-9]{2,6}$" },
+    "evidenceRef": { "type": "string", "pattern": "^p[0-9]{2,6}$" },
+    "eventId": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+
+    "eventType": {
+      "enum": [
+        "run_halt", "budget_breach", "tripwire", "retry_exhausted",
+        "step_failure", "corrupt_checkpoint", "lock_contention",
+        "scenario_fail", "human_correction", "adoption", "rollback"
+      ]
+    },
+
+    "runHaltCode": {
+      "enum": [
+        "unresolved_side_effect", "out_of_memory", "signal_termination",
+        "watchdog_timeout", "orphaned_lock", "budget_exhausted",
+        "unknown_halt"
+      ]
+    },
+    "budgetBreachCode": {
+      "enum": [
+        "max_wall_time", "max_token_count", "max_api_calls",
+        "max_step_execution", "max_memory", "max_cost"
+      ]
+    },
+    "tripwireCode": {
+      "enum": [
+        "unexpected_output_schema", "production_api_call",
+        "file_access_outside_boundary", "network_access",
+        "privilege_escalation", "env_access"
+      ]
+    },
+    "retryExhaustedCode": {
+      "enum": ["max_retries_step", "max_retries_run"]
+    },
+    "stepFailureCode": {
+      "enum": [
+        "worker_error", "module_not_found", "worker_timeout",
+        "invalid_output", "side_effect_mismatch", "unhandled_exception"
+      ]
+    },
+    "corruptCheckpointCode": {
+      "enum": [
+        "unreadable_file", "schema_mismatch", "hash_mismatch",
+        "truncated_file", "missing_file"
+      ]
+    },
+    "lockContentionCode": {
+      "enum": [
+        "deadlock_detected", "lease_expired", "lock_file_corrupt",
+        "owner_mismatch", "stale_lock"
+      ]
+    },
+    "scenarioFailCode": {
+      "enum": [
+        "invariant_violation", "expected_outcome_mismatch",
+        "scenario_crash", "infra_fault", "workflow_fault"
+      ]
+    },
+    "humanCorrectionCode": {
+      "enum": [
+        "gate3_prompt_adjustment", "data_correction",
+        "config_update", "manual_override", "knob_tune"
+      ]
+    },
+    "adoptionCode": {
+      "enum": [
+        "doc_change", "knob_change", "prompt_change",
+        "code_change", "config_only", "migration"
+      ]
+    },
+    "rollbackCode": {
+      "enum": [
+        "hard_failure", "human_decision", "pre_authorized",
+        "flagged", "abandoned_window"
+      ]
+    },
+
+    "codeByType": {
+      "if": { "$ref": "#/$defs/runHaltFilter" },
+      "then": { "properties": { "code": { "$ref": "#/$defs/runHaltCode" } } },
+      "else": {
+        "if": { "$ref": "#/$defs/budgetBreachFilter" },
+        "then": { "properties": { "code": { "$ref": "#/$defs/budgetBreachCode" } } },
+        "else": {
+          "if": { "$ref": "#/$defs/tripwireFilter" },
+          "then": { "properties": { "code": { "$ref": "#/$defs/tripwireCode" } } },
+          "else": {
+            "if": { "$ref": "#/$defs/retryExhaustedFilter" },
+            "then": { "properties": { "code": { "$ref": "#/$defs/retryExhaustedCode" } } },
+            "else": {
+              "if": { "$ref": "#/$defs/stepFailureFilter" },
+              "then": { "properties": { "code": { "$ref": "#/$defs/stepFailureCode" } } },
+              "else": {
+                "if": { "$ref": "#/$defs/corruptCheckpointFilter" },
+                "then": { "properties": { "code": { "$ref": "#/$defs/corruptCheckpointCode" } } },
+                "else": {
+                  "if": { "$ref": "#/$defs/lockContentionFilter" },
+                  "then": { "properties": { "code": { "$ref": "#/$defs/lockContentionCode" } } },
+                  "else": {
+                    "if": { "$ref": "#/$defs/scenarioFailFilter" },
+                    "then": { "properties": { "code": { "$ref": "#/$defs/scenarioFailCode" } } },
+                    "else": {
+                      "if": { "$ref": "#/$defs/humanCorrectionFilter" },
+                      "then": { "properties": { "code": { "$ref": "#/$defs/humanCorrectionCode" } } },
+                      "else": {
+                        "if": { "$ref": "#/$defs/adoptionFilter" },
+                        "then": { "properties": { "code": { "$ref": "#/$defs/adoptionCode" } } },
+                        "else": {
+                          "if": { "$ref": "#/$defs/rollbackFilter" },
+                          "then": { "properties": { "code": { "$ref": "#/$defs/rollbackCode" } } },
+                          "else": false
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "runHaltFilter": { "properties": { "type": { "const": "run_halt" } }, "required": ["type"] },
+    "budgetBreachFilter": { "properties": { "type": { "const": "budget_breach" } }, "required": ["type"] },
+    "tripwireFilter": { "properties": { "type": { "const": "tripwire" } }, "required": ["type"] },
+    "retryExhaustedFilter": { "properties": { "type": { "const": "retry_exhausted" } }, "required": ["type"] },
+    "stepFailureFilter": { "properties": { "type": { "const": "step_failure" } }, "required": ["type"] },
+    "corruptCheckpointFilter": { "properties": { "type": { "const": "corrupt_checkpoint" } }, "required": ["type"] },
+    "lockContentionFilter": { "properties": { "type": { "const": "lock_contention" } }, "required": ["type"] },
+    "scenarioFailFilter": { "properties": { "type": { "const": "scenario_fail" } }, "required": ["type"] },
+    "humanCorrectionFilter": { "properties": { "type": { "const": "human_correction" } }, "required": ["type"] },
+    "adoptionFilter": { "properties": { "type": { "const": "adoption" } }, "required": ["type"] },
+    "rollbackFilter": { "properties": { "type": { "const": "rollback" } }, "required": ["type"] },
+
+    "runHaltCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retries_attempted": { "$ref": "#/$defs/finiteInt" },
+        "steps_completed": { "$ref": "#/$defs/finiteInt" },
+        "steps_remaining": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "budgetBreachCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "elapsed_ms": { "$ref": "#/$defs/finiteInt" },
+        "budget_ms": { "$ref": "#/$defs/finiteInt" },
+        "overshoot_ms": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "tripwireCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tripwire_index": { "$ref": "#/$defs/finiteInt" },
+        "total_tripwires": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "retryExhaustedCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attempts_made": { "$ref": "#/$defs/finiteInt" },
+        "max_attempts": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "stepFailureCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attempt": { "$ref": "#/$defs/finiteInt" },
+        "total_retries": { "$ref": "#/$defs/finiteInt" },
+        "step_duration_ms": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "corruptCheckpointCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "file_size": { "$ref": "#/$defs/finiteInt" },
+        "expected_size": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "lockContentionCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "contention_attempts": { "$ref": "#/$defs/finiteInt" },
+        "lease_age_ms": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "scenarioFailCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "violation_count": { "$ref": "#/$defs/finiteInt" },
+        "total_invariants": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "humanCorrectionCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adjustment_count": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "adoptionCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tx_seq": { "$ref": "#/$defs/finiteInt" },
+        "entry_seq": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+    "rollbackCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "window_slot_count": { "$ref": "#/$defs/finiteInt" },
+        "hard_fail_count": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+
+    "countersByType": {
+      "if": { "$ref": "#/$defs/runHaltFilter" },
+      "then": { "properties": { "counters": { "$ref": "#/$defs/runHaltCounters" } } },
+      "else": {
+        "if": { "$ref": "#/$defs/budgetBreachFilter" },
+        "then": { "properties": { "counters": { "$ref": "#/$defs/budgetBreachCounters" } } },
+        "else": {
+          "if": { "$ref": "#/$defs/tripwireFilter" },
+          "then": { "properties": { "counters": { "$ref": "#/$defs/tripwireCounters" } } },
+          "else": {
+            "if": { "$ref": "#/$defs/retryExhaustedFilter" },
+            "then": { "properties": { "counters": { "$ref": "#/$defs/retryExhaustedCounters" } } },
+            "else": {
+              "if": { "$ref": "#/$defs/stepFailureFilter" },
+              "then": { "properties": { "counters": { "$ref": "#/$defs/stepFailureCounters" } } },
+              "else": {
+                "if": { "$ref": "#/$defs/corruptCheckpointFilter" },
+                "then": { "properties": { "counters": { "$ref": "#/$defs/corruptCheckpointCounters" } } },
+                "else": {
+                  "if": { "$ref": "#/$defs/lockContentionFilter" },
+                  "then": { "properties": { "counters": { "$ref": "#/$defs/lockContentionCounters" } } },
+                  "else": {
+                    "if": { "$ref": "#/$defs/scenarioFailFilter" },
+                    "then": { "properties": { "counters": { "$ref": "#/$defs/scenarioFailCounters" } } },
+                    "else": {
+                      "if": { "$ref": "#/$defs/humanCorrectionFilter" },
+                      "then": { "properties": { "counters": { "$ref": "#/$defs/humanCorrectionCounters" } } },
+                      "else": {
+                        "if": { "$ref": "#/$defs/adoptionFilter" },
+                        "then": { "properties": { "counters": { "$ref": "#/$defs/adoptionCounters" } } },
+                        "else": {
+                          "if": { "$ref": "#/$defs/rollbackFilter" },
+                          "then": { "properties": { "counters": { "$ref": "#/$defs/rollbackCounters" } } },
+                          "else": false
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "eventRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "seq", "event_id", "run_ref", "step_ref",
+        "ord", "delta_ms", "type", "code", "counters",
+        "lossy", "evidence_ref", "fingerprint"
+      ],
+      "allOf": [
+        { "$ref": "#/$defs/codeByType" },
+        { "$ref": "#/$defs/countersByType" }
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "seq": { "$ref": "#/$defs/finiteInt" },
+        "event_id": { "$ref": "#/$defs/eventId" },
+        "run_ref": { "$ref": "#/$defs/runRef" },
+        "step_ref": { "$ref": "#/$defs/stepRef" },
+        "ord": { "$ref": "#/$defs/finiteInt" },
+        "delta_ms": { "$ref": "#/$defs/finiteInt" },
+        "type": { "$ref": "#/$defs/eventType" },
+        "code": { "$ref": "#/$defs/nonEmpty" },
+        "counters": { "type": "object", "additionalProperties": false },
+        "lossy": { "type": "boolean" },
+        "evidence_ref": { "$ref": "#/$defs/evidenceRef" },
+        "fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+
+    "compilerStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "record_type",
+        "total_events", "skipped", "quarantined", "dropped_refs",
+        "rejected", "harvest_valid", "run_count", "broken_runs"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "record_type": { "const": "compiler_stats" },
+        "total_events": { "$ref": "#/$defs/finiteInt" },
+        "skipped": { "$ref": "#/$defs/finiteInt" },
+        "quarantined": { "$ref": "#/$defs/finiteInt" },
+        "dropped_refs": { "$ref": "#/$defs/finiteInt" },
+        "rejected": { "$ref": "#/$defs/finiteInt" },
+        "harvest_valid": { "type": "boolean" },
+        "run_count": { "$ref": "#/$defs/finiteInt" },
+        "broken_runs": { "$ref": "#/$defs/finiteInt" }
+      }
+    },
+
+    "evidenceMapEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "record_type", "alias", "alias_type", "real_value"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "record_type": { "const": "evidence_map_entry" },
+        "alias": { "$ref": "#/$defs/nonEmpty" },
+        "alias_type": {
+          "enum": ["run_ref", "step_ref", "evidence_ref"]
+        },
+        "real_value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9._:\\/-]{1,256}$"
+        }
+      }
+    },
+
+    "proposerViewEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "record_type", "compiler_sha256", "events"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "record_type": { "const": "proposer_view_envelope" },
+        "compiler_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "events": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/eventRecord" }
+        }
+      }
+    }
+  }
+}
