@@ -6,6 +6,7 @@ const path = require("path");
 
 const SCHEMA_VERSION = "1.0";
 const PROPERTIES = ["R", "E", "B", "T", "G", "Q", "X"];
+const VALID_STATUSES = new Set(["verified", "unavailable", "failed", "not-applicable"]);
 const PLATFORM_ALIASES = {
   darwin: "macOS",
   linux: "Linux",
@@ -58,10 +59,19 @@ function escapeMarkdown(text) {
     .replace(/\|/g, "\\|");
 }
 
+function validateStatus(status) {
+  if (status === null || status === undefined || status === "") {
+    return "unknown";
+  }
+  const normalized = String(status).trim();
+  return VALID_STATUSES.has(normalized) ? normalized : "unavailable";
+}
+
 function formatStatus(status, ciUrl) {
+  const validStatus = validateStatus(status);
   const validUrl = validateCiUrl(ciUrl);
   const url = validUrl ? escapeHtml(ciUrl) : "";
-  const escapedStatus = escapeHtml(status);
+  const escapedStatus = escapeHtml(validStatus);
   if (url) {
     return `<a href="${url}">${escapedStatus}</a>`;
   }
@@ -103,9 +113,10 @@ function aggregateReports(reportFiles, ciUrls) {
     if (report.profiles) {
       for (const prop of PROPERTIES) {
         const profile = report.profiles[prop];
-        if (profile && profile.status) {
+        if (profile && profile.status !== undefined) {
+          const validatedStatus = validateStatus(profile.status);
           matrix[platform][prop] = {
-            status: profile.status,
+            status: validatedStatus,
             ciUrl: ciUrl,
           };
         }
@@ -149,7 +160,8 @@ function generateMarkdown(matrix, metadata) {
     for (const platform of sortedPlatforms) {
       const cell = matrix[platform] && matrix[platform][prop];
       if (cell && cell.status) {
-        row.push(formatStatus(cell.status, cell.ciUrl));
+        const validatedStatus = validateStatus(cell.status);
+        row.push(formatStatus(validatedStatus, cell.ciUrl));
       } else {
         row.push(formatStatus("unavailable", null));
       }
@@ -202,8 +214,9 @@ function generateJson(matrix, metadata) {
     for (const prop of PROPERTIES) {
       const cell = matrix[platform] && matrix[platform][prop];
       if (cell && cell.status) {
+        const validatedStatus = validateStatus(cell.status);
         output.matrix[normalizedPlatform][prop] = {
-          status: cell.status,
+          status: validatedStatus,
           ci_url: validateCiUrl(cell.ciUrl) ? cell.ciUrl : null,
         };
       } else {
@@ -330,24 +343,99 @@ function runSelftest() {
     note: "Test report with malicious payloads in evidence",
   };
 
+  const report5 = {
+    schema_version: "1.0",
+    command: "profiles",
+    verifier_version: "1.0",
+    platform: "linux",
+    node_version: "v18.0.0",
+    root: "/fake/root",
+    evaluated_at: "2024-01-15T10:34:00Z",
+    evaluated_at_source: "SOURCE_DATE_EPOCH",
+    profiles: {
+      R: { status: "verified | INJECTED_COL | INJECTED_COL2", evidence: [], assumptions: [] },
+      E: { status: "verified", evidence: [], assumptions: [] },
+      B: { status: "verified", evidence: [], assumptions: [] },
+      T: { status: "verified", evidence: [], assumptions: [] },
+      G: { status: "verified", evidence: [], assumptions: [] },
+      Q: { status: "verified", evidence: [], assumptions: [] },
+      X: { status: "verified", evidence: [], assumptions: [] },
+    },
+    profile_string: "R:injected E:verified B:verified T:verified G:verified Q:verified X:verified",
+    note: "Test report with pipe injection attack",
+  };
+
+  const report6 = {
+    schema_version: "1.0",
+    command: "profiles",
+    verifier_version: "1.0",
+    platform: "win32",
+    node_version: "v18.0.0",
+    root: "C:\\fake\\root",
+    evaluated_at: "2024-01-15T10:35:00Z",
+    evaluated_at_source: "SOURCE_DATE_EPOCH",
+    profiles: {
+      R: { status: "verified", evidence: [], assumptions: [] },
+      E: { status: "verified\n\n# INJECTED HEADING\n\nfake body", evidence: [], assumptions: [] },
+      B: { status: "verified", evidence: [], assumptions: [] },
+      T: { status: "verified", evidence: [], assumptions: [] },
+      G: { status: "verified", evidence: [], assumptions: [] },
+      Q: { status: "verified", evidence: [], assumptions: [] },
+      X: { status: "verified", evidence: [], assumptions: [] },
+    },
+    profile_string: "R:verified E:injected B:verified T:verified G:verified Q:verified X:verified",
+    note: "Test report with newline injection attack",
+  };
+
+  const report7 = {
+    schema_version: "1.0",
+    command: "profiles",
+    verifier_version: "1.0",
+    platform: "darwin",
+    node_version: "v18.0.0",
+    root: "/fake/root",
+    evaluated_at: "2024-01-15T10:36:00Z",
+    evaluated_at_source: "SOURCE_DATE_EPOCH",
+    profiles: {
+      R: { status: "", evidence: [], assumptions: [] },
+      E: { status: "verified", evidence: [], assumptions: [] },
+      B: { status: "verified", evidence: [], assumptions: [] },
+      T: { status: "verified", evidence: [], assumptions: [] },
+      G: { status: "verified", evidence: [], assumptions: [] },
+      Q: { status: "verified", evidence: [], assumptions: [] },
+      X: { status: "verified", evidence: [], assumptions: [] },
+    },
+    profile_string: "R:blank E:verified B:verified T:verified G:verified Q:verified X:verified",
+    note: "Test report with blank status",
+  };
+
   const report1Path = path.join(tmpDir, "report-darwin-1.json");
   const report2Path = path.join(tmpDir, "report-linux.json");
   const report3Path = path.join(tmpDir, "report-win32.json");
   const report4Path = path.join(tmpDir, "report-darwin-2.json");
+  const report5Path = path.join(tmpDir, "report-linux-2.json");
+  const report6Path = path.join(tmpDir, "report-win32-2.json");
+  const report7Path = path.join(tmpDir, "report-darwin-3.json");
 
   fs.writeFileSync(report1Path, JSON.stringify(report1));
   fs.writeFileSync(report2Path, JSON.stringify(report2));
   fs.writeFileSync(report3Path, JSON.stringify(report3));
   fs.writeFileSync(report4Path, JSON.stringify(report4));
+  fs.writeFileSync(report5Path, JSON.stringify(report5));
+  fs.writeFileSync(report6Path, JSON.stringify(report6));
+  fs.writeFileSync(report7Path, JSON.stringify(report7));
 
   const ciUrls = [
     "https://ci.example.com/run/1",
     "https://ci.example.com/run/2",
     "https://ci.example.com/run/3",
     "https://ci.example.com/run/4",
+    "https://ci.example.com/run/5",
+    "https://ci.example.com/run/6",
+    "https://ci.example.com/run/7",
   ];
 
-  const reportFiles = [report1Path, report2Path, report3Path, report4Path];
+  const reportFiles = [report1Path, report2Path, report3Path, report4Path, report5Path, report6Path, report7Path];
 
   const { matrix, metadata } = aggregateReports(reportFiles, ciUrls);
 
@@ -375,8 +463,30 @@ function runSelftest() {
   console.log(`- Unescaped <img> tags found: ${hasUnescapedImg ? "FAIL" : "PASS"}`);
   console.log(`- Unescaped quotes found: ${hasUnescapedQuotes ? "FAIL" : "PASS"}`);
 
-  if (hasUnescapedScript || hasUnescapedImg || hasUnescapedQuotes) {
-    console.error("\n❌ SELFTEST FAILED: Unescaped content detected in Markdown output");
+  console.log("\nChecking for status injection attacks...");
+  const jsonContent = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+  const hasInjectedPipeStatus = mdContent.includes("INJECTED_COL") || JSON.stringify(jsonContent).includes("INJECTED_COL");
+  const hasInjectedNewlineStatus = mdContent.includes("INJECTED HEADING") || mdContent.includes("fake body") || JSON.stringify(jsonContent).includes("INJECTED HEADING");
+  
+  let hasBlankStatusUnknown = false;
+  if (matrix) {
+    for (const platform in matrix) {
+      for (const prop in matrix[platform]) {
+        if (matrix[platform][prop].status === "unknown") {
+          hasBlankStatusUnknown = true;
+          break;
+        }
+      }
+      if (hasBlankStatusUnknown) break;
+    }
+  }
+  
+  console.log(`- Pipe injection (INJECTED_COL) found: ${hasInjectedPipeStatus ? "FAIL" : "PASS"}`);
+  console.log(`- Newline injection (INJECTED HEADING) found: ${hasInjectedNewlineStatus ? "FAIL" : "PASS"}`);
+  console.log(`- Blank status validated as 'unknown': ${hasBlankStatusUnknown ? "PASS" : "FAIL"}`);
+
+  if (hasUnescapedScript || hasUnescapedImg || hasUnescapedQuotes || hasInjectedPipeStatus || hasInjectedNewlineStatus || !hasBlankStatusUnknown) {
+    console.error("\n❌ SELFTEST FAILED: Security issues detected");
     process.exit(1);
   }
 
@@ -452,5 +562,7 @@ module.exports = {
   validateCiUrl,
   escapeHtml,
   escapeMarkdown,
+  validateStatus,
+  runSelftest,
   SCHEMA_VERSION,
 };
