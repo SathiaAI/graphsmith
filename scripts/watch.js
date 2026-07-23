@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 /* GraphSmith watch — local terminal tail of a run's state.
  *
- * READ-ONLY observability: polls and displays a run's live state
- * (checkpoints/step progress, budget usage vs limits, tripwire state,
- * halt state, window/canary state) with an optional kill command.
- * Kill is process-group-aware and emits the capability-specific safety
- * message (safe-to-resume / reconciliation-required / no-external-effects-in-flight,
- * derived from the in-flight effect's capability — same as watchdog.js).
+ * READ-ONLY observability: continuously polls and displays a run's live
+ * state (checkpoints/step progress, budget usage VS limits, tripwire state,
+ * halt state, window/canary state) with an optional kill command. Tail mode
+ * stays alive — refreshing every DEFAULT_REFRESH_INTERVAL_MS — until it is
+ * killed or interrupted (Ctrl+C); it does not exit after the first frame.
+ * Kill is process-group-aware and always emits the capability-specific
+ * safety message (safe-to-resume / reconciliation-required /
+ * no-external-effects-in-flight, derived from the in-flight effect's
+ * capability — same as watchdog.js), even when the manager PID cannot be
+ * resolved (missing/unrecoverable lockfile).
  *
  * Zero-dep CJS, Node >= 18. Read-only tail, no network, no clock/random in
  * decisions (refresh interval is fine, documented). Never mutates run state.
@@ -64,6 +68,35 @@ function prettyPrintJson(obj, indent = 2) {
 
 // ---- Budget/Tripwire rendering ----
 
+/** Render one "used[/limit] (pct%)" usage line. `limit` may be undefined/null
+ * (no limit configured for that dimension) — never fabricate a denominator. */
+function formatUsageLine(label, usage, limit, fmt) {
+  const fmtVal = fmt || ((v) => String(v));
+  if (limit === undefined || limit === null) {
+    return `  ${label}: ${fmtVal(usage)} (no limit configured)`;
+  }
+  const pct =
+    typeof usage === "number" && typeof limit === "number" && limit > 0
+      ? ` (${Math.round((usage / limit) * 100)}% of limit)`
+      : "";
+  return `  ${label}: ${fmtVal(usage)} / ${fmtVal(limit)}${pct}`;
+}
+
+function renderTripwireLines(budgetState) {
+  const lines = ["=== TRIPWIRES ==="];
+  const tripwires = Array.isArray(budgetState.tripwires) ? budgetState.tripwires : [];
+  if (tripwires.length === 0) {
+    lines.push("  No tripwires configured.");
+    return lines;
+  }
+  for (const tw of tripwires) {
+    if (!tw || typeof tw !== "object") continue;
+    const thresholdPct = typeof tw.at === "number" ? `${Math.round(tw.at * 100)}%` : String(tw.at);
+    lines.push(`  - ${tw.rule || "unknown-rule"}: ${tw.status || "unknown"} (threshold ${thresholdPct})`);
+  }
+  return lines;
+}
+
 function renderBudgetSummary(budgetState) {
   if (!budgetState) return "No budget state loaded.";
 
@@ -78,14 +111,31 @@ function renderBudgetSummary(budgetState) {
     lines.push("[ACTIVE] Run is not halted.");
   }
 
-  lines.push(`  Steps executed: ${budgetState.steps_executed || 0}`);
-  lines.push(`  Furthest step: ${budgetState.furthest_step_index || -1}`);
-  lines.push(`  Cumulative wall time (ms): ${budgetState.cumulative_wall_time_ms || 0}`);
-  lines.push(`  External calls (total): ${budgetState.external_calls_total || 0}`);
-  lines.push(`  Estimated cost (USD): $${(budgetState.est_cost_usd || 0).toFixed(2)}`);
-  lines.push(`  Log bytes: ${budgetState.log_bytes || 0}`);
+  const limits = budgetState.limits && typeof budgetState.limits === "object" ? budgetState.limits : {};
+
+  lines.push(formatUsageLine("Steps executed", budgetState.steps_executed || 0, limits.max_steps));
+  lines.push(`  Furthest step: ${budgetState.furthest_step_index ?? -1}`);
+  lines.push(
+    formatUsageLine(
+      "Cumulative wall time (ms)",
+      budgetState.cumulative_wall_time_ms || 0,
+      limits.max_wall_time_ms
+    )
+  );
+  lines.push(
+    formatUsageLine("External calls (total)", budgetState.external_calls_total || 0, limits.max_external_calls)
+  );
+  lines.push(
+    formatUsageLine(
+      "Estimated cost (USD)",
+      budgetState.est_cost_usd || 0,
+      limits.max_est_cost_usd,
+      (v) => `$${Number(v).toFixed(2)}`
+    )
+  );
+  lines.push(formatUsageLine("Log bytes", budgetState.log_bytes || 0, limits.max_log_bytes));
   lines.push(`  State bytes: ${budgetState.state_bytes || 0}`);
-  lines.push(`  Output tokens: ${budgetState.output_tokens || 0}`);
+  lines.push(formatUsageLine("Output tokens", budgetState.output_tokens || 0, limits.max_output_tokens));
   lines.push(`  Subprocesses spawned: ${budgetState.subprocess_count || 0}`);
 
   if (budgetState.acknowledged_extensions && budgetState.acknowledged_extensions.length > 0) {
@@ -94,6 +144,9 @@ function renderBudgetSummary(budgetState) {
       lines.push(`    - ${ext.rule} (${ext.kind}): ${ext.previous_limit} → ${prettyPrintJson(ext.new_limits)}`);
     }
   }
+
+  lines.push("");
+  lines.push(...renderTripwireLines(budgetState));
 
   return lines.join("\n");
 }
@@ -153,7 +206,11 @@ function deriveKillMessage(capabilityData) {
     case "read-only":
       return "no external effects in flight";
     case "local-transactional":
-      return `safe to resume (local effect "${effectId}", inspected)`;
+      // "inspected" is a truth claim requiring actual inspection evidence (a landed/
+      // not-landed check on the effect itself). deriveKillMessage only ever sees the
+      // capability file's declaration — it has never inspected the effect — so state
+      // the recorded fact (the declared capability) without an unearned claim.
+      return `safe to resume (local effect "${effectId}", per recorded capability declaration; not verified against the effect itself)`;
     case "idempotent-by-key":
       return `resume will retry with the recorded idempotency key for "${effectId}" — safe ASSUMING the remote honors the declared key (declaration by the adapter author, not verified by GraphSmith)`;
     case "status-checkable":
@@ -218,6 +275,54 @@ function displayRunState(runId, runDir, budgetState) {
   console.log("");
 }
 
+/** Continuous poll/refresh loop — the actual "tail" behavior.
+ *
+ * Real CLI tail mode (opts.maxFrames omitted): the interval is left ref'd so
+ * the event loop — and the process — stays alive across frames until an
+ * external signal/interrupt or process kill stops it. It must NOT unref here;
+ * doing so is what let the process exit after the first frame.
+ *
+ * --selftest / tests (opts.maxFrames set): runs a bounded, injected number of
+ * frames on a short interval, then resolves via opts.onDone — proving the
+ * loop re-reads and re-renders state repeatedly without needing to run
+ * forever or spawn a real child process.
+ */
+function startWatchLoop(runId, runDir, budgetStatePath, opts = {}) {
+  const intervalMs = opts.intervalMs || DEFAULT_REFRESH_INTERVAL_MS;
+  const maxFrames = opts.maxFrames || null;
+  const onFrame = opts.onFrame || ((rid, dir, budgetState) => displayRunState(rid, dir, budgetState));
+  let frame = 0;
+  let poller = null;
+
+  const stop = () => {
+    if (poller) clearInterval(poller);
+  };
+
+  const renderFrame = () => {
+    frame += 1;
+    const budgetState = readJsonSafe(budgetStatePath);
+    onFrame(runId, runDir, budgetState, frame);
+    if (maxFrames && frame >= maxFrames) {
+      stop();
+      if (opts.onDone) opts.onDone(frame);
+    }
+  };
+
+  renderFrame();
+  if (!maxFrames || maxFrames > 1) {
+    // Left ref'd in BOTH modes: unbounded real tail must stay alive until
+    // killed/interrupted (the D4 fix — see doc comment above); bounded
+    // selftest runs need the timer to actually keep firing so the injected
+    // frames complete and `onDone` resolves (an unref'd timer can be skipped
+    // entirely if it's the only thing left keeping the event loop alive).
+    // `stop()` clears it once maxFrames is reached, so bounded runs still
+    // terminate promptly on their own.
+    poller = setInterval(renderFrame, intervalMs);
+  }
+
+  return { stop };
+}
+
 // ---- CLI / Main ----
 
 function printUsage() {
@@ -261,56 +366,61 @@ async function main() {
   const budgetStatePath = path.join(runDir, BUDGET_STATE_FILE);
 
   if (killRun) {
-    // Kill mode: read budget-state, derive message, kill the process
-    const budgetState = readJsonSafe(budgetStatePath);
+    // Kill mode: read budget-state, derive the capability-specific message, then
+    // (separately) try to kill the manager. The message must reach the operator
+    // even when there is no live process to signal — capability posture is
+    // independent of kill success.
     const capabilityPath = path.join(runDir, CAPABILITY_FILE);
     const capabilityData = readJsonSafe(capabilityPath);
-
     const killMessage = deriveKillMessage(capabilityData);
 
-    // Try to find the manager PID from budget-state or a lockfile
-    // For now, we'll use a simple approach: look for a manager.pid file or infer from state
+    // Resolve the manager PID from the lockfile. Missing file, unreadable JSON,
+    // or a non-positive/non-integer pid are all treated as "no recoverable PID"
+    // rather than throwing.
     let managerPid = null;
     const lockFile = path.join(runDir, ".manager.lock");
     if (fs.existsSync(lockFile)) {
       const lockData = readJsonSafe(lockFile);
-      if (lockData && lockData.pid) {
+      if (lockData && Number.isSafeInteger(lockData.pid) && lockData.pid > 0) {
         managerPid = lockData.pid;
       }
     }
 
-    if (!managerPid) {
-      // Fallback: try to find the pid from parent process or other heuristics
-      console.error("Error: cannot determine manager PID for kill operation");
-      console.error("Expected .manager.lock file in run directory.");
-      process.exitCode = 1;
-      return;
-    }
-
-    console.log(`Killing run ${runId} (PID ${managerPid})...`);
-    const killResult = killProcessGroup(managerPid);
-
-    if (killResult.success) {
-      console.log("Kill signal delivered.");
+    let killResult;
+    if (managerPid === null) {
+      console.log(`No live manager PID on record for run ${runId} (missing/unrecoverable .manager.lock).`);
+      console.log("Nothing to signal — falling back to recorded-state resume guidance below.");
+      killResult = { success: false, error: "no-live-process-pid" };
     } else {
-      console.error(`Failed to kill: ${killResult.error}`);
-      process.exitCode = 1;
-      return;
+      console.log(`Killing run ${runId} (PID ${managerPid})...`);
+      killResult = killProcessGroup(managerPid);
+      if (killResult.success) {
+        console.log("Kill signal delivered.");
+      } else {
+        console.error(`Failed to kill: ${killResult.error}`);
+      }
     }
 
     console.log("");
     console.log(`Kill message (capability-derived):`);
     console.log(killMessage);
+
+    if (!killResult.success) {
+      process.exitCode = 1;
+    }
   } else {
-    // Watch mode: poll and display state
-    displayRunState(runId, runDir, readJsonSafe(budgetStatePath));
+    // Watch mode: continuously poll and tail the run's state. Stays alive
+    // until killed or interrupted (Ctrl+C) — it does NOT unref the poller.
+    const { stop } = startWatchLoop(runId, runDir, budgetStatePath, {
+      intervalMs: DEFAULT_REFRESH_INTERVAL_MS,
+    });
 
-    const poller = setInterval(() => {
-      const budgetState = readJsonSafe(budgetStatePath);
-      displayRunState(runId, runDir, budgetState);
-    }, DEFAULT_REFRESH_INTERVAL_MS);
-
-    poller.unref();
+    const shutdown = () => {
+      stop();
+      process.exit(0);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   }
 }
 
@@ -500,6 +610,153 @@ async function selftest() {
     }
   }
 
+  // Test 6: Budget usage-vs-limits + tripwire rendering (D1)
+  {
+    const testName = "budget-usage-vs-limits-and-tripwire-rendering";
+    try {
+      const synthState = {
+        schema_version: SCHEMA_VERSION,
+        steps_executed: 42,
+        furthest_step_index: 41,
+        cumulative_wall_time_ms: 12000,
+        external_calls_total: 3,
+        est_cost_usd: 1,
+        limits: {
+          max_steps: 100,
+          max_wall_time_ms: 60000,
+          max_est_cost_usd: 10,
+          max_external_calls: 50,
+        },
+        tripwires: [
+          { rule: "max_steps", at: 0.8, status: "armed" },
+          { rule: "max_est_cost_usd", at: 0.5, status: "tripped" },
+        ],
+        halted: null,
+      };
+
+      const summary = renderBudgetSummary(synthState);
+      const hasUsageVsLimit =
+        summary.includes("42 / 100") && summary.includes("12000 / 60000") && summary.includes("$1.00 / $10.00");
+      const hasTripwireState =
+        summary.toLowerCase().includes("tripwire") && summary.includes("armed") && summary.includes("tripped");
+
+      if (hasUsageVsLimit && hasTripwireState) {
+        pass(testName, "usage/limit pairs and tripwire state both rendered");
+      } else {
+        fail(
+          testName,
+          `hasUsageVsLimit=${hasUsageVsLimit} hasTripwireState=${hasTripwireState}; summary: ${summary}`
+        );
+      }
+    } catch (e) {
+      fail(testName, e.message);
+    }
+  }
+
+  // Test 7: kill with a missing/unrecoverable manager PID still emits the
+  // capability-specific message instead of aborting (D2).
+  {
+    const testName = "kill-missing-pid-emits-capability-message";
+    try {
+      const { spawnSync } = require("child_process");
+      const projectRoot = path.join(tmpDir, "nopid-project");
+      const runId = "selftest-nopid-run";
+      const runDir = path.join(projectRoot, ".graphsmith", "runs", runId);
+      fs.mkdirSync(runDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(runDir, BUDGET_STATE_FILE),
+        JSON.stringify({ schema_version: SCHEMA_VERSION, steps_executed: 0, halted: null })
+      );
+      fs.writeFileSync(
+        path.join(runDir, CAPABILITY_FILE),
+        JSON.stringify({ capability: "none", effect_id: "selftest-effect" })
+      );
+      // Deliberately no .manager.lock file.
+
+      const result = spawnSync(process.execPath, [__filename, runId, "--kill-run"], {
+        cwd: projectRoot,
+        encoding: "utf8",
+        timeout: 5000,
+        windowsHide: true,
+      });
+      const out = (result.stdout || "") + (result.stderr || "");
+      const emittedMessage = /reconciliation required/i.test(out);
+      const failedClosed = result.status !== 0;
+
+      if (emittedMessage && failedClosed) {
+        pass(testName, `kill exited non-zero and still emitted capability message: code=${result.status}`);
+      } else {
+        fail(
+          testName,
+          `emittedMessage=${emittedMessage} failedClosed=${failedClosed} (code=${result.status}); out: ${out.slice(0, 300)}`
+        );
+      }
+    } catch (e) {
+      fail(testName, e.message);
+    }
+  }
+
+  // Test 8: no unearned "inspected" claim for local-transactional (D3)
+  {
+    const testName = "no-false-inspected-claim";
+    try {
+      const msg = deriveKillMessage({ capability: "local-transactional", effect_id: "write-cfg" });
+      const claimsInspected = /inspected/i.test(msg);
+      const claimsSafeToResume = msg.includes("safe to resume");
+      if (!claimsInspected && claimsSafeToResume) {
+        pass(testName, `no unearned "inspected" claim; still safe-to-resume: ${msg}`);
+      } else {
+        fail(testName, `claimsInspected=${claimsInspected} claimsSafeToResume=${claimsSafeToResume}: ${msg}`);
+      }
+    } catch (e) {
+      fail(testName, e.message);
+    }
+  }
+
+  // Test 9: continuous tail polls repeatedly across frames (D4), bounded/injected
+  // so selftest stays fast and does not spawn a real long-lived child process.
+  {
+    const testName = "continuous-tail-polls-repeatedly";
+    try {
+      const runDir = path.join(tmpDir, "poll-run");
+      fs.mkdirSync(runDir, { recursive: true });
+      const pollBudgetPath = path.join(runDir, BUDGET_STATE_FILE);
+      fs.writeFileSync(
+        pollBudgetPath,
+        JSON.stringify({ schema_version: SCHEMA_VERSION, steps_executed: 1, halted: null })
+      );
+
+      const observedFrames = [];
+      await new Promise((resolve) => {
+        startWatchLoop("selftest-poll-run", runDir, pollBudgetPath, {
+          intervalMs: 15,
+          maxFrames: 3,
+          onFrame: (rid, dir, budgetState, frame) => {
+            observedFrames.push(budgetState ? budgetState.steps_executed : null);
+            // Mutate state so the NEXT poll observes a changed value — proves
+            // it re-reads live state each frame instead of caching frame 1.
+            try {
+              fs.writeFileSync(
+                pollBudgetPath,
+                JSON.stringify({ schema_version: SCHEMA_VERSION, steps_executed: 1 + frame, halted: null })
+              );
+            } catch {}
+          },
+          onDone: () => resolve(),
+        });
+      });
+
+      const distinctValues = new Set(observedFrames);
+      if (observedFrames.length === 3 && distinctValues.size > 1) {
+        pass(testName, `observed ${observedFrames.length} frames, values changed: ${JSON.stringify(observedFrames)}`);
+      } else {
+        fail(testName, `expected 3 frames with changing steps_executed, got: ${JSON.stringify(observedFrames)}`);
+      }
+    } catch (e) {
+      fail(testName, e.message);
+    }
+  }
+
   try {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch {}
@@ -533,4 +790,5 @@ module.exports = {
   renderWindowSummary,
   deriveKillMessage,
   killProcessGroup,
+  startWatchLoop,
 };

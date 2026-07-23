@@ -1,0 +1,152 @@
+{
+  "schema_version": "1.0",
+  "target": "scripts/watch.js",
+  "lane": "tests/watch/grok",
+  "platform": "win32",
+  "node": "v24.18.0",
+  "passed": 13,
+  "failed": 0,
+  "skipped": 0,
+  "total": 13,
+  "results": [
+    {
+      "name": "A1-read-only-cli-render-hash-unchanged",
+      "status": "PASS",
+      "reason": "runDir+tree hash stable; exit code=null timedOut=true outLen=4210"
+    },
+    {
+      "name": "A2-budget-usage-vs-limits-render",
+      "status": "PASS",
+      "reason": "usage and limits both rendered with comparison cues"
+    },
+    {
+      "name": "A3-halt-tripwire-window-canary-render",
+      "status": "PASS",
+      "reason": "halt+window/canary rendered; hash stable"
+    },
+    {
+      "name": "A4-capability-kill-messages-cli",
+      "status": "PASS",
+      "reason": "all capability classes map correctly (module+cli)",
+      "extra": {
+        "read-only": {
+          "modMsg": "no external effects in flight",
+          "modClass": "no-external-effects-in-flight",
+          "cliClass": "no-external-effects-in-flight",
+          "expectClass": "no-external-effects-in-flight",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-read-only (PID 25848)...\nKill signal delivered.\n\nKill message (capability-derived):\nno external effects in flight\n\n"
+        },
+        "local-transactional": {
+          "modMsg": "safe to resume (local effect \"write-cfg\", per recorded capability declaration; not verified against the effect itself)",
+          "modClass": "safe-to-resume",
+          "cliClass": "safe-to-resume",
+          "expectClass": "safe-to-resume",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-local-transactional (PID 36652)...\nKill signal delivered.\n\nKill message (capability-derived):\nsafe to resume (local effect \"write-cfg\", per recorded capability declaration; not verified against the effect itself)\n\n"
+        },
+        "idempotent-by-key": {
+          "modMsg": "resume will retry with the recorded idempotency key for \"create-rec\" — safe ASSUMING the remote honors the declared key (declaration by the adapter author, not verified by GraphSmith)",
+          "modClass": "safe-to-resume-assumed",
+          "cliClass": "safe-to-resume-assumed",
+          "expectClass": "safe-to-resume-assumed",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-idempotent-by-key (PID 23536)...\nKill signal delivered.\n\nKill message (capability-derived):\nresume will retry with the recorded idempotency key for \"create-rec\" — safe ASSUMING the remote honors the declared key (declaration by the adapter author, not verified by GraphSmith)\n\n"
+        },
+        "status-checkable": {
+          "modMsg": "reconciliation required for \"deploy\" (status-checkable; resume will run the reconciliation state machine)",
+          "modClass": "reconciliation-required",
+          "cliClass": "reconciliation-required",
+          "expectClass": "reconciliation-required",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-status-checkable (PID 20096)...\nKill signal delivered.\n\nKill message (capability-derived):\nreconciliation required for \"deploy\" (status-checkable; resume will run the reconciliation state machine)\n\n"
+        },
+        "none": {
+          "modMsg": "reconciliation required for \"webhook\" (no capability declared; manual verification needed)",
+          "modClass": "reconciliation-required",
+          "cliClass": "reconciliation-required",
+          "expectClass": "reconciliation-required",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-none (PID 32904)...\nKill signal delivered.\n\nKill message (capability-derived):\nreconciliation required for \"webhook\" (no capability declared; manual verification needed)\n\n"
+        },
+        "null-capability": {
+          "modMsg": "no external effects in flight",
+          "modClass": "no-external-effects-in-flight",
+          "cliClass": "no-external-effects-in-flight",
+          "expectClass": "no-external-effects-in-flight",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-null-capability (PID 42688)...\nKill signal delivered.\n\nKill message (capability-derived):\nno external effects in flight\n\n"
+        },
+        "missing-file": {
+          "modMsg": "reconciliation required (capability file missing or unreadable; completion unknown, manual verification needed)",
+          "modClass": "reconciliation-required",
+          "cliClass": "reconciliation-required",
+          "expectClass": "reconciliation-required",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-missing-file (PID 41328)...\nKill signal delivered.\n\nKill message (capability-derived):\nreconciliation required (capability file missing or unreadable; completion unknown, manual verification needed)\n\n"
+        },
+        "corrupt-json": {
+          "modMsg": "reconciliation required (capability file missing or unreadable; completion unknown, manual verification needed)",
+          "modClass": "reconciliation-required",
+          "cliClass": "reconciliation-required",
+          "expectClass": "reconciliation-required",
+          "hashOk": true,
+          "code": 0,
+          "out": "Killing run run-kill-corrupt-json (PID 52016)...\nKill signal delivered.\n\nKill message (capability-derived):\nreconciliation required (capability file missing or unreadable; completion unknown, manual verification needed)\n\n"
+        }
+      }
+    },
+    {
+      "name": "A4b-kill-message-when-pid-missing",
+      "status": "PASS",
+      "reason": "capability message still emitted without PID"
+    },
+    {
+      "name": "A5-process-group-kill-no-orphans",
+      "status": "PASS",
+      "reason": "tree dead; kill message class=no-external-effects-in-flight"
+    },
+    {
+      "name": "A6-no-network-calls",
+      "status": "PASS",
+      "reason": "no http/https/net/dns/fetch used by watch render or kill"
+    },
+    {
+      "name": "A7-missing-corrupt-run-state-graceful",
+      "status": "PASS",
+      "reason": "missing-run-dir,missing-budget-state,corrupt-budget-json,corrupt-capability-kill,usage-exit,empty-project"
+    },
+    {
+      "name": "A8-local-transactional-inspected-truth-claim",
+      "status": "PASS",
+      "reason": "message does not falsely claim inspected: safe to resume (local effect \"write-cfg\", per recorded capability declaration; not verified against the effect itself)"
+    },
+    {
+      "name": "A9-continuous-tail-stays-alive-for-poll",
+      "status": "PASS",
+      "reason": "polled update observed; elapsed=3192"
+    },
+    {
+      "name": "A10-selftest-and-module-surface",
+      "status": "PASS",
+      "reason": "selftest pass; exports ok; selftest_total=14"
+    },
+    {
+      "name": "A11-killProcessGroup-invalid-pid",
+      "status": "PASS",
+      "reason": "invalid PIDs rejected"
+    },
+    {
+      "name": "A12-kill-does-not-mutate-run-state",
+      "status": "PASS",
+      "reason": "hash stable; msg class=safe-to-resume-assumed"
+    }
+  ]
+}
