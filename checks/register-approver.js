@@ -73,7 +73,15 @@ function verifyApprovers(ctx) {
     const needProposerNeApprover = sod.proposer_ne_approver === true;
     const nOfM = sod.n_of_m && typeof sod.n_of_m.n === "number" ? sod.n_of_m.n : 1;
 
-    const validApprovers = new Set(); // distinct approver_ids with a valid signature over the head
+    // If SoD is required, it cannot be enforced without a valid proposer identity — fail closed
+    // rather than silently skip the check (Mistral Lane-A finding: malformed proposer_id).
+    if (needProposerNeApprover && (typeof proposer_id !== "string" || proposer_id.length < 1)) {
+      return fail("separation-of-duties required but proposer_id is missing/invalid — cannot enforce, failing closed", "untrusted-input");
+    }
+
+    // Anti-Sybil: distinct authority = distinct SIGNER KEY, not claimed approver_id. One trusted
+    // key must never mint multiple "approvers" to beat N-of-M (DeepSeek Lane-A finding).
+    const validSigners = new Set();
     for (let i = 0; i < approvals.length; i++) {
       const a = approvals[i];
       if (!shapeOk(a, ["schema_version", "approver_id", "role", "method", "artifact_sha256", "obligation_set_id", "signature"], ATT_KEYS)) { evidence.push("attestation[" + i + "]: bad shape — ignored"); continue; }
@@ -90,11 +98,11 @@ function verifyApprovers(ctx) {
       if (needProposerNeApprover && typeof proposer_id === "string" && a.approver_id === proposer_id) {
         return fail("separation-of-duties violated: proposer '" + proposer_id + "' also approved", "untrusted-input");
       }
-      validApprovers.add(a.approver_id); // distinct identity — counted, not branched on
+      validSigners.add(s.signer); // distinct KEY = distinct authority (identity is evidence, not the count)
     }
 
-    const distinct = validApprovers.size;
-    evidence.push("distinct valid non-proposer approvers over the anchored head: " + distinct + " (threshold N=" + nOfM + ").");
+    const distinct = validSigners.size;
+    evidence.push("distinct valid non-proposer signer keys over the anchored head: " + distinct + " (threshold N=" + nOfM + ").");
     if (distinct < nOfM) {
       return { status: "unavailable", evidence, assumptions, reason: "under threshold — " + distinct + " valid approver(s), need " + nOfM };
     }
