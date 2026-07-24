@@ -44,7 +44,7 @@ function produceBundle(run, keys) {
   const sign = (hex) => {
     if (algo === "ed25519") return crypto.sign(null, Buffer.from(hex, "utf8"), keys.privateKey).toString("base64");
     if (algo === "ecdsa-p256-sha256") return crypto.sign("sha256", Buffer.from(hex, "utf8"), keys.privateKey).toString("base64");
-    if (algo === "rsa-pss-sha256") return crypto.sign("sha256", { key: keys.privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING }, Buffer.from(hex, "utf8")).toString("base64");
+    if (algo === "rsa-pss-sha256") return crypto.sign("sha256", Buffer.from(hex, "utf8"), { key: keys.privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST }).toString("base64");
     throw new Error("unsupported algo " + algo);
   };
 

@@ -39,7 +39,7 @@ function verifySignatureValue(algo, publicKeyPem, msgHex, valueB64) {
     if (!allowed || allowed.indexOf(key.asymmetricKeyType) === -1) return false;
     if (algo === "ed25519") return crypto.verify(null, msg, key, sigBuf);
     if (algo === "ecdsa-p256-sha256") return crypto.verify("sha256", msg, key, sigBuf);
-    if (algo === "rsa-pss-sha256") return crypto.verify("sha256", msg, { key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING }, sigBuf);
+    if (algo === "rsa-pss-sha256") return crypto.verify("sha256", msg, { key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST }, sigBuf);
     return false;
   } catch { return false; }
 }
