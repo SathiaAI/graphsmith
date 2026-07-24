@@ -35,7 +35,11 @@ Each cell is the status a conformant verifier reports for that property, on that
 |---|---|---|---|---|
 | GraphSmith reference (`gsa-produce`) — win32 | verified | verified | verified | 10/10 |
 | GraphSmith reference — Ubuntu / macOS | *(CI-populated)* | *(CI-populated)* | *(CI-populated)* | *(CI)* |
-| MCP boundary shim (`gsa-mcp-shim`) — any MCP agent | verified (boundary) | verified | verified | *(boundary subset)* |
-| Independent producer A / B (third-party impl) | *(pending independent implementations)* | — | — | — |
+| MCP boundary shim → **Claude Code** (claude-opus-4-8) — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
+| MCP boundary shim → **Cursor** (gpt-5.6) — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
+| MCP boundary shim → **LangGraph agent** (gemini-2.5-pro) — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
+| Independent producer (third-party GSA impl) | *(open — pending independent implementations)* | — | — | — |
+
+*(The three boundary rows are real: each was sealed by `gsa-mcp-shim` from a distinct agent/model session and verified `PASS`, confirming profile A-boundary only — never a full plan profile the shim couldn't observe.)*
 
 **Honest scope.** The reference producer and the MCP boundary shim are two producers GraphSmith ships; the boundary shim already emits a valid, honestly-labeled bundle for MCP agents GraphSmith did not build (profile A-boundary only — see [`tests/gsa-mcp/ADJUDICATION.md`](../tests/gsa-mcp/ADJUDICATION.md)). Rows for genuinely **independent** implementations are open — the conformance kit + evidence badge exist precisely so others can fill them; that is the path to a ratified (non-draft) protocol. See [`docs/standards/NIST-prior-art-submission.md`](standards/NIST-prior-art-submission.md).
