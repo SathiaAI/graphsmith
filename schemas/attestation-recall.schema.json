@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/attestation-recall.schema.json",
+  "title": "GraphSmith attestation recall / revocation (R3)",
+  "description": "A record that recalls a previously published attestation bundle (e.g. a signer was later revoked, or a defect was found). A verifier given the recall list flags a recalled bundle on re-verify — fail-closed: a recalled bundle never re-verifies as valid. C1: `recalled_at` is evidence, never a decision input. Frozen Wave 0 (v0.4.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "recalls"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "recalls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bundle_id", "manifest_sha256", "reason"],
+        "properties": {
+          "bundle_id": { "type": "string", "pattern": "^gsa-[0-9a-f]{16}$" },
+          "manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Binds the recall to the exact bundle content." },
+          "reason": { "type": "string", "minLength": 1, "enum": ["signer-revoked", "defect-found", "superseded", "other"] },
+          "detail": { "type": "string" },
+          "recalled_at": { "type": "string", "description": "Evidence only (C1); never a decision input." }
+        }
+      }
+    }
+  }
+}

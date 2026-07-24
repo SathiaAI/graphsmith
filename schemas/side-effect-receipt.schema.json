@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/side-effect-receipt.schema.json",
+  "title": "GraphSmith side-effect receipt (R2)",
+  "description": "The external system's returned confirmation for one recorded effect, captured where the adapter provides one; an UNKNOWN status where it does not. Extends the E (effect-reconciled) profile. Honest boundary: this is once-and-replay-verified reconciliation of a RECORDED effect — NOT exactly-once end-to-end (true single-delivery still needs an idempotency key the external system honours). C1-binding: `ts` is evidence, recorded, never a decision input. Frozen Wave 0 (v0.4.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "adapter_id", "action", "status"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "adapter_id": { "type": "string", "pattern": "^[a-z0-9-]+$", "description": "The adapter namespace that produced this receipt." },
+    "action": { "type": "string", "minLength": 1, "description": "The effect the receipt attests (e.g. 'email.send', 'payment.charge')." },
+    "external_id": {
+      "type": "string",
+      "description": "The external system's returned id for the effect (present iff the adapter provides one). Its presence is what upgrades an effect from UNKNOWN to reconciled."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "description": "The idempotency key sent to the external system, if any. End-to-end single delivery depends on the external system honouring this key — an adapter-author property, not something GSA verifies."
+    },
+    "status": {
+      "enum": ["success", "unknown", "failed"],
+      "description": "success = external system confirmed; unknown = no receipt from the adapter (UNKNOWN_EFFECT path — reconciliation-required, fail-closed); failed = external system rejected."
+    },
+    "ts": {
+      "type": "string",
+      "description": "Timestamp of the receipt. EVIDENCE ONLY (C1) — never a decision input. Optional; absence is not a failure."
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/signer-registry.schema.json",
+  "title": "GraphSmith approved-signer registry (R3)",
+  "description": "The set of signer keys a verifier trusts, with lifecycle status (active / rotated / revoked) and rotation chaining. Trust of a signer remains the verifier's policy (GSA-SPEC §5.5); this registry is how a verifier expresses that policy over time. C1: `added_at` is evidence, never a decision input. Frozen Wave 0 (v0.4.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "signers"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "signers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signer_id", "public_key_pem", "status"],
+        "properties": {
+          "signer_id": { "type": "string", "minLength": 1 },
+          "public_key_pem": { "type": "string", "minLength": 1 },
+          "role": { "type": "string", "description": "Optional role/hierarchy tag (e.g. release-owner, ci)." },
+          "status": { "enum": ["active", "rotated", "revoked"], "description": "revoked/rotated => fail-closed for new signatures; a signature valid at sign time may still verify if the registry records the key was active then (verifier policy)." },
+          "rotated_to": { "type": "string", "description": "signer_id of the successor key when status=rotated (rotation chain)." },
+          "added_at": { "type": "string", "description": "Evidence only (C1); never a decision input." }
+        }
+      }
+    }
+  }
+}

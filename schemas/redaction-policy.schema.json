@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/redaction-policy.schema.json",
+  "title": "GraphSmith trace-mode + redaction policy (R4)",
+  "description": "Declarative policy for how much of the execution trace a bundle carries (`trace_mode`) and the redaction rules applied before sealing. The redaction mechanism preserves the trace hash chain (redactions[] are recorded, not silently dropped). A leaked secret in an exported trace is a fail-closed defect. Frozen Wave 0 (v0.4.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trace_mode"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "trace_mode": {
+      "enum": ["full", "redacted", "metadata-only"],
+      "description": "full = complete trace; redacted = trace with redaction rules applied (redactions[] recorded, hash chain intact); metadata-only = step shape/status without payloads."
+    },
+    "redaction_rules": {
+      "type": "array",
+      "description": "Rules applied before sealing. Measured by a recall-gated secret/PII conformance battery.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["class"],
+        "properties": {
+          "class": { "enum": ["secret", "pii", "credential"] },
+          "pattern": { "type": "string", "description": "Optional regex/pattern identifying the class." },
+          "replacement": { "type": "string", "description": "What redacted content is replaced with (a hash reference by default, so the chain stays intact)." }
+        }
+      }
+    }
+  }
+}
