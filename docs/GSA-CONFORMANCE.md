@@ -38,8 +38,10 @@ Each cell is the status a conformant verifier reports for that property, on that
 | MCP boundary shim → **Claude Code** (claude-opus-4-8) — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
 | MCP boundary shim → **Cursor** (gpt-5.6) — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
 | MCP boundary shim → **LangGraph agent** (gemini-2.5-pro) — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
+| MCP boundary shim → **Devin** — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
+| MCP boundary shim → **Windsurf (Cascade)** — agent GS didn't build | verified (boundary) | verified | verified | boundary subset |
 | Independent producer (third-party GSA impl) | *(open — pending independent implementations)* | — | — | — |
 
-*(The three boundary rows are real: each was sealed by `gsa-mcp-shim` from a distinct agent/model session and verified `PASS`, confirming profile A-boundary only — never a full plan profile the shim couldn't observe.)*
+*(The boundary rows are real: each was sealed by `gsa-mcp-shim` from a distinct agent session and verified `PASS`, confirming profile A-boundary only — never a full plan profile the shim couldn't observe. The shim has **no per-agent code** — any MCP-speaking agent is attested identically, with no prior checking; the requirement is "speaks MCP + shim in the path," not "on our list." Non-MCP side effects and the agent's internal plan are out of boundary scope, stated in [`KNOWN-LIMITATIONS.md`](../KNOWN-LIMITATIONS.md).)*
 
 **Honest scope.** The reference producer and the MCP boundary shim are two producers GraphSmith ships; the boundary shim already emits a valid, honestly-labeled bundle for MCP agents GraphSmith did not build (profile A-boundary only — see [`tests/gsa-mcp/ADJUDICATION.md`](../tests/gsa-mcp/ADJUDICATION.md)). Rows for genuinely **independent** implementations are open — the conformance kit + evidence badge exist precisely so others can fill them; that is the path to a ratified (non-draft) protocol. See [`docs/standards/NIST-prior-art-submission.md`](standards/NIST-prior-art-submission.md).
