@@ -18,7 +18,9 @@ function subsetOk(cls, req, grant) {
     if (!Array.isArray(reqList)) return true;
     const g = Array.isArray(grantList) ? grantList : [];
     if (cls === "filesystem") return reqList.every((p) => {
-      if (typeof p !== "string" || p.indexOf("..") !== -1) return false;                 // reject traversal
+      if (typeof p !== "string") return false;
+      // Canonical paths only: reject any "." or ".." segment (defeats traversal + normalization tricks).
+      if (p.split("/").some((s) => s === "." || s === "..")) return false;
       // Segment-boundary containment: exactly the grant, or strictly under grant + "/".
       // (Plain startsWith would let "/inputs-evil" pass a grant of "/inputs".)
       return g.some((gp) => typeof gp === "string" && (p === gp || p.startsWith(gp.endsWith("/") ? gp : gp + "/")));
@@ -48,12 +50,16 @@ function verifyCapabilities(ctx) {
     if (!ctx || typeof ctx !== "object") return fail("no context");
     const grant = ctx.grant;
     if (!grant || typeof grant !== "object" || grant.schema_version !== "1.0") return fail("capability-grant missing/invalid");
+    // NOTE: skill_id is IDENTITY — validated as evidence elsewhere, but deliberately NOT a decision
+    // input here (C1). The capability verdict must be invariant to skill_id's value/type; gating on it
+    // would violate C1 (confirmed by the DeepSeek Lane-R1 C1 test).
     const enforced = new Set(Array.isArray(grant.enforced) ? grant.enforced : []);
     const grants = grant.grants || {};
     const requested = ctx.requested || {};
     const attested = ctx.attested || {};
 
     for (const cls of CLASSES) {
+      if (Object.prototype.hasOwnProperty.call(attested, cls) && typeof attested[cls] !== "boolean") return fail("attested['" + cls + "'] is present but not a boolean — refusing malformed attestation (fail-closed)");
       const claimsSatisfied = attested[cls] === true;
       const req = requested[cls];
       const within = subsetOk(cls, req, grants[cls]);
@@ -84,7 +90,7 @@ const check = {
     const r = verifyCapabilities(ctx || {});
     const out = { status: r.status, evidence: r.evidence.slice(), assumptions: r.assumptions.slice() };
     if (r.failure_domain) out.failure_domain = r.failure_domain;
-    if (r.reason) out.evidence.push("reason: " + r.reason);
+    if (r.reason) { out.reason = r.reason; out.evidence.push("reason: " + r.reason); }
     return out;
   },
 };
