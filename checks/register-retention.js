@@ -49,18 +49,23 @@ function walkRetention(ctx) {
     if (chain.length === 0) return { status: "not-applicable", evidence, assumptions, reason: "empty retention log — nothing to verify" };
 
     let prevHash = null;
+    let prevSeq = null;
     for (let i = 0; i < chain.length; i++) {
       const e = chain[i];
       if (!entryShapeOk(e)) return fail("entry[" + i + "] has an invalid shape/type — refusing (fail-closed)");
-      if (e.seq !== i + 1) return fail("entry[" + i + "] seq=" + e.seq + " expected " + (i + 1) + " — sequence gap or reorder (append-only violated)");
       if (i === 0) {
         if (e.prev_packet_sha256 !== null) return fail("entry[0].prev_packet_sha256 must be null (chain root)");
       } else {
+        // Contiguous append-only: seq increments by exactly 1. A gap/reorder while the hash chains
+        // contiguously means a manipulated sequence. The starting seq may be any int>=1 (a rotated
+        // or global counter need not begin at 1 — Mistral Lane-C finding).
+        if (e.seq !== prevSeq + 1) return fail("entry[" + i + "] seq=" + e.seq + " expected " + (prevSeq + 1) + " — sequence gap/reorder (append-only violated)");
         if (e.prev_packet_sha256 !== prevHash) return fail("entry[" + i + "] does not chain to entry[" + (i - 1) + "] — broken/mutated link");
       }
       prevHash = e.packet_sha256;
+      prevSeq = e.seq;
     }
-    evidence.push("hash chain intact across " + chain.length + " entry(ies); sequence monotonic from 1; append-only.");
+    evidence.push("hash chain intact across " + chain.length + " entry(ies); seq contiguous (append-only), starting at " + chain[0].seq + ".");
 
     // Anchored-head binding: the latest entry must match the current adoption-log head, when supplied.
     const last = chain[chain.length - 1];
