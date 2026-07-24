@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/register-policy.schema.json",
+  "title": "GraphSmith register policy (register — separation-of-duties + activation)",
+  "description": "Policy that governs approver separation-of-duties and the preconditions under which regulated mode may activate. C2-binding: fail_closed is a const true — the register never relaxes to fail-open; regulated mode activates only when every activation precondition holds against a complete, valid register. Frozen Wave 0 (v0.3.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "separation_of_duties", "fail_closed", "activation_preconditions"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "separation_of_duties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposer_ne_approver"],
+      "properties": {
+        "proposer_ne_approver": {
+          "type": "boolean",
+          "description": "When true, the proposer of a change MUST NOT be its approver (checked fail-closed)."
+        },
+        "n_of_m": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["n", "m"],
+          "description": "Optional threshold: require N distinct valid approvers out of M eligible.",
+          "properties": {
+            "n": { "type": "integer", "minimum": 1 },
+            "m": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "fail_closed": {
+      "const": true,
+      "description": "Non-negotiable. Any unmet precondition, missing evidence, or ambiguous state resolves to refuse/not-covered, never to pass."
+    },
+    "activation_preconditions": {
+      "type": "array",
+      "minItems": 1,
+      "description": "All must hold for regulated mode to activate. Any false => refuse to activate, loudly.",
+      "items": {
+        "enum": [
+          "obligations_register_complete",
+          "no_manual_only_marked_covered",
+          "approver_attestation_valid",
+          "retention_chain_intact",
+          "release_signature_verified"
+        ]
+      }
+    }
+  }
+}

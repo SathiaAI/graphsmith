@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/approver-attestation.schema.json",
+  "title": "GraphSmith approver attestation (register Lane A)",
+  "description": "Records WHO approved WHAT, bound by a detached signature over the assure-packet hash. C1-binding: approver identity and timestamps are EVIDENCE, recorded and verified, and MUST NOT be a decision input to any pass/fail path (mirrors adoption-entry.human.ts). Frozen Wave 0 (v0.3.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "approver_id",
+    "role",
+    "method",
+    "artifact_sha256",
+    "obligation_set_id",
+    "signature"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "approver_id": { "type": "string", "minLength": 1, "description": "Stable identity of the approver (evidence, not a routing input)." },
+    "role": { "type": "string", "minLength": 1, "description": "Role the approval was made under (e.g. release-owner, compliance-officer)." },
+    "method": {
+      "enum": ["signed-commit", "os-user", "external-idp"],
+      "description": "How the identity was established."
+    },
+    "artifact_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the exact artifact (assure packet) approved."
+    },
+    "obligation_set_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier of the obligation set (Lane B) this approval covers."
+    },
+    "attested_at": {
+      "type": "string",
+      "description": "Timestamp of attestation. EVIDENCE ONLY (C1) — never a decision input. Optional; absence is not a failure."
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algo", "signer", "packet_sha256", "value"],
+      "description": "Detached signature over the assure-packet SHA-256 (reuses the hash assure.js already computes).",
+      "properties": {
+        "algo": { "enum": ["ed25519", "ecdsa-p256-sha256", "rsa-pss-sha256"] },
+        "signer": { "type": "string", "minLength": 1, "description": "Key identifier; trust of the signer is verifier policy, not a GraphSmith guarantee." },
+        "packet_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "value": { "type": "string", "minLength": 1, "description": "Signature over packet_sha256." }
+      }
+    }
+  }
+}

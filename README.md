@@ -178,7 +178,7 @@ Read these before trusting the output with anything that matters:
 
 ## What this skill does NOT do
 
-Equally important to state explicitly:
+Equally important to state explicitly (for the GSA attestation layer, the full honesty boundary — what it verifies, and its replay, external-side-effect, generated-skill, per-skill-capability, and signer-trust limitations — is consolidated in [`KNOWN-LIMITATIONS.md`](KNOWN-LIMITATIONS.md), with a worked [offline-verifier transcript](docs/examples/offline-verify.md)):
 
 - **It does not replace orchestration frameworks or durable execution engines.** LangGraph, Temporal, Inngest and peers solve distributed, long-running, at-scale delivery-guarantee workloads. GraphSmith is the disciplined on-ramp; the graduation ladder tells you when to move up, and the checkpoint seam in generated code is built for that migration.
 - **It does not run or host anything.** No cloud service, no runtime, no daemon. Everything is local files and local scripts you can read in minutes.

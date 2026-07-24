@@ -18,8 +18,9 @@ const PIN = "0.8.0"; // bump together with GraphSmith releases, after review
 // release was reviewed against. A mismatch means the content behind the label
 // changed — refuse and say so. Residual (disclosed): the check queries the same
 // registry it distrusts, so it defeats label reassignment, not a registry that
-// lies consistently; air-gapped verification belongs to the v0.2.0 regulated
-// extension. Bump PIN and EXPECTED_INTEGRITY together, never separately.
+// lies consistently; air-gapped verification (out-of-band manifest signature)
+// is delivered in the v0.3.0 regulated register. Bump PIN and EXPECTED_INTEGRITY
+// together, never separately.
 const EXPECTED_INTEGRITY = "sha512-YAfZijKUBLJxfSeg0XQJNDT02z+YhjP778Wi3bmBNDpWNVzJtmmUKd5Wt88+OCT6bLhMo1efcOAS9ye+zJ+LuQ==";
 const GROUND_CMD = `npx knosky@${PIN} .`;
 const win = process.platform === "win32";
