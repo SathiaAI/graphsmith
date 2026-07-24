@@ -17,7 +17,12 @@ function subsetOk(cls, req, grant) {
   const within = (reqList, grantList) => {
     if (!Array.isArray(reqList)) return true;
     const g = Array.isArray(grantList) ? grantList : [];
-    if (cls === "filesystem") return reqList.every((p) => g.some((gp) => typeof p === "string" && typeof gp === "string" && p.startsWith(gp))); // path-prefix containment
+    if (cls === "filesystem") return reqList.every((p) => {
+      if (typeof p !== "string" || p.indexOf("..") !== -1) return false;                 // reject traversal
+      // Segment-boundary containment: exactly the grant, or strictly under grant + "/".
+      // (Plain startsWith would let "/inputs-evil" pass a grant of "/inputs".)
+      return g.some((gp) => typeof gp === "string" && (p === gp || p.startsWith(gp.endsWith("/") ? gp : gp + "/")));
+    });
     return reqList.every((x) => g.indexOf(x) !== -1); // exact-match allowlist (model/subprocess/network)
   };
   if (cls === "filesystem") return within(req.read, grant.read) && within(req.write, grant.write);
