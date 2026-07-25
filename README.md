@@ -13,6 +13,8 @@ Works identically in Claude Code, Codex CLI, Gemini CLI, Cursor, Windsurf / Devi
 
 [Reproduce it](https://graphsmith.ai) · [Get started](#60-second-start) · [What's inside](#whats-in-the-box) · [FAQ](#faq) · [Report a bug](https://github.com/SathiaAI/graphsmith/issues)
 
+<a href="https://graphsmith.ai"><img src="assets/gsa-v0.3.0-hero.png" alt="GraphSmith Attestation (GSA) — MCP connects your agents, GSA proves what they did: a signed, replayable, tamper-evident record of every AI workflow run" width="600"></a>
+
 <a href="https://graphsmith.ai"><img src="assets/graphsmith-demo.gif" alt="GraphSmith in motion — an agent workflow builds, is killed mid-run, and resumes from its last checkpoint instead of restarting; then the three failure modes it fixes — amnesia, duplication, hallucination — and a live proof run" width="760"></a>
 
 </div>
