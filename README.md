@@ -207,7 +207,18 @@ Driven by real user questions — the best way to influence it is to [open an is
 
 Every security-tier component was built by one model family and adversarially tested by ≥2 different, non-Anthropic families — **16 real defects found and fixed** (1 critical, 4 high), zero by rubber-stamp review — then closed out by a **282-scenario gauntlet (all HOLD / 0 BREAK), independently reproduced by a non-Anthropic harness**. The MCP shim attests any MCP-speaking agent with no agent changes (Claude Code, Cursor, LangGraph, Devin, Windsurf verified). Full record in [`docs/reviews/`](docs/reviews/).
 
-**Next — v0.4.0.** Per-skill capability grant enforcement (filesystem / model / subprocess); keyless / transparency-log signing (opt-in); deeper evidence-retention automation; and broader independent GSA implementations toward a ratified (non-draft) protocol.
+**In progress — v0.4.0: hardening the trust surface.** Deferred review gaps become enforced controls, each built by one model family and adversarially reviewed by ≥2 independent non-Anthropic families (no self-certification):
+
+- **Capability conformance (R1)** — per-skill filesystem / model / subprocess / network grants; requested ⊆ granted, attested only when the class is actually enforced.
+- **Side-effect receipts (R2)** — recorded external effects reconcile against adapter receipts; evidence-less "success" is not vouched for.
+- **Signer lifecycle + recall (R3)** — revoked signers and recalled attestations fail closed; a rotated key resolves only to a live successor.
+- **Secret / PII redaction (R4)** — an exported trace carrying an unredacted secret or PII fails closed, against a declared-format recall gate.
+- **SBOM + build provenance (R5)** — a hash-pinned bill of materials and provenance recomputed against actual artifact hashes; `npm publish --provenance`.
+- **Policy-as-code (R8)** — versioned enterprise-safe profiles; a required control counts only when enforced.
+- **GSA §9.11** — the verifier recomputes all five run-time controls from a bundle's own evidence and fails closed on any control-lie; a v0.3.0 bundle verifies unchanged.
+- **Independent Assurance (R7)** — a citable program formalizing the ≥2-non-Anthropic posture ([`docs/ASSURANCE.md`](docs/ASSURANCE.md)).
+
+A `graphsmith verify <bundle>` CLI ships from the `graphsmith-skill` package for CI and enterprise verifiers.
 
 **Also in design — System Blueprint & Architecture Review Gate** ([#2](https://github.com/SathiaAI/graphsmith/issues/2))
 Information architecture for multi-piece systems: a system blueprint (piece inventory, single-owner data map, frozen contract cards, blast-radius statements), lightweight decision records, a blocking architecture review gate with a concrete rubric and mandatory triggers, and chaos testing extended to the seams between pieces — kill one piece mid-handoff, and confirm the others' state survives.
