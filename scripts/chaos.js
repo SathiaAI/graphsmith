@@ -29,17 +29,40 @@ const runDir = path.join(dir, ".runs", runId);
 const fail = (msg) => { console.error("❌ FAIL: " + msg); process.exit(1); };
 const pass = (msg) => console.log("✅ " + msg);
 
-function startManager() {
-  return spawn(process.execPath, ["manager.js", runId], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+function startManager(extraArgs) {
+  return spawn(process.execPath, ["manager.js", runId].concat(extraArgs || []),
+    { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
 }
+const collect = (p) => {
+  let out = "";
+  p.stdout.on("data", (d) => (out += d));
+  p.stderr.on("data", (d) => (out += d));
+  return () => out;
+};
+const alivePid = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return false; } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A checkpoint is ONLY a completed-step save point: `.runs/<runId>/<step>.json`
+// for a step named in pipeline.json (e.g. 01-gather.json). Everything else the
+// run writes into that directory is RUNTIME STATE, not progress:
+// `.watchdog-*` (capability snapshot / heartbeat), `budget-state.json`,
+// `.lock`, and the logs. Counting runtime state as a checkpoint made the
+// harness (a) mis-report how far the run got, (b) mis-fire the PA-9
+// degenerate-run check, and (c) demand a `"status":"skipped"` line for a
+// pseudo-step like `.watchdog-capability`, whose normal re-write on resume was
+// then reported as a broken resume. Deriving the allowlist from pipeline.json
+// (which this harness already reads) is exact: no naming heuristic to drift.
+const STEP_CHECKPOINTS = new Set(PIPELINE.map((s) => s.step + ".json"));
 const checkpoints = () =>
-  fs.existsSync(runDir) ? fs.readdirSync(runDir).filter((f) => f.endsWith(".json") && !f.includes(".corrupt-")) : [];
+  fs.existsSync(runDir)
+    ? fs.readdirSync(runDir).filter((f) => STEP_CHECKPOINTS.has(f) && !f.includes(".corrupt-"))
+    : [];
 
 (async () => {
   // --- Run 1: kill after the first checkpoint appears -----------------------
   const p1 = startManager();
   let p1Exited = false;
   p1.on("exit", () => (p1Exited = true));
+  const p1Closed = new Promise((r) => p1.on("close", r)); // registered BEFORE the kill
   const killState = await new Promise((resolve) => {
     const t0 = Date.now();
     const iv = setInterval(() => {
@@ -56,8 +79,63 @@ const checkpoints = () =>
   const survivedSteps = killState.cps;
   pass(`Kill landed MID-FLIGHT after ${survivedSteps.length}/${totalSteps} checkpoint(s): ${survivedSteps.join(", ")}`);
 
+  // --- GUARD DISPOSITION after the crash (D4 dead-man switch) ---------------
+  // The scaffold's watchdog arms a dead-man switch (WATCHDOG-HALT.json) for the
+  // whole run: if the GUARD dies, that file persists and the next start REFUSES
+  // to resume without --acknowledge-budget. Killing the manager resolves one of
+  // two legitimate ways, and which one depends on the OS, not on correctness:
+  //   (a) the watchdog is orphaned but ALIVE — it sees its watched pid is gone,
+  //       writes an `.orphan` marker and withdraws the switch (POSIX).
+  //   (b) the kill takes the whole process tree, so the watchdog dies WITH the
+  //       manager (observed on Windows) — the switch legitimately persists and a
+  //       plain restart MUST refuse: from disk, "guard dead + run unfinished" is
+  //       exactly the state D4 exists to catch.
+  // Both are asserted. Acknowledging unconditionally instead would step over a
+  // real halt, and assuming (a) everywhere turns a correct Windows refusal into
+  // a red build; assuming (b) everywhere would let a guard that silently fails
+  // to disarm pass unnoticed. A guard still ALIVE but not disarming is a defect
+  // and fails below, as does real halt evidence (halt without dead_man_switch).
+  await p1Closed;
+  const haltFile = path.join(runDir, "WATCHDOG-HALT.json");
+  const readHalt = () => { try { return JSON.parse(fs.readFileSync(haltFile, "utf8")); } catch (e) { return null; } };
+  const disarmDeadline = Date.now() + 15000;
+  let guard = { seen: false, disarmed: true, evidence: null };
+  for (;;) {
+    const armed = readHalt();
+    if (armed === null) break;                            // withdrawn (or no watchdog in this project)
+    if (armed.halt && !armed.dead_man_switch)
+      fail("The watchdog reported a REAL halt during the crash test: " + (armed.kill_message || "") +
+        "\n" + JSON.stringify(armed) + "\nThat is not the fault this harness injected — investigate before trusting any resume result.");
+    guard = { seen: true, disarmed: false, evidence: armed };
+    if (armed.watchdog_pid && !alivePid(armed.watchdog_pid)) break;   // case (b): guard died with the tree
+    if (Date.now() > disarmDeadline)
+      fail("The watchdog is still RUNNING (pid " + armed.watchdog_pid + ") 15s after its manager died but never withdrew its dead-man switch — the orphan hand-off is broken, so every crashed run needs a manual --acknowledge-budget. Evidence: " + JSON.stringify(armed));
+    await sleep(50);
+  }
+  if (guard.seen && guard.disarmed === false && readHalt() === null) guard.disarmed = true;
+  // The orphan marker is the guard's positive receipt for case (a): it withdrew
+  // the switch BECAUSE its manager died, not because the switch was never armed.
+  // On POSIX the hand-off usually completes before the manager's `close` event
+  // even reaches us, so the marker — not a transient armed switch — is the
+  // evidence to assert on.
+  if (guard.disarmed && fs.existsSync(haltFile + ".orphan"))
+    pass("Guard hand-off: the orphaned watchdog withdrew its dead-man switch and left an orphan marker after its manager died (D4 evidence intact; a stale switch does not block the resume)");
+  if (guard.seen && !guard.disarmed) {
+    // The kill took the guard too. Prove the switch is HONORED before using it:
+    // a plain restart that resumed here would mean D4 is decorative.
+    const refuse = startManager();
+    const refuseOut = collect(refuse);
+    const refuseCode = await new Promise((r) => refuse.on("close", r));
+    if (refuseCode === 0 || !/--acknowledge-budget/.test(refuseOut()))
+      fail("The kill killed the guard too (watchdog pid " + guard.evidence.watchdog_pid + " is gone) and its dead-man switch is still on disk, yet a plain restart did NOT refuse (exit " + refuseCode + ") — a dead guard was silently stepped over. Output:\n" + refuseOut().slice(0, 500));
+    pass("Dead-man switch honored: the kill took the guard with the manager, and a plain restart REFUSED to resume past a dead guard (D4), demanding --acknowledge-budget");
+  }
+
   // --- Run 2: restart — must resume and either complete or halt safely ------
-  const p2 = startManager();
+  // When the guard died with the manager (case b) the operator's documented
+  // move is --acknowledge-budget; the resume guarantees below must hold either
+  // way. Acknowledging RECORDS the extension, it does not reset any budget.
+  const p2 = startManager(guard.disarmed ? [] : ["--acknowledge-budget"]);
   let out2 = "", err2 = "";
   p2.stdout.on("data", (d) => (out2 += d));
   p2.stderr.on("data", (d) => (err2 += d));
