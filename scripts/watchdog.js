@@ -35,8 +35,12 @@
  *                "elapsed_ms": <int>, "last_heartbeat": <int|null>,
  *                "kill_message": "<capability-specific>", "killed_at_mono_ms": <int>,
  *                "inspected": { ... } }
- *   Kill signal: SIGKILL on Unix (process-group via negative pid),
- *                taskkill /T /F on Windows (process tree).
+ *   Kill signal: SIGKILL on Unix to the process group (negative pid) AND to every
+ *                enumerated descendant of the watched pid — the group alone is
+ *                not enough, because kill(-pid) only reaches a group if the
+ *                watched process is that group's LEADER, which it is not when it
+ *                was spawned by another process rather than launched from a
+ *                shell. taskkill /T /F on Windows (process tree).
  *
  * D4 — Dead-man's-switch / watchdog liveness signal:
  *   At startup, the watchdog writes a preliminary halt file (dead_man_switch: true)
@@ -152,6 +156,67 @@ function deriveKillMessage(capStatus, capData) {
   }
 }
 
+// POSIX descendant enumeration. `kill(-pid)` addresses the process GROUP whose
+// pgid == pid, which exists only if the watched process is a group LEADER. A
+// manager started by a shell usually is; one spawned by another process (a test
+// harness, a supervisor, an IDE runner) is NOT — there `kill(-pid)` raises ESRCH
+// and the old fallback killed the manager ALONE, leaving its workers running.
+// Orphaned workers can keep firing external effects after the guard has declared
+// the run halted, which is exactly what the tree kill exists to prevent. So we
+// enumerate the real descendant set from the process table and kill it
+// explicitly, deepest-first, in addition to trying the group.
+function descendantsOf(rootPid) {
+  const children = new Map();      // ppid -> [pid...]
+  const record = (pid, ppid) => {
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || pid <= 0) return;
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  };
+  let mapped = false;
+  try {
+    // Linux: /proc/<pid>/stat field 4 is ppid. Field 2 (comm) can contain
+    // spaces and parentheses, so parse after the LAST ')'.
+    for (const entry of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      let stat;
+      try { stat = fs.readFileSync("/proc/" + entry + "/stat", "utf8"); } catch { continue; }
+      const close = stat.lastIndexOf(")");
+      if (close === -1) continue;
+      const ppid = parseInt(stat.slice(close + 2).split(" ")[1], 10);
+      record(parseInt(entry, 10), ppid);
+    }
+    mapped = children.size > 0;
+  } catch { mapped = false; }
+  if (!mapped) {
+    // macOS and any POSIX without /proc.
+    try {
+      const out = execSync("ps -Ao pid=,ppid=", { encoding: "utf8", timeout: 5000 });
+      for (const line of out.split("\n")) {
+        const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+        if (m) record(parseInt(m[1], 10), parseInt(m[2], 10));
+      }
+    } catch { return []; }
+  }
+  // Breadth-first from the root; `seen` also guards against a cycle in a
+  // malformed process table.
+  const out = [];
+  const seen = new Set([rootPid]);
+  let frontier = [rootPid];
+  while (frontier.length) {
+    const next = [];
+    for (const p of frontier) {
+      for (const c of children.get(p) || []) {
+        if (seen.has(c)) continue;
+        seen.add(c);
+        out.push(c);
+        next.push(c);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
 function killProcessGroup(pid) {
   if (process.platform === "win32") {
     try {
@@ -160,14 +225,20 @@ function killProcessGroup(pid) {
     } catch {
       try { process.kill(pid, "SIGKILL"); return true; } catch { return false; }
     }
-  } else {
-    try {
-      process.kill(-pid, "SIGKILL");
-      return true;
-    } catch {
-      try { process.kill(pid, "SIGKILL"); return true; } catch { return false; }
-    }
   }
+  // Snapshot descendants BEFORE killing the root: once the root is gone its
+  // children are reparented to init and the parent links are lost.
+  const descendants = descendantsOf(pid);
+  let rootKilled = false;
+  try { process.kill(-pid, "SIGKILL"); rootKilled = true; } catch (e) {}
+  if (!rootKilled) {
+    try { process.kill(pid, "SIGKILL"); rootKilled = true; } catch (e) {}
+  }
+  // Deepest-first so a parent cannot spawn a replacement while we work upward.
+  for (let i = descendants.length - 1; i >= 0; i--) {
+    try { process.kill(descendants[i], "SIGKILL"); } catch (e) {}
+  }
+  return rootKilled;
 }
 
 function pidAlive(pid) {

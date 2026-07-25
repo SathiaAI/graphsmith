@@ -24,10 +24,22 @@ function record(status, name, reason) {
 function alive(pid) {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  // A ZOMBIE has been killed but not yet reaped, and signal 0 still succeeds for
+  // it. Where PID 1 is a real init that is irrelevant; inside a container whose
+  // PID 1 does not reap orphans (a plain `docker run`, many CI-in-container
+  // setups) a correctly-killed grandchild lingers as a zombie forever and this
+  // check would report the tree kill as failed when it actually worked. State Z
+  // in /proc/<pid>/stat means dead. Field 3 is the state, but field 2 (comm) can
+  // contain spaces and parentheses, so read after the LAST ')'.
+  try {
+    const stat = require("fs").readFileSync("/proc/" + pid + "/stat", "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close !== -1 && stat.slice(close + 2).split(" ")[0] === "Z") return false;
+  } catch { /* no /proc (Windows, macOS): signal 0 is the best signal available */ }
+  return true;
 }
 
 function waitClose(child, timeoutMs) {
