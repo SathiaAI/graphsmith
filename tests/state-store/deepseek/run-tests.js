@@ -504,7 +504,20 @@ async function test5_runRegistry(tempDir) {
   const name = "5. Run registry: register/deregister; expired-lease sweep; live-lease trees reported";
   try {
     process.env.GRAPHSMITH_TEST_MODE = "1";
-    const store = requireFreshStore(tempDir, { leaseMs: 40, heartbeatMs: 5 });
+    // A COMFORTABLE lease for the liveness half of this test. Every registry
+    // operation takes the store lock, replays the journal and sweeps anything
+    // whose lease has expired BEFORE running -- that sweep-first ordering is the
+    // component's fail-safe and is correct. With the old 40ms lease, the whole
+    // register/re-register/conflict/heartbeat/deregister/list sequence below had
+    // to finish within 40ms of wall time, because "still registered" is an
+    // assertion that load can only break. On a loaded 2-core runner those ~8
+    // lock+fsync round-trips exceed 40ms easily, and the run was swept mid-test:
+    // that is what made this suite fail on every windows and macos CI leg, with
+    // the symptom rotating between "Re-registration should report existing=true",
+    // "Run is not registered" and "Deregistration failed" depending on where the
+    // scheduler stole the time. Expiry is exercised on its own store below,
+    // where the assertion is "already expired" -- a direction load can only help.
+    const store = requireFreshStore(tempDir, { leaseMs: 5000, heartbeatMs: 50 });
 
     // Register runs on different trees
     const reg1 = store.runRegistry.register("run-r1", "tree-alpha");
@@ -548,16 +561,26 @@ async function test5_runRegistry(tempDir) {
     const runsAfterDereg = store.runRegistry.list();
     assert(runsAfterDereg.length === 1 && runsAfterDereg[0].run_id === "run-r1", "List after dereg should have 1 run");
 
-    // Expired sweep: wait for lease to expire
-    const expiryWait = new Promise((resolve) => setTimeout(resolve, 60));
-    await expiryWait;
+    // Expired sweep, on its OWN store with a deliberately tiny lease. Only ONE
+    // registry operation precedes the wait, and the assertion is that the lease
+    // HAS expired -- so a slow or descheduled runner makes this more certain, not
+    // less. The 60ms wait is 1.5x the 40ms lease.
+    const expiryDir = path.join(tempDir, "expiry-store");
+    fs.mkdirSync(expiryDir, { recursive: true });
+    const expiryStore = requireFreshStore(expiryDir, { leaseMs: 40, heartbeatMs: 5 });
+    expiryStore.runRegistry.register("run-r1", "tree-alpha");
+    await new Promise((resolve) => setTimeout(resolve, 60));
 
-    const swept = store.runRegistry.sweepExpired();
+    const swept = expiryStore.runRegistry.sweepExpired();
     assert(swept.includes("run-r1"), "Expired run was not swept");
-    assert(store.runRegistry.list().length === 0, "List should be empty after expiry sweep");
+    assert(expiryStore.runRegistry.list().length === 0, "List should be empty after expiry sweep");
+
+    // The live store's own lease has NOT expired, so run-r1 is still registered
+    // there -- an expiry sweep must only remove what actually lapsed.
+    assert(store.runRegistry.list().length === 1, "Live-lease run should survive; only lapsed leases are swept");
 
     // Sweep must journal what it swept — check the EXPIRED record in registry
-    const registryPath = path.join(tempDir, ".graphsmith", "state", "run-registry.jsonl");
+    const registryPath = path.join(expiryDir, ".graphsmith", "state", "run-registry.jsonl");
     const regRaw = fs.readFileSync(registryPath, "utf8");
     assert(regRaw.includes('"EXPIRED"'), "Registry should contain EXPIRED record");
     assert(regRaw.includes("run-r1"), "EXPIRED record should name the swept run");

@@ -587,9 +587,23 @@ function attackRunRegistry() {
   const root = tempRoot("reg");
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
-      const store = createStore(root, { leaseMs: 50, heartbeatMs: 15 });
+      // Two store instances on the SAME root, so every journal/registry
+      // assertion below still reads one shared set of files. `lease_expires_at`
+      // is stamped at REGISTRATION time from the registering instance's lease,
+      // so the instance a run is registered through decides how long it lives.
+      //
+      // Why: every registry operation sweeps lapsed leases before it runs (the
+      // component's fail-safe, and correct). With one 50ms-lease store, the
+      // register/list/deregister/list sequence below had to complete within 50ms
+      // of wall time, because "still live" is an assertion that load can only
+      // break -- so on a loaded CI runner `run-live` was swept mid-test and this
+      // reported "live trees not queryable". Runs that must STAY live get a
+      // comfortable lease; only the run whose expiry is the point gets a short
+      // one, and its assertion ("has expired") is a direction load only helps.
+      const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
+      const shortLease = createStore(root, { leaseMs: 300, heartbeatMs: 50 });
       store.runRegistry.register("run-live", "tree-A");
-      store.runRegistry.register("run-expire-me", "tree-B");
+      shortLease.runRegistry.register("run-expire-me", "tree-B");
       const liveBefore = store.runRegistry.list();
       assert(liveBefore.length === 2, "register failed");
       assert(
@@ -600,7 +614,7 @@ function attackRunRegistry() {
       store.runRegistry.deregister("run-live", { disposition: "completed_pass" });
       assert(!store.runRegistry.list().some((r) => r.run_id === "run-live"), "deregister left run");
 
-      sleep(80);
+      sleep(400);   // > the 300ms short lease; oversleeping only helps
       const journalBefore = readRaw(root, "state-journal.jsonl");
       const swept = store.runRegistry.sweepExpired();
       assert(swept.includes("run-expire-me"), `sweep missed run-expire-me: ${JSON.stringify(swept)}`);
@@ -645,7 +659,13 @@ function attackWindowSlots() {
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
       const N = 3;
-      const store = createStore(root, { leaseMs: 80, heartbeatMs: 20 });
+      // Comfortable lease: this half asserts the runs are STILL SLOTTED across
+      // ~10 registry operations and then close CLOSED_PASS. With the old 80ms
+      // lease a loaded runner swept a slotted run as `abandoned` mid-test, which
+      // sets the FLAG bit, and the close returned CLOSED_FLAGGED -- the component
+      // was right, the test's timing assumption was not. The abandoned path is
+      // still exercised deliberately below, on its own short-lease store.
+      const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
       store.window.admitPending({
         txid: "tx-w",
         fingerprint: "fp-w",
@@ -681,7 +701,11 @@ function attackWindowSlots() {
       assert(closed.state === "CLOSED_PASS", `expected CLOSED_PASS got ${closed.state}`);
 
       // abandoned path: new window, expire while slotted → FLAG + close CLOSED_FLAGGED
-      const store2 = createStore(root, { leaseMs: 40, heartbeatMs: 10 });
+      // 300ms rather than 40ms: `run-abandon` must survive admitPending +
+      // finalize + register (three lock+fsync operations) and only lapse during
+      // the deliberate sleep below. At 40ms a loaded runner could expire it
+      // before it was ever slotted, so nothing would be there to abandon.
+      const store2 = createStore(root, { leaseMs: 300, heartbeatMs: 50 });
       store2.window.admitPending({
         txid: "tx-ab",
         fingerprint: "fp-ab",
@@ -690,7 +714,7 @@ function attackWindowSlots() {
       });
       store2.window.finalize("tx-ab");
       store2.runRegistry.register("run-abandon", "tree-ab");
-      sleep(70);
+      sleep(400);   // > the 300ms lease
       store2.runRegistry.sweepExpired();
       const wAb = store2.window.get();
       assert(wAb.flag === true, "abandoned did not set FLAG");
@@ -771,10 +795,19 @@ const n = Number(process.argv[4] || 40);
 const outFile = process.argv[5];
 const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
 let ok = 0, busy = 0, other = 0;
+// otherCodes: a bare count made a failure unactionable -- "errors a=0 b=1" said
+// nothing about WHAT went wrong. Record the code so a future failure names it.
+const otherCodes = [];
 for (let i = 0; i < n; i++) {
   const id = prefix + "-" + i;
   let done = false;
-  for (let attempt = 0; attempt < 80 && !done; attempt++) {
+  // DEADLINE-bounded, not attempt-bounded. Refusing under contention is the
+  // store's contract and the caller is expected to retry; the old budget of 80
+  // attempts x <=25ms backoff (~1.6s) was a *proxy* for time, and on a loaded
+  // 2-core runner two hammering processes exhausted it, reporting the retry
+  // budget as an error. A wall-clock deadline states the intent directly.
+  const deadline = Date.now() + 10000;
+  for (let attempt = 0; !done; attempt++) {
     try {
       store.runRegistry.register(id, "tree-conc");
       store.runRegistry.deregister(id, { disposition: "completed_pass" });
@@ -783,16 +816,17 @@ for (let i = 0; i < n; i++) {
     } catch (e) {
       if (e.code === "LOCKED" || e.code === "LOCK_CONTENTION") {
         busy++;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 + Math.min(attempt, 20));
+        if (Date.now() >= deadline) { other++; otherCodes.push("lock-starved-10s"); done = true; }
+        else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 + Math.min(attempt, 20));
       } else {
         other++;
+        otherCodes.push(String(e.code || e.message));
         done = true;
       }
     }
   }
-  if (!done) other++;
 }
-fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other }));
+fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }));
 `
       );
 
@@ -809,7 +843,10 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other }));
       });
       cb.unref();
 
-      const deadline = Date.now() + 60000;
+      // 120s, consistent with the workers' own per-id 10s lock deadline: the
+      // outer wait must outlast the retry budget it is waiting on, or a slow
+      // runner reports "workers did not finish" for work that was progressing.
+      const deadline = Date.now() + 120000;
       while (Date.now() < deadline) {
         if (fs.existsSync(outA) && fs.existsSync(outB)) break;
         sleep(50);
@@ -817,7 +854,7 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other }));
       assert(fs.existsSync(outA) && fs.existsSync(outB), "workers did not finish in time");
       const ra = JSON.parse(fs.readFileSync(outA, "utf8"));
       const rb = JSON.parse(fs.readFileSync(outB, "utf8"));
-      assert(ra.other === 0 && rb.other === 0, `errors a=${ra.other} b=${rb.other}`);
+      assert(ra.other === 0 && rb.other === 0, `errors a=${ra.other} b=${rb.other} codes a=${JSON.stringify(ra.otherCodes || [])} b=${JSON.stringify(rb.otherCodes || [])}`);
       assert(ra.ok === n && rb.ok === n, `incomplete ok a=${ra.ok} b=${rb.ok} busy a=${ra.busy} b=${rb.busy}`);
 
       const raw = readRaw(root, "run-registry.jsonl");
