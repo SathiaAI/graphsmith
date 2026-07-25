@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/capability-grant.schema.json",
+  "title": "GraphSmith per-skill capability grant (R1)",
+  "description": "The GRANTED resource envelope for one skill, per resource class (filesystem / model / subprocess / network). Enforcement checks requested ⊆ granted BEFORE execution and halts on violation. C2-binding (D1 honesty line): a resource class is only listed in `enforced` if the running engine actually enforces it this release; the GSA capability attestation may attest ONLY enforced classes — never a boundary that isn't enforced. Frozen Wave 0 (v0.4.0).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "skill_id", "grants", "enforced"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "skill_id": { "type": "string", "minLength": 1 },
+    "grants": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The granted envelope per class. Absent class => nothing granted for it (deny-by-default).",
+      "properties": {
+        "filesystem": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read": { "type": "array", "items": { "type": "string" }, "description": "Allowed read path prefixes (canonical, no traversal)." },
+            "write": { "type": "array", "items": { "type": "string" }, "description": "Allowed write path prefixes." }
+          }
+        },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "allowed": { "type": "array", "items": { "type": "string" }, "description": "Allowed model identifiers." } }
+        },
+        "subprocess": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "allowed": { "type": "array", "items": { "type": "string" }, "description": "Allowed executable/command allowlist (exact match)." } }
+        },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "destinations": { "type": "array", "items": { "type": "string" }, "description": "Allowed destination host allowlist (the v0.3.0-enforced class)." } }
+        }
+      }
+    },
+    "enforced": {
+      "type": "array",
+      "description": "The resource classes actually ENFORCED by the running engine this release. Only these may be attested in the GSA capabilities.grants result. A class in `grants` but not in `enforced` is declared, NOT attested (fail-closed honesty — never vouch for an unenforced boundary).",
+      "items": { "enum": ["filesystem", "model", "subprocess", "network"] }
+    }
+  }
+}

@@ -49,6 +49,8 @@
     "tests/attacks/deepseek/",
     "tests/attacks/gpt-sol-pro/",
     "tests/ci/deepseek/",
-    "tests/ci/gpt-sol-pro/"
+    "tests/ci/gpt-sol-pro/",
+    "tests/v040/",
+    "tests/gsa-ext/"
   ]
 }

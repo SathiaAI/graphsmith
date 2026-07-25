@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/graphsmith-logo.png" alt="GraphSmith anvil logo" width="76">
+
 <img src="assets/banner.png" alt="GraphSmith — agent workflows that survive" width="820">
 
 

@@ -1,0 +1,19 @@
+# v0.4.0 Wave 2 — GSA §9.11 extended-control integration — council adjudication
+
+**Target:** `scripts/gsa-verify.js` §9.11 (constitutional / protected review) · **Integrator:** claude-opus (Anthropic) · **Platform:** win32, Node v24.18.0 · **Testers (≥2 non-Anthropic):** Mistral-Large + DeepSeek-v3.1 (OpenRouter code-gen), each given a signed-bundle harness (`tests/gsa-ext/harness.js`) to attack the integration. Orchestrator re-ran both suites, ran an independent fail-open probe, and audited the zero-finding result for rubber-stamping.
+
+## The invariant under test
+No bundle that claims a v0.4.0 control **true** whose evidence does not actually recompute to `verified` may PASS (no over-attestation / fail-open). §9.11 recomputes each claimed control through its `checks/v040-*.js` module from the bundle's own evidence and fails closed on any claimed≠recomputed mismatch (D5).
+
+## Result
+No §9.11 defect. The integration is **not fail-open**, confirmed three independent ways:
+- **DeepSeek 28/28 (audited genuine).** Harness gate is `if (result === true)` (strict boolean, not the inverted `if (result)` seen in the R4 Mistral suite). Coverage is real and correct-direction: 9 per-control lies (capability exceeds-grant / unenforced-class, effects no-external-id / failed / unknown, signer revoked / unknown, leaky trace, tampered provenance) → each bundle FAILs; 4 `FAILOPEN_*_missing_evidence` (evidence removed while claiming true) → each FAILs; 8 malformed extended-block cases → fail closed; 5 honest cases (false-with-leak, subset, **all-true-with-valid-evidence**, backward-compat, false-with-broken) → PASS; 2 C1 (bundle_id / timestamp change) → invariant. The valid case passing proves DeepSeek built correct evidence, so the clean pass is genuine.
+- **Orchestrator independent probe.** Claiming every control true while explicitly removing each evidence key (`{key: undefined}`), plus a leaky trace under `trace_redaction:true` — all five → **FAIL**. No fail-open.
+
+## Adjudicated NOT defects (Mistral's 6 FAILs — all its own harness-usage errors)
+Mistral scored 24/30; every FAIL was reproduced as **correct** §9.11 behavior:
+- **`fail-open-{capability_grant,effects,signer_registry,build_provenance}-missing` (4).** Mistral removed evidence with `delete evidence.<key>` on a **shallow copy**, but the builder merges `{...EVIDENCE, ...evidence}`, so the deleted key is re-supplied from `EVIDENCE` — the missing-evidence condition was never created, the bundle stayed valid, and it PASSed. Mistral's "expect FAIL" was therefore wrong. DeepSeek's equivalent tests (which remove evidence correctly) and the orchestrator probe (explicit `{key: undefined}`) both show §9.11 **does** fail closed on genuinely-missing evidence.
+- **`honest-all-true-valid` / `honest-subset-claim` (2).** Mistral supplied a bogus `capability_grant` shape (`{grant:{classes,tokens}, …}`) instead of the R1 contract (`{grant:{schema_version:"1.0", grants:{<class>:…}, enforced:[…]}, attested:{<class>:bool}}`). The capability check correctly recomputes non-verified for that shape, so §9.11 rightly refused a bundle whose capability evidence does not verify. With the correct evidence shape (`tests/gsa-ext/validate.js`), the all-true and subset cases PASS.
+
+## Verdict
+**Wave 2 §9.11 integration TEST-PASSED.** Two non-Anthropic families + orchestrator probe; DeepSeek 28/28 audited-genuine, Mistral's 6 FAILs adjudicated as its own harness-usage errors (independently reproduced as correct fail-closed behavior). The GSA verifier recomputes all five v0.4.0 controls from bundle evidence, catches every control-lie, fails closed on missing/malformed evidence, honors honest declarations and backward-compat (a v0.3.0 bundle without `control_attestations_v040` is unchanged), and is invariant to identity/timestamps (C1). Orchestrator regression: `tests/gsa-ext/validate.js` 11/11.

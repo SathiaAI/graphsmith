@@ -1,0 +1,12 @@
+# v0.4.0 Lane E / R5 — SBOM + build-provenance verifier — adversarial adjudication
+
+**Target:** `checks/v040-provenance.js` · **Builder:** claude-opus (Anthropic) · **Platform:** win32, Node v24.18.0 · **Testers (≥2 non-Anthropic):** Mistral-Large + DeepSeek-v3.1 (OpenRouter code-gen). Builder ≠ testers. Orchestrator re-ran both suites.
+
+## Real defect found + fixed
+1. **Non-content `bytes` folded into the attested SBOM digest (MEDIUM) — Mistral `bigint-component-bytes`.** The SBOM digest was computed over `(path, sha256, bytes)`, so a component's declared byte count was part of the value the provenance subject had to attest. That made the digest brittle to a field that carries no security (the sha256 already pins content) and inconsistent when `bytes` was a non-finite/BigInt value. **Fixed:** the digest is now computed over `(path, sha256)` only — a component's identity is its path + content hash; `bytes` is pure evidence, inert to the verdict. Mistral → **32/32**; the BigInt-bytes case now verifies (evidence-only).
+
+## Adjudicated NOT a defect
+- **`proto-pollution` (DeepSeek).** `ctx.sbom.__proto__ = { components: [] }` on an otherwise-valid context. The check reads `sbom.components` as an **own** property, which shadows the polluted prototype, so it verifies the genuine (valid) component set. DeepSeek expected `failed`, but the pollution is inert — the verdict must be invariant to it. Same class as the R1–R3 proto-pollution adjudications. (DeepSeek's `bigint-bytes` crash test passed: a status is returned, never a throw.)
+
+## Verdict
+**Lane E / R5 TEST-PASSED.** Two non-Anthropic families; one real digest-brittleness defect fixed. Properties under executed attack: a **tampered** artifact (actual hash ≠ declared) fails closed; a **forged provenance** whose subject omits the recomputed SBOM digest fails closed; a **stray material** not covered by the SBOM fails closed; a **`complete` SBOM** that omits an actual artifact fails closed; an **absent** SBOM or provenance is `unavailable` (never a silent pass); the verdict is **invariant to builder identity and build timestamps** (C1) and to inert prototype pollution; malformed input (bad schema_version, non-hex sha256, empty components, BigInt, hostile getter, proxy, duplicate path) never throws (C2). The verifier **recomputes** the SBOM digest and the declared-vs-actual hash relationship rather than trusting any self-declared digest (D5). Pure decision path.

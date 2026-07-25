@@ -11,6 +11,13 @@
  */
 "use strict";
 const crypto = require("crypto");
+// v0.4.0 extended-control checks (§9.11). Each exports run(ctx) -> {status}. The bundle's claimed
+// extended controls are RECOMPUTED through these, never trusted-as-declared (D5), exactly like §9.9.
+const v040Caps = require("../checks/v040-caps.js");
+const v040Receipts = require("../checks/v040-receipts.js");
+const v040Signer = require("../checks/v040-signer.js");
+const v040Trace = require("../checks/v040-trace.js");
+const v040Provenance = require("../checks/v040-provenance.js");
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const SIG_ALGOS = new Set(["ed25519", "ecdsa-p256-sha256", "rsa-pss-sha256"]);
@@ -147,6 +154,31 @@ function verifyBundle(bundle, opts) {
     }
     rec("9-control-attestations", "PASS", "all five control attestations match the recomputed evidence");
 
+    // §9.11 Extended controls (v0.4.0) — ADDITIVE + backward-compatible: engages ONLY when the bundle
+    // declares `control_attestations_v040`. Each claimed control is RECOMPUTED through its checks/v040-*.js
+    // module from the bundle's own evidence (the execution_trace bytes are the §9.3-verified artifact),
+    // and the claim MUST match the recomputed verdict — a control claimed true that recomputes non-verified
+    // is a lie and fails closed (D5, same discipline as §9.9). A v0.3.0 bundle without this key is untouched.
+    if (own(m, "control_attestations_v040")) {
+      const ext = m.control_attestations_v040;
+      if (!ext || typeof ext !== "object" || Array.isArray(ext)) { rec("11-extended-controls", "FAIL", "control_attestations_v040 malformed"); return done("FAIL"); }
+      const verified = (mod, ctx) => { try { return mod.run(ctx).status === "verified"; } catch { return false; } };
+      const cg = (m.capability_grant && typeof m.capability_grant === "object") ? m.capability_grant : {};
+      const recomputedExt = {
+        capability_conformance: verified(v040Caps, { grant: cg.grant, requested: cg.requested, attested: cg.attested }),
+        effects_reconciled: verified(v040Receipts, { effects: m.effects }),
+        signer_trust: verified(v040Signer, m.signer_registry && typeof m.signer_registry === "object"
+          ? { ...m.signer_registry, bundle_id: m.bundle_id, manifest_sha256: bsig.manifest_sha256 } : {}),
+        trace_redaction: verified(v040Trace, { trace_mode: m.trace_mode, trace: traceStr }),
+        build_provenance: verified(v040Provenance, (m.build_provenance && typeof m.build_provenance === "object") ? m.build_provenance : {}),
+      };
+      for (const k of Object.keys(ext)) {
+        if (!Object.prototype.hasOwnProperty.call(recomputedExt, k)) { rec("11-extended-controls", "FAIL", "unknown extended control '" + k + "'"); return done("FAIL"); }
+        if (ext[k] !== recomputedExt[k]) { rec("11-extended-controls", "FAIL", "extended control '" + k + "' claimed " + ext[k] + " but recomputes to " + recomputedExt[k]); return done("FAIL"); }
+      }
+      rec("11-extended-controls", "PASS", "all declared v0.4.0 controls match recomputed evidence: " + Object.keys(ext).join(", "));
+    }
+
     // §9.10 Profiles — confirm the ones we can; A is the floor (a passing §9 to here).
     const asserted = Array.isArray(m.profiles) ? m.profiles : [];
     const confirmed = [], downgraded = [];
@@ -202,10 +234,28 @@ if (require.main === module && process.argv.includes("--selftest")) {
   const badTrust = verifyBundle({ manifest, contents: c }, { trustedKeys: {} });
   const traversal = JSON.parse(JSON.stringify(manifest)); traversal.artifacts.goal.path = "../evil";
   const badPath = verifyBundle({ manifest: traversal, contents: c }, { trustedKeys: tk });
-  const pass = good.status === "PASS" && badArtifact.status === "FAIL" && badControl.status === "FAIL" && badTrust.status === "FAIL" && badPath.status === "FAIL";
+
+  // §9.11 extended-control (v0.4.0) cases — recompute trace_redaction from the REAL execution_trace bytes.
+  const signedExtBundle = (traceBody, claim) => {
+    const cx = { ...c, "execution_trace.jsonl": traceBody };
+    const ax = JSON.parse(JSON.stringify(art));
+    ax.execution_trace = { path: "execution_trace.jsonl", sha256: sha256Hex(Buffer.from(traceBody, "utf8")), bytes: Buffer.byteLength(traceBody, "utf8") };
+    const mx = { ...manifest, artifacts: ax, control_attestations_v040: claim, trace_mode: "full" };
+    delete mx.bundle_signature;
+    const ph = sha256Hex(Buffer.from(canonicalize(mx), "utf8"));
+    mx.bundle_signature = { algo: "ed25519", signer: "k", manifest_sha256: ph, value: sign(ph) };
+    return verifyBundle({ manifest: mx, contents: cx }, { trustedKeys: tk });
+  };
+  const extValid = signedExtBundle('{"step":1,"status":"ok"}', { trace_redaction: true });                 // clean trace, claim honest → PASS
+  const extLie = signedExtBundle('{"step":1,"tok":"sk-ABCDEFGHIJKLMNOPQRSTUV"}', { trace_redaction: true }); // leaky trace, claim is a lie → FAIL
+  const extFalseHonest = signedExtBundle('{"step":1,"tok":"sk-ABCDEFGHIJKLMNOPQRSTUV"}', { trace_redaction: false }); // leaky trace, honestly claims false → PASS (§9.11 catches lies, not leaks per se)
+
+  const pass = good.status === "PASS" && badArtifact.status === "FAIL" && badControl.status === "FAIL" && badTrust.status === "FAIL" && badPath.status === "FAIL" &&
+    extValid.status === "PASS" && extLie.status === "FAIL" && extFalseHonest.status === "PASS";
   console.log("gsa-verify selftest:", pass ? "OK" : "FAIL",
     "| valid=" + (good.status === "PASS"), "confirmed=" + JSON.stringify(good.confirmed_profiles),
     "tamper-artifact=" + (badArtifact.status === "FAIL"), "control-lie=" + (badControl.status === "FAIL"),
-    "untrusted=" + (badTrust.status === "FAIL"), "path-traversal=" + (badPath.status === "FAIL"));
+    "untrusted=" + (badTrust.status === "FAIL"), "path-traversal=" + (badPath.status === "FAIL"),
+    "| ext-valid=" + (extValid.status === "PASS"), "ext-redaction-lie=" + (extLie.status === "FAIL"), "ext-honest-false=" + (extFalseHonest.status === "PASS"));
   process.exit(pass ? 0 : 1);
 }
