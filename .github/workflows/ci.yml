@@ -167,10 +167,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      # Exposed at job level so the List B step can skip itself when the maintainer
-      # has not configured the hygiene secrets (List B is opt-in; List A always gates).
-      HYGIENE_HMAC_KEY: ${{ secrets.HYGIENE_HMAC_KEY }}
+    # NO job-level `env:` here, deliberately. A job-level secret is in the
+    # environment of EVERY step in the job -- including List A below, which runs
+    # on `pull_request` from the PR's own working tree. A same-repo PR could edit
+    # scripts/docs-lint.js and exfiltrate the List B key from that step. The List
+    # B secrets are therefore step-scoped, and the "is List B configured?" test
+    # lives inside hygiene-scan.js (which exits 0 when neither secret is set)
+    # instead of in an `if:` expression that would need the secret at job level.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -179,9 +182,11 @@ jobs:
       - name: List A — honest-language lint (contract 10)
         run: node scripts/docs-lint.js
       - name: List B — publication-hygiene scan (trusted context only; opt-in; never fork-PR)
-        # Runs only when the maintainer has configured the hygiene secrets. Without them
-        # the scan can't check anything, so skip (green) rather than hard-fail the build.
-        if: github.event_name != 'pull_request' && env.HYGIENE_HMAC_KEY != ''
+        # Never on `pull_request` (the PR controls the scanned tree and the script).
+        # Opt-in is decided by the script: both secrets set -> enforce; neither ->
+        # clean skip (exit 0); exactly one -> exit 2, because a half-configured
+        # List B must never report clean.
+        if: github.event_name != 'pull_request'
         env:
           HYGIENE_HMAC_KEY: ${{ secrets.HYGIENE_HMAC_KEY }}
           HYGIENE_DIGESTS: ${{ secrets.HYGIENE_DIGESTS }}
