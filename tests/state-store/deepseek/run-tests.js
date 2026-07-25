@@ -678,17 +678,31 @@ async function test7_concurrency(tempDir) {
     const prepStore = requireFreshStore(tempDir, { leaseMs: 10000, heartbeatMs: 2000 });
 
     // Worker script — each worker creates a fresh StateStore per attempt with randomized backoff
+    //
+    // DEADLINE-bounded, not attempt-bounded, per run-id. store._acquireLock()
+    // throws LOCKED immediately on real contention -- it does not retry
+    // internally, so the caller's budget is the only thing absorbing
+    // contention from the other hammering process. The old budget here was 60
+    // attempts x <=10ms backoff (~600ms) -- an attempt count used as a *proxy*
+    // for wall-clock time. That is even thinner than the sibling grok suite's
+    // budget (80 attempts x <=25ms, ~1.6s), which was already proven to flake
+    // on a loaded 2-core CI runner: two hammering processes exhausted it and
+    // the exhaustion was reported as an error, even though refusing under
+    // contention is the store's correct, safe behavior. A wall-clock deadline
+    // (mirroring the grok fix) states the real intent directly: keep retrying
+    // for up to 10s per run-id, not for up to N attempts.
     const workerScript = path.join(tempDir, "worker-concurrency.js");
     fs.writeFileSync(workerScript,
 '"use strict";\n' +
 'var { StateStore } = require(' + JSON.stringify(STATE_STORE_PATH) + ');\n' +
-'var results = { ops: 0, errors: 0, lastError: null };\n' +
+'var results = { ops: 0, errors: 0, lastError: null, errorCodes: [] };\n' +
 'var workerId = process.argv[2];\n' +
 'function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }\n' +
 'for (var i = 0; i < 10; i++) {\n' +
 '  var runId = "wrk-" + workerId + "-" + i;\n' +
 '  var done = false;\n' +
-'  for (var attempt = 0; attempt < 60 && !done; attempt++) {\n' +
+'  var deadline = Date.now() + 10000;\n' +
+'  for (var attempt = 0; !done; attempt++) {\n' +
 '    try {\n' +
 '      var store = new StateStore(' + JSON.stringify(tempDir) + ', { leaseMs: 5000, heartbeatMs: 500 });\n' +
 '      store.runRegistry.register(runId, "tree-conc");\n' +
@@ -696,8 +710,13 @@ async function test7_concurrency(tempDir) {
 '      results.ops++;\n' +
 '      done = true;\n' +
 '    } catch (e) {\n' +
-'      results.lastError = e.code || e.message;\n' +
-'      if (attempt === 59) { results.errors++; done = true; }\n' +
+// Record the actual error CODE (not just a count) so a genuine failure --
+// e.g. a real CORRUPT_STATE bug in the store -- is named in the report
+// instead of hiding behind a bare "errors a=0 b=1" that says nothing about
+// what went wrong.
+'      var code = e.code || e.message;\n' +
+'      results.lastError = code;\n' +
+'      if (Date.now() >= deadline) { results.errors++; results.errorCodes.push(runId + ":" + code); done = true; }\n' +
 '      else sleepSync(2 + Math.floor(Math.random() * 8));\n' +
 '    }\n' +
 '  }\n' +
@@ -714,18 +733,45 @@ async function test7_concurrency(tempDir) {
       });
       workers.push(child);
       const p = new Promise((resolve) => {
-        child.on("message", (msg) => resolve(msg));
-        child.on("exit", () => resolve(null));
+        let sawMessage = false;
+        child.on("message", (msg) => { sawMessage = true; resolve(msg); });
+        // If the process exits WITHOUT ever sending a result, that is a crash,
+        // not a benign "nothing to report" -- surface it as an error result
+        // instead of silently resolving to null and being dropped by the
+        // .filter(Boolean) below, which would let a worker's 10 run-ids
+        // (and any lost update within them) vanish from the report unnoticed.
+        child.on("exit", (code, signal) => {
+          if (!sawMessage) {
+            resolve({ ops: 0, errors: 1, errorCodes: [`worker-${w}-exited-without-result(code=${code},signal=${signal})`] });
+          }
+        });
       });
       workerPromises.push(p);
     }
 
-    const allResults = (await Promise.all(workerPromises)).filter(Boolean);
+    // OUTER wait must outlast the workers' own per-run-id retry budget above
+    // (10 run-ids x up to 10000ms deadline each = up to 100000ms of worst-case
+    // wall time per worker), or a slow CI runner would have this outer wait
+    // report "workers did not finish" for work that was still genuinely
+    // progressing. 150000ms gives a comfortable margin over that 100000ms
+    // worst case for both forked workers running concurrently.
+    const OUTER_WAIT_MS = 150000;
+    let outerTimer;
+    const outerTimeout = new Promise((_, reject) => {
+      outerTimer = setTimeout(() => reject(new Error(`workers did not finish within ${OUTER_WAIT_MS}ms`)), OUTER_WAIT_MS);
+    });
+    const allResults = await Promise.race([Promise.all(workerPromises), outerTimeout]);
+    clearTimeout(outerTimer);
+
+    // A worker that vanished (see the exit handler above) must not be
+    // silently excluded from accounting -- every forked worker must report.
+    assert(allResults.length === workers.length, `expected ${workers.length} worker results, got ${allResults.length}`);
 
     const totalOps = allResults.reduce((a, r) => a + (r.ops || 0), 0);
     const totalErrors = allResults.reduce((a, r) => a + (r.errors || 0), 0);
+    const allErrorCodes = allResults.reduce((a, r) => a.concat(r.errorCodes || []), []);
 
-    if (totalErrors > 0) throw new Error(`${totalErrors} operations failed across ${workers.length} workers (${totalOps} succeeded)`);
+    if (totalErrors > 0) throw new Error(`${totalErrors} operations failed across ${workers.length} workers (${totalOps} succeeded); codes=${JSON.stringify(allErrorCodes)}`);
 
     // After all deregistrations, verify data integrity
     const finalStore = requireFreshStore(tempDir, { leaseMs: 200, heartbeatMs: 50 });

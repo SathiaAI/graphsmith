@@ -742,10 +742,22 @@ setInterval(() => {}, 1000);
   });
 
   const cli = runWatchSync(root, [runId, "--kill-run"], 10000);
-  await sleep(800);
-
-  const mgrAlive = pidAlive(meta.pid);
-  const childAlive = childPid ? pidAlive(childPid) : false;
+  // Was: await sleep(800) then read pidAlive once, assuming SIGKILL delivery + this test
+  // process's own libuv SIGCHLD reaping (of a *grandchild* two process-hops away) always
+  // settles inside 800ms. That reap only progresses when our event loop gets a tick, and
+  // spawnSync above just blocked the loop for the CLI's full lifetime — under load there is
+  // no guaranteed slack left for the fixed 800ms to cover both delivery and reaping (Shape 1:
+  // fixed sleep standing in for a precondition). Poll for the actual precondition (mgr +
+  // child both reaped) with a bounded, generous deadline instead.
+  const DEAD_DEADLINE_MS = 10000;
+  const deadStart = Date.now();
+  let mgrAlive = pidAlive(meta.pid);
+  let childAlive = childPid ? pidAlive(childPid) : false;
+  while ((mgrAlive || childAlive) && Date.now() - deadStart < DEAD_DEADLINE_MS) {
+    await sleep(100);
+    mgrAlive = pidAlive(meta.pid);
+    childAlive = childPid ? pidAlive(childPid) : false;
+  }
   // orphan = child alive while manager dead, or descendant still alive
   let orphanAlive = false;
   for (const p of beforeDesc) {
@@ -1064,9 +1076,40 @@ async function testWatchContinuousTailUnref() {
     },
   });
 
-  const { child, done } = runWatchCli(root, [runId], { timeoutMs: 3000 });
-  await sleep(600);
-  // mutate budget while watch should be polling
+  // Was: sleep(600) [assume first frame has rendered], write mutation, sleep(1200) [assume
+  // >=1 of the 500ms-interval poll ticks landed in that window], then await done (bounded by
+  // the CLI's own 3000ms kill-timer). That's Shape 3 (assume N ticks happened because we slept
+  // N*interval) stacked on Shape 1 (assume node startup + first render finished inside a fixed
+  // 600ms — measured elsewhere in this suite family at 187-211ms on a loaded 2-core box, so
+  // 600ms is not absurd but is still a guess, not an observation). Wait for the actual
+  // observables instead: (1) the process has produced its first frame at all, (2) the mutated
+  // marker has actually appeared in stdout — each bounded by a generous deadline, not a stopwatch.
+  const timeoutMs = 15000; // safety net only; we drive completion ourselves below
+  const { child, done } = runWatchCli(root, [runId], { timeoutMs });
+  let liveStdout = "";
+  child.stdout.on("data", (d) => {
+    liveStdout += d.toString();
+  });
+  let doneSettled = false;
+  let doneResult = null;
+  done.then((r) => {
+    doneSettled = true;
+    doneResult = r;
+  });
+
+  const FIRST_FRAME_DEADLINE_MS = 5000;
+  const firstFrameStart = Date.now();
+  while (!liveStdout.length && !doneSettled && Date.now() - firstFrameStart < FIRST_FRAME_DEADLINE_MS) {
+    await sleep(25);
+  }
+  if (!liveStdout.length && !doneSettled) {
+    forceKillTree(child.pid);
+    await done;
+    rec(name, "FAIL", `watch produced no output within ${FIRST_FRAME_DEADLINE_MS}ms of the first frame`);
+    return;
+  }
+
+  // mutate budget while watch should be polling (scripts/watch.js DEFAULT_REFRESH_INTERVAL_MS = 500ms)
   fs.writeFileSync(
     budgetPath,
     JSON.stringify({
@@ -1077,11 +1120,21 @@ async function testWatchContinuousTailUnref() {
       marker_unique: "SEEN_99_POLL",
     })
   );
-  await sleep(1200);
-  const r = await done;
-  const sawUpdate = r.stdout.includes("99") || r.stdout.includes("SEEN_99_POLL");
-  // Process should still be running until our timeout kills it (continuous tail).
-  // If unref exited early, timedOut=false and elapsed << 3000 and never saw 99.
+
+  const UPDATE_DEADLINE_MS = 6000;
+  const updateStart = Date.now();
+  let sawUpdate = liveStdout.includes("99") || liveStdout.includes("SEEN_99_POLL");
+  while (!sawUpdate && !doneSettled && Date.now() - updateStart < UPDATE_DEADLINE_MS) {
+    await sleep(50);
+    sawUpdate = liveStdout.includes("99") || liveStdout.includes("SEEN_99_POLL");
+  }
+
+  if (!doneSettled) forceKillTree(child.pid);
+  const r = doneSettled ? doneResult : await done;
+  sawUpdate = sawUpdate || r.stdout.includes("99") || r.stdout.includes("SEEN_99_POLL");
+
+  // Process should still be running (continuous tail) unless it self-exited very early.
+  // If unref exited early, timedOut=false and elapsed << timeoutMs and never saw 99.
   if (!r.timedOut && r.elapsedMs < 1500 && !sawUpdate) {
     rec(
       name,
@@ -1094,7 +1147,7 @@ async function testWatchContinuousTailUnref() {
     rec(
       name,
       "FAIL",
-      `alive but never re-rendered updated budget (outLen=${r.stdout.length})`
+      `alive but never re-rendered updated budget within ${UPDATE_DEADLINE_MS}ms (outLen=${r.stdout.length})`
     );
     return;
   }

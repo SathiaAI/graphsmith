@@ -461,23 +461,45 @@ async function testProcessTreeNoOrphans() {
       spinMs: 30000,
       children: true,
     });
-    await sleep(300); // allow OS to reap
-    // Re-check orphans after settle
+    // Wait for the OS to actually reap the killed descendants instead of
+    // assuming a fixed 300ms window is enough. SIGKILL delivery is not the
+    // same as reaping: a killed orphan is reparented to init/a subreaper and
+    // stays visible to pidAlive() (still in the process table as a zombie)
+    // until that parent calls wait() on it -- a step that visibly slows down
+    // under CI load. That is exactly the kind of load-sensitive gap this
+    // suite has been rotating failures through across the windows/macos
+    // legs, so poll for death with a generous bounded deadline instead of a
+    // fixed sleep. r.markerPidAlive was captured before this settle window,
+    // so re-read it fresh on every poll tick too.
+    const childMarkerPath = path.join(dir, "child-alive");
     let childPids = [];
-    try {
-      childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
-    } catch {}
-    const still = childPids.filter((p) => pidAlive(p));
+    let still = [];
+    let markerAlive = false;
+    const reapBy = Date.now() + 5000;
+    do {
+      try {
+        childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
+      } catch {}
+      still = childPids.filter((p) => pidAlive(p));
+      markerAlive = false;
+      try {
+        const m = fs.readFileSync(childMarkerPath, "utf8").trim();
+        const mp = parseInt(m.split(/\s+/)[0], 10);
+        if (mp && pidAlive(mp)) markerAlive = true;
+      } catch {}
+      if (still.length === 0 && !markerAlive) break;
+      await sleep(50);
+    } while (Date.now() < reapBy);
     if (r.managerStillAlive) {
       rec(name, "FAIL", "manager survived; cannot judge tree kill");
       for (const p of still) forceKillTree(p);
       return;
     }
-    if (still.length > 0 || r.markerPidAlive) {
+    if (still.length > 0 || markerAlive) {
       rec(
         name,
         "FAIL",
-        `orphaned children survived kill: pids=${JSON.stringify(still)} markerAlive=${r.markerPidAlive}`,
+        `orphaned children survived kill: pids=${JSON.stringify(still)} markerAlive=${markerAlive}`,
         { platform: process.platform }
       );
       for (const p of still) forceKillTree(p);
@@ -1015,7 +1037,20 @@ async function testBudgetBoundaries() {
     const name = "A7a-budget-just-under-no-kill";
     const dir = mkTmp("a7a");
     try {
-      const budgetMs = 600;
+      // budgetMs is a large multiple of the heartbeat interval (was 600ms
+      // against an 80ms heartbeat, ~7.5x) rather than a small one, so a
+      // single delayed setInterval tick under CI scheduler contention can't
+      // accidentally push a real heartbeat gap up near the budget and cause
+      // a FALSE kill in a scenario that is supposed to prove "healthy
+      // heartbeats are never killed". The A8 case measured ~187-211ms of
+      // pure node-startup jitter alone on a loaded 2-core box; a setInterval
+      // callback competing with other CI load can suffer comparable delays,
+      // so the gap between budget and heartbeat cadence needs to swallow
+      // that comfortably. 1800ms budget vs 80ms heartbeat (~22.5x) leaves
+      // that headroom while the manager still runs well past budget (3000ms
+      // total) with heartbeats flowing throughout, which is the property
+      // this case exists to prove.
+      const budgetMs = 1800;
       const heartbeatFile = path.join(dir, "heartbeat");
       const capabilityFile = path.join(dir, "capability.json");
       const haltFile = path.join(dir, "halt.json");
@@ -1029,7 +1064,7 @@ const iv = setInterval(() => {
   c++;
   fs.writeFileSync(hb, String(c));
 }, 80);
-setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
+setTimeout(() => { clearInterval(iv); process.exit(0); }, 3000);
 `;
       const vp = writeMockManager(dir, src);
       const victim = spawnManager(vp, { detached: false });
@@ -1041,7 +1076,14 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
         capabilityFile,
         haltFile,
       });
-      const wdResult = await wd.done;
+      // Bounded wait: every other test in this file races wd.done against a
+      // generous timeout so a real defect (or an unexpected hang) turns
+      // into a clean FAIL rather than stalling the whole suite. This case
+      // was missing that race — add it, matching the pattern used elsewhere.
+      const wdResult = await Promise.race([
+        wd.done,
+        sleep(budgetMs + 5000).then(() => ({ code: -1, timedOut: true })),
+      ]);
       // Manager exits normally → watchdog exit 0, no halt file (or halt false)
       const halt = readJson(haltFile);
       if (wdResult.code === 3 || (halt && halt.halt === true)) {
@@ -1049,7 +1091,7 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
       } else if (wdResult.code === 0 && !pidAlive(victim.pid)) {
         rec(name, "PASS", "manager exited clean; watchdog exit 0");
       } else {
-        rec(name, "FAIL", `unexpected code=${wdResult.code} alive=${pidAlive(victim.pid)}`);
+        rec(name, "FAIL", `unexpected code=${wdResult.code} timedOut=${!!wdResult.timedOut} alive=${pidAlive(victim.pid)}`);
       }
       forceKillTree(victim.pid);
       if (wd.child && pidAlive(wd.child.pid)) forceKillTree(wd.child.pid);
@@ -1082,8 +1124,24 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
         rec(name, "FAIL", `elapsed ${r.halt.elapsed_ms} not > budget ${budgetMs}`);
         return;
       }
-      // upper bound: poll slack budget/10 + some OS jitter
-      if (r.halt.elapsed_ms > budgetMs + 2000) {
+      // Watchdog only ever writes halt evidence from inside
+      // `if (elapsedMs > budgetMs)` (scripts/watchdog.js runWatchdog), so
+      // the check above cannot flake — there is no code path that reports
+      // elapsed_ms <= budget. What DOES vary under load is detection
+      // LATENCY: elapsed_ms is measured at the poll tick that first observes
+      // the breach, and on a quiet box that lands just a few ms over budget
+      // (observed: elapsed=352ms and elapsed=355ms for budget=350ms — a
+      // 2-5ms margin). Under CI contention Node's timer wheel is not
+      // guaranteed to fire poll ticks on schedule, and that scheduling
+      // overhead is roughly a FIXED cost (comparable to the ~187-211ms of
+      // pure node-startup jitter measured for A8), not one that shrinks with
+      // a smaller budget — so a 350ms budget needs proportionally MORE
+      // upper-bound slack than a 500ms one, not less. Widen the "not too
+      // late" tolerance well past the poll interval (budget/10) instead of
+      // tuning it to the quiet-runner numbers above; the guarantee under
+      // test — it killed, and elapsed_ms genuinely exceeds budget — is
+      // unchanged.
+      if (r.halt.elapsed_ms > budgetMs + 4000) {
         rec(name, "FAIL", `kill overly late ${r.halt.elapsed_ms}ms`);
         return;
       }
