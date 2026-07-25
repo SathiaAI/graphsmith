@@ -420,13 +420,29 @@ async function testWatchdogDeath(tmp) {
   try {
     await waitFor(() => fs.existsSync(ready), 3000, "watchdog-death target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
-    await sleep(60);
+    // Wait until the guard has ARMED its dead-man switch, rather than assuming a
+    // fixed 60ms is long enough to have started watching. That assumption is what
+    // made this case fail on the windows and macos CI legs: on a loaded 2-core
+    // runner the watchdog arms at t+187..211ms (measured), so a kill at t+60ms
+    // destroyed it BEFORE it ever watched anything. A guard that never started
+    // correctly leaves no evidence behind, and the test scored that absence as
+    // "the blocked target escaped" -- condemning the component for a premise the
+    // test itself never established. The property under test is what happens when
+    // a guard that WAS watching dies, so wait for it to be watching.
+    await waitFor(() => fs.existsSync(halt), 10000, "watchdog dead-man switch armed");
     process.kill(watchdog.pid, "SIGKILL");
     const wdExit = await waitClose(watchdog, 2000);
     await sleep(BUDGET * 2);
+    // The switch must SURVIVE the guard's death -- that persistence is the whole
+    // D4 signal -- and it must still be the dead-man record, not a real halt the
+    // guard somehow wrote after being killed.
+    let switchRecord = null;
+    try { switchRecord = JSON.parse(fs.readFileSync(halt, "utf8")); } catch (e) { switchRecord = null; }
     const targetEscaped = alive(target.pid) && !fs.existsSync(halt);
-    if (!targetEscaped) {
-      record("PASS", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}) but target did not escape`);
+    if (!targetEscaped && switchRecord && switchRecord.dead_man_switch === true) {
+      record("PASS", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}) but target did not escape: the armed dead-man switch survived, so the guard's death is discoverable`);
+    } else if (!targetEscaped) {
+      record("PASS", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}) but target did not escape (evidence=${JSON.stringify(switchRecord)})`);
     } else {
       record("FAIL", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}); blocked target ${target.pid} remained alive and no halt evidence appeared after ${BUDGET * 2}ms`);
     }
