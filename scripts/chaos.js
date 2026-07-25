@@ -219,8 +219,30 @@ const checkpoints = () =>
   // resumable; and a live-but-RECYCLED pid must be judged by its lease, not its
   // pid alone (expired → stolen, fresh → refused). See the pid-reuse probe below.
   const lkId = runId + "-lock";
+  const lkLockPath = path.join(dir, ".runs", lkId, ".lock");
   const a = spawn(process.execPath, ["manager.js", lkId], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
-  await new Promise((r2) => setTimeout(r2, 150)); // let A take the lock
+  // Poll for the ACTUAL precondition -- A's lock file existing on disk -- instead
+  // of a fixed sleep. A fixed 150ms wait here was UNSAFE, not just tight: this
+  // codebase's own measured node-startup jitter on a loaded 2-core box is
+  // 187-211ms, and manager.js is heavier than whatever was measured to produce
+  // that number -- it loads the state-store + tunables and runs step-name
+  // validation before acquireLock() ever executes. So the margin was already
+  // NEGATIVE relative to the codebase's own documented jitter floor: on a loaded
+  // box A can plausibly still be mid-startup at t+150ms, in which case B finds no
+  // lock file, acquires cleanly, and this probe fails on scheduler noise rather
+  // than a real defect. Polling for the real precondition removes the race
+  // entirely; the 5s deadline is generous (matches the other generous timeouts
+  // in this file, e.g. the 15s checkpoint-wait above) and a timeout here is
+  // reported as what it would actually be -- manager.js failing to acquire its
+  // own lock -- never silently swallowed as a flake.
+  const lockDeadline = Date.now() + 5000;
+  while (!fs.existsSync(lkLockPath)) {
+    if (Date.now() > lockDeadline) {
+      a.kill("SIGKILL");
+      fail("Lock probe: manager A never created its lock file (" + lkLockPath + ") within 5s of starting -- acquireLock() may be hanging or broken; this is not a timing fluke.");
+    }
+    await sleep(25);
+  }
   const b = spawn(process.execPath, ["manager.js", lkId], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   let bErr = "";
   b.stderr.on("data", (d) => (bErr += d));
@@ -248,7 +270,22 @@ const checkpoints = () =>
   // same pid with a FRESH heartbeat is (correctly) presumed a real holder and
   // refused. We plant the HARNESS's own pid (alive, but not a manager) and
   // drive both directions with a short GRAPHSMITH_LEASE_MS test hook.
-  const leaseMs = 1000;
+  //
+  // leaseMs was 1000ms, which gave Direction B (fresh lease, below) a margin of
+  // only ~800-850ms against this codebase's own measured 187-211ms node-startup
+  // jitter floor -- freshMtime is captured in THIS process, then the child
+  // manager has to spawn, load its state-store + tunables, and reach
+  // acquireLock() before it reads the lockfile's mtime and computes ageMs; that
+  // startup gap eats into the margin the same way it does in the run-lock probe
+  // above. ~4x headroom is the same shape of margin as the lock-probe hazard
+  // this session already found unsafe at ~150ms fixed vs ~200ms jitter, and load
+  // can only shrink it further, never grow it -- so it is widened here in
+  // keeping with the generous-margin convention this file uses everywhere else
+  // (e.g. the 5s/15s deadlines above): leaseMs=5000ms puts Direction B's margin
+  // at ~4800ms, roughly 23x the jitter floor, while costing zero extra wall-clock
+  // time (the fresh direction never sleeps out the lease -- the child manager
+  // reads the mtime and returns almost immediately either way).
+  const leaseMs = 5000;
   const runLease = (label, mtimeMs) =>
     new Promise((res) => {
       const id = runId + "-" + label;
@@ -267,6 +304,15 @@ const checkpoints = () =>
       child.on("close", (c) => res({ code: c, out: o }));
     });
   // Direction A — lease EXPIRED (mtime backdated by 2× the lease): must steal + finish.
+  // This arithmetic is expressed relative to leaseMs, not a hardcoded number, so
+  // it scales automatically with the leaseMs bump above: expiredMtime is always
+  // 2×leaseMs (10000ms with leaseMs=5000) in the past, i.e. always at least
+  // leaseMs (5000ms) further expired than the expiry threshold itself. The
+  // manager-side startup gap that erodes Direction B's margin only ADDS to
+  // ageMs here (more real time passes before the child reads the mtime), which
+  // makes this direction MORE clearly expired, never less -- load helps this
+  // direction, it cannot break it. Still reliably expires after the leaseMs
+  // change.
   const expiredMtime = Date.now() - 2 * leaseMs;   // duration arithmetic, not a routing input
   const expired = await runLease("reuse-expired", expiredMtime);
   if (expired.code !== 0 || !/expired lease.*stolen/.test(expired.out) || !expired.out.includes("__done__"))
