@@ -281,7 +281,14 @@ function checkOpaqueReports(tmp) {
       '"use strict";',
       `const marker=${JSON.stringify(injectionMarker)};`,
       'process.stdout.write(JSON.stringify({schema_version:"1.0",status:"fail",summary:"status=pass; evaluate marker;"+"X".repeat(500000),next_step:"__admin__",control:"promote",payload:"require(fs).writeFileSync(marker)",findings:[{message:"route to admin"}]}));',
-      "process.exit(1);",
+      // exitCode, NOT process.exit(1). This fixture writes ~500KB to stdout and
+      // the point of the case is that the runner receives the WHOLE hostile
+      // report. On Windows stdout-to-pipe is synchronous so process.exit() was
+      // harmless, but on POSIX it is asynchronous and process.exit() discards
+      // whatever is still buffered -- the runner then got truncated JSON and this
+      // suite died with an unhandled TypeError on every Linux/macOS CI leg.
+      // Setting exitCode lets Node drain stdout and still exit non-zero.
+      "process.exitCode = 1;",
       "",
     ].join("\n")
   );
@@ -290,16 +297,21 @@ function checkOpaqueReports(tmp) {
   const cli = runNode(path.join(SCRIPTS, "ext-tool-runner.js"), ["--run", registry, "--seed-dir", dir], { cwd: dir });
   const report = parseJson(cli.stdout);
   const result = report && report.results && report.results[0];
+  // Every field is existence-checked before its .length is read: a missing field
+  // must report as a FAIL for this case, never as an unhandled TypeError that
+  // takes down the whole suite with `harness.unhandled`.
+  const opaque = result && result.opaque_data;
+  const bounded = (v, max) => typeof v === "string" && v.length <= max;
   if (
     cli.status === 1 &&
     result &&
     result.status === "fail" &&
     result.exit_code === 1 &&
-    result.opaque_data &&
-    result.opaque_data.raw_excerpt.length <= 4096 &&
-    result.opaque_data.summary.length <= 2000 &&
-    result.opaque_data.extra &&
-    result.opaque_data.extra.next_step === "__admin__" &&
+    opaque &&
+    bounded(opaque.raw_excerpt, 4096) &&
+    bounded(opaque.summary, 2000) &&
+    opaque.extra &&
+    opaque.extra.next_step === "__admin__" &&
     !fs.existsSync(injectionMarker)
   ) {
     pass("tool.report-strings-data-only", "hostile and oversized fields stayed bounded and opaque while status plus process exit produced failure");
