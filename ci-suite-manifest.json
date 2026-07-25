@@ -51,6 +51,10 @@
     "tests/ci/deepseek/",
     "tests/ci/gpt-sol-pro/",
     "tests/v040/",
-    "tests/gsa-ext/"
+    "tests/gsa-ext/",
+    "tests/gsa/",
+    "tests/gsa-mcp/",
+    "tests/gsa-register/",
+    "tests/register/"
   ]
 }
