@@ -130,6 +130,15 @@ stages:
       console.log('');
       console.log('All gating suite(s) passed (' + suites.length + ' discovered, ' + failedEvidence.length + ' evidence-only failure(s) logged above, non-gating).');
       "
+    # The evidence-only suites above are run and logged but never gate. Their
+    # GATE is the pair of gauntlet batteries, which fold in each
+    # ADJUDICATION.md and exit 0 only when every failing test is a documented
+    # adjudicated false-positive matched BY NAME. Without this step the
+    # evidence-only suites are completely ungated on GitLab -- a real
+    # regression in any v0.3.0/v0.4.0 control would pass a green pipeline.
+    # Mirrors the GitHub Actions `phase-a-selftests` job's gauntlet step.
+    - node tests/gauntlet/v0.3.0-battery.js
+    - node tests/gauntlet/v0.4.0-battery.js
 
 phase-a:linux:node18:
   extends: .phase-a-selftests-and-suites
