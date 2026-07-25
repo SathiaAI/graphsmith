@@ -51,7 +51,7 @@ Controls added or hardened this cycle, each builder≠tester, ≥2 non-Anthropic
 
 ## 5. Owner-set (to be filled)
 
-- **Milestone name:** _(e.g. "GraphSmith v0.3.1 Independent Assurance" — owner to confirm)_
+- **Milestone name:** **GraphSmith Independent Assurance — Cycle 1 (v0.4.0 controls)** _(proposed; owner to confirm. Named as a repeatable cycle rather than a point version so later releases become Cycle 2, 3, … and this first cycle is anchored to the reproducible v0.4.0 control evidence.)_
 - **External reviewers:** _(roster to be lined up by the owner)_
 - **Publication surface:** this page, mirrored to the project website and wiki after review.
 
