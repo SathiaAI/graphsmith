@@ -45,6 +45,16 @@ function verifySigner(ctx) {
     const registry = ctx.registry;
     if (!registry || typeof registry !== "object" || registry.schema_version !== "1.0" || !Array.isArray(registry.signers)) return fail("signer-registry missing/invalid");
     if (typeof ctx.signer !== "string" || ctx.signer.length < 1) return fail("no signer to verify");
+    // A structurally malformed registry entry is corrupt TRUST CONFIG — refuse the whole registry
+    // (fail-closed, C2). This validates config shape, not the subject's identity value (not a C1 input).
+    const seenIds = new Set();
+    for (const s of registry.signers) {
+      if (!s || typeof s !== "object" || typeof s.signer_id !== "string" || s.signer_id.length < 1 || ["active", "rotated", "revoked"].indexOf(s.status) === -1) {
+        return fail("signer-registry has a malformed entry — refusing corrupt trust config (fail-closed)");
+      }
+      if (seenIds.has(s.signer_id)) return fail("duplicate signer_id '" + s.signer_id + "' — ambiguous trust config (fail-closed)");
+      seenIds.add(s.signer_id);
+    }
 
     // Attestation recall — a recalled bundle never re-verifies (fail-closed).
     const recalls = ctx.recalls;
