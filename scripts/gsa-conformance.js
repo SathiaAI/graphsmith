@@ -51,6 +51,14 @@ function buildVectors(kp) {
   b = clone(std); b.manifest.control_attestations.adversarial_batteries_passed = false; reseal(b.manifest); V.push({ name: "neg-control-lie", bundle: b, trustedKeys: tk, expect: "FAIL" });
   b = clone(reg); delete b.manifest.artifacts.regulator_summary; delete b.contents["regulator_summary.md"]; reseal(b.manifest); V.push({ name: "neg-regulator-missing-summary", bundle: b, trustedKeys: tk, expect: "FAIL" });
   b = clone(std); b.manifest.artifacts.regulator_summary = { path: "regulator_summary.md", sha256: sha256Hex(Buffer.from("x", "utf8")), bytes: 1 }; b.contents["regulator_summary.md"] = "x"; reseal(b.manifest); V.push({ name: "neg-regulator-summary-wrong-mode", bundle: b, trustedKeys: tk, expect: "FAIL" });
+
+  // v0.4.0 §9.11 extended-control vectors — the verifier recomputes a claimed control from the bundle's
+  // own §9.3-verified execution_trace and fails closed on a lie. trace_redaction is the portable case.
+  const setTrace = (bb, body) => { bb.contents["execution_trace.jsonl"] = body; bb.manifest.artifacts.execution_trace.sha256 = sha256Hex(Buffer.from(body, "utf8")); bb.manifest.artifacts.execution_trace.bytes = Buffer.byteLength(body, "utf8"); };
+  b = clone(std); b.manifest.trace_mode = "full"; b.manifest.control_attestations_v040 = { trace_redaction: true }; reseal(b.manifest); V.push({ name: "valid-v040-trace-redaction", bundle: b, trustedKeys: tk, expect: "PASS" });
+  b = clone(std); setTrace(b, '{"step":1,"tok":"sk-ABCDEFGHIJKLMNOPQRSTUV"}'); b.manifest.trace_mode = "full"; b.manifest.control_attestations_v040 = { trace_redaction: true }; reseal(b.manifest); V.push({ name: "neg-v040-redaction-lie", bundle: b, trustedKeys: tk, expect: "FAIL" });
+  b = clone(std); b.manifest.control_attestations_v040 = { made_up_control: true }; reseal(b.manifest); V.push({ name: "neg-v040-unknown-control", bundle: b, trustedKeys: tk, expect: "FAIL" });
+  b = clone(std); b.manifest.control_attestations_v040 = ["not", "an", "object"]; reseal(b.manifest); V.push({ name: "neg-v040-malformed-ext", bundle: b, trustedKeys: tk, expect: "FAIL" });
   return V;
 }
 
