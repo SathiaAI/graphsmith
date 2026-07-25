@@ -1,5 +1,9 @@
 name: 'GraphSmith Verify'
-description: 'Run GraphSmith verification profiles to enforce deterministic merge boundaries for agent PRs. Consumers MUST pin by full commit SHA, never a tag.'
+# Security: consumers MUST pin this action by full commit SHA, never a tag.
+description: 'Enforce deterministic merge boundaries for agent PRs with signed, replayable, tamper-evident GraphSmith attestation.'
+branding:
+  icon: 'shield'
+  color: 'orange'
 inputs:
   profiles:
     description: 'Which profiles to require (comma-separated). Default: all-available'
