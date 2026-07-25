@@ -374,12 +374,20 @@ async function runManagerWithKill(workDir, runId, crashAfterStep, timeoutMs) {
   return { code: child.exitCode ?? -1, stdout, stderr, elapsed: Date.now() - t0, killState };
 }
 
-function readRunState(runDir) {
+// stepNames (optional): the scenario's declared step ids. A run directory also
+// holds RUNTIME STATE that happens to be JSON (budget-state.json, a watchdog
+// capability snapshot, ...). Treating those as completed-step checkpoints made
+// the resume check demand a '"status":"skipped"' line for a pseudo-step that is
+// not a step at all — the same mis-detection that broke scripts/chaos.js. When
+// the caller knows the step ids, only those count.
+function readRunState(runDir, stepNames) {
   const state = { checkpoints: [], intents: [], effects: [], lockExists: false };
   if (!fs.existsSync(runDir)) return state;
+  const allowed = stepNames ? new Set(stepNames) : null;
   state.checkpoints = fs.readdirSync(runDir)
     .filter((f) => f.endsWith(".json") && !f.includes(".corrupt-"))
-    .map((f) => f.replace(/\.json$/, ""));
+    .map((f) => f.replace(/\.json$/, ""))
+    .filter((s) => (allowed ? allowed.has(s) : true));
   const intentsPath = path.join(runDir, "intents.log");
   if (fs.existsSync(intentsPath))
     state.intents = fs.readFileSync(intentsPath, "utf8").split("\n").filter(Boolean);
@@ -446,13 +454,48 @@ function classifyOutcome(result, state, scenario) {
   return { pass: false, cause_code: "infra_fault" };
 }
 
+function scenarioStepNames(scenario) {
+  const names = (scenario.fixture.pipeline || []).map((s) => s.step);
+  for (const group of scenario.fixture.fan_out_groups || [])
+    for (const s of group) names.push(s.step);
+  return names;
+}
+
+// PA-1 parity with scripts/chaos.js. A crash-resume scenario kills the manager
+// the instant the target step's checkpoint lands. Where that instant falls is
+// scheduling-dependent: it can land OUTSIDE any side-effect window (resume runs
+// to completion) or INSIDE a concurrent fan-out sibling's window (the run has an
+// intent recorded with no completion). In the second case the CORRECT behaviour
+// is a loud halt — the workflow refuses to guess about external state instead of
+// silently re-sending — so scoring it as a failure marks the component wrong for
+// being right, and makes the bundle's pass/cause_code depend on CPU scheduling
+// (which also puts the evaluator's own determinism claim, checks 1a/6b, at risk).
+// A halt is accepted ONLY when the on-disk state justifies it: a real unresolved
+// intent, and no duplicate effect (i.e. the halt came INSTEAD of a re-send, not
+// after one). A string alone never earns it.
+function certifyHaltOnUncertainty(state, combined) {
+  if (!combined.includes("UNRESOLVED SIDE EFFECT")) return { halted: false };
+  const unresolved = state.intents.filter((i) => !state.effects.includes(i));
+  if (!unresolved.length)
+    return { halted: true, certified: false,
+      reason: "run printed UNRESOLVED SIDE EFFECT but intents.log/effects.log show no unresolved intent — the halt string was emitted without the halt state" };
+  const cnt = {};
+  for (const e of state.effects) cnt[e] = (cnt[e] || 0) + 1;
+  const dupes = Object.entries(cnt).filter(([, n]) => n > 1);
+  if (dupes.length)
+    return { halted: true, certified: false,
+      reason: "halted, but effects.log already shows duplicated effects (" + dupes.map(([s, n]) => s + "×" + n).join(", ") + ") — the halt came after a re-send, not instead of one" };
+  return { halted: true, certified: true, unresolved };
+}
+
 async function executeScenario(scenario, workDir, seed) {
   const runId = "scen-" + scenario.id + "-" + seed;
   const runDir = path.join(workDir, ".runs", runId);
+  const stepNames = scenarioStepNames(scenario);
 
   if (scenario.fixture.crash_after_step) {
     const result1 = await runManagerWithKill(workDir, runId, scenario.fixture.crash_after_step, 15000);
-    const preCrashState = readRunState(runDir);
+    const preCrashState = readRunState(runDir, stepNames);
 
     if (!result1.killState.landed) {
       return {
@@ -464,7 +507,7 @@ async function executeScenario(scenario, workDir, seed) {
     }
 
     const result2 = await runManager(workDir, runId, 15000);
-    const state = readRunState(runDir);
+    const state = readRunState(runDir, stepNames);
     const violations = checkInvariants(state, scenario);
     const outcome = classifyOutcome(result2, state, scenario);
 
@@ -473,6 +516,21 @@ async function executeScenario(scenario, workDir, seed) {
         if (!result2.stdout.includes('"step":"' + s + '","status":"skipped'))
           violations.push({ invariant: "no-step-reexecuted-after-resume", detail: "step " + s + " was re-executed" });
       }
+    }
+
+    // The kill landed inside a side-effect window: a certified halt is the
+    // correct outcome, and `completed_steps` is inapplicable to a run that
+    // deliberately stopped. Every other check above still had to pass.
+    const halt = certifyHaltOnUncertainty(state, result2.stdout + result2.stderr);
+    if (halt.halted) {
+      if (!halt.certified)
+        violations.push({ invariant: "halt-must-be-state-justified", detail: halt.reason });
+      return {
+        pass: violations.length === 0,
+        cause_code: violations.length > 0 ? "workflow_fault" : "ok",
+        violations,
+        state,
+      };
     }
 
     const expectedSteps = scenario.expected.completed_steps || [];
@@ -491,7 +549,7 @@ async function executeScenario(scenario, workDir, seed) {
   }
 
   const result = await runManager(workDir, runId, 15000);
-  const state = readRunState(runDir);
+  const state = readRunState(runDir, stepNames);
   const violations = checkInvariants(state, scenario);
   const outcome = classifyOutcome(result, state, scenario);
 
@@ -647,6 +705,26 @@ async function selftest() {
 
   if (bundle1.bundle_sha256 !== bundle2.bundle_sha256)
     errors.push("DETERMINISM FAILURE: same seed produced different bundle hashes\n  run1: " + bundle1.bundle_sha256 + "\n  run2: " + bundle2.bundle_sha256);
+
+  // Halt certification is what keeps "a crash inside a side-effect window halts"
+  // from becoming "any run that prints the magic string passes". Pinned here so a
+  // later edit cannot loosen it into a rubber stamp.
+  {
+    const noHalt = certifyHaltOnUncertainty({ intents: [], effects: [] }, "all good, __done__");
+    if (noHalt.halted) errors.push("halt-certification: a clean run must not be read as halted");
+
+    const justified = certifyHaltOnUncertainty({ intents: ["02b"], effects: [] }, "UNRESOLVED SIDE EFFECT for step \"02b\"");
+    if (!justified.halted || !justified.certified)
+      errors.push("halt-certification: a halt with a real unresolved intent must be certified");
+
+    const stringOnly = certifyHaltOnUncertainty({ intents: ["02b"], effects: ["02b"] }, "UNRESOLVED SIDE EFFECT");
+    if (!stringOnly.halted || stringOnly.certified)
+      errors.push("halt-certification: the magic string with NO unresolved intent must NOT be certified");
+
+    const afterResend = certifyHaltOnUncertainty({ intents: ["02b", "02c"], effects: ["02b", "02b"] }, "UNRESOLVED SIDE EFFECT");
+    if (!afterResend.halted || afterResend.certified)
+      errors.push("halt-certification: a halt after a duplicated effect must NOT be certified");
+  }
 
   const result = {
     schema_version: SCHEMA_VERSION,
