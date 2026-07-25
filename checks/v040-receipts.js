@@ -38,6 +38,9 @@ function reconcileEffects(ctx) {
       if (typeof r !== "object" || r.schema_version !== "1.0") return fail("effect[" + i + "] receipt malformed/invalid");
       if (typeof r.action !== "string" || typeof r.adapter_id !== "string") return fail("effect[" + i + "] receipt missing action/adapter_id");
       if (["success", "unknown", "failed"].indexOf(r.status) === -1) return fail("effect[" + i + "] receipt.status not in enum — refusing malformed status");
+      // An invalid external_id VALUE (null/number/BigInt/absent) is not valid external evidence — the
+      // effect is UNKNOWN (reconciliation-required, below), never "failed" (it may have succeeded; we
+      // just can't confirm). Only a structurally malformed RECEIPT (above) fails closed.
 
       if (r.status === "failed") { failed++; evidence.push("effect[" + i + "] '" + r.action + "': receipt failed."); continue; }
       // "success" reconciles ONLY with genuine external evidence (external_id). A bare success is UNKNOWN.
