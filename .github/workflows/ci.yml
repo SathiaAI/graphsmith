@@ -167,6 +167,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # Exposed at job level so the List B step can skip itself when the maintainer
+      # has not configured the hygiene secrets (List B is opt-in; List A always gates).
+      HYGIENE_HMAC_KEY: ${{ secrets.HYGIENE_HMAC_KEY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -174,8 +178,10 @@ jobs:
           node-version: 20
       - name: List A — honest-language lint (contract 10)
         run: node scripts/docs-lint.js
-      - name: List B — publication-hygiene scan (trusted context only; never fork-PR)
-        if: github.event_name != 'pull_request'
+      - name: List B — publication-hygiene scan (trusted context only; opt-in; never fork-PR)
+        # Runs only when the maintainer has configured the hygiene secrets. Without them
+        # the scan can't check anything, so skip (green) rather than hard-fail the build.
+        if: github.event_name != 'pull_request' && env.HYGIENE_HMAC_KEY != ''
         env:
           HYGIENE_HMAC_KEY: ${{ secrets.HYGIENE_HMAC_KEY }}
           HYGIENE_DIGESTS: ${{ secrets.HYGIENE_DIGESTS }}
