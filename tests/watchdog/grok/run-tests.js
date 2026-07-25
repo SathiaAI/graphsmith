@@ -1131,7 +1131,20 @@ const iv = setInterval(() => {
       capabilityFile,
       haltFile,
     });
-    await sleep(80);
+    // Wait for the guard to have ARMED its dead-man switch before killing it,
+    // instead of assuming a fixed 80ms is enough to have started watching. The
+    // watchdog writes that switch as its first startup act, and node startup is
+    // not free: measured on a loaded 2-core box it lands at t+187..211ms. A kill
+    // at t+80ms therefore often destroyed the guard BEFORE it watched anything,
+    // and a guard that never started correctly leaves no evidence -- which this
+    // case then read as the interface gap below. That is why this suite failed
+    // ONLY on the node 18 CI legs while node 22 passed on the same runners: node
+    // 18 starts more slowly, so it lost the 80ms race more often. Killing the
+    // guard mid-watch is the point of the case, so wait until it IS watching.
+    {
+      const armedBy = Date.now() + 10000;
+      while (!fs.existsSync(haltFile) && Date.now() < armedBy) await sleep(10);
+    }
     // Kill the watchdog itself mid-watch
     forceKillTree(wd.child.pid);
     await sleep(1500);
@@ -1151,7 +1164,15 @@ const iv = setInterval(() => {
       return;
     }
     if (halt && halt.halt) {
-      rec(name, "PASS", "halt still produced (unlikely race)");
+      // The switch the guard armed SURVIVED its death, which is the channel this
+      // case was written to say did not exist. It does now: the dead-man switch
+      // persists (D4) and scaffold's manager also watches the guard's own exit
+      // and HALTs fail-closed (D3, covered by its selftest). The FAIL branch above
+      // is kept deliberately -- if that evidence ever stops surviving, a blocked
+      // run really is left unguarded and this must say so.
+      rec(name, "PASS", halt.dead_man_switch
+        ? "guard killed mid-watch; its armed dead-man switch survived, so the guard's death is discoverable (D4)"
+        : "halt evidence survived the guard's death");
       return;
     }
     rec(name, "FAIL", `ambiguous victimStill=${victimStill} halt=${!!halt}`);
