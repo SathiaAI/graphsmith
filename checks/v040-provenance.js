@@ -22,11 +22,13 @@ function canonicalize(v) {
   return JSON.stringify(v === undefined ? null : v);
 }
 
-/* The SBOM digest is the hash of the canonicalized, path-sorted component list — the single value the
- * provenance subject must attest. Decision-relevant only; ignores SBOM metadata (name/version/dates). */
+/* The SBOM digest is the hash of the canonicalized, path-sorted (path, sha256) pairs — the single value
+ * the provenance subject must attest. A component's identity is its path + content hash ONLY; `bytes` is
+ * evidence derivable from content and is deliberately excluded so the digest is stable against non-content
+ * metadata (and inert to a hostile/BigInt bytes field). Ignores SBOM metadata (name/version/dates). */
 function sbomDigest(components) {
   const norm = components
-    .map((c) => ({ path: String(c.path), sha256: String(c.sha256), bytes: Number.isFinite(c.bytes) ? c.bytes : null }))
+    .map((c) => ({ path: String(c.path), sha256: String(c.sha256) }))
     .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return sha256Hex(Buffer.from(canonicalize(norm), "utf8"));
 }
