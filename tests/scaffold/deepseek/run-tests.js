@@ -583,7 +583,17 @@ async function testResumeIntegrity() {
   writeWorker(project, '"use strict"; module.exports.run=async function(){ return {}; };\n', "process");
   writeWorker(project, '"use strict"; module.exports.run=async function(){ return {}; };\n', "deliver");
 
-  const resume = runManager(project, "run");
+  // --acknowledge-budget is REQUIRED here, and its absence was the second half of
+  // this test's flakiness. The step above SIGKILLs the manager, which leaves the
+  // watchdog's dead-man switch armed whenever the kill takes the guard with it
+  // (the whole process tree on Windows) or lands before the orphaned guard has
+  // withdrawn it (POSIX). The next start then REFUSES -- correctly, per D4 -- so a
+  // plain resume did no work at all: no second external call, no budget trip, and
+  // `halted` stayed null while the run still exited 2. Acknowledging is the
+  // documented operator action after a hard kill, and it records the extension
+  // rather than resetting any counter, so the accumulation assertion below still
+  // holds exactly as intended.
+  const resume = runManager(project, "run", ["--acknowledge-budget"]);
   const resumeState = haltState(project, "run");
 
   // At limit 1, after 1st call from before-kill + 1 more = 2 > 1 → HALT on max_external_calls
@@ -605,14 +615,38 @@ async function testResumeIntegrity() {
     fail("resume/unexpected", "exit=" + resume.status);
   }
 
-  // Now test: resume without --acknowledge-budget after a HALT (should refuse)
+  // Now test: resume without --acknowledge-budget after a HALT (should refuse).
+  //
+  // This check only means anything if the run is ALREADY halted going in --
+  // otherwise the next start does not refuse, it legitimately RUNS, and any state
+  // it writes is correct work rather than a mutation-during-refusal. Exit 2 alone
+  // does not distinguish the two: a start that runs and then trips a budget also
+  // exits 2. Under load the preceding kill/resume sequence does not always cross
+  // max_external_calls, so `halted` was null and this reported a CRITICAL
+  // immutability violation for a run that had simply done its job (observed:
+  // halted null -> max_external_calls, steps_executed 1 -> 2, stderr "HALT
+  // (budget)" rather than the "Run previously HALTED" refusal). Establish the
+  // precondition explicitly, then require the REFUSAL, not just the exit code.
   const sp = statePath(project, "run");
+  let preHalt = haltState(project, "run");
+  if (!preHalt || !preHalt.halted) {
+    // Acknowledge so this start actually RUNS (see the note above -- a plain start
+    // may still be refused by the dead-man switch) and trips the budget, giving us
+    // the halted state the refusal check needs to mean anything.
+    runManager(project, "run", ["--acknowledge-budget"]);
+    preHalt = haltState(project, "run");
+  }
   const beforeNoAck = fs.readFileSync(sp, "utf8");
   const noAck = runManager(project, "run");
   const afterNoAck = fs.existsSync(sp) ? fs.readFileSync(sp, "utf8") : null;
+  const refused = /Run previously HALTED/.test(String(noAck.stderr || "") + String(noAck.stdout || ""));
 
-  if (noAck.status === 2 && beforeNoAck === afterNoAck) {
-    pass("resume/refused-without-ack", "exit=2; budget state unchanged (no silent mutation)");
+  if (!preHalt || !preHalt.halted) {
+    fail("resume/refusal-precondition", "could not reach a halted state to test refusal against; last state=" + JSON.stringify(preHalt && preHalt.halted));
+  } else if (!refused) {
+    fail("resume/NOT-REFUSED", "a run already HALTED (" + preHalt.halted.rule + ") did not refuse a resume that omitted --acknowledge-budget; exit=" + noAck.status);
+  } else if (noAck.status === 2 && beforeNoAck === afterNoAck) {
+    pass("resume/refused-without-ack", "refused with exit=2; budget state unchanged (no silent mutation)");
   } else if (noAck.status === 2 && beforeNoAck !== afterNoAck) {
     fail("resume/REFUSED-BUT-MUTATED", "exit=2 but budget-state.json was modified during refusal — state should be immutable on refused resume");
   } else if (noAck.status === 0) {
