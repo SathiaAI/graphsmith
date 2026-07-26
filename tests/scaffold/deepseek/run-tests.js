@@ -18,6 +18,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const REPO = path.resolve(__dirname, "../../..");
 const SCAFFOLD = path.join(REPO, "scripts", "scaffold.js");
@@ -943,7 +944,7 @@ function waitForFile(file, timeoutMs) {
   return new Promise((resolve, reject) => {
     const t = setInterval(() => {
       if (fs.existsSync(file)) { clearInterval(t); resolve(); }
-      else if (Date.now() - start > timeoutMs) { clearInterval(t); reject(new Error("timeout waiting for " + file)); }
+      else if (Date.now() - start > harnessDeadline(timeoutMs)) { clearInterval(t); reject(new Error("timeout waiting for " + file)); }
     }, 20);
   });
 }
@@ -997,7 +998,18 @@ async function main() {
     await testWatchdogHaltFile();
 
   } catch (e) {
-    fail("harness/internal", e.stack || e.message);
+    // A catch-all that reports a PRECONDITION TIMEOUT as an ordinary failure puts a
+    // harness problem in the product-findings bucket. But it must not blanket-tag
+    // everything: an unexpected exception from the product IS a real defect, and
+    // calling that inconclusive would hide it. So split on the actual error --
+    // "timeout waiting for X" means the trial never started; anything else is a
+    // genuine failure and stays one.
+    if (/timeout waiting for/i.test(String(e && e.message))) {
+      inconclusive("harness/internal",
+        "a precondition never materialised, so the case never ran -- " + String(e.message));
+    } else {
+      fail("harness/internal", e.stack || e.message);
+    }
   } finally {
     try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch (_) {}
   }

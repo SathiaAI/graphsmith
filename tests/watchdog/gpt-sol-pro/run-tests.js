@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, execFileSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const ROOT = path.resolve(__dirname, "../../..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
@@ -54,7 +55,7 @@ function waitClose(child, timeoutMs) {
         settled = true;
         resolve({ code: child.exitCode, signal: child.signalCode, timedOut: true });
       }
-    }, timeoutMs);
+    }, harnessDeadline(timeoutMs));
     child.once("close", (code, signal) => {
       if (!settled) {
         settled = true;
@@ -67,7 +68,8 @@ function waitClose(child, timeoutMs) {
 
 async function waitFor(predicate, timeoutMs, label) {
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+  const budget = harnessDeadline(timeoutMs);
+  while (Date.now() - start < budget) {
     if (predicate()) return;
     await sleep(10);
   }
@@ -574,7 +576,19 @@ async function main() {
     await testBudgetBoundary(tmp);
     await testWatchdogDeath(tmp);
   } catch (error) {
-    record("FAIL", "harness-unexpected-error", error.stack || error.message);
+    // A catch-all that reports a PRECONDITION TIMEOUT as an ordinary failure puts a
+    // harness problem in the product-findings bucket. But it must not blanket-tag
+    // everything: an unexpected exception from the product IS a real defect, and
+    // calling that inconclusive would hide it. So split on the actual error --
+    // "timeout waiting for X" means the trial never started; anything else is a
+    // genuine failure and stays one.
+    if (/timeout waiting for/i.test(String(error && error.message))) {
+      record("FAIL", "harness-unexpected-error",
+        "INCONCLUSIVE (harness): a precondition never materialised, so the case never ran -- " +
+        String(error.message));
+    } else {
+      record("FAIL", "harness-unexpected-error", error.stack || error.message);
+    }
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   }

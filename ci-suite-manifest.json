@@ -51,6 +51,7 @@
   "gating_suites": [
     "tests/manifest/",
     "tests/report-integrity/",
+    "tests/harness-honesty/",
     "tests/state-store/",
     "tests/loaders/",
     "tests/scenario/",

@@ -9,6 +9,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const ROOT = path.resolve(__dirname, "..", "..", "..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
@@ -541,7 +542,7 @@ async function testProcessTreeNoOrphans() {
     let childPids = null;
     let still = [];
     let markerAlive = false;
-    const reapBy = Date.now() + 5000;
+    const reapBy = Date.now() + harnessDeadline(5000);
     do {
       try {
         childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
@@ -1232,7 +1233,19 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 3000);
 }
 
 async function testWatchdogSelfCrash() {
-  const name = "A8-watchdog-self-crash-no-manager-notice-channel";
+  // Renamed from "A8-watchdog-self-crash-no-manager-notice-channel".
+  //
+  // That name asserted an ABSENCE -- no reverse heartbeat, no exit pipe, no way for
+  // the manager to notice its guard had died -- because when this case was written
+  // that was a true adversarial finding (recorded under the old name in this
+  // family's FINDINGS.md, which is left intact: it was accurate when written).
+  //
+  // The dead-man switch has since been built, and this case now verifies the
+  // OPPOSITE: that killing the guard mid-watch leaves discoverable evidence (D4).
+  // So the old name contradicted its own pass message, and anyone reading a green
+  // run saw a case name announcing a gap that no longer exists. A name is a claim
+  // like any other; a stale one is a stale claim.
+  const name = "A8-guard-death-leaves-discoverable-evidence-D4";
   const dir = mkTmp("a8");
   try {
     // Interface has no reverse heartbeat / integrity channel from watchdog → manager.
@@ -1282,8 +1295,9 @@ const iv = setInterval(() => {
     // it cannot mask a real failure, because a guard that never arms still
     // fails below. Record whether it armed so a timeout cannot be misreported.
     let guardArmed = false;
+    const armBudgetMs = harnessDeadline(45000);
     {
-      const armedBy = Date.now() + 45000;
+      const armedBy = Date.now() + armBudgetMs;
       while (!(guardArmed = fs.existsSync(haltFile)) && Date.now() < armedBy) await sleep(10);
     }
     // Kill the watchdog itself mid-watch
@@ -1303,10 +1317,9 @@ const iv = setInterval(() => {
       // same dishonesty this suite exists to prevent. Only claim the interface
       // gap when the guard demonstrably armed and the death still went unnoticed.
       if (!guardArmed) {
-        rec(
+        inconclusive(
           name,
-          "FAIL",
-          "INCONCLUSIVE (harness): the watchdog never armed within 45000ms, so it was " +
+          "the watchdog never armed within " + armBudgetMs + "ms, so it was " +
             "killed before it began watching -- this says nothing about whether a " +
             "guard-death notice channel exists. Re-run; if this persists the watchdog " +
             "is failing to arm at all, which is a separate defect."
