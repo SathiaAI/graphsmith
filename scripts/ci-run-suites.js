@@ -163,9 +163,21 @@ function main() {
   }
 
   if (failedGating.length) {
-    console.error("");
-    console.error("FAILED gating suite(s):");
-    for (const f of failedGating) console.error("  " + f);
+  // Everything below goes to STDOUT, deliberately, even though it is failure
+  // reporting and console.error would be the reflex.
+  //
+  // The evidence-only list above is written with console.log. When the gating
+  // list went to stderr, the two streams interleaved unpredictably in the
+  // captured CI log, so evidence-only suites appeared UNDER the "FAILED gating"
+  // header. That produced a log which read as though tests/v040/** -- listed
+  // plainly as evidence_only in ci-suite-manifest.json -- had been classified
+  // as gating on macOS but not on Linux. Hours went into hunting a
+  // classification bug that did not exist, including a full battery run against
+  // two trees to compare them. There was never any inconsistency; there were
+  // two streams. One stream, one ordering, no phantom.
+    console.log("");
+    console.log("FAILED gating suite(s):");
+    for (const f of failedGating) console.log("  " + f);
 
     // Re-run each failure ONCE with output captured, purely to classify it as
     // broken vs flaky and to surface its FAIL lines somewhere readable. Only on
@@ -173,15 +185,15 @@ function main() {
     const reruns = [];
     for (const f of failedGating) {
       const rel = f.split(" (exit")[0];
-      console.error("");
-      console.error("--- re-running " + rel + " once to classify broken vs flaky ---");
+      console.log("");
+      console.log("--- re-running " + rel + " once to classify broken vs flaky ---");
       const rr = cp.spawnSync(process.execPath, [rel], { encoding: "utf8" });
       const lines = interestingLines((rr.stdout || "") + (rr.stderr || ""), 30);
       reruns.push({ suite: rel, status: rr.status, flaky: rr.status === 0, lines: lines });
-      console.error(rr.status === 0
+      console.log(rr.status === 0
         ? "    re-run PASSED -> FLAKY (a timing assumption), not a component regression"
         : "    re-run also failed (exit " + rr.status + ") -> reproducible");
-      if (lines) console.error(lines);
+      if (lines) console.log(lines);
     }
     writeSummary(failedGating, reruns);
     process.exit(1);

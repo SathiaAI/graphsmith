@@ -27,11 +27,17 @@
  * changes the reader/writer interleaving in the harness's favour.
  *
  * WHAT IT ASSERTS, per (script, args) pair below:
- *   1. captured via spawnSync (a pipe -- the async path), stdout parses as JSON;
- *   2. it is byte-identical to the same command redirected to a FILE (the
- *      synchronous path, i.e. the report the author intended to emit);
+ *   1. captured via spawnSync (a pipe -- the async path), stdout parses, either as
+ *      one JSON document or as JSON Lines;
+ *   2. the document count matches the same command redirected to a FILE (the
+ *      synchronous path). The count matters because a JSON-Lines report clipped
+ *      exactly at a line boundary would otherwise still parse;
  *   3. repeated REPEATS times, because the defect is an interleaving race and a
  *      single green run proves nothing.
+ *
+ * It does NOT compare bytes across invocations. An earlier version did, and it was
+ * unsound -- see the comment at the determinism decision below. Structure is the
+ * right invariant here: every loss this suite exists to catch destroys it.
  *
  * Exit code is deliberately NOT part of the pass condition -- the whole point is
  * that the exit code was 0 while the evidence was missing.
@@ -219,16 +225,24 @@ function main() {
         continue;
       }
 
-      // Two file-path runs, so determinism is MEASURED rather than assumed.
-      // Some reports legitimately carry a pid, an elapsed_ms or a timestamp and
-      // are therefore not byte-stable between invocations -- watchdog.js is one.
-      // Comparing bytes across runs for those produces a flaky suite, and a flaky
-      // gate gets ignored, which is worse than no gate. So: byte-equality where
-      // the report is stable (the strongest available check), and structural
-      // equality where it is not.
+      // Deliberately NOT comparing bytes across invocations.
+      //
+      // The first version of this suite did, and it was unsound. Reports here
+      // legitimately carry pids, elapsed_ms values and timestamps, so two runs of
+      // the same command are not byte-identical. Trying to detect that by running
+      // the file path twice and checking for equality does not work either: a
+      // low-resolution timing field can happen to match across two runs and differ
+      // on the third, so the suite decides "deterministic" and then fails on a
+      // legitimate variation. That is a false positive in a gating suite, and a
+      // gate that cries wolf gets ignored -- worse than no gate at all. It cost a
+      // red macos-22 leg on a commit whose macos-18 leg was green.
+      //
+      // Byte-equality also buys no detection power. Every loss this suite exists
+      // to catch destroys the report's structure: a truncated JSON document does
+      // not parse, an empty capture does not parse, and a JSON-Lines report clipped
+      // at a line boundary changes the document count. Those two checks are
+      // sufficient, and unlike byte-equality they cannot fire on a timestamp.
       const expected = viaFile(scriptPath, c.args, tmpdir);
-      const expectedAgain = viaFile(scriptPath, c.args, tmpdir);
-      const deterministic = expected === expectedAgain;
       const expectedJson = firstJsonValue(expected);
       if (expectedJson === null) {
         // A CLI that emits no JSON on stdout has no report for this suite to
@@ -275,16 +289,9 @@ function main() {
           why = "captured " + (gotJson.documents || 1) + " document(s) but the file path produced " + expectedDocs;
           break;
         }
-        if (deterministic && got.out.length !== expected.length) {
-          brokenRun = i;
-          why =
-            "file=" + expected.length + "B but pipe=" + got.out.length + "B (short by " +
-            (expected.length - got.out.length) + "B)";
-          break;
-        }
       }
 
-      const mode = deterministic ? "byte-identical to the file path" : "parses + document count matches (report is not byte-stable)";
+      const mode = "parses, " + expectedDocs + " document(s) as on the file path";
       if (brokenRun === -1) {
         report(true, id, "report survived spawnSync " + REPEATS + "/" + REPEATS + " runs, " + mode + " (" + expected.length + "B)");
       } else {

@@ -1237,9 +1237,15 @@ const iv = setInterval(() => {
     // ONLY on the node 18 CI legs while node 22 passed on the same runners: node
     // 18 starts more slowly, so it lost the 80ms race more often. Killing the
     // guard mid-watch is the point of the case, so wait until it IS watching.
+    // 10s was still not enough on a loaded GitHub macOS runner (observed: this
+    // case red on macos-22 in run #67 and green on the identical SHA in #66).
+    // Waiting longer for something that HAS to have happened can only help --
+    // it cannot mask a real failure, because a guard that never arms still
+    // fails below. Record whether it armed so a timeout cannot be misreported.
+    let guardArmed = false;
     {
-      const armedBy = Date.now() + 10000;
-      while (!fs.existsSync(haltFile) && Date.now() < armedBy) await sleep(10);
+      const armedBy = Date.now() + 45000;
+      while (!(guardArmed = fs.existsSync(haltFile)) && Date.now() < armedBy) await sleep(10);
     }
     // Kill the watchdog itself mid-watch
     forceKillTree(wd.child.pid);
@@ -1252,6 +1258,22 @@ const iv = setInterval(() => {
     if (wd.child && pidAlive(wd.child.pid)) forceKillTree(wd.child.pid);
 
     if (victimStill && !halt) {
+      // Distinguish the two ways to arrive here. Reporting a HARNESS TIMEOUT as
+      // "there is no notice channel" is a false architectural finding -- it
+      // describes a product gap that the evidence does not support, which is the
+      // same dishonesty this suite exists to prevent. Only claim the interface
+      // gap when the guard demonstrably armed and the death still went unnoticed.
+      if (!guardArmed) {
+        rec(
+          name,
+          "FAIL",
+          "INCONCLUSIVE (harness): the watchdog never armed within 45000ms, so it was " +
+            "killed before it began watching -- this says nothing about whether a " +
+            "guard-death notice channel exists. Re-run; if this persists the watchdog " +
+            "is failing to arm at all, which is a separate defect."
+        );
+        return;
+      }
       rec(
         name,
         "FAIL",

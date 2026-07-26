@@ -218,8 +218,13 @@ async function testProcessTree(tmp) {
     await waitFor(() => fs.existsSync(ready) && fs.existsSync(childPidFile), 3000, "process tree readiness");
     leafPid = Number(fs.readFileSync(childPidFile, "utf8"));
     watchdog = spawnWatchdog(parent.pid, heartbeat, capability, halt);
-    const wdExit = await waitClose(watchdog, 5000);
-    await waitClose(parent, 1500);
+    // Deadlines widened after this case went red on ubuntu-18 (run #62) with
+    // parentAlive=false childAlive=true -- the tree kill had simply not finished
+    // landing on the grandchild. The re-run passed. Every bound below waits for
+    // something that HAS to have happened, so a longer wait cannot mask a real
+    // failure: a tree kill that never lands still reports parentAlive/leafAlive.
+    const wdExit = await waitClose(watchdog, 20000);
+    await waitClose(parent, 15000);
     // `parent` has a child_process handle we can await a real 'close' event on,
     // but `leafPid` (the grandchild) does not -- it was spawned BY parent.js, so
     // this harness only ever observes it via /proc polling through alive(). A
@@ -234,7 +239,7 @@ async function testProcessTree(tmp) {
     // timeout; a genuine tree-kill failure still gets reported below via
     // parentAlive/leafAlive rather than hanging.
     try {
-      await waitFor(() => !alive(parent.pid) && !alive(leafPid), 5000, "process tree kill to land");
+      await waitFor(() => !alive(parent.pid) && !alive(leafPid), 30000, "process tree kill to land");
     } catch { /* fall through; parentAlive/leafAlive below report the real state */ }
     const ev = fs.existsSync(halt) ? readEvidence(halt) : null;
     const parentAlive = alive(parent.pid);
