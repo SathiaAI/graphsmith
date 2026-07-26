@@ -91,6 +91,22 @@ function makeClassifier(manifest, manifestPath) {
   };
 }
 
+// A case that could not establish its preconditions reports
+//   FAIL <name> - INCONCLUSIVE (harness): <reason>
+// It did not pass and it did not find a defect: it did not run. That still fails
+// the gate -- a check that never executed must never read as green, the same
+// fail-closed rule the manifest applies to unlisted suites -- but it must never
+// be counted or displayed as a product finding either. Mixing the two is how a
+// harness timeout comes to be reported as a product defect, which is exactly what
+// one watchdog case did: it announced "no interface for manager to detect guard
+// death" when it had merely run out of time waiting for the guard to arm.
+function inconclusiveLines(text) {
+  return String(text)
+    .split("\n")
+    .filter(function (line) { return line.indexOf("INCONCLUSIVE (harness)") !== -1; })
+    .join("\n");
+}
+
 // Only the lines a human needs to see: the verdicts, not the whole transcript.
 function interestingLines(text, limit) {
   return String(text)
@@ -108,6 +124,26 @@ function writeSummary(failedGating, reruns) {
   out.push("");
   for (const f of failedGating) out.push("- `" + f + "`");
   out.push("");
+  const anyInconclusive = reruns.some((r) => r.inconclusive);
+  if (anyInconclusive) {
+    out.push("### Inconclusive case(s) — NOT product findings");
+    out.push("");
+    out.push("These checks could not establish their preconditions, so they did not run. " +
+      "They are counted as failures because a check that never executed must not read as " +
+      "green, but nothing below says anything about whether the product is correct. A " +
+      "recurring inconclusive is a bug with an owner — a deadline too tight, or a component " +
+      "too slow to arm — not a condition to be tolerated.");
+    out.push("");
+    for (const r of reruns) {
+      if (!r.inconclusive) continue;
+      out.push("- `" + r.suite + "`" + (r.flaky ? " (cleared on re-run — transient)" : " (still inconclusive on re-run)"));
+      out.push("");
+      out.push("```");
+      out.push(r.inconclusive);
+      out.push("```");
+      out.push("");
+    }
+  }
   for (const r of reruns) {
     out.push(r.flaky
       ? "### " + r.suite + " — re-run PASSED, so this suite is FLAKY, not broken"
@@ -188,11 +224,23 @@ function main() {
       console.log("");
       console.log("--- re-running " + rel + " once to classify broken vs flaky ---");
       const rr = cp.spawnSync(process.execPath, [rel], { encoding: "utf8" });
-      const lines = interestingLines((rr.stdout || "") + (rr.stderr || ""), 30);
-      reruns.push({ suite: rel, status: rr.status, flaky: rr.status === 0, lines: lines });
+      const combined = (rr.stdout || "") + (rr.stderr || "");
+      const lines = interestingLines(combined, 30);
+      const inconclusive = inconclusiveLines(combined);
+      reruns.push({
+        suite: rel,
+        status: rr.status,
+        flaky: rr.status === 0,
+        lines: lines,
+        inconclusive: inconclusive,
+      });
       console.log(rr.status === 0
         ? "    re-run PASSED -> FLAKY (a timing assumption), not a component regression"
         : "    re-run also failed (exit " + rr.status + ") -> reproducible");
+      if (inconclusive) {
+        console.log("    NOTE: this suite reported INCONCLUSIVE case(s) -- the harness could not");
+        console.log("          establish preconditions. That is not a product finding; see below.");
+      }
       if (lines) console.log(lines);
     }
     writeSummary(failedGating, reruns);

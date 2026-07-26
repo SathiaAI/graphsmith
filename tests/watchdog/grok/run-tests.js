@@ -18,6 +18,19 @@ const NODE = process.execPath;
 const results = [];
 let failures = 0;
 
+// A check whose PRECONDITIONS never held has not passed and has not found a
+// defect -- it did not run. PASS would claim an untested guarantee, FAIL would
+// assert an unobserved defect, and SKIPPED means "not applicable", which is a
+// different untruth. Without a fourth verdict a test in that position has no
+// honest option and will emit a dishonest one -- exactly what A8 did when it
+// reported "no interface for manager to detect guard death", a claim about the
+// PRODUCT, because the harness had run out of time waiting for the guard to arm.
+// Counts as a failure so the gate stays fail-closed; tagged so it can never be
+// read as a product finding.
+function inconclusive(name, reason, extra) {
+  rec(name, "FAIL", "INCONCLUSIVE (harness): " + reason, extra);
+}
+
 function rec(name, status, reason, extra) {
   const row = { name, status, reason: reason || null };
   if (extra) row.extra = extra;
@@ -338,6 +351,7 @@ const iv = setInterval(() => {
   ]);
   const t1 = monoMs();
 
+  let childPidsUnreadable = null;
   // External cleanup if watchdog failed
   if (pidAlive(managerPid)) forceKillTree(managerPid);
   try {
@@ -349,11 +363,17 @@ const iv = setInterval(() => {
   if (wd.child && pidAlive(wd.child.pid)) forceKillTree(wd.child.pid);
 
   // Collect child pids if any
-  let childPids = [];
+  // An unreadable child-pids.json used to leave childPids as [] and therefore
+  // orphans as [] -- i.e. "no orphans found" -- which is the same silent-blindness
+  // bug as the ps/wmic enumeration that had disabled orphan detection on two
+  // platforms. Not knowing the child pids is not the same as there being none.
+  let childPids = null;
   try {
     childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
-  } catch {}
-  const orphans = childPids.filter((p) => pidAlive(p));
+  } catch (error) {
+    childPidsUnreadable = String((error && error.message) || error);
+  }
+  const orphans = (childPids || []).filter((p) => pidAlive(p));
   // also check marker freshness
   let markerPidAlive = false;
   try {
@@ -374,9 +394,10 @@ const iv = setInterval(() => {
   } catch {}
 
   // Ensure no leftover kids
-  for (const p of childPids) forceKillTree(p);
+  for (const p of childPids || []) forceKillTree(p);
 
   return {
+    childPidsUnreadable,
     managerPid,
     wdResult,
     wallMs: t1 - t0,
@@ -510,15 +531,22 @@ async function testProcessTreeNoOrphans() {
     // fixed sleep. r.markerPidAlive was captured before this settle window,
     // so re-read it fresh on every poll tick too.
     const childMarkerPath = path.join(dir, "child-alive");
-    let childPids = [];
+    // childPids starts as null, NOT []. This case is named "no-orphans", and an
+    // unreadable child-pids.json used to leave the list empty, which made
+    // `still` empty, which read as "no orphans survived" -- a PASS asserting the
+    // guarantee precisely when the harness had no idea which pids to look for.
+    // The same blindness had already disabled orphan detection on two platforms
+    // via the ps/wmic enumeration. Never having learned the pids is not evidence
+    // that there are none.
+    let childPids = null;
     let still = [];
     let markerAlive = false;
     const reapBy = Date.now() + 5000;
     do {
       try {
         childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
-      } catch {}
-      still = childPids.filter((p) => pidAlive(p));
+      } catch { /* retried below; if it never parses the case is inconclusive */ }
+      still = (childPids || []).filter((p) => pidAlive(p));
       markerAlive = false;
       try {
         const m = fs.readFileSync(childMarkerPath, "utf8").trim();
@@ -528,8 +556,19 @@ async function testProcessTreeNoOrphans() {
       if (still.length === 0 && !markerAlive) break;
       await sleep(50);
     } while (Date.now() < reapBy);
+    if (childPids === null) {
+      inconclusive(
+        name,
+        "child-pids.json never became readable within 5000ms, so the harness never learned which " +
+          "descendants to look for -- no conclusion about orphans is available either way"
+      );
+      return;
+    }
     if (r.managerStillAlive) {
-      rec(name, "FAIL", "manager survived; cannot judge tree kill");
+      // The phrasing here was already honest -- "cannot judge" -- but it was
+      // filed as a product FAIL, so an unjudgeable trial was indistinguishable
+      // from a failed tree kill in every count and summary.
+      inconclusive(name, "the manager survived, so the tree kill was never exercised and cannot be judged");
       for (const p of still) forceKillTree(p);
       return;
     }

@@ -35,6 +35,18 @@ function pass(name, reason) { record("PASS", name, reason); }
 function fail(name, reason) { record("FAIL", name, reason); }
 function skip(name, reason) { record("SKIP", name, reason); }
 
+// A check whose PRECONDITIONS never held has not passed and has not found a
+// defect -- it did not run. PASS would claim a guarantee that was never
+// exercised; FAIL would assert a defect that was never observed; SKIP means "not
+// applicable here", which is a different and equally untrue thing. Without this
+// fourth verdict a test in that position has no honest option, and will emit a
+// dishonest one. It counts as a failure so the gate stays fail-closed -- a check
+// that did not execute must never read as green -- but it is tagged so no reader
+// or summary ever mistakes it for a product finding.
+function inconclusive(name, reason) {
+  record("FAIL", name, "INCONCLUSIVE (harness): " + reason);
+}
+
 function readJson(file) { return JSON.parse(fs.readFileSync(file, "utf8")); }
 function writeJson(file, value) { fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n"); }
 
@@ -801,8 +813,24 @@ async function testWatchdogHaltFile() {
     pass("watchdog/halt-file-written", "kill_message=" + haltData.kill_message +
       " elapsed=" + haltData.elapsed_ms + "ms budget=" + haltData.budget_ms + "ms");
   } else {
-    // Watchdog may not have fired — could be a Windows/scheduling issue
-    pass("watchdog/halt-not-written", "watchdog did not fire within test window (may be OS timing)");
+    // This used to call pass() -- BOTH branches did, with a comment excusing the
+    // miss as "may be a Windows/scheduling issue". So the dead-man switch, the
+    // single most safety-critical mechanism in the product, could fail to arm
+    // entirely and this GATING suite reported success and exited 0. Green while
+    // blind, on the one guarantee that must never be assumed.
+    //
+    // If the halt file is absent we have not verified the switch and we have not
+    // disproved it either: the watchdog may genuinely have failed to arm, or this
+    // machine may simply be slower than the window allows. Say exactly that and
+    // fail closed. If this fires routinely, the window is too tight or the
+    // watchdog is too slow to arm -- both are bugs with an owner, not conditions
+    // to be tolerated.
+    inconclusive(
+      "watchdog/halt-file-written",
+      "WATCHDOG-HALT.json never appeared" +
+        (fs.existsSync(haltFile) ? " in a parseable form" : "") +
+        ", so the dead-man switch was never exercised -- this is not evidence that it works"
+    );
   }
 
   // Try resume without ack
@@ -813,7 +841,9 @@ async function testWatchdogHaltFile() {
   } else if (haltData && haltData.halt && noAck.status === 0) {
     fail("watchdog/HALT-BYPASSED", "WATCHDOG-HALT.json exists but resume without --acknowledge-budget succeeded (exit=0)");
   } else if (!haltData || !haltData.halt) {
-    skip("watchdog/halt-resume-test", "no halt file to test against");
+    // Not "not applicable" -- the precondition for this check simply never
+    // materialised, which is the inconclusive case, not the skipped one.
+    inconclusive("watchdog/halt-resume-test", "no halt file was produced upstream, so halt-honouring on resume was never exercised");
   } else {
     fail("watchdog/halt-unexpected", "exit=" + noAck.status + " stderr=" + noAck.stderr.slice(0, 200));
   }
@@ -824,6 +854,10 @@ async function testWatchdogHaltFile() {
     const ack = runManager(project, "run", ["--acknowledge-budget"]);
     if (ack.status === 0) pass("watchdog/halt-ack-resume", "--acknowledge-budget accepted, run resumed");
     else fail("watchdog/halt-ack-failed", "exit=" + ack.status);
+  } else {
+    // Previously this check just evaporated -- no verdict of any kind was
+    // recorded, so its absence was invisible in the counts.
+    inconclusive("watchdog/halt-ack-resume", "no halt file was produced upstream, so --acknowledge-budget was never exercised");
   }
 }
 
