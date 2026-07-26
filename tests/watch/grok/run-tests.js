@@ -126,35 +126,75 @@ function forceKillTree(pid) {
   } catch {}
 }
 
+// Read the whole pid -> ppid table once, portably.
+//
+// Both of the previous per-platform queries were silently broken on a CI leg:
+//   - POSIX used `ps -o pid= --ppid <pid>`. `--ppid` is a GNU/procps long
+//     option; BSD ps (macOS) rejects it outright.
+//   - Windows used `wmic process where (ParentProcessId=...)`. wmic is
+//     deprecated and is no longer present on current Windows (removed in
+//     Windows 11 24H2 / Server 2025, which is what `windows-latest` now is).
+// In both cases the call threw, the enclosing catch swallowed it, an empty set
+// came back, and every orphan-detection loop downstream became a no-op that
+// could only ever report "no orphans". The check looked green precisely
+// because it had stopped checking.
+//
+// `ps -Ao pid=,ppid=` uses only `-A` and `-o keyword=`, both of which procps
+// and BSD ps support (it is the same form scripts/watchdog.js already uses),
+// and Get-CimInstance is the documented wmic replacement. Failure is no longer
+// silent: it is reported on stderr so a leg where enumeration is impossible
+// says so instead of quietly passing.
+function processTable() {
+  const children = new Map(); // ppid -> [pid...]
+  let raw;
+  if (IS_WIN) {
+    raw = execSync(
+      "powershell -NoProfile -NonInteractive -Command " +
+        "\"Get-CimInstance Win32_Process | ForEach-Object { \\\"$($_.ProcessId) $($_.ParentProcessId)\\\" }\"",
+      { encoding: "utf8", timeout: 20000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }
+    );
+  } else {
+    raw = execSync("ps -Ao pid=,ppid=", { encoding: "utf8", timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
+  }
+  for (const line of String(raw).split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    const ppid = parseInt(m[2], 10);
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  }
+  if (children.size === 0) throw new Error("process table came back empty");
+  return children;
+}
+
 function listDescendants(rootPid) {
   const out = new Set();
+  let children;
   try {
-    if (IS_WIN) {
-      const raw = execSync(
-        `wmic process where (ParentProcessId=${rootPid}) get ProcessId /FORMAT:LIST`,
-        { encoding: "utf8", timeout: 5000, windowsHide: true }
-      );
-      for (const m of raw.matchAll(/ProcessId=(\d+)/g)) {
-        const p = parseInt(m[1], 10);
-        if (p && p !== rootPid) {
-          out.add(p);
-          for (const c of listDescendants(p)) out.add(c);
-        }
-      }
-    } else {
-      const raw = execSync(`ps -o pid= --ppid ${rootPid}`, {
-        encoding: "utf8",
-        timeout: 5000,
-      });
-      for (const line of raw.split(/\s+/)) {
-        const p = parseInt(line.trim(), 10);
-        if (p && p !== rootPid) {
-          out.add(p);
-          for (const c of listDescendants(p)) out.add(c);
-        }
+    children = processTable();
+  } catch (error) {
+    process.stderr.write(
+      "WARNING -- could not enumerate the process table (" +
+        String((error && error.message) || error) +
+        "); descendant/orphan detection is degraded on this platform.\n"
+    );
+    return out;
+  }
+  let frontier = [rootPid];
+  const seen = new Set([rootPid]);
+  while (frontier.length) {
+    const next = [];
+    for (const p of frontier) {
+      for (const c of children.get(p) || []) {
+        if (seen.has(c)) continue;
+        seen.add(c);
+        out.add(c);
+        next.push(c);
       }
     }
-  } catch {}
+    frontier = next;
+  }
   return out;
 }
 
