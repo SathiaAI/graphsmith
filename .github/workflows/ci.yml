@@ -115,7 +115,16 @@ jobs:
       - name: Component selftest — ci-check-pr-separation.js
         run: node scripts/ci-check-pr-separation.js --selftest
       - name: Run every committed suite under tests/<component>/<family>/run-tests.js (gated by ci-suite-manifest.json)
-        run: node -e "const fs=require('fs'), path=require('path'), cp=require('child_process'); const manifest=JSON.parse(fs.readFileSync('ci-suite-manifest.json','utf8')); const gatingPrefixes=manifest.gating_suites||[]; const evidencePrefixes=manifest.evidence_only||[]; function classifySuite(p){ if (evidencePrefixes.some(function(pre){return p.startsWith(pre);})) return 'evidence_only'; if (gatingPrefixes.some(function(pre){return p.startsWith(pre);})) return 'gating'; return 'unknown_gating'; } const root='tests'; const suites=[]; (function walk(dir){ for (const e of fs.readdirSync(dir, {withFileTypes:true})) { const p = path.join(dir, e.name).split(path.sep).join('/'); if (e.isDirectory()) walk(p); else if (e.name === 'run-tests.js') suites.push(p); } })(root); suites.sort(); console.log('Discovered ' + suites.length + ' suite(s):'); suites.forEach(function(s){ console.log('  ' + s + '  [' + classifySuite(s) + ']'); }); const failedGating=[]; const failedEvidence=[]; const unknownWarned=[]; for (const s of suites) { const kind = classifySuite(s); if (kind === 'unknown_gating') { unknownWarned.push(s); console.warn('WARNING -- ' + s + ' is not listed in ci-suite-manifest.json (gating_suites or evidence_only) -- treating as GATING (fail-safe).'); } console.log(''); console.log('=== ' + s + ' [' + kind + '] ==='); const r = cp.spawnSync(process.execPath, [s], {stdio:'inherit'}); if (r.status !== 0) { if (kind === 'evidence_only') failedEvidence.push(s + ' (exit ' + r.status + ')'); else failedGating.push(s + ' (exit ' + r.status + ')'); } } console.log(''); if (failedEvidence.length) { console.log('EVIDENCE-ONLY suite(s) reported findings (logged, does NOT gate merge):'); failedEvidence.forEach(function(f){ console.log('  ' + f); }); } if (unknownWarned.length) { console.log('Suite(s) absent from ci-suite-manifest.json (treated as gating, fail-safe):'); unknownWarned.forEach(function(f){ console.log('  ' + f); }); } if (failedGating.length) { console.error(''); console.error('FAILED gating suite(s):'); failedGating.forEach(function(f){ console.error('  ' + f); }); process.exit(1); } console.log(''); console.log('All gating suite(s) passed (' + suites.length + ' discovered, ' + failedEvidence.length + ' evidence-only failure(s) logged above, non-gating).');"
+        # The classification policy lives in ci-suite-manifest.json and the runner
+        # is scripts/ci-run-suites.js. It used to be a ~2000-character `node -e`
+        # one-liner here, duplicated again in ci-templates/gitlab-ci.yml: it could
+        # not be run locally the way CI runs it, was not covered by the repo's own
+        # `node --check scripts/*.js` step, and one quoting slip broke all six
+        # matrix legs at once. On failure the runner also writes the failing suite
+        # names to $GITHUB_STEP_SUMMARY and re-runs each failure once to say
+        # whether it is reproducible or merely FLAKY -- the log viewer buries that
+        # ~3300 lines deep, which repeatedly cost more time than the fixes did.
+        run: node scripts/ci-run-suites.js
 
       - name: Gauntlet regression batteries (v0.3.0 + v0.4.0 — adjudicated HOLD/BREAK gate)
         # The raw adversarial suites above are evidence-only (they exit non-zero on their

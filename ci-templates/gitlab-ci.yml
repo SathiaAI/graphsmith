@@ -67,69 +67,17 @@ stages:
     - node scripts/gate.js --selftest
     - node scripts/verify.js --selftest
     - node scripts/ci-check-pr-separation.js --selftest
-    - |
-      node -e "
-      const fs = require('fs'), path = require('path'), cp = require('child_process');
-      // ci-suite-manifest.json (task A-ci-fix B3): gating_suites must stay
-      // green; evidence_only suites are one-shot adversarial-review
-      // harnesses that exit non-zero BY DESIGN on findings -- they are run
-      // and logged but never gate. A suite in neither list is fail-safe
-      // GATING with an explicit warning (never silently ignored).
-      const manifest = JSON.parse(fs.readFileSync('ci-suite-manifest.json', 'utf8'));
-      const gatingPrefixes = manifest.gating_suites || [];
-      const evidencePrefixes = manifest.evidence_only || [];
-      function classifySuite(p) {
-        if (evidencePrefixes.some(function (pre) { return p.startsWith(pre); })) return 'evidence_only';
-        if (gatingPrefixes.some(function (pre) { return p.startsWith(pre); })) return 'gating';
-        return 'unknown_gating';
-      }
-      const root = 'tests';
-      const suites = [];
-      (function walk(dir) {
-        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-          const p = path.join(dir, e.name).split(path.sep).join('/');
-          if (e.isDirectory()) walk(p);
-          else if (e.name === 'run-tests.js') suites.push(p);
-        }
-      })(root);
-      suites.sort();
-      console.log('Discovered ' + suites.length + ' suite(s):');
-      suites.forEach(function (s) { console.log('  ' + s + '  [' + classifySuite(s) + ']'); });
-      const failedGating = [];
-      const failedEvidence = [];
-      const unknownWarned = [];
-      for (const s of suites) {
-        const kind = classifySuite(s);
-        if (kind === 'unknown_gating') {
-          unknownWarned.push(s);
-          console.warn('WARNING -- ' + s + ' is not listed in ci-suite-manifest.json (gating_suites or evidence_only) -- treating as GATING (fail-safe).');
-        }
-        console.log('');
-        console.log('=== ' + s + ' [' + kind + '] ===');
-        const r = cp.spawnSync(process.execPath, [s], { stdio: 'inherit' });
-        if (r.status !== 0) {
-          if (kind === 'evidence_only') failedEvidence.push(s + ' (exit ' + r.status + ')');
-          else failedGating.push(s + ' (exit ' + r.status + ')');
-        }
-      }
-      console.log('');
-      if (failedEvidence.length) {
-        console.log('EVIDENCE-ONLY suite(s) reported findings (logged, does NOT gate merge):');
-        failedEvidence.forEach(function (f) { console.log('  ' + f); });
-      }
-      if (unknownWarned.length) {
-        console.log('Suite(s) absent from ci-suite-manifest.json (treated as gating, fail-safe):');
-        unknownWarned.forEach(function (f) { console.log('  ' + f); });
-      }
-      if (failedGating.length) {
-        console.error('');
-        console.error('FAILED gating suite(s):');
-        failedGating.forEach(function (f) { console.error('  ' + f); });
-        process.exit(1);
-      }
-      console.log('');
-      console.log('All gating suite(s) passed (' + suites.length + ' discovered, ' + failedEvidence.length + ' evidence-only failure(s) logged above, non-gating).');
-      "
+    # The classification policy lives in ci-suite-manifest.json and the runner
+    # is scripts/ci-run-suites.js -- the same script the GitHub Actions
+    # workflow calls, so the two CI surfaces cannot drift apart. This used to
+    # be a 3122-character inline `node -e` duplicated from .github/workflows/
+    # ci.yml: it could not be run locally the way CI runs it, was not covered
+    # by the repo's own `node --check scripts/*.js` step, and any quoting slip
+    # broke the pipeline with no local reproduction. gating_suites must stay
+    # green; evidence_only suites are one-shot adversarial-review harnesses
+    # that exit non-zero BY DESIGN on findings -- they are run and logged but
+    # never gate. Anything in NEITHER list is treated as gating (fail-safe).
+    - node scripts/ci-run-suites.js
     # The evidence-only suites above are run and logged but never gate. Their
     # GATE is the pair of gauntlet batteries, which fold in each
     # ADJUDICATION.md and exit 0 only when every failing test is a documented
