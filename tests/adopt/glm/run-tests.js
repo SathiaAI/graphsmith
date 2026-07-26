@@ -149,7 +149,7 @@ function loadAdoptModule() {
 
 function runCli(args) {
   try {
-    const output = execSync(`node "${ADOPT_SCRIPT}" ${args}`, { encoding: "utf8", cwd: TEST_ROOT });
+    const output = execSync(`"${process.execPath}" "${ADOPT_SCRIPT}" ${args}`, { encoding: "utf8", cwd: TEST_ROOT });
     return { success: true, output, exitCode: 0 };
   } catch (error) {
     return { success: false, output: error.stdout || error.stderr || "", exitCode: error.status || 1 };
