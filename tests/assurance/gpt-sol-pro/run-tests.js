@@ -96,6 +96,25 @@ function snapshotsEqual(a, b) {
   return ak.length === bk.length && ak.every((key) => b[key] === a[key]);
 }
 
+// snapshotsEqual answers "did the tree change"; when it says yes, the only
+// useful next question is "which path". Reporting just "the snapshot changed"
+// is what made this check unactionable on a CI leg we cannot reproduce
+// locally: it named no file, so a red macOS run taught us nothing. This names
+// the offending paths without changing what counts as a violation.
+function snapshotDelta(a, b, limit) {
+  const max = limit || 12;
+  const out = [];
+  for (const key of Object.keys(a)) {
+    if (!(key in b)) out.push("removed " + key);
+    else if (b[key] !== a[key]) out.push("changed " + key);
+  }
+  for (const key of Object.keys(b)) {
+    if (!(key in a)) out.push("added " + key);
+  }
+  const shown = out.slice(0, max).join("; ");
+  return out.length > max ? shown + "; (+" + (out.length - max) + " more)" : shown;
+}
+
 function noContainerEnv(emptyPath) {
   const env = Object.assign({}, process.env, { PATH: emptyPath, Path: emptyPath });
   for (const key of Object.keys(env)) {
@@ -513,7 +532,7 @@ function main() {
 
   const after = snapshotTree(ROOT);
   if (snapshotsEqual(before, after)) pass("harness.no-real-tree-mutation", "repository snapshot was identical before and after all temp-driven CLI attacks");
-  else fail("harness.no-real-tree-mutation", "repository snapshot changed while the harness was running");
+  else fail("harness.no-real-tree-mutation", "repository snapshot changed while the harness was running: " + snapshotDelta(before, after));
 
   for (const result of results) {
     process.stdout.write(`${result.status} ${result.id} - ${result.reason}\n`);
