@@ -2413,20 +2413,61 @@ function parseArgs(argv) {
   return opts;
 }
 
+// A machine-readable report on stdout must survive process.exit().
+//
+// process.stdout.write() to a PIPE is asynchronous on POSIX: libuv performs one
+// write(2) and queues whatever did not fit, then flushes it on later event-loop
+// turns. process.exit() discards that queue, so a queued tail is lost while the
+// exit code still reports success. A Linux pipe holds 65536 bytes, so a report
+// this size (~12 KB) always lands in a single syscall and nothing is ever
+// queued -- which is why this has always been green on Linux. On the macOS CI
+// leg it is not: node 18 there delivered an incomplete report with exit 0, and
+// the caller failed on `Unexpected end of JSON input`. Reproduced on Linux by
+// shrinking a real pipe with fcntl(F_SETPIPE_SZ) to 4096 while draining it
+// concurrently, exactly as execSync does: the report arrives clipped to 4096
+// bytes and still exits 0. The exact macOS pipe capacity is not asserted here
+// and is not the point -- the dropped queue is.
+//
+// Writing to fd 1 with fs.writeSync loops until every byte has been handed to
+// the kernel, so the report cannot be lost regardless of when the process
+// exits. This deliberately does NOT change exit timing or exit codes: switching
+// to process.exitCode would also fix the truncation but would let the process
+// keep running until the event loop drained, which is a different behaviour
+// with its own failure mode (a lingering handle turns a fast exit into a hang).
+function writeReport(text) {
+  const buf = Buffer.from(text, "utf8");
+  const idle = new Int32Array(new SharedArrayBuffer(4));
+  let off = 0;
+  while (off < buf.length) {
+    try {
+      off += fs.writeSync(1, buf, off, buf.length - off);
+    } catch (error) {
+      if (error && error.code === "EAGAIN") {
+        // Non-blocking pipe is momentarily full; yield without spinning hot.
+        Atomics.wait(idle, 0, 0, 1);
+        continue;
+      }
+      // EPIPE means the reader is gone -- there is nobody left to tell.
+      if (error && error.code === "EPIPE") return;
+      throw error;
+    }
+  }
+}
+
 function main() {
   const argv = process.argv.slice(2);
   const opts = parseArgs(argv);
   try {
     if (argv.includes("--selftest")) {
       const result = runSelftest();
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       process.stderr.write(`selftest: ${result.total - result.failed} passed, ${result.failed} failed\n`);
       process.exit(result.pass ? 0 : 1);
       return;
     }
     if (argv.includes("--integrity")) {
       const report = runIntegrity(opts.root, opts);
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      writeReport(JSON.stringify(report, null, 2) + "\n");
       const code = integrityExitCode(report);
       process.stderr.write(
         `verify --integrity: release-verified=${report.release_verified} self-consistent=${report.self_consistent} failure_domain=${report.failure_domain}\n`
@@ -2436,7 +2477,7 @@ function main() {
     }
     if (argv.includes("--profiles")) {
       const report = runProfiles(opts.root, opts);
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      writeReport(JSON.stringify(report, null, 2) + "\n");
       // Exit code preserved at 0 for existing callers; the evidence-carrying
       // status lives in the JSON. A one-line profile string goes to stderr for
       // the badge/CI to scrape without parsing JSON.
@@ -2449,12 +2490,12 @@ function main() {
     if (argv.includes("--trust-model")) {
       const report = runTrustModel();
       process.stderr.write(report.circular_trust_limit + "\n");
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      writeReport(JSON.stringify(report, null, 2) + "\n");
       process.exit(0);
       return;
     }
     if (argv.includes("--platform-probe")) {
-      process.stdout.write(JSON.stringify(runPlatformProbe(), null, 2) + "\n");
+      writeReport(JSON.stringify(runPlatformProbe(), null, 2) + "\n");
       process.exit(0);
       return;
     }
