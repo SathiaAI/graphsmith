@@ -5,6 +5,7 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const os = require("os");
 const path = require("path");
 const STATE_SCHEMA = require("../schemas/state-store.schema.json");
@@ -1193,9 +1194,9 @@ function selftest() {
 if (require.main === module) {
   const command = process.argv[2];
   try {
-    if (command === "status") console.log(JSON.stringify(createStore(process.cwd()).status()));
-    else if (command === "sweep") console.log(JSON.stringify({ schema_version: SCHEMA_VERSION, swept: createStore(process.cwd()).sweepExpired() }));
-    else if (command === "--selftest") console.log(JSON.stringify(selftest()));
+    if (command === "status") writeReport(JSON.stringify(createStore(process.cwd()).status()) + "\n");
+    else if (command === "sweep") writeReport(JSON.stringify({ schema_version: SCHEMA_VERSION, swept: createStore(process.cwd()).sweepExpired() }) + "\n");
+    else if (command === "--selftest") writeReport(JSON.stringify(selftest()) + "\n");
     else {
       console.error("Usage: node scripts/state-store.js status|sweep|--selftest");
       process.exitCode = 2;

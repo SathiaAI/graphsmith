@@ -67,6 +67,35 @@
 "use strict";
 
 const fs = require("fs");
+/* writeReport is INLINED here on purpose — do not replace it with a require.
+ *
+ * scaffold.js copies this file, and only this file, as a standalone unit into
+ * every generated project (see its watchdogSrc/frozenFileHashes handling). A
+ * local require would resolve at scaffold time and then fail with
+ * MODULE_NOT_FOUND inside the generated project, taking the watchdog — and
+ * therefore the sync-execution budget enforcement — down with it. The scaffold
+ * suites catch that, which is how this comment came to exist.
+ *
+ * Rationale for the helper itself lives in scripts/write-report.js; keep the two
+ * in step. Both must hand every byte to the kernel before process.exit() can
+ * discard a queued write and leave the caller with a truncated report and a
+ * success exit code.
+ */
+const WRITE_REPORT_IDLE = new Int32Array(new SharedArrayBuffer(4));
+function writeReport(text) {
+  const buf = Buffer.from(String(text), "utf8");
+  let off = 0;
+  while (off < buf.length) {
+    try {
+      off += fs.writeSync(1, buf, off, buf.length - off);
+    } catch (error) {
+      const code = error && error.code;
+      if (code === "EAGAIN") { Atomics.wait(WRITE_REPORT_IDLE, 0, 0, 1); continue; }
+      if (code === "EPIPE") return;
+      throw error;
+    }
+  }
+}
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 const os = require("os");
@@ -417,7 +446,7 @@ function runWatchdog(opts) {
         try { fs.unlinkSync(watchdogHbFile); } catch {}
         try { fs.unlinkSync(orphanFile); } catch {}
 
-        process.stdout.write(JSON.stringify(haltEvidence) + "\n");
+        writeReport(JSON.stringify(haltEvidence) + "\n");
         resolve({ halted: true, evidence: haltEvidence });
       }
     }, pollIntervalMs);
@@ -1193,7 +1222,7 @@ async function main() {
   if (args.selftest) {
     try {
       const result = await selftest();
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       process.exitCode = result.status === "pass" ? 0 : 1;
     } catch (e) {
       process.stderr.write(`watchdog selftest error: ${e.stack || e.message}\n`);

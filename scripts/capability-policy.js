@@ -28,6 +28,7 @@
  */
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 
 const POLICY_PATH = path.join(__dirname, "risk-policy.json");
@@ -481,7 +482,7 @@ function selftest() {
 
   const allPass = results.every((r) => r.pass);
   const output = { selftest: "capability-policy", policy_id: POLICY.raw.policy_id, schema_version: POLICY.raw.schema_version, all_pass: allPass, results };
-  console.log(JSON.stringify(output, null, 2));
+  writeReport(JSON.stringify(output, null, 2) + "\n");
   if (!allPass) process.exitCode = 1;
 }
 

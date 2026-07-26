@@ -12,6 +12,7 @@
  * Paths:    repo-relative, forward slashes, NFC, case-fold collision REFUSAL.
  * No clocks/randomness in decision paths (timestamps in metadata OK). */
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const crypto = require("crypto");
 
@@ -444,7 +445,7 @@ function cli() {
     }
     try {
       const result = verifyTree(manifestPath, rootDir);
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       if (result.ok) {
         process.stderr.write("Verification: OK\n");
         process.exit(0);

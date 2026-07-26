@@ -29,6 +29,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
@@ -864,7 +865,7 @@ function parseFlags(argv) {
 }
 
 function printJson(value) {
-  process.stdout.write(JSON.stringify(value, null, 2) + "\n");
+  writeReport(JSON.stringify(value, null, 2) + "\n");
 }
 
 function usage() {

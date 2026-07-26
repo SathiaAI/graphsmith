@@ -21,6 +21,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
@@ -1313,7 +1314,7 @@ function parseProposed(argv) {
 function main(argv) {
   if (argv.includes("--selftest")) {
     const out = selftest();
-    process.stdout.write(`${JSON.stringify(out)}\n`);
+    writeReport(`${JSON.stringify(out)}\n`);
     process.exitCode = out.status === "pass" ? 0 : 1;
     return;
   }
@@ -1323,7 +1324,7 @@ function main(argv) {
 
   if (cmd === "--diagnose") {
     const r = diagnose(root);
-    process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+    writeReport(`${JSON.stringify(r, null, 2)}\n`);
     return;
   }
 
@@ -1349,7 +1350,7 @@ function main(argv) {
       target,
       proposedContent: proposed,
     });
-    process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+    writeReport(`${JSON.stringify(r, null, 2)}\n`);
     return;
   }
 
@@ -1361,7 +1362,7 @@ function main(argv) {
       return;
     }
     const r = doRollback(id, root);
-    process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+    writeReport(`${JSON.stringify(r, null, 2)}\n`);
     return;
   }
 

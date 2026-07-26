@@ -47,6 +47,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const os = require("os");
 const migrateLib = require("./migrate.js");
@@ -65,7 +66,10 @@ const NETWORK_MODULE_NAMES = new Set([
   "node:tls", "node:dgram", "node:child_process",
 ]);
 
-const ALLOWED_REQUIRE_MODULES = new Set(["fs", "path", "os", "./migrate.js"]);
+// "./write-report.js" is listed deliberately, not incidentally: this allowlist
+// exists so that acquiring a new dependency is a conscious act, and the
+// self-scan below fails the selftest until it is recorded here.
+const ALLOWED_REQUIRE_MODULES = new Set(["fs", "path", "os", "./migrate.js", "./write-report.js"]);
 
 const REQUIRE_CALL_RE = /require\(\s*['"]([^'"]+)['"]\s*\)/g;
 
@@ -751,7 +755,7 @@ if (require.main === module) {
 
   if (argv.includes("--selftest")) {
     const report = selftest();
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    writeReport(`${JSON.stringify(report, null, 2)}\n`);
     process.exit(report.exitCode);
   } else if (argv[0] === "export") {
     const rest = argv.slice(1);

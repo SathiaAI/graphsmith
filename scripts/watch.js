@@ -21,6 +21,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const { execSync } = require("child_process");
 
@@ -336,7 +337,7 @@ async function main() {
   if (args[0] === "--selftest") {
     try {
       const result = await selftest();
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       process.exitCode = result.status === "pass" ? 0 : 1;
     } catch (e) {
       process.stderr.write(`selftest error: ${e.stack || e.message}\n`);

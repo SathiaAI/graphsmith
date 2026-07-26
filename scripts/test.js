@@ -15,6 +15,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
@@ -27,7 +28,7 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const DEFAULT_CORPUS = path.join(REPO_ROOT, "scenarios");
 
 const err = (msg) => process.stderr.write(msg + "\n");
-const out = (obj) => process.stdout.write(JSON.stringify(obj, null, 2) + "\n");
+const out = (obj) => writeReport(JSON.stringify(obj, null, 2) + "\n");
 
 function sha256(data) {
   return crypto

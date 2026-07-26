@@ -12,6 +12,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
@@ -685,7 +686,7 @@ function cli() {
 
   if (!gate || gate === "--selftest" || args.selftest) {
     const result = selftestMain();
-    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    writeReport(JSON.stringify(result, null, 2) + "\n");
     process.exit(result.exitCode || 0);
   }
 
@@ -719,25 +720,25 @@ function cli() {
       catch (e) { process.stderr.write("ERR: cannot read candidate: " + e.message + "\n"); process.exit(2); }
     }
     const result = gate3Prepare(candidateId, { candidate, evidence: args.evidence ? JSON.parse(args.evidence) : null });
-    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    writeReport(JSON.stringify(result, null, 2) + "\n");
     process.exit(0);
   } else if (gate === "4") {
     if (args.status) {
       const stateStore = require("./state-store");
       const status = stateStore.status();
-      process.stdout.write(JSON.stringify(status, null, 2) + "\n");
+      writeReport(JSON.stringify(status, null, 2) + "\n");
       process.exit(0);
     } else if (args.observe) {
       const stateStore = require("./state-store");
       const runId = args.observe;
       const treeId = args.tree || "default";
       const result = gate4Observe({ runId, treeId }, stateStore);
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       process.exit(0);
     } else if (args.close) {
       const stateStore = require("./state-store");
       const result = gate4Close(args.close, args.outcome || "flagged", stateStore);
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       process.exit(0);
     } else {
       process.stderr.write("Usage: node scripts/gate.js 4 --status|--observe <runId>|--close <windowId>\n");
@@ -754,7 +755,7 @@ function cli() {
 }
 
 function outputResult(result, exitCode) {
-  process.stdout.write(JSON.stringify({ schema_version: SCHEMA_VERSION, ...result }, null, 2) + "\n");
+  writeReport(JSON.stringify({ schema_version: SCHEMA_VERSION, ...result }, null, 2) + "\n");
   if (!result.pass) process.stderr.write("GATE REJECT: " + JSON.stringify(result.hard || result.primary || result.findings?.slice(0, 3)) + "\n");
   process.exit(exitCode);
 }

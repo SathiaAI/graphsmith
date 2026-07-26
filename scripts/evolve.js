@@ -17,6 +17,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
@@ -752,7 +753,7 @@ if (require.main === module) {
 
   if (args.includes("--selftest")) {
     const report = selftest();
-    process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    writeReport(JSON.stringify(report, null, 2) + "\n");
     if (report.exitCode !== 0) process.exit(report.exitCode);
     process.exit(0);
   }
@@ -782,7 +783,7 @@ if (require.main === module) {
     process.exitCode = 2;
   } else {
     const result = cycle(runDirs, { projectRoot: projectRoot });
-    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    writeReport(JSON.stringify(result, null, 2) + "\n");
     process.exitCode = result.proposals > 0 ? 0 : 1;
   }
 }

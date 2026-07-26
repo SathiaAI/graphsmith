@@ -219,7 +219,16 @@ function main() {
         continue;
       }
 
+      // Two file-path runs, so determinism is MEASURED rather than assumed.
+      // Some reports legitimately carry a pid, an elapsed_ms or a timestamp and
+      // are therefore not byte-stable between invocations -- watchdog.js is one.
+      // Comparing bytes across runs for those produces a flaky suite, and a flaky
+      // gate gets ignored, which is worse than no gate. So: byte-equality where
+      // the report is stable (the strongest available check), and structural
+      // equality where it is not.
       const expected = viaFile(scriptPath, c.args, tmpdir);
+      const expectedAgain = viaFile(scriptPath, c.args, tmpdir);
+      const deterministic = expected === expectedAgain;
       const expectedJson = firstJsonValue(expected);
       if (expectedJson === null) {
         // A CLI that emits no JSON on stdout has no report for this suite to
@@ -240,36 +249,49 @@ function main() {
         continue;
       }
 
-      let worstLen = null;
+      const expectedDocs = expectedJson.documents || 1;
       let brokenRun = -1;
-      let brokenLen = -1;
+      let why = "";
       for (let i = 0; i < REPEATS; i += 1) {
         const got = viaPipe(scriptPath, c.args);
         if (got.error) {
           brokenRun = i;
-          brokenLen = -1;
+          why = "spawnSync errored: " + String(got.error.message || got.error);
           break;
         }
         const gotJson = firstJsonValue(got.out);
-        if (gotJson === null || got.out.length !== expected.length) {
+        if (gotJson === null) {
           brokenRun = i;
-          brokenLen = got.out.length;
+          why =
+            "captured " + got.out.length + "B that does not parse" +
+            (got.out.length === 0 ? " (entirely empty)" : "") +
+            " while the file path produced a valid " + expected.length + "B report";
           break;
         }
-        if (worstLen === null || got.out.length < worstLen) worstLen = got.out.length;
+        // A JSON-Lines report truncated exactly at a line boundary would still
+        // parse, so the document count has to be checked too.
+        if ((gotJson.documents || 1) !== expectedDocs) {
+          brokenRun = i;
+          why = "captured " + (gotJson.documents || 1) + " document(s) but the file path produced " + expectedDocs;
+          break;
+        }
+        if (deterministic && got.out.length !== expected.length) {
+          brokenRun = i;
+          why =
+            "file=" + expected.length + "B but pipe=" + got.out.length + "B (short by " +
+            (expected.length - got.out.length) + "B)";
+          break;
+        }
       }
 
+      const mode = deterministic ? "byte-identical to the file path" : "parses + document count matches (report is not byte-stable)";
       if (brokenRun === -1) {
-        report(true, id, "report survived spawnSync intact " + REPEATS + "/" + REPEATS + " runs (" + expected.length + "B)");
-      } else if (brokenLen === -1) {
-        report(false, id, "spawnSync errored on run " + (brokenRun + 1));
+        report(true, id, "report survived spawnSync " + REPEATS + "/" + REPEATS + " runs, " + mode + " (" + expected.length + "B)");
       } else {
         report(
           false,
           id,
-          "report LOST through the pipe on run " + (brokenRun + 1) + " of " + REPEATS +
-            ": file=" + expected.length + "B but pipe=" + brokenLen + "B" +
-            (brokenLen === 0 ? " (entirely empty)" : " (short by " + (expected.length - brokenLen) + "B)") +
+          "report LOST through the pipe on run " + (brokenRun + 1) + " of " + REPEATS + ": " + why +
             " — the CLI must hand every byte to the kernel before it exits"
         );
       }
