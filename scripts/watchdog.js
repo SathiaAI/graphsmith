@@ -35,8 +35,12 @@
  *                "elapsed_ms": <int>, "last_heartbeat": <int|null>,
  *                "kill_message": "<capability-specific>", "killed_at_mono_ms": <int>,
  *                "inspected": { ... } }
- *   Kill signal: SIGKILL on Unix (process-group via negative pid),
- *                taskkill /T /F on Windows (process tree).
+ *   Kill signal: SIGKILL on Unix to the process group (negative pid) AND to every
+ *                enumerated descendant of the watched pid — the group alone is
+ *                not enough, because kill(-pid) only reaches a group if the
+ *                watched process is that group's LEADER, which it is not when it
+ *                was spawned by another process rather than launched from a
+ *                shell. taskkill /T /F on Windows (process tree).
  *
  * D4 — Dead-man's-switch / watchdog liveness signal:
  *   At startup, the watchdog writes a preliminary halt file (dead_man_switch: true)
@@ -63,6 +67,35 @@
 "use strict";
 
 const fs = require("fs");
+/* writeReport is INLINED here on purpose — do not replace it with a require.
+ *
+ * scaffold.js copies this file, and only this file, as a standalone unit into
+ * every generated project (see its watchdogSrc/frozenFileHashes handling). A
+ * local require would resolve at scaffold time and then fail with
+ * MODULE_NOT_FOUND inside the generated project, taking the watchdog — and
+ * therefore the sync-execution budget enforcement — down with it. The scaffold
+ * suites catch that, which is how this comment came to exist.
+ *
+ * Rationale for the helper itself lives in scripts/write-report.js; keep the two
+ * in step. Both must hand every byte to the kernel before process.exit() can
+ * discard a queued write and leave the caller with a truncated report and a
+ * success exit code.
+ */
+const WRITE_REPORT_IDLE = new Int32Array(new SharedArrayBuffer(4));
+function writeReport(text) {
+  const buf = Buffer.from(String(text), "utf8");
+  let off = 0;
+  while (off < buf.length) {
+    try {
+      off += fs.writeSync(1, buf, off, buf.length - off);
+    } catch (error) {
+      const code = error && error.code;
+      if (code === "EAGAIN") { Atomics.wait(WRITE_REPORT_IDLE, 0, 0, 1); continue; }
+      if (code === "EPIPE") return;
+      throw error;
+    }
+  }
+}
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 const os = require("os");
@@ -152,6 +185,67 @@ function deriveKillMessage(capStatus, capData) {
   }
 }
 
+// POSIX descendant enumeration. `kill(-pid)` addresses the process GROUP whose
+// pgid == pid, which exists only if the watched process is a group LEADER. A
+// manager started by a shell usually is; one spawned by another process (a test
+// harness, a supervisor, an IDE runner) is NOT — there `kill(-pid)` raises ESRCH
+// and the old fallback killed the manager ALONE, leaving its workers running.
+// Orphaned workers can keep firing external effects after the guard has declared
+// the run halted, which is exactly what the tree kill exists to prevent. So we
+// enumerate the real descendant set from the process table and kill it
+// explicitly, deepest-first, in addition to trying the group.
+function descendantsOf(rootPid) {
+  const children = new Map();      // ppid -> [pid...]
+  const record = (pid, ppid) => {
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || pid <= 0) return;
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  };
+  let mapped = false;
+  try {
+    // Linux: /proc/<pid>/stat field 4 is ppid. Field 2 (comm) can contain
+    // spaces and parentheses, so parse after the LAST ')'.
+    for (const entry of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      let stat;
+      try { stat = fs.readFileSync("/proc/" + entry + "/stat", "utf8"); } catch { continue; }
+      const close = stat.lastIndexOf(")");
+      if (close === -1) continue;
+      const ppid = parseInt(stat.slice(close + 2).split(" ")[1], 10);
+      record(parseInt(entry, 10), ppid);
+    }
+    mapped = children.size > 0;
+  } catch { mapped = false; }
+  if (!mapped) {
+    // macOS and any POSIX without /proc.
+    try {
+      const out = execSync("ps -Ao pid=,ppid=", { encoding: "utf8", timeout: 5000 });
+      for (const line of out.split("\n")) {
+        const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+        if (m) record(parseInt(m[1], 10), parseInt(m[2], 10));
+      }
+    } catch { return []; }
+  }
+  // Breadth-first from the root; `seen` also guards against a cycle in a
+  // malformed process table.
+  const out = [];
+  const seen = new Set([rootPid]);
+  let frontier = [rootPid];
+  while (frontier.length) {
+    const next = [];
+    for (const p of frontier) {
+      for (const c of children.get(p) || []) {
+        if (seen.has(c)) continue;
+        seen.add(c);
+        out.push(c);
+        next.push(c);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
 function killProcessGroup(pid) {
   if (process.platform === "win32") {
     try {
@@ -160,14 +254,20 @@ function killProcessGroup(pid) {
     } catch {
       try { process.kill(pid, "SIGKILL"); return true; } catch { return false; }
     }
-  } else {
-    try {
-      process.kill(-pid, "SIGKILL");
-      return true;
-    } catch {
-      try { process.kill(pid, "SIGKILL"); return true; } catch { return false; }
-    }
   }
+  // Snapshot descendants BEFORE killing the root: once the root is gone its
+  // children are reparented to init and the parent links are lost.
+  const descendants = descendantsOf(pid);
+  let rootKilled = false;
+  try { process.kill(-pid, "SIGKILL"); rootKilled = true; } catch (e) {}
+  if (!rootKilled) {
+    try { process.kill(pid, "SIGKILL"); rootKilled = true; } catch (e) {}
+  }
+  // Deepest-first so a parent cannot spawn a replacement while we work upward.
+  for (let i = descendants.length - 1; i >= 0; i--) {
+    try { process.kill(descendants[i], "SIGKILL"); } catch (e) {}
+  }
+  return rootKilled;
 }
 
 function pidAlive(pid) {
@@ -346,7 +446,7 @@ function runWatchdog(opts) {
         try { fs.unlinkSync(watchdogHbFile); } catch {}
         try { fs.unlinkSync(orphanFile); } catch {}
 
-        process.stdout.write(JSON.stringify(haltEvidence) + "\n");
+        writeReport(JSON.stringify(haltEvidence) + "\n");
         resolve({ halted: true, evidence: haltEvidence });
       }
     }, pollIntervalMs);
@@ -1122,7 +1222,7 @@ async function main() {
   if (args.selftest) {
     try {
       const result = await selftest();
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       process.exitCode = result.status === "pass" ? 0 : 1;
     } catch (e) {
       process.stderr.write(`watchdog selftest error: ${e.stack || e.message}\n`);

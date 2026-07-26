@@ -9,6 +9,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const ROOT = path.resolve(__dirname, "..", "..", "..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
@@ -17,6 +18,19 @@ const NODE = process.execPath;
 
 const results = [];
 let failures = 0;
+
+// A check whose PRECONDITIONS never held has not passed and has not found a
+// defect -- it did not run. PASS would claim an untested guarantee, FAIL would
+// assert an unobserved defect, and SKIPPED means "not applicable", which is a
+// different untruth. Without a fourth verdict a test in that position has no
+// honest option and will emit a dishonest one -- exactly what A8 did when it
+// reported "no interface for manager to detect guard death", a claim about the
+// PRODUCT, because the harness had run out of time waiting for the guard to arm.
+// Counts as a failure so the gate stays fail-closed; tagged so it can never be
+// read as a product finding.
+function inconclusive(name, reason, extra) {
+  rec(name, "FAIL", "INCONCLUSIVE (harness): " + reason, extra);
+}
 
 function rec(name, status, reason, extra) {
   const row = { name, status, reason: reason || null };
@@ -78,36 +92,74 @@ function forceKillTree(pid) {
   } catch {}
 }
 
+// Read the whole pid -> ppid table once, portably.
+//
+// Both of the previous per-platform queries were silently broken on a CI leg:
+//   - POSIX used `ps -o pid= --ppid <pid>`. `--ppid` is a GNU/procps long
+//     option; BSD ps (macOS) rejects it outright.
+//   - Windows used `wmic process where (ParentProcessId=...)`. wmic is
+//     deprecated and is no longer present on current Windows (removed in
+//     Windows 11 24H2 / Server 2025, which is what `windows-latest` now is).
+// In both cases the call threw, the enclosing catch swallowed it, an empty set
+// came back, and every orphan-detection loop downstream became a no-op that
+// could only ever report "no orphans". The check looked green precisely
+// because it had stopped checking.
+//
+// `ps -Ao pid=,ppid=` uses only `-A` and `-o keyword=`, both of which procps
+// and BSD ps support (it is the same form scripts/watchdog.js already uses),
+// and Get-CimInstance is the documented wmic replacement. Failure is no longer
+// silent: it is reported on stderr so a leg where enumeration is impossible
+// says so instead of quietly passing.
+function processTable() {
+  const children = new Map(); // ppid -> [pid...]
+  let raw;
+  if (IS_WIN) {
+    raw = execSync(
+      "powershell -NoProfile -NonInteractive -Command " +
+        "\"Get-CimInstance Win32_Process | ForEach-Object { \\\"$($_.ProcessId) $($_.ParentProcessId)\\\" }\"",
+      { encoding: "utf8", timeout: 20000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }
+    );
+  } else {
+    raw = execSync("ps -Ao pid=,ppid=", { encoding: "utf8", timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
+  }
+  for (const line of String(raw).split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    const ppid = parseInt(m[2], 10);
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  }
+  if (children.size === 0) throw new Error("process table came back empty");
+  return children;
+}
+
 function listDescendantPids(rootPid) {
   const out = new Set();
+  let children;
   try {
-    if (IS_WIN) {
-      const raw = execSync(
-        `wmic process where (ParentProcessId=${rootPid}) get ProcessId /FORMAT:LIST`,
-        { encoding: "utf8", timeout: 5000, windowsHide: true }
-      );
-      for (const m of raw.matchAll(/ProcessId=(\d+)/g)) {
-        const p = parseInt(m[1], 10);
-        if (p && p !== rootPid) {
-          out.add(p);
-          for (const c of listDescendantPids(p)) out.add(c);
-        }
-      }
-    } else {
-      const raw = execSync(`ps -o pid= --ppid ${rootPid}`, {
-        encoding: "utf8",
-        timeout: 5000,
-      });
-      for (const line of raw.split(/\s+/)) {
-        const p = parseInt(line.trim(), 10);
-        if (p && p !== rootPid) {
-          out.add(p);
-          for (const c of listDescendantPids(p)) out.add(c);
-        }
+    children = processTable();
+  } catch (error) {
+    process.stderr.write(
+      "WARNING -- could not enumerate the process table (" +
+        String((error && error.message) || error) +
+        "); descendant/orphan detection is degraded on this platform.\n"
+    );
+    return out;
+  }
+  let frontier = [rootPid];
+  const seen = new Set([rootPid]);
+  while (frontier.length) {
+    const next = [];
+    for (const p of frontier) {
+      for (const c of children.get(p) || []) {
+        if (seen.has(c)) continue;
+        seen.add(c);
+        out.add(c);
+        next.push(c);
       }
     }
-  } catch {
-    /* empty / tool missing */
+    frontier = next;
   }
   return out;
 }
@@ -300,6 +352,7 @@ const iv = setInterval(() => {
   ]);
   const t1 = monoMs();
 
+  let childPidsUnreadable = null;
   // External cleanup if watchdog failed
   if (pidAlive(managerPid)) forceKillTree(managerPid);
   try {
@@ -311,11 +364,17 @@ const iv = setInterval(() => {
   if (wd.child && pidAlive(wd.child.pid)) forceKillTree(wd.child.pid);
 
   // Collect child pids if any
-  let childPids = [];
+  // An unreadable child-pids.json used to leave childPids as [] and therefore
+  // orphans as [] -- i.e. "no orphans found" -- which is the same silent-blindness
+  // bug as the ps/wmic enumeration that had disabled orphan detection on two
+  // platforms. Not knowing the child pids is not the same as there being none.
+  let childPids = null;
   try {
     childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
-  } catch {}
-  const orphans = childPids.filter((p) => pidAlive(p));
+  } catch (error) {
+    childPidsUnreadable = String((error && error.message) || error);
+  }
+  const orphans = (childPids || []).filter((p) => pidAlive(p));
   // also check marker freshness
   let markerPidAlive = false;
   try {
@@ -336,9 +395,10 @@ const iv = setInterval(() => {
   } catch {}
 
   // Ensure no leftover kids
-  for (const p of childPids) forceKillTree(p);
+  for (const p of childPids || []) forceKillTree(p);
 
   return {
+    childPidsUnreadable,
     managerPid,
     wdResult,
     wallMs: t1 - t0,
@@ -461,23 +521,63 @@ async function testProcessTreeNoOrphans() {
       spinMs: 30000,
       children: true,
     });
-    await sleep(300); // allow OS to reap
-    // Re-check orphans after settle
-    let childPids = [];
-    try {
-      childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
-    } catch {}
-    const still = childPids.filter((p) => pidAlive(p));
+    // Wait for the OS to actually reap the killed descendants instead of
+    // assuming a fixed 300ms window is enough. SIGKILL delivery is not the
+    // same as reaping: a killed orphan is reparented to init/a subreaper and
+    // stays visible to pidAlive() (still in the process table as a zombie)
+    // until that parent calls wait() on it -- a step that visibly slows down
+    // under CI load. That is exactly the kind of load-sensitive gap this
+    // suite has been rotating failures through across the windows/macos
+    // legs, so poll for death with a generous bounded deadline instead of a
+    // fixed sleep. r.markerPidAlive was captured before this settle window,
+    // so re-read it fresh on every poll tick too.
+    const childMarkerPath = path.join(dir, "child-alive");
+    // childPids starts as null, NOT []. This case is named "no-orphans", and an
+    // unreadable child-pids.json used to leave the list empty, which made
+    // `still` empty, which read as "no orphans survived" -- a PASS asserting the
+    // guarantee precisely when the harness had no idea which pids to look for.
+    // The same blindness had already disabled orphan detection on two platforms
+    // via the ps/wmic enumeration. Never having learned the pids is not evidence
+    // that there are none.
+    let childPids = null;
+    let still = [];
+    let markerAlive = false;
+    const reapBy = Date.now() + harnessDeadline(5000);
+    do {
+      try {
+        childPids = JSON.parse(fs.readFileSync(path.join(dir, "child-pids.json"), "utf8"));
+      } catch { /* retried below; if it never parses the case is inconclusive */ }
+      still = (childPids || []).filter((p) => pidAlive(p));
+      markerAlive = false;
+      try {
+        const m = fs.readFileSync(childMarkerPath, "utf8").trim();
+        const mp = parseInt(m.split(/\s+/)[0], 10);
+        if (mp && pidAlive(mp)) markerAlive = true;
+      } catch {}
+      if (still.length === 0 && !markerAlive) break;
+      await sleep(50);
+    } while (Date.now() < reapBy);
+    if (childPids === null) {
+      inconclusive(
+        name,
+        "child-pids.json never became readable within 5000ms, so the harness never learned which " +
+          "descendants to look for -- no conclusion about orphans is available either way"
+      );
+      return;
+    }
     if (r.managerStillAlive) {
-      rec(name, "FAIL", "manager survived; cannot judge tree kill");
+      // The phrasing here was already honest -- "cannot judge" -- but it was
+      // filed as a product FAIL, so an unjudgeable trial was indistinguishable
+      // from a failed tree kill in every count and summary.
+      inconclusive(name, "the manager survived, so the tree kill was never exercised and cannot be judged");
       for (const p of still) forceKillTree(p);
       return;
     }
-    if (still.length > 0 || r.markerPidAlive) {
+    if (still.length > 0 || markerAlive) {
       rec(
         name,
         "FAIL",
-        `orphaned children survived kill: pids=${JSON.stringify(still)} markerAlive=${r.markerPidAlive}`,
+        `orphaned children survived kill: pids=${JSON.stringify(still)} markerAlive=${markerAlive}`,
         { platform: process.platform }
       );
       for (const p of still) forceKillTree(p);
@@ -1015,7 +1115,20 @@ async function testBudgetBoundaries() {
     const name = "A7a-budget-just-under-no-kill";
     const dir = mkTmp("a7a");
     try {
-      const budgetMs = 600;
+      // budgetMs is a large multiple of the heartbeat interval (was 600ms
+      // against an 80ms heartbeat, ~7.5x) rather than a small one, so a
+      // single delayed setInterval tick under CI scheduler contention can't
+      // accidentally push a real heartbeat gap up near the budget and cause
+      // a FALSE kill in a scenario that is supposed to prove "healthy
+      // heartbeats are never killed". The A8 case measured ~187-211ms of
+      // pure node-startup jitter alone on a loaded 2-core box; a setInterval
+      // callback competing with other CI load can suffer comparable delays,
+      // so the gap between budget and heartbeat cadence needs to swallow
+      // that comfortably. 1800ms budget vs 80ms heartbeat (~22.5x) leaves
+      // that headroom while the manager still runs well past budget (3000ms
+      // total) with heartbeats flowing throughout, which is the property
+      // this case exists to prove.
+      const budgetMs = 1800;
       const heartbeatFile = path.join(dir, "heartbeat");
       const capabilityFile = path.join(dir, "capability.json");
       const haltFile = path.join(dir, "halt.json");
@@ -1029,7 +1142,7 @@ const iv = setInterval(() => {
   c++;
   fs.writeFileSync(hb, String(c));
 }, 80);
-setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
+setTimeout(() => { clearInterval(iv); process.exit(0); }, 3000);
 `;
       const vp = writeMockManager(dir, src);
       const victim = spawnManager(vp, { detached: false });
@@ -1041,7 +1154,14 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
         capabilityFile,
         haltFile,
       });
-      const wdResult = await wd.done;
+      // Bounded wait: every other test in this file races wd.done against a
+      // generous timeout so a real defect (or an unexpected hang) turns
+      // into a clean FAIL rather than stalling the whole suite. This case
+      // was missing that race — add it, matching the pattern used elsewhere.
+      const wdResult = await Promise.race([
+        wd.done,
+        sleep(budgetMs + 5000).then(() => ({ code: -1, timedOut: true })),
+      ]);
       // Manager exits normally → watchdog exit 0, no halt file (or halt false)
       const halt = readJson(haltFile);
       if (wdResult.code === 3 || (halt && halt.halt === true)) {
@@ -1049,7 +1169,7 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
       } else if (wdResult.code === 0 && !pidAlive(victim.pid)) {
         rec(name, "PASS", "manager exited clean; watchdog exit 0");
       } else {
-        rec(name, "FAIL", `unexpected code=${wdResult.code} alive=${pidAlive(victim.pid)}`);
+        rec(name, "FAIL", `unexpected code=${wdResult.code} timedOut=${!!wdResult.timedOut} alive=${pidAlive(victim.pid)}`);
       }
       forceKillTree(victim.pid);
       if (wd.child && pidAlive(wd.child.pid)) forceKillTree(wd.child.pid);
@@ -1082,8 +1202,24 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
         rec(name, "FAIL", `elapsed ${r.halt.elapsed_ms} not > budget ${budgetMs}`);
         return;
       }
-      // upper bound: poll slack budget/10 + some OS jitter
-      if (r.halt.elapsed_ms > budgetMs + 2000) {
+      // Watchdog only ever writes halt evidence from inside
+      // `if (elapsedMs > budgetMs)` (scripts/watchdog.js runWatchdog), so
+      // the check above cannot flake — there is no code path that reports
+      // elapsed_ms <= budget. What DOES vary under load is detection
+      // LATENCY: elapsed_ms is measured at the poll tick that first observes
+      // the breach, and on a quiet box that lands just a few ms over budget
+      // (observed: elapsed=352ms and elapsed=355ms for budget=350ms — a
+      // 2-5ms margin). Under CI contention Node's timer wheel is not
+      // guaranteed to fire poll ticks on schedule, and that scheduling
+      // overhead is roughly a FIXED cost (comparable to the ~187-211ms of
+      // pure node-startup jitter measured for A8), not one that shrinks with
+      // a smaller budget — so a 350ms budget needs proportionally MORE
+      // upper-bound slack than a 500ms one, not less. Widen the "not too
+      // late" tolerance well past the poll interval (budget/10) instead of
+      // tuning it to the quiet-runner numbers above; the guarantee under
+      // test — it killed, and elapsed_ms genuinely exceeds budget — is
+      // unchanged.
+      if (r.halt.elapsed_ms > budgetMs + 4000) {
         rec(name, "FAIL", `kill overly late ${r.halt.elapsed_ms}ms`);
         return;
       }
@@ -1097,7 +1233,19 @@ setTimeout(() => { clearInterval(iv); process.exit(0); }, 1800);
 }
 
 async function testWatchdogSelfCrash() {
-  const name = "A8-watchdog-self-crash-no-manager-notice-channel";
+  // Renamed from "A8-watchdog-self-crash-no-manager-notice-channel".
+  //
+  // That name asserted an ABSENCE -- no reverse heartbeat, no exit pipe, no way for
+  // the manager to notice its guard had died -- because when this case was written
+  // that was a true adversarial finding (recorded under the old name in this
+  // family's FINDINGS.md, which is left intact: it was accurate when written).
+  //
+  // The dead-man switch has since been built, and this case now verifies the
+  // OPPOSITE: that killing the guard mid-watch leaves discoverable evidence (D4).
+  // So the old name contradicted its own pass message, and anyone reading a green
+  // run saw a case name announcing a gap that no longer exists. A name is a claim
+  // like any other; a stale one is a stale claim.
+  const name = "A8-guard-death-leaves-discoverable-evidence-D4";
   const dir = mkTmp("a8");
   try {
     // Interface has no reverse heartbeat / integrity channel from watchdog → manager.
@@ -1131,7 +1279,27 @@ const iv = setInterval(() => {
       capabilityFile,
       haltFile,
     });
-    await sleep(80);
+    // Wait for the guard to have ARMED its dead-man switch before killing it,
+    // instead of assuming a fixed 80ms is enough to have started watching. The
+    // watchdog writes that switch as its first startup act, and node startup is
+    // not free: measured on a loaded 2-core box it lands at t+187..211ms. A kill
+    // at t+80ms therefore often destroyed the guard BEFORE it watched anything,
+    // and a guard that never started correctly leaves no evidence -- which this
+    // case then read as the interface gap below. That is why this suite failed
+    // ONLY on the node 18 CI legs while node 22 passed on the same runners: node
+    // 18 starts more slowly, so it lost the 80ms race more often. Killing the
+    // guard mid-watch is the point of the case, so wait until it IS watching.
+    // 10s was still not enough on a loaded GitHub macOS runner (observed: this
+    // case red on macos-22 in run #67 and green on the identical SHA in #66).
+    // Waiting longer for something that HAS to have happened can only help --
+    // it cannot mask a real failure, because a guard that never arms still
+    // fails below. Record whether it armed so a timeout cannot be misreported.
+    let guardArmed = false;
+    const armBudgetMs = harnessDeadline(45000);
+    {
+      const armedBy = Date.now() + armBudgetMs;
+      while (!(guardArmed = fs.existsSync(haltFile)) && Date.now() < armedBy) await sleep(10);
+    }
     // Kill the watchdog itself mid-watch
     forceKillTree(wd.child.pid);
     await sleep(1500);
@@ -1143,6 +1311,21 @@ const iv = setInterval(() => {
     if (wd.child && pidAlive(wd.child.pid)) forceKillTree(wd.child.pid);
 
     if (victimStill && !halt) {
+      // Distinguish the two ways to arrive here. Reporting a HARNESS TIMEOUT as
+      // "there is no notice channel" is a false architectural finding -- it
+      // describes a product gap that the evidence does not support, which is the
+      // same dishonesty this suite exists to prevent. Only claim the interface
+      // gap when the guard demonstrably armed and the death still went unnoticed.
+      if (!guardArmed) {
+        inconclusive(
+          name,
+          "the watchdog never armed within " + armBudgetMs + "ms, so it was " +
+            "killed before it began watching -- this says nothing about whether a " +
+            "guard-death notice channel exists. Re-run; if this persists the watchdog " +
+            "is failing to arm at all, which is a separate defect."
+        );
+        return;
+      }
       rec(
         name,
         "FAIL",
@@ -1151,7 +1334,15 @@ const iv = setInterval(() => {
       return;
     }
     if (halt && halt.halt) {
-      rec(name, "PASS", "halt still produced (unlikely race)");
+      // The switch the guard armed SURVIVED its death, which is the channel this
+      // case was written to say did not exist. It does now: the dead-man switch
+      // persists (D4) and scaffold's manager also watches the guard's own exit
+      // and HALTs fail-closed (D3, covered by its selftest). The FAIL branch above
+      // is kept deliberately -- if that evidence ever stops surviving, a blocked
+      // run really is left unguarded and this must say so.
+      rec(name, "PASS", halt.dead_man_switch
+        ? "guard killed mid-watch; its armed dead-man switch survived, so the guard's death is discoverable (D4)"
+        : "halt evidence survived the guard's death");
       return;
     }
     rec(name, "FAIL", `ambiguous victimStill=${victimStill} halt=${!!halt}`);

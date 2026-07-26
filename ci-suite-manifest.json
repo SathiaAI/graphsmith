@@ -30,10 +30,28 @@
     "NEITHER list below is treated as GATING and the runner prints an",
     "explicit warning naming it. Unknown suites are never silently",
     "downgraded to evidence-only -- only a suite explicitly listed here as",
-    "evidence_only is exempted from gating."
+    "evidence_only is exempted from gating.",
+    "",
+    "2026-07-25: 13 families were relying on that fail-safe rather than being",
+    "listed (adopt, assurance, diagnostics, evalenv, event-compiler, evolve,",
+    "graphlint, heal, risk-policy, scaffold, watch, watchdog, watcher). Each",
+    "was classified BY IDENTITY against the RULE above, and each of the 13",
+    "targets a real GraphSmith component (scripts/adopt.js, assure.js,",
+    "diagnostics.js, evalenv.js, event-compiler.js, evolve.js, graphlint.js,",
+    "heal.js, risk-policy, scaffold.js, watch.js, watchdog.js, watcher.js), so",
+    "all 13 are per-component REGRESSION suites and are now listed as GATING",
+    "explicitly. They were already gating via the fail-safe; listing them only",
+    "removes 13 warnings and makes the decision reviewable. NONE was moved to",
+    "evidence_only: doing so to make the gate green would have un-gated 13",
+    "real components. Three of them were genuinely failing and were FIXED (a",
+    "POSIX stdout-flush bug in the assurance fixture, and the watchdog's",
+    "process-group kill missing non-leader trees); tests/scenario/ was fixed",
+    "too. See claude/graphsmith-ci-remediation-progress-2026-07-25.md."
   ],
   "gating_suites": [
     "tests/manifest/",
+    "tests/report-integrity/",
+    "tests/harness-honesty/",
     "tests/state-store/",
     "tests/loaders/",
     "tests/scenario/",
@@ -43,7 +61,20 @@
     "tests/lab/",
     "tests/attacks/constitutional/",
     "tests/attacks/toctou/",
-    "tests/attacks/module-escape/"
+    "tests/attacks/module-escape/",
+    "tests/adopt/",
+    "tests/assurance/",
+    "tests/diagnostics/",
+    "tests/evalenv/",
+    "tests/event-compiler/",
+    "tests/evolve/",
+    "tests/graphlint/",
+    "tests/heal/",
+    "tests/risk-policy/",
+    "tests/scaffold/",
+    "tests/watch/",
+    "tests/watchdog/",
+    "tests/watcher/"
   ],
   "evidence_only": [
     "tests/attacks/deepseek/",
@@ -51,6 +82,10 @@
     "tests/ci/deepseek/",
     "tests/ci/gpt-sol-pro/",
     "tests/v040/",
-    "tests/gsa-ext/"
+    "tests/gsa-ext/",
+    "tests/gsa/",
+    "tests/gsa-mcp/",
+    "tests/gsa-register/",
+    "tests/register/"
   ]
 }

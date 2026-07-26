@@ -3,6 +3,7 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const os = require("os");
 const path = require("path");
 const { generate, verifyTree } = require("./manifest.js");
@@ -970,7 +971,7 @@ if (require.main === module) {
       process.stderr.write("Usage: node scripts/promote.js promote <packet.json> | rollback <txid> | recover | --selftest\n");
       process.exitCode = 2;
     }
-    if (result) process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (result) writeReport(`${JSON.stringify(result)}\n`);
   } catch (error) {
     process.stderr.write(`${error.code || "ERROR"}: ${error.message}\n`);
     if (error.evidence !== undefined) process.stderr.write(`${JSON.stringify(error.evidence)}\n`);

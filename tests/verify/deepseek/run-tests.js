@@ -607,7 +607,7 @@ function attack4FalseNegativeHunt() {
         "A6 is the documented out-of-scope case — confirm it's NOT claimed as undetectable."
       );
       // Verify trust-model output confirms A6 out-of-scope
-      const trustOutput = execSync(`node "${path.resolve("scripts/verify.js")}" --trust-model`, { encoding: "utf8", maxBuffer: 64 * 1024 });
+      const trustOutput = execSync(`"${process.execPath}" "${path.resolve("scripts/verify.js")}" --trust-model`, { encoding: "utf8", maxBuffer: 64 * 1024 });
       report("4f. A6-both-manifests-rewritten/trust-model-states-A6-out-of-scope",
         trustOutput.includes("A6") && trustOutput.includes("OUT OF SCOPE"),
         "trust-model must state A6 is out of scope"
@@ -716,7 +716,7 @@ function attack5HonestLanguage() {
 
   for (const cmd of cmds) {
     try {
-      const output = execSync(`node "${verifySrcPath}" ${cmd}`, {
+      const output = execSync(`"${process.execPath}" "${verifySrcPath}" ${cmd}`, {
         encoding: "utf8",
         maxBuffer: 64 * 1024,
         timeout: 10000,
@@ -856,7 +856,7 @@ function attack6NoSideEffects() {
       const lockPath = path.join(root, ".graphsmith", "state", "state.lock");
       const lockBeforeExists = fs.existsSync(lockPath);
       try {
-        const output = execSync(`node "${path.resolve("scripts/verify.js")}" --integrity --root "${root}"`, {
+        const output = execSync(`"${process.execPath}" "${path.resolve("scripts/verify.js")}" --integrity --root "${root}"`, {
           encoding: "utf8",
           maxBuffer: 64 * 1024,
           timeout: 10000,
@@ -909,7 +909,7 @@ function attack7PlatformProbe() {
 
   // 7a. --platform-probe actually runs and reports probe-verified behavior
   try {
-    const output = execSync(`node "${path.resolve("scripts/verify.js")}" --platform-probe`, {
+    const output = execSync(`"${process.execPath}" "${path.resolve("scripts/verify.js")}" --platform-probe`, {
       encoding: "utf8",
       maxBuffer: 64 * 1024,
       timeout: 10000,
@@ -974,7 +974,7 @@ function extraAttacks() {
   {
     const nonexistent = path.join(os.tmpdir(), "graphsmith-nonexistent-" + crypto.randomBytes(8).toString("hex"));
     try {
-      const output = execSync(`node "${path.resolve("scripts/verify.js")}" --integrity --root "${nonexistent}"`, {
+      const output = execSync(`"${process.execPath}" "${path.resolve("scripts/verify.js")}" --integrity --root "${nonexistent}"`, {
         encoding: "utf8",
         maxBuffer: 64 * 1024,
         timeout: 10000,
@@ -1171,10 +1171,21 @@ function extraAttacks() {
   // E6. Check that --selftest runs without crashing
   {
     try {
-      const output = execSync(`node "${path.resolve("scripts/verify.js")}" --selftest`, {
+      const output = execSync(`"${process.execPath}" "${path.resolve("scripts/verify.js")}" --selftest`, {
         encoding: "utf8",
         maxBuffer: 256 * 1024,
-        timeout: 30000,
+        // 78-check attack corpus over multiple ephemeral fixture builds is the
+        // heaviest single operation in this suite (measured 8.7s-26.9s even on
+        // an already-loaded 2-core Linux box here, vs ~0.2-1.1s for every other
+        // execSync in this file). A GitHub macOS runner is slower still and
+        // node 18's startup is slower than 22's, so the old 30000ms budget had
+        // as little as ~10% headroom under load -- reproduced by shrinking this
+        // to 50ms locally: `node scripts/verify.js --selftest` itself still
+        // completes and reports pass, but execSync throws ETIMEDOUT and this
+        // check misreports a harness timeout as a product failure. Widening the
+        // upper bound only gives the child process more wall-clock to finish;
+        // it does not touch what --selftest checks or what counts as pass/fail.
+        timeout: 120000,
       });
       const result = JSON.parse(output);
       report("E6. selftest/pass", result.pass === true, `total=${result.total} failed=${result.failed}`);

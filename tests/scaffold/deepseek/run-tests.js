@@ -18,6 +18,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const REPO = path.resolve(__dirname, "../../..");
 const SCAFFOLD = path.join(REPO, "scripts", "scaffold.js");
@@ -34,6 +35,18 @@ function record(status, name, reason) {
 function pass(name, reason) { record("PASS", name, reason); }
 function fail(name, reason) { record("FAIL", name, reason); }
 function skip(name, reason) { record("SKIP", name, reason); }
+
+// A check whose PRECONDITIONS never held has not passed and has not found a
+// defect -- it did not run. PASS would claim a guarantee that was never
+// exercised; FAIL would assert a defect that was never observed; SKIP means "not
+// applicable here", which is a different and equally untrue thing. Without this
+// fourth verdict a test in that position has no honest option, and will emit a
+// dishonest one. It counts as a failure so the gate stays fail-closed -- a check
+// that did not execute must never read as green -- but it is tagged so no reader
+// or summary ever mistakes it for a product finding.
+function inconclusive(name, reason) {
+  record("FAIL", name, "INCONCLUSIVE (harness): " + reason);
+}
 
 function readJson(file) { return JSON.parse(fs.readFileSync(file, "utf8")); }
 function writeJson(file, value) { fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n"); }
@@ -583,7 +596,17 @@ async function testResumeIntegrity() {
   writeWorker(project, '"use strict"; module.exports.run=async function(){ return {}; };\n', "process");
   writeWorker(project, '"use strict"; module.exports.run=async function(){ return {}; };\n', "deliver");
 
-  const resume = runManager(project, "run");
+  // --acknowledge-budget is REQUIRED here, and its absence was the second half of
+  // this test's flakiness. The step above SIGKILLs the manager, which leaves the
+  // watchdog's dead-man switch armed whenever the kill takes the guard with it
+  // (the whole process tree on Windows) or lands before the orphaned guard has
+  // withdrawn it (POSIX). The next start then REFUSES -- correctly, per D4 -- so a
+  // plain resume did no work at all: no second external call, no budget trip, and
+  // `halted` stayed null while the run still exited 2. Acknowledging is the
+  // documented operator action after a hard kill, and it records the extension
+  // rather than resetting any counter, so the accumulation assertion below still
+  // holds exactly as intended.
+  const resume = runManager(project, "run", ["--acknowledge-budget"]);
   const resumeState = haltState(project, "run");
 
   // At limit 1, after 1st call from before-kill + 1 more = 2 > 1 → HALT on max_external_calls
@@ -605,14 +628,38 @@ async function testResumeIntegrity() {
     fail("resume/unexpected", "exit=" + resume.status);
   }
 
-  // Now test: resume without --acknowledge-budget after a HALT (should refuse)
+  // Now test: resume without --acknowledge-budget after a HALT (should refuse).
+  //
+  // This check only means anything if the run is ALREADY halted going in --
+  // otherwise the next start does not refuse, it legitimately RUNS, and any state
+  // it writes is correct work rather than a mutation-during-refusal. Exit 2 alone
+  // does not distinguish the two: a start that runs and then trips a budget also
+  // exits 2. Under load the preceding kill/resume sequence does not always cross
+  // max_external_calls, so `halted` was null and this reported a CRITICAL
+  // immutability violation for a run that had simply done its job (observed:
+  // halted null -> max_external_calls, steps_executed 1 -> 2, stderr "HALT
+  // (budget)" rather than the "Run previously HALTED" refusal). Establish the
+  // precondition explicitly, then require the REFUSAL, not just the exit code.
   const sp = statePath(project, "run");
+  let preHalt = haltState(project, "run");
+  if (!preHalt || !preHalt.halted) {
+    // Acknowledge so this start actually RUNS (see the note above -- a plain start
+    // may still be refused by the dead-man switch) and trips the budget, giving us
+    // the halted state the refusal check needs to mean anything.
+    runManager(project, "run", ["--acknowledge-budget"]);
+    preHalt = haltState(project, "run");
+  }
   const beforeNoAck = fs.readFileSync(sp, "utf8");
   const noAck = runManager(project, "run");
   const afterNoAck = fs.existsSync(sp) ? fs.readFileSync(sp, "utf8") : null;
+  const refused = /Run previously HALTED/.test(String(noAck.stderr || "") + String(noAck.stdout || ""));
 
-  if (noAck.status === 2 && beforeNoAck === afterNoAck) {
-    pass("resume/refused-without-ack", "exit=2; budget state unchanged (no silent mutation)");
+  if (!preHalt || !preHalt.halted) {
+    fail("resume/refusal-precondition", "could not reach a halted state to test refusal against; last state=" + JSON.stringify(preHalt && preHalt.halted));
+  } else if (!refused) {
+    fail("resume/NOT-REFUSED", "a run already HALTED (" + preHalt.halted.rule + ") did not refuse a resume that omitted --acknowledge-budget; exit=" + noAck.status);
+  } else if (noAck.status === 2 && beforeNoAck === afterNoAck) {
+    pass("resume/refused-without-ack", "refused with exit=2; budget state unchanged (no silent mutation)");
   } else if (noAck.status === 2 && beforeNoAck !== afterNoAck) {
     fail("resume/REFUSED-BUT-MUTATED", "exit=2 but budget-state.json was modified during refusal — state should be immutable on refused resume");
   } else if (noAck.status === 0) {
@@ -767,8 +814,24 @@ async function testWatchdogHaltFile() {
     pass("watchdog/halt-file-written", "kill_message=" + haltData.kill_message +
       " elapsed=" + haltData.elapsed_ms + "ms budget=" + haltData.budget_ms + "ms");
   } else {
-    // Watchdog may not have fired — could be a Windows/scheduling issue
-    pass("watchdog/halt-not-written", "watchdog did not fire within test window (may be OS timing)");
+    // This used to call pass() -- BOTH branches did, with a comment excusing the
+    // miss as "may be a Windows/scheduling issue". So the dead-man switch, the
+    // single most safety-critical mechanism in the product, could fail to arm
+    // entirely and this GATING suite reported success and exited 0. Green while
+    // blind, on the one guarantee that must never be assumed.
+    //
+    // If the halt file is absent we have not verified the switch and we have not
+    // disproved it either: the watchdog may genuinely have failed to arm, or this
+    // machine may simply be slower than the window allows. Say exactly that and
+    // fail closed. If this fires routinely, the window is too tight or the
+    // watchdog is too slow to arm -- both are bugs with an owner, not conditions
+    // to be tolerated.
+    inconclusive(
+      "watchdog/halt-file-written",
+      "WATCHDOG-HALT.json never appeared" +
+        (fs.existsSync(haltFile) ? " in a parseable form" : "") +
+        ", so the dead-man switch was never exercised -- this is not evidence that it works"
+    );
   }
 
   // Try resume without ack
@@ -779,7 +842,9 @@ async function testWatchdogHaltFile() {
   } else if (haltData && haltData.halt && noAck.status === 0) {
     fail("watchdog/HALT-BYPASSED", "WATCHDOG-HALT.json exists but resume without --acknowledge-budget succeeded (exit=0)");
   } else if (!haltData || !haltData.halt) {
-    skip("watchdog/halt-resume-test", "no halt file to test against");
+    // Not "not applicable" -- the precondition for this check simply never
+    // materialised, which is the inconclusive case, not the skipped one.
+    inconclusive("watchdog/halt-resume-test", "no halt file was produced upstream, so halt-honouring on resume was never exercised");
   } else {
     fail("watchdog/halt-unexpected", "exit=" + noAck.status + " stderr=" + noAck.stderr.slice(0, 200));
   }
@@ -790,6 +855,10 @@ async function testWatchdogHaltFile() {
     const ack = runManager(project, "run", ["--acknowledge-budget"]);
     if (ack.status === 0) pass("watchdog/halt-ack-resume", "--acknowledge-budget accepted, run resumed");
     else fail("watchdog/halt-ack-failed", "exit=" + ack.status);
+  } else {
+    // Previously this check just evaporated -- no verdict of any kind was
+    // recorded, so its absence was invisible in the counts.
+    inconclusive("watchdog/halt-ack-resume", "no halt file was produced upstream, so --acknowledge-budget was never exercised");
   }
 }
 
@@ -875,7 +944,7 @@ function waitForFile(file, timeoutMs) {
   return new Promise((resolve, reject) => {
     const t = setInterval(() => {
       if (fs.existsSync(file)) { clearInterval(t); resolve(); }
-      else if (Date.now() - start > timeoutMs) { clearInterval(t); reject(new Error("timeout waiting for " + file)); }
+      else if (Date.now() - start > harnessDeadline(timeoutMs)) { clearInterval(t); reject(new Error("timeout waiting for " + file)); }
     }, 20);
   });
 }
@@ -929,7 +998,18 @@ async function main() {
     await testWatchdogHaltFile();
 
   } catch (e) {
-    fail("harness/internal", e.stack || e.message);
+    // A catch-all that reports a PRECONDITION TIMEOUT as an ordinary failure puts a
+    // harness problem in the product-findings bucket. But it must not blanket-tag
+    // everything: an unexpected exception from the product IS a real defect, and
+    // calling that inconclusive would hide it. So split on the actual error --
+    // "timeout waiting for X" means the trial never started; anything else is a
+    // genuine failure and stays one.
+    if (/timeout waiting for/i.test(String(e && e.message))) {
+      inconclusive("harness/internal",
+        "a precondition never materialised, so the case never ran -- " + String(e.message));
+    } else {
+      fail("harness/internal", e.stack || e.message);
+    }
   } finally {
     try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch (_) {}
   }

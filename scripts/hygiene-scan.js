@@ -267,18 +267,28 @@ function scanLocal(cwd, identifiers) {
 
 // --- CI HMAC detection mode ---------------------------------------------------
 
+// The opt-in decision lives HERE, not in a CI `if:` expression. A workflow can
+// only branch on a secret by exposing it to the job (job-level `env:`), which
+// puts a List B key in the environment of every step in that job -- including
+// List A, which runs on `pull_request` where the PR controls the script. Keeping
+// the decision in this script lets the secret stay scoped to this one step.
+//   both set     -> "configured": enforce (a finding is a red build)
+//   both unset   -> "unconfigured": clean skip, exit 0 -- List B is opt-in and
+//                   with no key and no digests there is nothing it could check
+//   exactly one  -> "partial": exit 2. Half-configured is a MISCONFIGURATION,
+//                   never a skip: a maintainer who set one secret believes the
+//                   scan is running, so silence here would be a false green.
+function ciConfigStatus(env) {
+  var hasKey = !!(env && env.HYGIENE_HMAC_KEY);
+  var hasDigests = !!(env && env.HYGIENE_DIGESTS);
+  if (hasKey && hasDigests) return "configured";
+  if (!hasKey && !hasDigests) return "unconfigured";
+  return hasKey ? "partial-missing-digests" : "partial-missing-key";
+}
+
 function loadCISecrets() {
   var key = process.env.HYGIENE_HMAC_KEY;
   var digestsRaw = process.env.HYGIENE_DIGESTS;
-
-  if (!key) {
-    process.stderr.write("hygiene-scan: HYGIENE_HMAC_KEY not set\n");
-    process.exit(2);
-  }
-  if (!digestsRaw) {
-    process.stderr.write("hygiene-scan: HYGIENE_DIGESTS not set\n");
-    process.exit(2);
-  }
 
   // Digests is a newline-separated (or comma-separated) list of hex strings
   var lines = digestsRaw.split(/[\r\n,]+/);
@@ -651,6 +661,24 @@ function selftest() {
       assert("selftest exit code assertion", true);
     }
 
+    // --- 15. List B opt-in gating decision (secret scoping) -----------------
+    // Locks in the three-way rule so a future edit cannot quietly turn a
+    // half-configured List B into a false green, nor make an unconfigured
+    // repo hard-fail. See ciConfigStatus for why the decision lives here and
+    // not in a workflow `if:` expression that would need a job-level secret.
+    {
+      assert("List B gate: both secrets set -> enforce",
+        ciConfigStatus({ HYGIENE_HMAC_KEY: "k", HYGIENE_DIGESTS: "abc" }) === "configured");
+      assert("List B gate: neither secret set -> clean skip",
+        ciConfigStatus({}) === "unconfigured");
+      assert("List B gate: key without digests -> misconfiguration, not a skip",
+        ciConfigStatus({ HYGIENE_HMAC_KEY: "k" }) === "partial-missing-digests");
+      assert("List B gate: digests without key -> misconfiguration, not a skip",
+        ciConfigStatus({ HYGIENE_DIGESTS: "abc" }) === "partial-missing-key");
+      assert("List B gate: empty-string secrets count as unset (GitHub injects '' for a missing secret)",
+        ciConfigStatus({ HYGIENE_HMAC_KEY: "", HYGIENE_DIGESTS: "" }) === "unconfigured");
+    }
+
   } finally {
     process.chdir(prevCwd);
     try { fs.rmSync(root, { recursive: true, force: true }); } catch (e) {}
@@ -692,6 +720,17 @@ function main() {
   var isCi = args.includes("--ci");
 
   if (isCi) {
+    var status = ciConfigStatus(process.env);
+    if (status === "unconfigured") {
+      process.stderr.write("hygiene-scan: List B not configured (no HYGIENE_HMAC_KEY and no HYGIENE_DIGESTS) -- skipping, nothing to detect. List B is opt-in; List A (docs-lint.js) always gates.\n");
+      process.exit(0);
+      return;
+    }
+    if (status !== "configured") {
+      process.stderr.write("hygiene-scan: List B is HALF-configured (" + status + ") -- refusing to report clean. Set BOTH HYGIENE_HMAC_KEY and HYGIENE_DIGESTS to enforce, or neither to skip.\n");
+      process.exit(2);
+      return;
+    }
     var secrets;
     try {
       secrets = loadCISecrets();
@@ -735,4 +774,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { normalize, normalizeFilename, extractNgrams, hmacDigest, scanLocal, scanCI, selftest, loadBannedIdentifiers };
+module.exports = { normalize, normalizeFilename, extractNgrams, hmacDigest, scanLocal, scanCI, selftest, loadBannedIdentifiers, ciConfigStatus };

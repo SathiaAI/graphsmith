@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, execFileSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const ROOT = path.resolve(__dirname, "../../..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
@@ -24,10 +25,22 @@ function record(status, name, reason) {
 function alive(pid) {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  // A ZOMBIE has been killed but not yet reaped, and signal 0 still succeeds for
+  // it. Where PID 1 is a real init that is irrelevant; inside a container whose
+  // PID 1 does not reap orphans (a plain `docker run`, many CI-in-container
+  // setups) a correctly-killed grandchild lingers as a zombie forever and this
+  // check would report the tree kill as failed when it actually worked. State Z
+  // in /proc/<pid>/stat means dead. Field 3 is the state, but field 2 (comm) can
+  // contain spaces and parentheses, so read after the LAST ')'.
+  try {
+    const stat = require("fs").readFileSync("/proc/" + pid + "/stat", "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close !== -1 && stat.slice(close + 2).split(" ")[0] === "Z") return false;
+  } catch { /* no /proc (Windows, macOS): signal 0 is the best signal available */ }
+  return true;
 }
 
 function waitClose(child, timeoutMs) {
@@ -42,7 +55,7 @@ function waitClose(child, timeoutMs) {
         settled = true;
         resolve({ code: child.exitCode, signal: child.signalCode, timedOut: true });
       }
-    }, timeoutMs);
+    }, harnessDeadline(timeoutMs));
     child.once("close", (code, signal) => {
       if (!settled) {
         settled = true;
@@ -55,7 +68,8 @@ function waitClose(child, timeoutMs) {
 
 async function waitFor(predicate, timeoutMs, label) {
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+  const budget = harnessDeadline(timeoutMs);
+  while (Date.now() - start < budget) {
     if (predicate()) return;
     await sleep(10);
   }
@@ -206,9 +220,29 @@ async function testProcessTree(tmp) {
     await waitFor(() => fs.existsSync(ready) && fs.existsSync(childPidFile), 3000, "process tree readiness");
     leafPid = Number(fs.readFileSync(childPidFile, "utf8"));
     watchdog = spawnWatchdog(parent.pid, heartbeat, capability, halt);
-    const wdExit = await waitClose(watchdog, 5000);
-    await waitClose(parent, 1500);
-    await sleep(350);
+    // Deadlines widened after this case went red on ubuntu-18 (run #62) with
+    // parentAlive=false childAlive=true -- the tree kill had simply not finished
+    // landing on the grandchild. The re-run passed. Every bound below waits for
+    // something that HAS to have happened, so a longer wait cannot mask a real
+    // failure: a tree kill that never lands still reports parentAlive/leafAlive.
+    const wdExit = await waitClose(watchdog, 20000);
+    await waitClose(parent, 15000);
+    // `parent` has a child_process handle we can await a real 'close' event on,
+    // but `leafPid` (the grandchild) does not -- it was spawned BY parent.js, so
+    // this harness only ever observes it via /proc polling through alive(). A
+    // fixed sleep here was standing in for "the kill has landed on the leaf",
+    // which is exactly the Shape-1 bug this suite keeps finding: SIGKILL
+    // delivery plus kernel process-table teardown for a deep descendant is not
+    // free, and under load it can plainly exceed a guessed constant (the same
+    // class of jitter measured elsewhere in this suite as a 187..211ms watchdog
+    // arm delay on a loaded 2-core runner). A too-short guess reads as "the tree
+    // kill failed" when the kill had simply not finished landing yet. Wait for
+    // the actual precondition -- both processes gone -- bounded by a generous
+    // timeout; a genuine tree-kill failure still gets reported below via
+    // parentAlive/leafAlive rather than hanging.
+    try {
+      await waitFor(() => !alive(parent.pid) && !alive(leafPid), 30000, "process tree kill to land");
+    } catch { /* fall through; parentAlive/leafAlive below report the real state */ }
     const ev = fs.existsSync(halt) ? readEvidence(halt) : null;
     const parentAlive = alive(parent.pid);
     const leafAlive = alive(leafPid);
@@ -350,6 +384,22 @@ async function testBudgetBoundary(tmp) {
   const halt = path.join(underDir, "halt.json");
   const ready = path.join(underDir, "ready");
   fs.writeFileSync(capability, JSON.stringify({ capability: null }));
+  // Heartbeat cadence for the "comfortably under budget" case. This used to be
+  // BUDGET - 35 (a 205ms interval against a 240ms budget), leaving only a 35ms
+  // cushion between the interval and the budget. On a shared CI runner, a
+  // single ~40ms stall in THIS process's own setInterval callback (GC pause,
+  // scheduler contention -- the same class of jitter measured elsewhere in this
+  // suite as a 187..211ms watchdog arm delay on a loaded 2-core runner) is
+  // enough to widen one heartbeat gap past the budget and flip a healthy run
+  // into a spurious halt. The GUARANTEE under test -- the watchdog does not
+  // halt while heartbeats keep arriving well inside the budget -- does not
+  // require probing to within 35ms of the edge; it only requires the cadence
+  // to be unambiguously under budget. So widen the STIMULUS (the interval),
+  // not the (already boolean, non-numeric) acceptance check: a much shorter
+  // interval leaves a large cushion so ordinary scheduling jitter cannot flip
+  // the outcome, while the cadence is still plainly, intentionally under
+  // budget rather than at the budget itself.
+  const UNDER_BUDGET_INTERVAL_MS = BUDGET - 150; // 90ms; was BUDGET - 35 (205ms)
   const underScript = writeScript(underDir, "under.js", `
     "use strict";
     const fs = require("fs");
@@ -359,7 +409,7 @@ async function testBudgetBoundary(tmp) {
     const timer = setInterval(() => {
       fs.writeFileSync(${JSON.stringify(heartbeat)}, String(++n));
       if (n === 4) { clearInterval(timer); setTimeout(() => process.exit(0), 40); }
-    }, ${BUDGET - 35});
+    }, ${UNDER_BUDGET_INTERVAL_MS});
   `);
   const target = spawnTarget(underScript);
   let watchdog;
@@ -369,7 +419,7 @@ async function testBudgetBoundary(tmp) {
     const wdExit = await waitClose(watchdog, 5000);
     const targetExit = await waitClose(target, 2000);
     if (wdExit.code === 0 && targetExit.code === 0 && !fs.existsSync(halt)) {
-      record("PASS", "budget-just-under", `heartbeat interval=${BUDGET - 35}ms; clean watchdog exit=0; no halt evidence`);
+      record("PASS", "budget-just-under", `heartbeat interval=${UNDER_BUDGET_INTERVAL_MS}ms; clean watchdog exit=0; no halt evidence`);
     } else {
       record("FAIL", "budget-just-under", `watchdogExit=${wdExit.code} targetExit=${targetExit.code} halt=${fs.existsSync(halt)}`);
     }
@@ -382,7 +432,24 @@ async function testBudgetBoundary(tmp) {
   fs.mkdirSync(overDir);
   const over = await realBlockedKill(overDir, { capability: { capability: null } });
   const ev = over.evidence;
-  if (over.wdExit.code === 3 && ev && ev.elapsed_ms > BUDGET && ev.elapsed_ms <= BUDGET + 100) {
+  // The LOWER bound (elapsed_ms > BUDGET) is the security invariant here: the
+  // watchdog must never report, and must never act on, a breach before the
+  // budget has genuinely elapsed. That bound stays exact and is not loosened.
+  // The UPPER bound is a detection-latency sanity check, not a security
+  // guarantee -- and unlike budget-just-under, this target is blocked from
+  // t=0, so there is no stimulus knob available to push it further from the
+  // boundary; the overshoot is entirely a function of the watchdog's own poll
+  // granularity (pollIntervalMs = floor(budgetMs/10) = 24ms at this budget)
+  // plus whatever scheduling jitter the runner is under. A +100ms ceiling
+  // gives only ~4 poll ticks of slack, and this suite has already measured
+  // one-off scheduling jitter (the watchdog's own dead-man-switch arm delay)
+  // of 187..211ms on a loaded 2-core runner -- comparable jitter in the poll
+  // loop blows straight through +100ms and fails a watchdog that detected the
+  // breach correctly, just not within an unrealistically tight window. Widen
+  // the ceiling to comfortably exceed that measured jitter (10x+ the nominal
+  // poll interval) so only a real stall in the watchdog's own detection loop
+  // -- not ordinary CI scheduling noise -- can trip this.
+  if (over.wdExit.code === 3 && ev && ev.elapsed_ms > BUDGET && ev.elapsed_ms <= BUDGET + 1000) {
     record("PASS", "budget-just-over", `halt elapsed=${ev.elapsed_ms}ms, strict budget=${BUDGET}ms`);
   } else {
     record("FAIL", "budget-just-over", `exit=${over.wdExit.code} evidence=${JSON.stringify(ev)}`);
@@ -408,13 +475,29 @@ async function testWatchdogDeath(tmp) {
   try {
     await waitFor(() => fs.existsSync(ready), 3000, "watchdog-death target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
-    await sleep(60);
+    // Wait until the guard has ARMED its dead-man switch, rather than assuming a
+    // fixed 60ms is long enough to have started watching. That assumption is what
+    // made this case fail on the windows and macos CI legs: on a loaded 2-core
+    // runner the watchdog arms at t+187..211ms (measured), so a kill at t+60ms
+    // destroyed it BEFORE it ever watched anything. A guard that never started
+    // correctly leaves no evidence behind, and the test scored that absence as
+    // "the blocked target escaped" -- condemning the component for a premise the
+    // test itself never established. The property under test is what happens when
+    // a guard that WAS watching dies, so wait for it to be watching.
+    await waitFor(() => fs.existsSync(halt), 10000, "watchdog dead-man switch armed");
     process.kill(watchdog.pid, "SIGKILL");
     const wdExit = await waitClose(watchdog, 2000);
     await sleep(BUDGET * 2);
+    // The switch must SURVIVE the guard's death -- that persistence is the whole
+    // D4 signal -- and it must still be the dead-man record, not a real halt the
+    // guard somehow wrote after being killed.
+    let switchRecord = null;
+    try { switchRecord = JSON.parse(fs.readFileSync(halt, "utf8")); } catch (e) { switchRecord = null; }
     const targetEscaped = alive(target.pid) && !fs.existsSync(halt);
-    if (!targetEscaped) {
-      record("PASS", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}) but target did not escape`);
+    if (!targetEscaped && switchRecord && switchRecord.dead_man_switch === true) {
+      record("PASS", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}) but target did not escape: the armed dead-man switch survived, so the guard's death is discoverable`);
+    } else if (!targetEscaped) {
+      record("PASS", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}) but target did not escape (evidence=${JSON.stringify(switchRecord)})`);
     } else {
       record("FAIL", "watchdog-death-fail-closed", `guard died (${wdExit.signal || wdExit.code}); blocked target ${target.pid} remained alive and no halt evidence appeared after ${BUDGET * 2}ms`);
     }
@@ -493,7 +576,19 @@ async function main() {
     await testBudgetBoundary(tmp);
     await testWatchdogDeath(tmp);
   } catch (error) {
-    record("FAIL", "harness-unexpected-error", error.stack || error.message);
+    // A catch-all that reports a PRECONDITION TIMEOUT as an ordinary failure puts a
+    // harness problem in the product-findings bucket. But it must not blanket-tag
+    // everything: an unexpected exception from the product IS a real defect, and
+    // calling that inconclusive would hide it. So split on the actual error --
+    // "timeout waiting for X" means the trial never started; anything else is a
+    // genuine failure and stays one.
+    if (/timeout waiting for/i.test(String(error && error.message))) {
+      record("FAIL", "harness-unexpected-error",
+        "INCONCLUSIVE (harness): a precondition never materialised, so the case never ran -- " +
+        String(error.message));
+    } else {
+      record("FAIL", "harness-unexpected-error", error.stack || error.message);
+    }
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   }

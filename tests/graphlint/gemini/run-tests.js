@@ -7,7 +7,7 @@ const FIXTURES_DIR = path.resolve(__dirname, 'fixtures');
 
 function run(dir) {
   try {
-    const out = execSync(`node "${GRAPHLINT}" "${dir}"`, { encoding: 'utf8' });
+    const out = execSync(`"${process.execPath}" "${GRAPHLINT}" "${dir}"`, { encoding: 'utf8' });
     return out;
   } catch (err) {
     return err.stdout;
@@ -137,7 +137,7 @@ try {
 
 try {
   console.log('\n--- TEST 4: Regression --selftest ---');
-  const selftestOut = execSync(`node "${GRAPHLINT}" --selftest`, { encoding: 'utf8' });
+  const selftestOut = execSync(`"${process.execPath}" "${GRAPHLINT}" --selftest`, { encoding: 'utf8' });
   console.log(selftestOut.trim());
   console.log('PASS: --selftest completed without errors');
 } catch (err) {

@@ -144,6 +144,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
@@ -1226,12 +1227,28 @@ function profileResumableState() {
     // (1) Clean checkpoint round-trip: a committed state survives a restart
     // byte-identically (recovery is a no-op on clean state — no phantom writes,
     // no loss).
-    const storeA = stateStore.createStore(rootA, { leaseMs: 40, heartbeatMs: 10 });
+    // leaseMs is widened to 5000 (was 40) plus an explicit heartbeat between the
+    // two hashes: hashAfter comes from a FRESH createStore, which runs a full
+    // expired-lease sweep before it can be read. A 40ms lease asserts the run is
+    // STILL ACTIVE across that sweep with only the wall-clock cost of a SHA-256
+    // hash + JSON.stringify + a second lock-acquire/fsync/journal-read cycle as
+    // margin (0-40ms) — and this project's own measured process/IO jitter floor
+    // on a loaded 2-core box is 187-211ms, already above the whole lease. Under
+    // load the lease can expire between hashBefore and hashAfter, flipping the
+    // slot active -> terminal/abandoned in hashAfter only and failing
+    // roundTripMatch for reasons that have nothing to do with round-trip
+    // correctness. "Still active" is a fragile assertion (load can only break
+    // it); 5000ms plus a fresh heartbeat restores the margin this fixture needs
+    // without touching the real product default (DEFAULT_LEASE_MS = 30000 in
+    // state-store.js, applied outside GRAPHSMITH_TEST_MODE regardless of what a
+    // caller passes — this 40/5000 knob only ever exists in test fixtures).
+    const storeA = stateStore.createStore(rootA, { leaseMs: 5000, heartbeatMs: 10 });
     storeA.window.admitPending({ txid: "tx-R", fingerprint: "fp-R", tree_id: "tree-R", n: 1 });
     storeA.window.finalize("tx-R");
     storeA.runRegistry.register("run-clean", "tree-R");
+    storeA.runRegistry.heartbeat("run-clean");
     const hashBefore = sha256Hex(Buffer.from(JSON.stringify(slotProjection(storeA))));
-    const restarted = stateStore.createStore(rootA, { leaseMs: 40, heartbeatMs: 10 });
+    const restarted = stateStore.createStore(rootA, { leaseMs: 5000, heartbeatMs: 10 });
     const hashAfter = sha256Hex(Buffer.from(JSON.stringify(slotProjection(restarted))));
     const roundTripMatch = hashBefore === hashAfter;
     evidence.push({ check: "clean-restart-round-trip", state_hash_pre_restart: hashBefore, state_hash_post_restart: hashAfter, match: roundTripMatch });
@@ -2403,14 +2420,14 @@ function main() {
   try {
     if (argv.includes("--selftest")) {
       const result = runSelftest();
-      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      writeReport(JSON.stringify(result, null, 2) + "\n");
       process.stderr.write(`selftest: ${result.total - result.failed} passed, ${result.failed} failed\n`);
       process.exit(result.pass ? 0 : 1);
       return;
     }
     if (argv.includes("--integrity")) {
       const report = runIntegrity(opts.root, opts);
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      writeReport(JSON.stringify(report, null, 2) + "\n");
       const code = integrityExitCode(report);
       process.stderr.write(
         `verify --integrity: release-verified=${report.release_verified} self-consistent=${report.self_consistent} failure_domain=${report.failure_domain}\n`
@@ -2420,7 +2437,7 @@ function main() {
     }
     if (argv.includes("--profiles")) {
       const report = runProfiles(opts.root, opts);
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      writeReport(JSON.stringify(report, null, 2) + "\n");
       // Exit code preserved at 0 for existing callers; the evidence-carrying
       // status lives in the JSON. A one-line profile string goes to stderr for
       // the badge/CI to scrape without parsing JSON.
@@ -2433,12 +2450,12 @@ function main() {
     if (argv.includes("--trust-model")) {
       const report = runTrustModel();
       process.stderr.write(report.circular_trust_limit + "\n");
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      writeReport(JSON.stringify(report, null, 2) + "\n");
       process.exit(0);
       return;
     }
     if (argv.includes("--platform-probe")) {
-      process.stdout.write(JSON.stringify(runPlatformProbe(), null, 2) + "\n");
+      writeReport(JSON.stringify(runPlatformProbe(), null, 2) + "\n");
       process.exit(0);
       return;
     }

@@ -10,6 +10,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 
 const SCHEMA_VERSION = "1.0";
@@ -634,7 +635,7 @@ if (require.main === module) {
   (async () => {
     if (args.includes("--selftest")) {
       const report = await selftest();
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      writeReport(JSON.stringify(report, null, 2) + "\n");
       if (report.status !== "pass") process.exit(1);
       process.exit(0);
     }
@@ -652,7 +653,7 @@ if (require.main === module) {
     }
 
     const result = await watch({ enabled, projectRoot });
-    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    writeReport(JSON.stringify(result, null, 2) + "\n");
   })().catch((err) => {
     console.error(err && err.stack ? err.stack : String(err));
     process.exit(1);

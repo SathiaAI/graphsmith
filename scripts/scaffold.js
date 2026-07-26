@@ -61,6 +61,16 @@
  *        anti-evolution guarantee is contract 04's gate fence (candidates/
  *        evolve structurally cannot touch this manifest), and a same-user
  *        arbitrary-write attacker is out of scope per contract 05 threat A6.
+ *   D6 - clean completion clears the watchdog dead-man switch (WATCHDOG-HALT
+ *        .json + its .watchdog-hb/.orphan siblings) so a back-to-back run +
+ *        immediate resume does not misread a stale switch as a dead guard and
+ *        exit 2. The clear sits on the exit-0 success path AFTER __done__ and
+ *        is UNREACHABLE on any HALT path (a blocked-loop kill ends the process
+ *        group before __done__; a supervisor HALT throws to the error path), so
+ *        it can never erase real halt evidence -- a genuinely halted/incomplete
+ *        run still leaves the switch in place and its resume still blocks until
+ *        --acknowledge-budget. watchdog.js is unchanged. Fixes the CI
+ *        "Run + resume the scaffolded project" flake (#2b).
  *
  * Usage: node scaffold.js <project-name> | node scaffold.js --selftest
  *
@@ -1461,6 +1471,33 @@ function managerJsContent() {
     "  supervisor.recordDiskUsage();",
     "  supervisor.save();",
     "  log(\"__done__\", \"complete\", 0);",
+    "  // Clean completion clears the watchdog dead-man switch. This point is",
+    "  // UNREACHABLE on any HALT path: a blocked-event-loop kill ends the process",
+    "  // group before __done__, and a supervisor HALT throws to the error path.",
+    "  // Removing these markers here therefore can never erase real halt evidence.",
+    "  // Stop our own guard (expected), then remove the dead-man artifacts so a",
+    "  // back-to-back resume does not misread a stale switch as a dead guard.",
+    "  //",
+    "  // D6/E -- clear ONLY IF THE GUARD WAS STILL ALIVE when we stopped it. If it",
+    "  // had already died (crash / OOM / external kill) with its 'exit' event still",
+    "  // queued, setting watchdogExpectedExit unconditionally would suppress",
+    "  // haltOnDeadWatchdog AND delete the switch -- masking a guard death on an",
+    "  // otherwise-completed run, which is the one case where the dead-man switch",
+    "  // is the only surviving evidence. Liveness is checked against the OS (signal",
+    "  // 0), not just the ChildProcess bookkeeping, because a death microseconds ago",
+    "  // has not been delivered to this event loop yet; both must agree.",
+    "  var guardWasAlive = false;",
+    "  if (watchdogChild && watchdogChild.exitCode === null && watchdogChild.signalCode === null) {",
+    "    try { process.kill(watchdogChild.pid, 0); guardWasAlive = true; } catch (e) { guardWasAlive = false; }",
+    "  }",
+    "  if (watchdogChild && !guardWasAlive) {",
+    "    log(\"__watchdog__\", \"guard (watchdog pid \" + watchdogChild.pid + \") was already DEAD at clean completion -- dead-man switch PRESERVED so the next start cannot silently step over a guard death; re-run with --acknowledge-budget once you have accounted for it\", 0);",
+    "  } else {",
+    "  try { if (watchdogChild) { watchdogExpectedExit = true; watchdogChild.kill(); } } catch (e) {}",
+    "  try { fs.unlinkSync(watchdogHaltPath); } catch (e) {}",
+    "  try { fs.unlinkSync(watchdogHaltPath + \".watchdog-hb\"); } catch (e) {}",
+    "  try { fs.unlinkSync(watchdogHaltPath + \".orphan\"); } catch (e) {}",
+    "  }",
     "  process.exit(0); // D3: the watchdog child is no longer unref()'d (so its death can be",
     "                    // noticed), so an explicit exit is required to end the run promptly",
     "                    // instead of waiting on that still-ref'd child handle.",
@@ -1978,6 +2015,17 @@ function runSelftest() {
     // ---- 10. end-to-end: a real manager.js run halts on a real budget breach,
     // resumes cleanly after --acknowledge-budget with progress preserved ----
     {
+      // ---- #2b regression: a CLEANLY-COMPLETING run, immediately re-invoked
+      // (the CI "run + resume" step), must have BOTH invocations exit 0. Before
+      // the fix, run 1's watchdog left WATCHDOG-HALT.json (dead_man_switch) behind
+      // and run 2 misread it as a dead guard on a halted run -> exit 2. The fix
+      // clears the dead-man switch on clean completion. ----
+      const rc1 = spawnSync(process.execPath, ["manager.js", "resume-clean-run"], { cwd: projDir, encoding: "utf8", timeout: 30000 });
+      const rc2 = spawnSync(process.execPath, ["manager.js", "resume-clean-run"], { cwd: projDir, encoding: "utf8", timeout: 30000 });
+      assertTrue(results, "e2e-run-then-immediate-resume-completes-clean",
+        rc1.status === 0 && rc2.status === 0 && !/previously HALTED/.test((rc2.stdout || "") + (rc2.stderr || "")),
+        "rc1=" + rc1.status + " rc2=" + rc2.status + " r2=" + ((rc2.stdout || "") + (rc2.stderr || "")).replace(/\n/g, " ").slice(0, 300));
+
       const tunablesPath = path.join(projDir, "tunables.json");
       const originalRaw = fs.readFileSync(tunablesPath, "utf8");
       const patched = JSON.parse(originalRaw);

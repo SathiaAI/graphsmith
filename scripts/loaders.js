@@ -63,6 +63,7 @@
 "use strict";
 
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const path = require("path");
 const crypto = require("crypto");
 
@@ -627,7 +628,7 @@ function runSelftest() {
   const results = [];
   const record = (name, pass, detail) => {
     results.push({ name, pass, detail: detail === undefined ? undefined : String(detail) });
-    console.log(JSON.stringify({ selftest: name, pass, detail }));
+    writeReport(JSON.stringify({ selftest: name, pass, detail }) + "\n");
   };
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-loaders-selftest-"));
@@ -920,7 +921,7 @@ function runSelftest() {
   }
 
   const failed = results.filter((r) => !r.pass);
-  console.log(JSON.stringify({ selftest: "__summary__", total: results.length, failed: failed.length }));
+  writeReport(JSON.stringify({ selftest: "__summary__", total: results.length, failed: failed.length }) + "\n");
   return failed.length === 0 ? 0 : 1;
 }
 

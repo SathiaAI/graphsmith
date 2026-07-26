@@ -5,6 +5,7 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
+const { writeReport } = require("./write-report.js");
 const os = require("os");
 const path = require("path");
 const STATE_SCHEMA = require("../schemas/state-store.schema.json");
@@ -264,6 +265,36 @@ class StateStore {
     }
   }
 
+  // The lock must never be OBSERVABLE in a half-formed state. The historical
+  // `openSync(lockPath, "wx")` + `writeSync` pair made the file exist before its
+  // content did, so a competing acquirer that hit EEXIST and read it saw "" (or a
+  // truncated record) and the store reported CORRUPT_STATE for what was only an
+  // ordinary acquisition race. Writing to a temp file and hard-LINKING it into
+  // place keeps the exclusive-create contract -- link() fails EEXIST when the
+  // lock is held, exactly as "wx" did -- while making the record atomically
+  // visible, fully formed. Filesystems without hard links fall back to the old
+  // two-step create; _acquireLock's retry below covers that residual window.
+  _createLockFile(record) {
+    const payload = JSON.stringify(record);
+    const temporary = `${this.lockPath}.new-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+    const writeTo = (target, flag) => {
+      const fd = fs.openSync(target, flag);
+      try { fs.writeSync(fd, payload); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    };
+    writeTo(temporary, "wx");
+    try {
+      fs.linkSync(temporary, this.lockPath);
+    } catch (error) {
+      try { fs.unlinkSync(temporary); } catch (cleanupError) { /* best effort */ }
+      if (["EPERM", "ENOSYS", "EXDEV", "EOPNOTSUPP", "ENOTSUP"].includes(error.code)) {
+        writeTo(this.lockPath, "wx");   // no hard links here; EEXIST still propagates
+        return;
+      }
+      throw error;                      // EEXIST -> the caller's contention path
+    }
+    try { fs.unlinkSync(temporary); } catch (error) { /* the lock keeps the inode */ }
+  }
+
   _readLock() {
     try {
       const record = parseStateJson(fs.readFileSync(this.lockPath, "utf8"), path.basename(this.lockPath));
@@ -293,7 +324,9 @@ class StateStore {
 
   _acquireLock() {
     this._ensureStateDir();
-    for (let attempt = 0; attempt < 8; attempt++) {
+    const ATTEMPTS = 8;
+    let unreadableLock = null;
+    for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       const ownerToken = crypto.randomBytes(16).toString("hex");
       const record = {
         schema_version: SCHEMA_VERSION,
@@ -303,8 +336,7 @@ class StateStore {
       };
       validateStateRecord(record, path.basename(this.lockPath));
       try {
-        const fd = fs.openSync(this.lockPath, "wx");
-        try { fs.writeSync(fd, JSON.stringify(record)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        this._createLockFile(record);
         const heartbeat = setInterval(() => {
           try { this._renewLock(ownerToken); } catch {}
         }, this.heartbeatMs);
@@ -312,7 +344,28 @@ class StateStore {
         return { ownerToken, heartbeat };
       } catch (error) {
         if (error.code !== "EEXIST") throw error;
-        const observed = this._readLock();
+        // A lock file that EXISTS but does not parse is either being BORN (the
+        // window _createLockFile closes, still reachable via its no-hard-link
+        // fallback) or genuinely damaged (a crash between create and write).
+        // Those are indistinguishable in any single observation -- only
+        // PERSISTENCE tells them apart. Reporting CORRUPT_STATE on the first
+        // sight, as this did, turned an ordinary acquisition race into "your
+        // state store is corrupt" and aborted a healthy operation. Retry within
+        // the bounded loop; if it is still unreadable after every attempt, it is
+        // reported as corruption below. It is never silently stolen: the steal
+        // path needs the owner_token that an unparseable lock cannot supply.
+        let observed;
+        try {
+          observed = this._readLock();
+        } catch (readError) {
+          if (readError.code !== "CORRUPT_STATE") throw readError;
+          unreadableLock = readError;
+          // Outlast a write window without busy-spinning: 8 x 2ms >> the
+          // microseconds between creating the file and its content landing.
+          try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2); } catch (waitError) { /* best effort */ }
+          continue;
+        }
+        unreadableLock = null;
         if (!observed) continue;
         const age = Date.now() - observed.stat.mtimeMs;
         const expired = age > this.leaseMs || !this._pidAlive(observed.record.pid);
@@ -326,6 +379,9 @@ class StateStore {
         }
       }
     }
+    // Persisted across every attempt: this is real, and it is reported as such.
+    if (unreadableLock)
+      throw fail(`State lock ${this.lockPath} existed but never became readable across ${ATTEMPTS} attempts (${unreadableLock.message}). A crash between creating and writing the lock leaves exactly this; remove the file after confirming no run holds it.`, "CORRUPT_STATE");
     throw fail("Could not acquire state-store lock after bounded contention", "LOCK_CONTENTION");
   }
 
@@ -1044,6 +1100,41 @@ function selftest() {
     if (!mismatchRefused) throw new Error("owner-token mismatch was not refused");
     tests.push({ name: "expired-lock-steal-and-token-refusal", status: "pass" });
 
+    // An EMPTY lock file is exactly what a competing acquirer used to observe
+    // between `open(lockPath,"wx")` and the content write, and the store reported
+    // it as CORRUPT_STATE on FIRST SIGHT -- an ordinary acquisition race dressed
+    // up as state corruption, aborting a healthy operation. Two properties are
+    // pinned here; the transient case itself is covered end-to-end by
+    // tests/state-store/grok's two-process concurrency battery.
+    {
+      const raceStore = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
+      raceStore._ensureStateDir();
+
+      // (1) The lock is created fully formed, and leaves no temp file behind.
+      const created = raceStore._testing.acquireLock();
+      const lockRaw = fs.readFileSync(raceStore.lockPath, "utf8");
+      if (!lockRaw || JSON.parse(lockRaw).owner_token !== created.ownerToken)
+        throw new Error("lock file was not fully formed on creation");
+      const strays = fs.readdirSync(raceStore.stateDir).filter((entry) => entry.includes(".lock.new-"));
+      if (strays.length) throw new Error(`atomic lock create left temp file(s): ${strays.join(", ")}`);
+      raceStore._testing.releaseLock(created.ownerToken);
+      clearInterval(created.heartbeat);
+
+      // (2) An unreadable lock is RETRIED across the whole budget, and only then
+      // reported as corruption -- never condemned on the first observation.
+      fs.writeFileSync(raceStore.lockPath, "");
+      let condemned = null;
+      let message = "";
+      try { raceStore._testing.acquireLock(); }
+      catch (error) { condemned = error.code; message = error.message; }
+      try { fs.unlinkSync(raceStore.lockPath); } catch (error) { /* cleanup */ }
+      if (condemned !== "CORRUPT_STATE")
+        throw new Error(`a permanently unreadable lock must report CORRUPT_STATE, got ${condemned}`);
+      if (!/never became readable across \d+ attempts/.test(message))
+        throw new Error(`an unreadable lock must be retried before it is condemned, got: ${message}`);
+      tests.push({ name: "lock-created-atomically-unreadable-lock-retried-then-condemned", status: "pass" });
+    }
+
     store.window.admitPending({ txid: "tx-selftest", fingerprint: "fp-selftest", tree_id: "tree-selftest", n: 1 });
     store.window.finalize("tx-selftest");
     store._testing.crashNextMutationAfter(1);
@@ -1103,9 +1194,9 @@ function selftest() {
 if (require.main === module) {
   const command = process.argv[2];
   try {
-    if (command === "status") console.log(JSON.stringify(createStore(process.cwd()).status()));
-    else if (command === "sweep") console.log(JSON.stringify({ schema_version: SCHEMA_VERSION, swept: createStore(process.cwd()).sweepExpired() }));
-    else if (command === "--selftest") console.log(JSON.stringify(selftest()));
+    if (command === "status") writeReport(JSON.stringify(createStore(process.cwd()).status()) + "\n");
+    else if (command === "sweep") writeReport(JSON.stringify({ schema_version: SCHEMA_VERSION, swept: createStore(process.cwd()).sweepExpired() }) + "\n");
+    else if (command === "--selftest") writeReport(JSON.stringify(selftest()) + "\n");
     else {
       console.error("Usage: node scripts/state-store.js status|sweep|--selftest");
       process.exitCode = 2;
