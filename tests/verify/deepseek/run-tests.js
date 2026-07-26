@@ -1174,7 +1174,18 @@ function extraAttacks() {
       const output = execSync(`node "${path.resolve("scripts/verify.js")}" --selftest`, {
         encoding: "utf8",
         maxBuffer: 256 * 1024,
-        timeout: 30000,
+        // 78-check attack corpus over multiple ephemeral fixture builds is the
+        // heaviest single operation in this suite (measured 8.7s-26.9s even on
+        // an already-loaded 2-core Linux box here, vs ~0.2-1.1s for every other
+        // execSync in this file). A GitHub macOS runner is slower still and
+        // node 18's startup is slower than 22's, so the old 30000ms budget had
+        // as little as ~10% headroom under load -- reproduced by shrinking this
+        // to 50ms locally: `node scripts/verify.js --selftest` itself still
+        // completes and reports pass, but execSync throws ETIMEDOUT and this
+        // check misreports a harness timeout as a product failure. Widening the
+        // upper bound only gives the child process more wall-clock to finish;
+        // it does not touch what --selftest checks or what counts as pass/fail.
+        timeout: 120000,
       });
       const result = JSON.parse(output);
       report("E6. selftest/pass", result.pass === true, `total=${result.total} failed=${result.failed}`);
