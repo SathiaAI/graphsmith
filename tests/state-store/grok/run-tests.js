@@ -211,7 +211,15 @@ function attackLockStealAndTokenMismatch() {
   const root = tempRoot("lock");
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
-      const store = createStore(root, { leaseMs: 80, heartbeatMs: 20 });
+      // Comfortable lease: "fresh lock not refused while held" below asserts
+      // a lock this test JUST created (via acquireLock's own fresh mtime) is
+      // still live moments later -- a "still live" assertion that load can
+      // only break, so it needs headroom past the write+fsync+read+stat round
+      // trip on a loaded or slow-fs (Windows/macOS) runner. The steal-when-
+      // STALE assertion above uses an explicit 5000ms backdate via
+      // utimesSync, so it stays correct as long as the lease is well under
+      // 5000ms.
+      const store = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
       store.status(); // ensure dir
 
       const staleToken = crypto.randomBytes(16).toString("hex");
@@ -290,8 +298,15 @@ function attackPidReuseAndEnvOverride() {
   const name = "lock.pid-alive-stale-steal-fresh-refuse-env-gate";
   const root = tempRoot("pid");
   try {
-    withEnv({ GRAPHSMITH_TEST_MODE: "1", GRAPHSMITH_LEASE_MS: "40", GRAPHSMITH_HEARTBEAT_MS: "10" }, () => {
-      const store = createStore(root, { leaseMs: 40, heartbeatMs: 10 });
+    withEnv({ GRAPHSMITH_TEST_MODE: "1", GRAPHSMITH_LEASE_MS: "2000", GRAPHSMITH_HEARTBEAT_MS: "200" }, () => {
+      // Comfortable lease: "fresh heartbeat (recent mtime, pid alive) →
+      // refuse" below writes a lock and immediately re-asserts it is still
+      // live in the same tick -- a "still live" assertion that load can only
+      // break, so it needs headroom past the write+fsync+read+stat round trip
+      // on a loaded or slow-fs (Windows/macOS) runner. The stale-lock steal
+      // assertion above uses an explicit 5000ms backdate via utimesSync, so
+      // it stays correct as long as the lease is well under 5000ms.
+      const store = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
       store.status();
 
       // pid alive (self) but lease stale → stealable

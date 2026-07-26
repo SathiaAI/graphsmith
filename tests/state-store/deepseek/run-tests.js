@@ -210,7 +210,16 @@ function test1_lockStealMismatch(tempDir) {
     const prevMode = process.env.GRAPHSMITH_TEST_MODE;
     process.env.GRAPHSMITH_TEST_MODE = "1";
     try {
-      const store1 = requireFreshStore(tempDir, { leaseMs: 40, heartbeatMs: 5 });
+      // Comfortable lease: the very next lines write a lock and then, in the
+      // SAME synchronous tick, assert it is still "fresh" (not stealable).
+      // That "still live" assertion is one load can only break -- a 40ms
+      // lease left no headroom for the write+fsync+read+stat round trip on a
+      // loaded or slow-fs (Windows/macOS) runner, so the lock could look
+      // expired before the refusal check even ran. The later steal-when-STALE
+      // assertions below use an explicit 5000ms backdate via utimesSync, so
+      // they are unaffected by raising the lease as long as it stays well
+      // under 5000ms.
+      const store1 = requireFreshStore(tempDir, { leaseMs: 2000, heartbeatMs: 200 });
 
       // Pre-create a fresh lock with a fake owner token
       store1._ensureStateDir();
@@ -305,8 +314,15 @@ function test2_pidReuseAndTestMode(tempDir) {
       else process.env.GRAPHSMITH_HEARTBEAT_MS = savedHeartbeat;
     }
 
-    // Now with TEST_MODE=1
-    const store = requireFreshStore(tempDir, { leaseMs: 40, heartbeatMs: 5 });
+    // Now with TEST_MODE=1. Comfortable lease: the "fresh heartbeat ... →
+    // refused" check further down writes a lock and immediately re-asserts
+    // it is still live in the same tick -- a "still live" assertion that
+    // load can only break, so it needs headroom past the write+fsync+read+
+    // stat round trip on a loaded or slow-fs (Windows/macOS) runner. The
+    // stale-lock steal checks below use an explicit 5000ms backdate via
+    // utimesSync, so they stay correct as long as the lease is well under
+    // 5000ms.
+    const store = requireFreshStore(tempDir, { leaseMs: 2000, heartbeatMs: 200 });
     store._ensureStateDir();
 
     // Create a stale lock with OUR pid (alive) but expired lease
