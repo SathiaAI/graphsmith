@@ -423,10 +423,15 @@ function runTests() {
         buildTree(treeDir, { appendix });
         const ctx = makeCtx("test-inj-split", treeDir);
         const out = loadAppendix(ctx);
+        /* This case found a real bypass and scored it PASS. The word "FINDING" sat in
+         * the free-text detail, which no summary reads and no gate inspects, while the
+         * verdict flag said the guarantee held. A control that detects a bypass and
+         * then reports green is worse than no control: it manufactures the evidence
+         * that the limit works. The verdict now follows what was observed. */
         const bypassed2h = !out.quarantined;
         report(
-          "2h. loadAppendix: marker split across lines — BYPASSES detection (FINDING)",
-          true,
+          "2h. loadAppendix: marker split across lines evades the marker check",
+          !bypassed2h,
           bypassed2h
             ? `FINDING: markers split across newlines evade detection. text.includes("IGNORE ALL PREVIOUS INSTRUCTIONS") fails when the literal string is "IGNORE ALL\\nPREVIOUS INSTRUCTIONS". Split markers pass through unharmed.`
             : `unexpected: quarantined with ${out.reason}`
@@ -487,8 +492,8 @@ function runTests() {
           report("3a. loadAppendix: CJK no-space text — token cap enforced", true);
         } else if (!out.quarantined) {
           report(
-            "3a. loadAppendix: CJK no-space text — token cap BYPASSED (FINDING)",
-            true,
+            "3a. loadAppendix: CJK no-space text bypasses the token cap",
+            false,
             `FINDING: 3000 CJK chars, word-count heuristic => 1 word => ~2 tokens, cap of ${APPENDIX_TOKEN_CAP} bypassed. Real token count would be ~3000+. The whitespace-split heuristic is insufficient for CJK/ideographic text.`
           );
         } else {
@@ -511,8 +516,8 @@ function runTests() {
           report("3b. loadAppendix: no-space ASCII — token cap enforced", true);
         } else if (!out.quarantined) {
           report(
-            "3b. loadAppendix: no-space ASCII — token cap BYPASSED (FINDING)",
-            true,
+            "3b. loadAppendix: no-space ASCII bypasses the token cap",
+            false,
             `FINDING: ${noSpace.length} char single-word blob estimates as ~2 tokens, cap of ${APPENDIX_TOKEN_CAP} bypassed. Whitespace heuristic is trivially gamed by omitting whitespace.`
           );
         } else {
@@ -533,8 +538,8 @@ function runTests() {
         const ctx = makeCtx("test-cap-cjk-mixed", treeDir);
         const out = loadAppendix(ctx);
         report(
-          "3c. loadAppendix: CJK appended after hitting word-cap — cap may undercount",
-          true,
+          "3c. loadAppendix: CJK appended after hitting word-cap still charges the cap",
+          out.quarantined === true,
           out.quarantined && out.reason === "token-cap-exceeded"
             ? "CJK overflow triggered cap"
             : !out.quarantined
@@ -1260,8 +1265,8 @@ function runTests() {
         const out = loadAppendix(ctx);
         const estTokens = loaders.WORDS_TO_TOKENS; // for reference
         report(
-          "A8. loadAppendix: CJK mixed text — heuristic undercount confirmed (FINDING)",
-          true,
+          "A8. loadAppendix: CJK mixed text is charged against the token cap",
+          out.quarantined === true,
           !out.quarantined
             ? `FINDING: ${cjkText.length}-char CJK text accepted (heuristic estimates under ~10 tokens, real token count likely 500+)`
             : `quarantined: ${out.reason}`
