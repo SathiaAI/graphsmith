@@ -83,6 +83,9 @@ const TARGETS = [
   "tests/scaffold/deepseek/run-tests.js",
   "tests/watch/grok/run-tests.js",
   "tests/scaffold/gpt-sol-pro/run-tests.js",
+  "tests/attacks/toctou/run-tests.js",
+  "tests/attacks/module-escape/run-tests.js",
+  "tests/adopt/grok/run-tests.js",
 ];
 
 let pass = 0;
