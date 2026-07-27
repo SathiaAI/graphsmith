@@ -25,12 +25,28 @@ const SIG_KEYS = ["schema_version", "algo", "signer", "manifest_sha256", "value"
 // from the key and an algo mislabel slips through (algorithm-confusion, Codex D1/D2).
 const ALGO_KEYTYPE = { "ed25519": ["ed25519"], "ecdsa-p256-sha256": ["ec"], "rsa-pss-sha256": ["rsa", "rsa-pss"] };
 
+/* The own-key allowlist below used Object.keys(), which sees OWN enumerable keys
+ * only -- so a field supplied through the prototype chain passed straight through
+ * the additionalProperties:false intent, while the doc comment promised it was
+ * rejected. Reproduced: Object.create({ inherited: "field" }) carrying all the
+ * required own keys verified clean.
+ *
+ * Exploitability through the normal path is low, because real callers pass
+ * JSON.parse output, which has an ordinary prototype and no inherited fields. That
+ * is an argument about reachability, not about correctness: this is trusted-core
+ * code whose stated contract is an allowlist, and the alternative resolution --
+ * editing the comment down to match the weaker code -- would be downgrading a
+ * documented security guarantee to make a check pass.
+ *
+ * for...in walks own AND inherited enumerable keys, so the allowlist now means what
+ * it says. Required keys still demand hasOwnProperty: a required field satisfied
+ * from a prototype must never count. */
 /* Strict shape: exactly the allowed OWN keys — rejects extra fields (additionalProperties:false)
  * and inherited/prototype-supplied fields (own-property required). */
 function strictSigShape(sig) {
   if (!sig || typeof sig !== "object") return false;
   for (const k of SIG_KEYS) if (!Object.prototype.hasOwnProperty.call(sig, k)) return false;
-  for (const k of Object.keys(sig)) if (SIG_KEYS.indexOf(k) === -1) return false;
+  for (const k in sig) if (SIG_KEYS.indexOf(k) === -1) return false;
   return true;
 }
 
