@@ -67,6 +67,15 @@ test("leak-bypass-stripe-key", () => {
  * from it still fails, and print them under their own status. */
 let adjudicated = 0;
 function adjudicatedTest(name, fn, ruling) {
+    /* Contract 10 List C: an ADJUDICATED verdict is only admissible with a citation to
+     * the ruling that produced it. Without one it is an unexplained non-failure, which is
+     * the shape this status exists to prevent. Fail closed on a missing citation. */
+    if (typeof ruling !== "string" || ruling.trim().length === 0) {
+      console.log("FAIL " + name + " - ADJUDICATED recorded with no citation to the ruling " +
+        "that settled it (contract 10 List C)");
+      fail++;
+      return;
+    }
   let ok;
   try { ok = fn(); } catch (e) {
     console.log("FAIL " + name + " REGRESSED: threw -- " + e.message); fail++; return;

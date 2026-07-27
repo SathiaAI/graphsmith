@@ -11,6 +11,15 @@ let pass = 0, fail = 0;
  * so a regression away from it still fails, and print it under its own status. */
 let adjudicated = 0;
 function adjudicatedTest(name, ctx, adjudicatedStatus, ruling) {
+  /* Contract 10 List C: an ADJUDICATED verdict is only admissible with a citation to
+   * the ruling that produced it. Without one it is an unexplained non-failure, which is
+   * the shape this status exists to prevent. Fail closed on a missing citation. */
+  if (typeof ruling !== "string" || ruling.trim().length === 0) {
+    console.log("FAIL " + name + " - ADJUDICATED recorded with no citation to the ruling " +
+      "that settled it (contract 10 List C)");
+    fail++;
+    return;
+  }
   const result = reconcileEffects(ctx);
   if (result.status === adjudicatedStatus) {
     console.log("ADJUDICATED " + name + " -> " + adjudicatedStatus + " (not a defect: " + ruling + ")");
