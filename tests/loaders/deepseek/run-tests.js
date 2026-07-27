@@ -1255,21 +1255,49 @@ function runTests() {
       }
     }
 
-    // A8. CJK appendix with specific real-token estimate comparison
+    /* A8. The token ESTIMATE for CJK text, asserted directly.
+     *
+     * This case used to build 21 characters of Japanese followed by 500 copies of
+     * the ideographic full stop, call loadAppendix, and report PASS unconditionally
+     * with "real token count likely 500+" in the detail. Two things were wrong with
+     * it. The premise: 500 identical punctuation marks do not tokenize to 500
+     * tokens, so the claimed real count was never right. And the method: at 521
+     * characters the text is legitimately UNDER the 1,500 cap, so quarantined/not
+     * cannot distinguish a correct estimate from one that collapsed to ~2 -- there
+     * was nothing for the case to assert, which is how it became an always-pass.
+     *
+     * Assert the estimate itself, on real prose, against the property that matters:
+     * a script where one character is roughly one token must be charged roughly one
+     * token per character. Delete the dense-script term from estimateTokens and this
+     * fails immediately, which is the whole point. */
+    {
+      const cjkProse = "契約書の内容を確認してください。重要な条項が含まれています。".repeat(8);
+      const denseChars = (cjkProse.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/gu) || []).length;
+      const est = loaders.estimateTokens(cjkProse);
+      report(
+        "A8. estimateTokens charges CJK text about one token per character",
+        est >= denseChars,
+        `${cjkProse.length} chars, ${denseChars} in dense scripts, estimate ${est}` +
+          (est >= denseChars ? "" : " — the estimate undercounts ideographic text, so a large CJK appendix rides under the cap")
+      );
+    }
+
+    /* A8b. The same defect at the scale where it actually bites: a CJK blob big
+     * enough to exceed the cap must be refused. This is the case that was reported
+     * as a bypass and scored PASS. */
     {
       const treeDir = fs.mkdtempSync(path.join(tmpRoot, "extra-cjk-real-"));
       try {
-        const cjkText = "日本語のテキストです。これは長い文章です。" + "。".repeat(500);
+        const cjkText = "契約書の内容を確認してください。".repeat(200);
         buildTree(treeDir, { appendix: cjkText });
         const ctx = makeCtx("test-extra-cjk-real", treeDir);
         const out = loadAppendix(ctx);
-        const estTokens = loaders.WORDS_TO_TOKENS; // for reference
         report(
-          "A8. loadAppendix: CJK mixed text is charged against the token cap",
-          out.quarantined === true,
-          !out.quarantined
-            ? `FINDING: ${cjkText.length}-char CJK text accepted (heuristic estimates under ~10 tokens, real token count likely 500+)`
-            : `quarantined: ${out.reason}`
+          "A8b. loadAppendix: over-cap CJK appendix is quarantined",
+          out.quarantined === true && out.reason === "token-cap-exceeded",
+          out.quarantined
+            ? out.reason
+            : `${cjkText.length}-char CJK appendix accepted; estimate ${loaders.estimateTokens(cjkText)} vs cap ${loaders.APPENDIX_TOKEN_CAP}`
         );
       } finally {
         fs.rmSync(treeDir, { recursive: true, force: true });

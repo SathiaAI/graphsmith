@@ -121,9 +121,37 @@ const ACTIVE_SCHEMA_VERSION_RE = /^[0-9]+\.[0-9]+$/;
 // or CJK blob of many thousands of characters, the actual attack this cap
 // exists to stop) without punishing normal prose for having slightly
 // longer words than "the/a/of"-heavy filler text.
+//
+// THIRD TERM, added after the /5 floor was measured and found NOT to close the
+// CJK case it was believed to close. The floor is calibrated for scripts where a
+// token spans several characters. Ideographic and syllabic scripts do not behave
+// that way: a CJK character is roughly one token, sometimes more. So 3,000 CJK
+// characters score 1 "word" (~2 tokens) on the word estimate and 3000/5 = 600 on
+// the char floor -- both comfortably under the 1,500 cap -- while the real token
+// count is around 2,000-3,000. The blob the /5 floor was introduced to stop still
+// sailed through, as long as it was written in Chinese, Japanese or Korean.
+//
+// Two adversarial suites found this and reported it as a PASS for months
+// (tests/loaders/deepseek 3a and A8, tests/loaders/grok CAP/CJK-no-space): the
+// bypass was detected, the word FINDING was written into a detail string nothing
+// reads, and the gating suite exited 0.
+//
+// DENSE_CHARS_TO_TOKENS = 1 keeps the same fail-safe posture as the rest of this
+// block: over-count rather than under-count. Real BPE tokenizers often emit MORE
+// than one token per CJK character once UTF-8 bytes are split, so 1-per-character
+// is a floor, not an over-estimate, and it cannot punish Latin prose because the
+// term only counts characters actually in these scripts.
+//
+// Unicode property escapes rather than hand-written ranges: \p{Script=Han} covers
+// the CJK Unified blocks AND the supplementary-plane extensions, which a
+// [\u4e00-\u9fff] range silently misses -- exactly the kind of range that looks
+// complete and is not.
 const APPENDIX_TOKEN_CAP = 1500;
 const WORDS_TO_TOKENS = 1.3;
 const CHARS_PER_TOKEN_FLOOR = 5;
+const DENSE_CHARS_TO_TOKENS = 1;
+const DENSE_SCRIPT_RE =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
 
 // B3: "size cap (64 KB)"
 const PROMPT_SIZE_CAP_BYTES = 64 * 1024;
@@ -282,7 +310,8 @@ function estimateTokens(text) {
   const words = text.split(/\s+/).filter(Boolean);
   const wordEstimate = words.length * WORDS_TO_TOKENS;
   const charEstimate = text.length / CHARS_PER_TOKEN_FLOOR;
-  return Math.ceil(Math.max(wordEstimate, charEstimate));
+  const denseEstimate = (text.match(DENSE_SCRIPT_RE) || []).length * DENSE_CHARS_TO_TOKENS;
+  return Math.ceil(Math.max(wordEstimate, charEstimate, denseEstimate));
 }
 
 function wrapDelimited(text, { subordination }) {
@@ -467,7 +496,7 @@ function loadAppendix(ctx) {
   if (approxTokens > APPENDIX_TOKEN_CAP) {
     return quarantined(
       "token-cap-exceeded",
-      `Appendix is ~${approxTokens} tokens (max of word-count x ${WORDS_TO_TOKENS} and char-count / ${CHARS_PER_TOKEN_FLOOR} heuristics), cap is ${APPENDIX_TOKEN_CAP}.`
+      `Appendix is ~${approxTokens} tokens (max of word-count x ${WORDS_TO_TOKENS}, char-count / ${CHARS_PER_TOKEN_FLOOR}, and dense-script-char x ${DENSE_CHARS_TO_TOKENS} heuristics), cap is ${APPENDIX_TOKEN_CAP}.`
     );
   }
 
@@ -570,6 +599,12 @@ module.exports = {
   APPENDIX_TOKEN_CAP,
   WORDS_TO_TOKENS,
   CHARS_PER_TOKEN_FLOOR,
+  DENSE_CHARS_TO_TOKENS,
+  // Exported so a test can assert on the ESTIMATE itself. Without it the only
+  // observable is quarantined/not, so a case about undercounting text that is
+  // genuinely under the cap has nothing to assert and degenerates into an
+  // always-pass -- which is precisely what happened to loaders/deepseek A8.
+  estimateTokens,
   PROMPT_SIZE_CAP_BYTES,
   ACTIVE_POINTER_SCHEMA_VERSION,
   validateActivePointer,
