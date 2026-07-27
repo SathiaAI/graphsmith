@@ -16,6 +16,23 @@ function report(name, passed, reason = '') {
   }
 }
 
+/* A precondition this platform cannot provide (no privilege to create a junction,
+ * a case-insensitive filesystem, a filesystem that re-normalizes Unicode) means the
+ * control below was NEVER EXERCISED. These were reported through report(name, true,
+ * 'SKIPPED: ...'), which prints PASS and leaves `failures` untouched -- so on a
+ * default macOS or Windows runner the case-fold collision refusal in
+ * manifest.generate() is never tested, and the suite says PASS anyway.
+ *
+ * A skip is not a pass. It is printed distinctly, and counted, so a leg that
+ * exercises none of these path-confusability controls cannot look identical to a
+ * leg that exercises all of them. It does not fail the suite: an unavailable
+ * platform capability is not a defect. */
+let skips = 0;
+function skipped(name, reason) {
+  skips++;
+  console.log(`SKIPPED: ${name} - ${reason} [control NOT exercised on this platform]`);
+}
+
 function runTests() {
   let tmpDir;
   try {
@@ -87,7 +104,7 @@ function runTests() {
         // Wait, manifest.js doesn't export checkCaseFoldCollisions.
         // Let's create a subdirectory? Doesn't change case insensitivity.
         // We can just note it.
-        report('Case-fold collision', true, 'SKIPPED: FS merged files, cannot test natively');
+        skipped('Case-fold collision', 'this filesystem is case-insensitive and merged the two files, so manifest.generate()\'s collision refusal was never reached');
       } else {
         let caught = false;
         try {
@@ -116,7 +133,7 @@ function runTests() {
         if (m4.files[0].path === nfc) report('Unicode NFC normalization', true);
         else report('Unicode NFC normalization', false, 'path was not canonicalized to NFC');
       } else {
-         report('Unicode NFC normalization', true, 'SKIPPED: FS altered normalization');
+         skipped('Unicode NFC normalization', 'this filesystem re-normalized the name, so the NFC-confusability control was never reached');
       }
     } catch (e) {
       report('Unicode NFC normalization', false, e.message);
@@ -150,7 +167,7 @@ function runTests() {
         fs.symlinkSync(targetDir, path.join(d6, 'link'), 'junction');
         junctionCreated = true;
       } catch (e) {
-        report('Symlink refusal', true, 'SKIPPED: No privilege to create junction');
+        skipped('Symlink refusal', 'no privilege to create a junction');
       }
 
       if (junctionCreated) {
@@ -239,6 +256,14 @@ function runTests() {
     if (tmpDir) {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  }
+
+  // State the skip count explicitly. A leg where every path-confusability control
+  // was skipped for want of a platform capability must not read the same as a leg
+  // where all of them ran and refused.
+  if (skips > 0) {
+    console.log(`SKIPPED-TOTAL: ${skips} control(s) not exercised on this platform ` +
+      `(${process.platform}) — this run provides NO coverage for them`);
   }
 
   if (failures > 0) {

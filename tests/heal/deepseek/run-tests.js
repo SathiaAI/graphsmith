@@ -55,7 +55,17 @@ function assertUnchanged(prefix, root, files, before) {
     var f = files[i];
     var fp = path.join(root, f);
     var h = fileHash(fp);
-    if (h === null) continue;
+    if (h === null) {
+      // The file is gone or unreadable. That is not "unchanged" -- deleting a file
+      // heal.js must never touch is the most severe mutation available, and the old
+      // `continue` skipped it, letting the run end on "zero-mutation on all
+      // executables". Absence of a hash is absence of an observation, never a pass.
+      report(prefix + ": unreadable " + f, false,
+        "could not hash after the run (deleted or permission-denied); the zero-mutation " +
+        "invariant cannot be evaluated for this file");
+      changed = true;
+      continue;
+    }
     if (h !== before[f]) {
       report(prefix + ": mutated " + f, false, "hash changed: " + (before[f] || "").slice(0, 16) + " -> " + (h || "").slice(0, 16));
       changed = true;

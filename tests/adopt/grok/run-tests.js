@@ -11,6 +11,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..").replace(/\\/g, "/");
 const ADOPT_CLI = path.join(REPO_ROOT, "scripts", "adopt.js");
@@ -39,6 +40,22 @@ function record(name, status, detail) {
 function pass(name, detail) { record(name, "PASS", detail); }
 function fail(name, detail) { record(name, "FAIL", detail); }
 function skip(name, detail) { record(name, "SKIPPED", detail); }
+
+/* A verdict this case could not have observed must never read as either a
+ * guarantee upheld or a defect found. spawnSync kills the child with SIGTERM when
+ * its own `timeout` elapses and reports error.code === "ETIMEDOUT" with
+ * status === null -- that is the HARNESS running out of patience, not the product
+ * answering. It still counts as a failure (fail-closed: a case that did not run
+ * must never read as green), but the tag keeps it out of the product findings, and
+ * tests/harness-honesty/starvation/ requires it.
+ *
+ * status === null alone is NOT the test: a process killed by a signal for any other
+ * reason also reports null, and calling that a harness timeout would hide a real
+ * crash. */
+function timedOutByHarness(r) {
+  return !!(r && r.error && r.error.code === "ETIMEDOUT");
+}
+function inconclusive(n, d) { record(n, "FAIL", "INCONCLUSIVE (harness): " + d); }
 
 function mkRoot(tag) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `gs-adopt-grok-${tag}-`));
@@ -213,7 +230,7 @@ function runCliRaw(argv, projectRoot) {
     encoding: "utf8",
     env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" },
     cwd: projectRoot || process.cwd(),
-    timeout: 60000,
+    timeout: harnessDeadline(60000),
   });
 }
 
@@ -330,6 +347,14 @@ function attack_cli_without_yes() {
 
   for (const v of variants) {
     const r = runCliRaw(v.argv, root);
+    // A CLI killed by the harness timeout wrote nothing and adopted nothing, which is
+    // indistinguishable from a CLI that correctly refused -- and the fall-through
+    // below reported exactly that: "refused_or_error disk-clean".
+    if (timedOutByHarness(r)) {
+      inconclusive(`cli-confirm:${v.name}`, "the adopt CLI was killed by the harness " +
+        "timeout, so whether it refuses without --yes was not observed");
+      continue;
+    }
     const after = snaphotDisk(paths);
     const mutated = diskUnchanged(before, after, ["active", "adoption", "pending", "window", "journal", "manifest"]);
     let body = null;
@@ -371,7 +396,11 @@ function attack_cli_without_yes() {
   let body2 = null;
   try { body2 = JSON.parse((r2.stdout || "").trim() || "null"); } catch (_) {}
   const after2 = snaphotDisk(fx2.paths);
-  if (!(body2 && body2.adopted === true && r2.status === 0)) {
+  if (timedOutByHarness(r2)) {
+    inconclusive("cli-confirm:cli-with-yes-adopts", "the adopt CLI was killed by the " +
+      "harness timeout, so the positive control did not run -- without it the negative " +
+      "cases above prove nothing, since a CLI that never adopts passes them all");
+  } else if (!(body2 && body2.adopted === true && r2.status === 0)) {
     fail("cli-confirm:cli-with-yes-adopts", `expected adopt: exit=${r2.status} body=${JSON.stringify(body2)} err=${(r2.stderr || "").slice(0, 200)}`);
   } else if (before2.active === after2.active) {
     fail("cli-confirm:cli-with-yes-adopts", "ACTIVE unchanged after confirmed CLI adopt");

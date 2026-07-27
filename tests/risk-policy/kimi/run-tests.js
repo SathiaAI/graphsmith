@@ -441,10 +441,18 @@ function runConsistencyTests() {
     "Reflect.construct(X, []);",
   ];
 
-  const healOk = HEAL
-    ? healSamples.every((s) => HEAL.capabilityPolicyScan([s]).no_external_calls === false)
-    : true;
-  record("heal-representative-fail-closed", healOk);
+  // HEAL is loaded in a try/catch at the top of this file. When that require throws
+  // -- exactly what a bug newly introduced into heal.js would do -- HEAL stays null,
+  // and defaulting to `true` recorded a PASS for a scan that never ran against any of
+  // these adversarial fail-closed samples.
+  if (!HEAL) {
+    record("heal-representative-fail-closed", false,
+      "INCONCLUSIVE (harness): scripts/heal.js could not be require()d, so " +
+      healSamples.length + " fail-closed samples were never scanned");
+  } else {
+    record("heal-representative-fail-closed",
+      healSamples.every((s) => HEAL.capabilityPolicyScan([s]).no_external_calls === false));
+  }
 
   const policyOk = healSamples.every((s) => CP.capabilityScan([s]).no_external_calls === false);
   record("policy-matches-heal-representative-fail-closed", policyOk);

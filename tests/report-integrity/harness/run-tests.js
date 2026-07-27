@@ -113,8 +113,9 @@ function viaFile(scriptPath, args, tmpdir) {
   // Redirecting to a file is synchronous on POSIX, so this is the complete report.
   const target = path.join(tmpdir, "report.json");
   const fd = fs.openSync(target, "w");
+  let r;
   try {
-    spawnSync(process.execPath, [scriptPath].concat(args), {
+    r = spawnSync(process.execPath, [scriptPath].concat(args), {
       cwd: ROOT,
       stdio: ["ignore", fd, "ignore"],
       timeout: 300000,
@@ -123,7 +124,7 @@ function viaFile(scriptPath, args, tmpdir) {
   } finally {
     fs.closeSync(fd);
   }
-  return fs.readFileSync(target, "utf8");
+  return { text: fs.readFileSync(target, "utf8"), status: r.status, error: r.error };
 }
 
 // Return a truthy marker when `text` carries a well-formed JSON report, else null.
@@ -242,7 +243,23 @@ function main() {
       // not parse, an empty capture does not parse, and a JSON-Lines report clipped
       // at a line boundary changes the document count. Those two checks are
       // sufficient, and unlike byte-equality they cannot fire on a timestamp.
-      const expected = viaFile(scriptPath, c.args, tmpdir);
+      const baseline = viaFile(scriptPath, c.args, tmpdir);
+      const expected = baseline.text;
+      // A CLI that CRASHED before writing anything also produces an empty file, and
+      // the empty-output branch below would have called that "correctly out of scope"
+      // -- this suite quietly not checking, which is the exact defect it exists to
+      // catch. Separate the two before drawing any conclusion.
+      if (baseline.error || (baseline.status !== 0 && expected.trim() === "")) {
+        report(
+          false,
+          id,
+          "INCONCLUSIVE (harness): the baseline file-redirected run did not complete " +
+            "(exit " + baseline.status + (baseline.error ? ", " + baseline.error.code : "") +
+            ") and wrote 0B, so there is no reference report to compare the piped capture " +
+            "against -- this case checked nothing"
+        );
+        continue;
+      }
       const expectedJson = firstJsonValue(expected);
       if (expectedJson === null) {
         // A CLI that emits no JSON on stdout has no report for this suite to
