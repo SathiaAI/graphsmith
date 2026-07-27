@@ -66,6 +66,31 @@ function waitClose(child, timeoutMs) {
   });
 }
 
+/* How long to wait for a freshly SPAWNED target to write its readiness file.
+ *
+ * Six precondition waits in this file sat at a bare 3000ms. That is not a budget the
+ * product is being measured against — nothing under test depends on the target becoming
+ * ready quickly; every assertion in these cases happens AFTER readiness. It is the
+ * harness's patience for Windows process creation plus Node startup plus a file write,
+ * on a shared CI runner with a virus scanner in the path. Windows process creation costs
+ * far more than a POSIX fork/exec, and 3s is a stopwatch guess rather than an
+ * observation.
+ *
+ * It bit on GitHub Actions run #79: `timeout waiting for chaos point 5` on both Windows
+ * legs, correctly reported INCONCLUSIVE (harness) rather than as a watchdog defect, and
+ * the runner's own re-run passed — FLAKY, not a regression. Linux and macOS passed. This
+ * is flake taxonomy shape 1 from the CI remediation plan: a fixed deadline used as a
+ * precondition proxy.
+ *
+ * Widening a PRECONDITION wait cannot make a failing test pass. The product assertions
+ * are downstream of it; all this changes is how long the harness is willing to wait
+ * before admitting it observed nothing. Waits return the moment the predicate holds, so
+ * on a healthy machine this costs nothing. Product-lifecycle waits in this file keep
+ * their own budgets (30000 for the process tree to die, 10000 for the dead-man switch to
+ * arm) — those are measuring the product and are deliberately left alone.
+ */
+const TARGET_READY_MS = 30000;
+
 async function waitFor(predicate, timeoutMs, label) {
   const start = Date.now();
   const budget = harnessDeadline(timeoutMs);
@@ -157,7 +182,7 @@ async function realBlockedKill(dir, options = {}) {
   const target = spawnTarget(targetScript);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(readyFile), 3000, "blocked target readiness");
+    await waitFor(() => fs.existsSync(readyFile), TARGET_READY_MS, "blocked target readiness");
     const started = Date.now();
     watchdog = spawnWatchdog(target.pid, heartbeatFile, capabilityFile, haltFile, options.budget || BUDGET);
     const wdExit = await waitClose(watchdog, 5000);
@@ -217,7 +242,7 @@ async function testProcessTree(tmp) {
   let watchdog;
   let leafPid = null;
   try {
-    await waitFor(() => fs.existsSync(ready) && fs.existsSync(childPidFile), 3000, "process tree readiness");
+    await waitFor(() => fs.existsSync(ready) && fs.existsSync(childPidFile), TARGET_READY_MS, "process tree readiness");
     leafPid = Number(fs.readFileSync(childPidFile, "utf8"));
     watchdog = spawnWatchdog(parent.pid, heartbeat, capability, halt);
     // Deadlines widened after this case went red on ubuntu-18 (run #62) with
@@ -351,7 +376,7 @@ async function testForgedHeartbeat(tmp) {
   const target = spawnTarget(script);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(ready), 3000, "forged-heartbeat target");
+    await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, "forged-heartbeat target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
     const started = Date.now();
     let forged = 9007199254740000;
@@ -414,7 +439,7 @@ async function testBudgetBoundary(tmp) {
   const target = spawnTarget(underScript);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(ready), 3000, "under-budget target");
+    await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, "under-budget target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
     const wdExit = await waitClose(watchdog, 5000);
     const targetExit = await waitClose(target, 2000);
@@ -473,7 +498,7 @@ async function testWatchdogDeath(tmp) {
   const target = spawnTarget(script);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(ready), 3000, "watchdog-death target");
+    await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, "watchdog-death target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
     // Wait until the guard has ARMED its dead-man switch, rather than assuming a
     // fixed 60ms is long enough to have started watching. That assumption is what
@@ -536,7 +561,7 @@ async function testChaosResume(tmp) {
     const target = spawnTarget(managerScript, [String(point)]);
     let watchdog;
     try {
-      await waitFor(() => fs.existsSync(ready), 3000, `chaos point ${point}`);
+      await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, `chaos point ${point}`);
       watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
       const wdExit = await waitClose(watchdog, 5000);
       await waitClose(target, 1500);
