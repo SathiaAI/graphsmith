@@ -11,6 +11,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
+const { harnessDeadline } = require("../_harness/deadline.js");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const SCENARIO_JS = path.join(REPO_ROOT, "scripts", "scenario.js");
@@ -29,7 +30,21 @@ function record(name, status, detail) {
   console.log(line);
 }
 function pass(name, detail) { record(name, "PASS", detail); }
-function fail(name, detail) { record(name, "FAIL", detail); }
+function fail(name, detail) {
+  /* Once the harness has run out of patience even once, no later negative verdict in
+   * this sequential run can be attributed to scenario.js. Latching once beats
+   * threading a timedOut check through every call site -- the same edit repeated is
+   * the one that eventually gets missed. Can only downgrade a FAIL to a tagged FAIL:
+   * never a pass, exit code unchanged, and a run with no timeout behaves as before. */
+  if (harnessStarved) {
+    record(name, "FAIL", "INCONCLUSIVE (harness): a scenario.js invocation in this run was " +
+      "killed by the harness timeout, so this verdict cannot be attributed to the product" +
+      (detail ? " [original: " + detail + "]" : ""));
+    return;
+  }
+  record(name, "FAIL", detail);
+}
+let harnessStarved = false;
 function skip(name, detail) { record(name, "SKIPPED", detail); }
 
 function mkRoot(tag) {
@@ -42,13 +57,29 @@ function writeScenario(dir, scenario) {
   fs.writeFileSync(path.join(dir, scenario.id + ".json"), JSON.stringify(scenario, null, 2));
 }
 
+/* Fail-closed, but tagged so it is never read as a product finding -- see
+ * tests/harness-honesty/starvation/ for the convention. Every case in this file draws
+ * its verdict from a runCLI result, so a child killed by the harness's own timeout
+ * would otherwise be reported as scenario.js misbehaving. */
+function inconclusive(name, detail) { record(name, "FAIL", "INCONCLUSIVE (harness): " + detail); }
+
+function timedOutByHarness(r) {
+  return !!(r && r.error && r.error.code === "ETIMEDOUT");
+}
+
 function runCLI(args, opts) {
   const r = spawnSync(process.execPath, [SCENARIO_JS, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
-    timeout: (opts && opts.timeoutMs) || 60000,
+    timeout: harnessDeadline((opts && opts.timeoutMs) || 60000),
     maxBuffer: 64 * 1024 * 1024,
   });
+  if (timedOutByHarness(r) && !harnessStarved) {
+    harnessStarved = true;
+    inconclusive("harness/scenario-cli-timed-out",
+      "a scenario.js invocation exceeded the harness timeout; every failing verdict from " +
+      "here on is tagged INCONCLUSIVE rather than attributed to scenario.js");
+  }
   return r;
 }
 

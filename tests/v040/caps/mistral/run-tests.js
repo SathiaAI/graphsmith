@@ -272,18 +272,43 @@ test("malformed-proxy", () => {
     return result.status === "failed";
 });
 
-test("malformed-bigint", () => {
+/* ADJUDICATED: this is an adversarial-review artifact, and a tester's expectation is
+ * not automatically the right answer. tests/v040/caps/ADJUDICATION.md records that
+ * this expectation was tried, broke the binding C1 rule, and was reverted. Flipping it
+ * silently would erase that history; leaving it FAILing forever is why nobody reads
+ * the evidence-only list. Run it, assert the adjudicated behaviour so a regression
+ * away from C1 still fails, and print it under its own status. */
+let adjudicated = 0;
+function adjudicatedTest(name, fn, ruling) {
+    let ok;
+    try { ok = fn(); } catch (e) {
+        console.log("FAIL " + name + " REGRESSED: threw -- " + String(e)); fail++; return;
+    }
+    if (ok === true) {
+        console.log("ADJUDICATED " + name + " (not a defect: " + ruling + ")");
+        adjudicated++;
+    } else {
+        console.log("FAIL " + name + " REGRESSED away from the adjudicated behaviour");
+        fail++;
+    }
+}
+
+adjudicatedTest("malformed-bigint", () => {
     const ctx = makeBaseCtx();
     ctx.grant.skill_id = 123n;
-    const result = run(ctx);
-    return result.status === "failed";
-});
+    return run(ctx).status === "verified";
+}, "ADJUDICATION.md \"The C1 conflict\" — skill_id is IDENTITY. Gating the capability verdict on it was tried to satisfy this very expectation, immediately broke DeepSeek's C1 invariance test, and was reverted. Identity is evidence, never a decision input");
 
+/* Accepting either status made this unfalsifiable -- no product change short of a
+ * crash could fail it. It also hid a real fail-open: within() returned true for a
+ * non-array reqList, so a request we cannot read counted as "requested nothing" and
+ * was vacuously within grant. checks/v040-caps.js now distinguishes absent (legitimate
+ * -- a filesystem request may set read and not write) from present-but-malformed
+ * (fail closed, per that module's own stated posture). Pin the one correct answer. */
 test("malformed-wrong-types-in-requested", () => {
     const ctx = makeBaseCtx();
     ctx.requested.filesystem.read = "not an array";
-    const result = run(ctx);
-    return result.status === "failed" || result.status === "verified";
+    return run(ctx).status === "failed";
 });
 
 test("malformed-wrong-types-in-attested", () => {
@@ -293,5 +318,6 @@ test("malformed-wrong-types-in-attested", () => {
     return result.status === "failed";
 });
 
-console.log("# summary PASS=" + pass + " FAIL=" + fail + " total=" + (pass + fail));
+console.log("# summary PASS=" + pass + " FAIL=" + fail + " ADJUDICATED=" + adjudicated +
+    " total=" + (pass + fail + adjudicated));
 process.exitCode = fail === 0 ? 0 : 1;

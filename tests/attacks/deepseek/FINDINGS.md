@@ -49,7 +49,7 @@ attack that still passes against a broken guarantee is **HOLLOW (BLOCKING)**.
 - **NC_PASS**: scan correctly detected eval after comment/string strip. evalHit=true fnHit=false newFnHit=false — bite proven
 
 ### gap-A5-BYO-tool
-- **FINDING**: No attack in corpus exercises A5 (malicious BYO test / external tool) container profile enforcement. Contract 04-B10 mandates 'no container -> tool reports unavailable' and 'report strings display-only, never control flow'. The module-escape suite covers static posture only; a dynamic attack that submits a malicious report and asserts it does not reach control flow is absent. This is a real coverage gap but may be deferred per §17 seam boundary.
+- **FINDING**: A5 (malicious BYO test / external tool): container-required refusal and report-strings-never-control-flow ARE covered by scripts/ext-tool-runner.js --selftest. Still unattacked end-to-end: the container's confinement properties themselves — network denial, read-only source mount, environment scrubbing — are declared but never exercised by an attack. Deferrable per §17 seam boundary; tracked, not silent.
 
 ### unaudit-true-parallel-rename
 - **NC_PASS**: UNAVAILABLE is honest — explicitly states single-threaded limitation, never greenwashes. Platform-probe territory documented.
@@ -127,6 +127,6 @@ contained eval, the attack **WOULD FAIL** → bite confirmed (scanner functional
 | NC_PASS | NC-post-BEGIN-mutation-HALT-bite | broken recover OK after hostile ACTIVE mutation (txDone=1 hostileSurvived=true) — bite proven |
 | NC_PASS | NC-module-escape-nonbuiltin-require-bite | scan correctly detected non-builtin require: evil-backdoor-tool — bite proven |
 | NC_PASS | NC-module-escape-eval-Function-bite | scan correctly detected eval after comment/string strip. evalHit=true fnHit=false newFnHit=false — bite proven |
-| FINDING | coverage-gap-A5-BYO-tool | No attack in corpus exercises A5 (malicious BYO test / external tool) container profile enforcement. Contract 04-B10 mandates 'no container -> tool reports unavailable' and 'report strings display-only, never control flow'. The module-escape suite covers static posture only; a dynamic attack that submits a malicious report and asserts it does not reach control flow is absent. This is a real coverage gap but may be deferred per §17 seam boundary. |
+| FINDING | coverage-gap-A5-BYO-tool | A5 (malicious BYO test / external tool): container-required refusal and report-strings-never-control-flow ARE covered by scripts/ext-tool-runner.js --selftest. Still unattacked end-to-end: the container's confinement properties themselves — network denial, read-only source mount, environment scrubbing — are declared but never exercised by an attack. Deferrable per §17 seam boundary; tracked, not silent. |
 | NC_PASS | coverage-unaudit-true-parallel-rename | UNAVAILABLE is honest — explicitly states single-threaded limitation, never greenwashes. Platform-probe territory documented. |
 | NC_PASS | network-static-coverage-sufficient | Static require('http'/'net'/etc.) scan covers known CJS decision-path patterns. Runtime dynamic import is out of scope per README (A1 runtime monkey-patching is verify domain). |

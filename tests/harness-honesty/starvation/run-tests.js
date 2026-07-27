@@ -89,6 +89,7 @@ const TARGETS = [
   "tests/report-integrity/harness/run-tests.js",
   "tests/heal/deepseek/run-tests.js",
   "tests/evalenv/gpt-sol-pro/run-tests.js",
+  "tests/scenario/run-tests.js",
 ];
 
 let pass = 0;

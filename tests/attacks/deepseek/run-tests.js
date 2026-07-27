@@ -686,7 +686,18 @@ function nc_coverageGap() {
    * a report from an untrusted tool is NOT used as control flow.
    * This IS a gap, but may be deferred based on Phase. */
   const nameA5 = "coverage-gap-A5-BYO-tool";
-  finding(nameA5, "No attack in corpus exercises A5 (malicious BYO test / external tool) container profile enforcement. Contract 04-B10 mandates 'no container -> tool reports unavailable' and 'report strings display-only, never control flow'. The module-escape suite covers static posture only; a dynamic attack that submits a malicious report and asserts it does not reach control flow is absent. This is a real coverage gap but may be deferred per §17 seam boundary.");
+  /* Narrowed after checking. The two properties this used to name as uncovered ARE
+   * covered: scripts/ext-tool-runner.js --selftest exercises container-required
+   * refusal (no runtime -> status "unavailable", never a silent downgrade to
+   * standard) and report-strings-are-display-only-never-control-flow. Leaving a
+   * coverage audit claiming they are absent is the same dishonesty this suite exists
+   * to catch, aimed inward -- and it makes the genuinely missing part harder to see.
+   *
+   * What is genuinely unattacked: the container's own confinement properties --
+   * network denial, read-only source mounting, environment scrubbing -- as an
+   * end-to-end ATTACKED guarantee rather than a declared one. This stays a FINDING,
+   * which is this harness working: a coverage backlog is its deliverable, not rot. */
+  finding(nameA5, "A5 (malicious BYO test / external tool): container-required refusal and report-strings-never-control-flow ARE covered by scripts/ext-tool-runner.js --selftest. Still unattacked end-to-end: the container's confinement properties themselves — network denial, read-only source mount, environment scrubbing — are declared but never exercised by an attack. Deferrable per §17 seam boundary; tracked, not silent.");
 
   /* UNAVAILABLE verdict scrutiny: toctou true-parallel-rename.
    * Is "unavailable" honest? The harness states it's "inherently unprovable"

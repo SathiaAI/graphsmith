@@ -309,7 +309,11 @@ test("crash-bigint", () => {
   const trustedKeys = { "key-1": publicKeyPem(keyPair) };
   const packetSha256 = "a".repeat(64);
   const attestation = createAttestation(keyPair, "key-1", "alice", packetSha256);
-  const policy = createPolicy(1);
+  // createPolicy(1) leaves proposer_ne_approver false, so checks/register-approver.js
+  // never reads proposer_id at all and the BigInt was inert -- the case could only
+  // ever have passed by accident or failed for an unrelated reason. Turn separation of
+  // duties ON so the hostile value actually reaches the code path under test.
+  const policy = createPolicy(1, true);
   const ctx = {
     packet_sha256: packetSha256,
     approvals: [attestation],
@@ -388,10 +392,25 @@ test("crash-proto-pollution", () => {
   };
   // Pollute Object.prototype
   Object.prototype.polluted = "yes";
-  const result = target.run(ctx);
-  delete Object.prototype.polluted;
-  if (result.status !== "failed") {
-    throw new Error("Proto pollution did not fail gracefully");
+  let result;
+  try {
+    result = target.run(ctx);
+  } finally {
+    delete Object.prototype.polluted;   // was leaking into every later case on a throw
+  }
+  /* The security property is that a polluted prototype cannot produce a TRUSTED
+   * verdict, and the only status that grants trust is "verified" --
+   * scripts/gsa-register.js:40 gates the precondition on exactly that string, so
+   * "unavailable" and "failed" are equally fail-closed downstream.
+   *
+   * The old assertion demanded "failed" specifically. What actually happens is
+   * "unavailable": the allowlist in shapeOk() walks inherited enumerable keys, so the
+   * injected key makes the attestation shape-invalid, leaving zero valid signers --
+   * "cannot determine" rather than "determined to be bad", which is the honest reading
+   * and the one this module documents. Assert the property, not one spelling of it. */
+  if (result.status === "verified") {
+    throw new Error("Object.prototype pollution produced a VERIFIED attestation: " +
+      JSON.stringify(result));
   }
 });
 

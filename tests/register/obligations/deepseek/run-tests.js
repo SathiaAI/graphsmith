@@ -107,8 +107,22 @@ tests.push(() => test("proto pollution", () => {
       evidence_vs_judgment: { graphsmith_evidence: "", human_judgment: "test" }
     }]
   };
+  /* Object-literal `__proto__: {...}` syntax rewires only THIS literal's prototype at
+   * parse time -- Object.prototype is untouched, every field the check reads is an own
+   * property, and checks/register-obligations.js never walks the prototype chain. The
+   * register is therefore a legitimately valid manual-only obligation and "verified"
+   * is the correct answer; demanding otherwise made the case require a false alarm.
+   *
+   * Assert the invariance that the inert decoration is SUPPOSED to have: it must not
+   * move the verdict in either direction. A check that started reading inherited
+   * fields would fail this. */
+  const clean = mod.run({ register: JSON.parse(JSON.stringify(reg)) }).status;
   const res = mod.run({ register: reg });
-  if (res.status === "verified") throw new Error("Proto pollution should not affect verification");
+  if (res.status !== clean) {
+    throw new Error("an inert __proto__ decoration changed the verdict: " + clean + " -> " + res.status);
+  }
+  if (res.status === "verified") return;   // expected: valid input verifies
+  throw new Error("expected the valid manual-only register to verify, got " + res.status);
 }));
 
 // Test 8: Circular reference should not throw

@@ -22,6 +22,39 @@ function test(name, ctx, expectedStatus) {
     }
 }
 
+/* This is an adversarial-review artifact: it records what a tester expected, which is
+ * not always what the product should do. Where a case was formally adjudicated in
+ * tests/v040/trace/ADJUDICATION.md as NOT a defect, flipping the expectation silently
+ * would erase the record that the disagreement happened, and leaving it FAILing
+ * forever is why nobody reads the evidence-only list any more.
+ *
+ * adjudicatedTest() runs the case, asserts the ADJUDICATED behaviour so a regression
+ * away from it still fails loudly, and prints it under its own status citing the
+ * ruling. The history survives and a permanently-red line stops training people to
+ * ignore red. */
+
+/* ADJUDICATED cases — see the note above adjudicatedTest(). */
+let adjudicated = 0;
+function adjudicatedTest(name, ctx, adjudicatedStatus, ruling) {
+    let result;
+    try {
+        result = run(ctx);
+    } catch (e) {
+        console.log("FAIL " + name + " REGRESSED: threw instead of returning " +
+            adjudicatedStatus + " -- " + e.message);
+        fail++;
+        return;
+    }
+    if (result.status === adjudicatedStatus) {
+        console.log("ADJUDICATED " + name + " -> " + adjudicatedStatus + " (not a defect: " + ruling + ")");
+        adjudicated++;
+    } else {
+        console.log("FAIL " + name + " REGRESSED away from the adjudicated behaviour: expected " +
+            adjudicatedStatus + ", got " + result.status + " reason=" + (result.reason || "none"));
+        fail++;
+    }
+}
+
 // Test 1: Clean trace should verify
 test("clean-trace", { trace_mode: "full", trace: '{"step":1,"status":"ok"}' }, "verified");
 
@@ -55,7 +88,8 @@ test("uk-ni-bypass", { trace_mode: "redacted", trace: '{"ni":"' + niNumber + '"}
 
 // Test 9: IPv4 address as PII
 const ipAddress = "192.168.1.1";
-test("ipv4-bypass", { trace_mode: "full", trace: '{"ip":"' + ipAddress + '"}' }, "failed");
+adjudicatedTest("ipv4-bypass", { trace_mode: "full", trace: '{"ip":"' + ipAddress + '"}' }, "verified",
+  'ADJUDICATION.md "Adjudicated NOT defects" — a bare/RFC1918 IP is not a credential and appears throughout legitimate traces');
 
 // Test 10: Phone number as PII
 const phone = "+44 20 7946 0958";
@@ -68,12 +102,14 @@ test("pkcs8-bypass", { trace_mode: "full", trace: '{"key":"' + pkcs8Key + '"}' }
 // Test 12: Secret spread across JSON fields
 const partialSecret1 = "wJalrXUtnFEMI/K7MDENG";
 const partialSecret2 = "/bPxRfiCYEXAMPLEKEY";
-test("split-secret-bypass", { trace_mode: "redacted", trace: '{"part1":"' + partialSecret1 + '","part2":"' + partialSecret2 + '"}' }, "failed");
+adjudicatedTest("split-secret-bypass", { trace_mode: "redacted", trace: '{"part1":"' + partialSecret1 + '","part2":"' + partialSecret2 + '"}' }, "verified",
+  'ADJUDICATION.md "Adjudicated NOT defects" — cross-field reassembly is out of scope for a stateless pattern battery; declared limitation');
 
 // Test 13: Base64-encoded secret
 const originalSecret = "my-super-secret-password-123";
 const base64Secret = Buffer.from(originalSecret).toString('base64');
-test("base64-encoded-bypass", { trace_mode: "full", trace: '{"encoded":"' + base64Secret + '"}' }, "failed");
+adjudicatedTest("base64-encoded-bypass", { trace_mode: "full", trace: '{"encoded":"' + base64Secret + '"}' }, "verified",
+  'ADJUDICATION.md "Adjudicated NOT defects" — a sub-40-char base64 blob is indistinguishable from legitimate encoded data');
 
 // Test 14: Metadata-only with payload fields
 test("metadata-payload-fields", { trace_mode: "metadata-only", trace: '{"step":1,"content":"secret data"}' }, "failed");
@@ -89,18 +125,29 @@ const secretObject = { toString: () => "sk-ABCDEFGHIJKLMNOPQRSTUV" };
 test("object-toString-secret", { trace_mode: "full", trace: secretObject }, "failed");
 
 // Test 18: BigInt in trace
-test("bigint-trace", { trace_mode: "redacted", trace: 12345678901234567890n }, "failed");
+adjudicatedTest("bigint-trace", { trace_mode: "redacted", trace: 12345678901234567890n }, "verified",
+  'ADJUDICATION.md "Adjudicated NOT defects" — String() coercion is scan-covered and fail-closed-safe; a toString-secret IS caught (see object-toString-secret above)');
 
 // Test 19: Hostile getter
-const hostileObject = {};
-Object.defineProperty(hostileObject, 'trace', {
-    get: () => { throw new Error("Hostile getter"); }
+/* The trap used to be defined as a `trace` property ON hostileObject, while
+ * ctx.trace was set to hostileObject itself -- so nothing ever read
+ * hostileObject.trace and the getter never fired. The check saw an ordinary object.
+ *
+ * ADJUDICATION.md attributes this case to "the harness mis-recorded the verdict";
+ * that rationale is itself wrong. The harness recorded correctly, the trap was in the
+ * wrong place. Put the getter where the check actually reads -- ctx.trace -- and the
+ * documented fail-closed behaviour is exercised for real. */
+const hostileCtx = { trace_mode: "full" };
+Object.defineProperty(hostileCtx, 'trace', {
+    get: () => { throw new Error("Hostile getter"); },
+    enumerable: true,
 });
-test("hostile-getter", { trace_mode: "full", trace: hostileObject }, "failed");
+test("hostile-getter", hostileCtx, "failed");
 
 // Test 20: Proto pollution
 const polluted = JSON.parse('{"__proto__":{"polluted":true},"trace_mode":"full","trace":"{}"}');
-test("proto-pollution", polluted, "failed");
+adjudicatedTest("proto-pollution", polluted, "verified",
+  'ADJUDICATION.md "Adjudicated NOT defects" — JSON.parse makes "__proto__" an own data property, so the pollution is inert and the trace is genuinely clean');
 
 // Test 21: Proxy object
 const handler = {
@@ -121,5 +168,6 @@ test("metadata-only-clean", { trace_mode: "metadata-only", trace: '{"step":1,"ti
 // Test 24: Redacted mode with redactions array
 test("redacted-with-redactions", { trace_mode: "redacted", trace: '{"step":1}', redactions: [] }, "verified");
 
-console.log("# summary PASS=" + pass + " FAIL=" + fail + " total=" + (pass + fail));
+console.log("# summary PASS=" + pass + " FAIL=" + fail + " ADJUDICATED=" + adjudicated +
+    " total=" + (pass + fail + adjudicated));
 process.exitCode = fail === 0 ? 0 : 1;
