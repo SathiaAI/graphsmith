@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const REPO = path.resolve(__dirname, "../../..");
 const SCAFFOLD = path.join(REPO, "scripts", "scaffold.js");
@@ -21,6 +22,30 @@ function pass(name, reason) { record("PASS", name, reason); }
 function fail(name, reason) { record("FAIL", name, reason); }
 function skipped(name, reason) { record("SKIPPED", name, reason); }
 
+// A case whose PRECONDITION never arrived within the harness's own patience has not
+// observed anything about the product, so it must not emit a product verdict either
+// way. It still counts as a failure -- fail-closed, a case that did not execute must
+// never read as green -- but the tag keeps it out of the product findings, and
+// tests/harness-honesty/starvation/ requires it: under starved deadlines this is the
+// ONLY verdict a case that waits is allowed to reach.
+function inconclusive(name, reason) {
+  record("FAIL", name, "INCONCLUSIVE (harness): " + reason);
+}
+
+// spawnSync kills the child with SIGTERM when its own `timeout` elapses and reports
+// error.code === "ETIMEDOUT" with status === null. That is the HARNESS running out of
+// patience, not the manager declining to halt -- assertHalt must not read it as the
+// latter.
+function timedOutByHarness(result) {
+  return !!(result && result.error && result.error.code === "ETIMEDOUT");
+}
+
+// waitForFile / waitClose reject with this text; the top-level catch uses it to tell a
+// starved wait apart from a genuine harness bug.
+function isDeadlineError(e) {
+  return !!e && /^timed out waiting for /.test(String(e.message || e));
+}
+
 function readJson(file) { return JSON.parse(fs.readFileSync(file, "utf8")); }
 function writeJson(file, value) { fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n"); }
 
@@ -29,8 +54,24 @@ function scaffold(label) {
   fs.mkdirSync(parent, { recursive: true });
   const name = label.replace(/[^A-Za-z0-9._-]/g, "-");
   const made = spawnSync(process.execPath, [SCAFFOLD, name], {
+    // DELIBERATELY NOT routed through harnessDeadline(). Every other deadline in this
+    // file is, and the reason this one is not is a coverage argument, not an exemption:
+    // scaffolding is the setup step every case runs first, so starving it kills the
+    // suite at case 1 and the sweep learns nothing about the 40-odd verdicts that
+    // follow. Its expiry is also not verdict-bearing -- it throws, and the throw is
+    // shaped so the top-level catch reports INCONCLUSIVE, so this step stays honest
+    // under starvation either way. The sweep's static wiring check only looks for the
+    // string "harnessDeadline" in this file, so it CANNOT see this choice; that is why
+    // it is written down here.
     cwd: parent, encoding: "utf8", timeout: 30000,
   });
+  // Distinguish "the scaffold CLI reported an error" from "the harness stopped waiting
+  // for it". Only the first is a finding; the second must reach the top-level catch in
+  // the shape it recognises as a deadline, or every case downstream of it reports a
+  // confident harness failure it never observed.
+  if (timedOutByHarness(made)) {
+    throw new Error("timed out waiting for the scaffold CLI to produce " + label);
+  }
   if (made.status !== 0) throw new Error("scaffold CLI failed: status=" + made.status + " stderr=" + made.stderr);
   return path.join(parent, name);
 }
@@ -48,7 +89,7 @@ function writeWorker(project, source, worker) {
 
 function runManager(project, runId, extraArgs, timeout) {
   return spawnSync(process.execPath, ["manager.js", runId].concat(extraArgs || []), {
-    cwd: project, encoding: "utf8", timeout: timeout || 30000,
+    cwd: project, encoding: "utf8", timeout: harnessDeadline(timeout || 30000),
     env: Object.assign({}, process.env, { GRAPHSMITH_HEARTBEAT_MS: "50" }),
   });
 }
@@ -62,6 +103,15 @@ function haltState(project, runId) {
 }
 
 function assertHalt(name, project, runId, result, kind, rule, extraCheck) {
+  // The manager was still running when the harness's own spawnSync timeout fired, so
+  // whether it would have halted is unobserved. Reporting "expected exit=2 ... exit=null"
+  // here would be a product verdict drawn from a harness deadline -- the exact defect
+  // tests/harness-honesty/starvation/ exists to catch.
+  if (timedOutByHarness(result)) {
+    inconclusive(name, "manager was killed by the harness spawnSync timeout before it " +
+      "could halt or complete, so no " + kind + "/" + rule + " verdict was observed");
+    return;
+  }
   const state = haltState(project, runId);
   const halt = state && state.halted;
   const ok = result.status === 2 && halt && halt.kind === kind && halt.rule === rule &&
@@ -159,9 +209,9 @@ async function killAfterReady(project, runId, readyFile) {
     cwd: project, stdio: "ignore",
     env: Object.assign({}, process.env, { GRAPHSMITH_HEARTBEAT_MS: "50" }),
   });
-  await waitForFile(readyFile, 5000);
+  await waitForFile(readyFile, harnessDeadline(5000));
   try { child.kill("SIGKILL"); } catch (_) {}
-  await waitClose(child, 5000);
+  await waitClose(child, harnessDeadline(5000));
 }
 
 function testBudgets() {
@@ -346,10 +396,10 @@ async function testResume() {
   const wallReady = path.join(wallProject, ".runs", "run", "ready");
   writeWorker(wallProject, `"use strict"; const fs=require("fs"),path=require("path"); module.exports.run=async function(_i,ctx){fs.writeFileSync(path.join(ctx.runDir,"ready"),"1");const end=Date.now()+10000;while(Date.now()<end){}return {};};\n`);
   const child = spawn(process.execPath, ["manager.js", "run"], { cwd: wallProject, stdio: "ignore" });
-  await waitForFile(wallReady, 5000);
+  await waitForFile(wallReady, harnessDeadline(5000));
   await new Promise((r) => setTimeout(r, 1700));
   try { child.kill("SIGKILL"); } catch (_) {}
-  await waitClose(child, 5000);
+  await waitClose(child, harnessDeadline(5000));
   writeWorker(wallProject, `"use strict"; module.exports.run=async function(){return {};};\n`);
   const wallResume = runManager(wallProject, "run", ["--acknowledge-budget"]);
   const wallState = haltState(wallProject, "run");
@@ -479,7 +529,15 @@ async function main() {
     testCapabilities();
     testPrompts();
   } catch (e) {
-    fail("harness/internal", e.stack || e.message);
+    // A precondition wait that expired says nothing about the product, and it also
+    // aborted every group after it -- both facts belong in the verdict, and neither is
+    // a finding about the scaffold.
+    if (isDeadlineError(e)) {
+      inconclusive("harness/internal", (e.message || String(e)) +
+        " -- the remaining groups in this suite did not run");
+    } else {
+      fail("harness/internal", e.stack || e.message);
+    }
   } finally {
     try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch (_) {}
   }

@@ -12,6 +12,7 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn, spawnSync, execSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 const net = require("net");
 const http = require("http");
 const https = require("https");
@@ -21,6 +22,14 @@ const ROOT = path.resolve(__dirname, "..", "..", "..");
 const WATCH = path.join(ROOT, "scripts", "watch.js");
 const NODE = process.execPath;
 const IS_WIN = process.platform === "win32";
+
+// Two PRODUCT constants the honesty guards below reason against. They are not harness
+// deadlines and must never be scaled -- they are the physics a verdict has to respect.
+//   POLL_INTERVAL_MS         scripts/watch.js DEFAULT_REFRESH_INTERVAL_MS
+//   NODE_FIRST_FRAME_FLOOR_MS node startup + first render, measured at 187-211ms on a
+//                            loaded 2-core box elsewhere in this suite family
+const POLL_INTERVAL_MS = 500;
+const NODE_FIRST_FRAME_FLOOR_MS = 250;
 
 const results = [];
 const tempRoots = [];
@@ -35,6 +44,28 @@ function rec(name, status, reason, extra) {
   if (status === "FAIL") failures++;
 }
 
+/* A case whose watch process was killed by THIS HARNESS'S timeout observed nothing
+ * about watch.js, so it must not report a product verdict either way. It still counts
+ * as a failure -- fail-closed; a case that did not execute must never read as green --
+ * but the tag keeps it out of the product findings, and
+ * tests/harness-honesty/starvation/ requires it: under starved deadlines this is the
+ * only verdict a case that waits is allowed to reach.
+ *
+ * Every guard below keys off `timedOut`, which runWatchCli and runWatchSync already
+ * surface (spawnSync sets error.code === "ETIMEDOUT" and status === null; the async
+ * path sets it when its own timer fires). `code === null` alone is NOT the test: a
+ * process killed by a signal for any other reason also reports null, and calling that
+ * a harness timeout would hide a real crash.
+ */
+function inconclusive(name, reason) {
+  rec(name, "FAIL", "INCONCLUSIVE (harness): " + reason);
+}
+
+/* NOTE ON `sleep()`: the fixed sleeps in this file are deliberately NOT routed through
+ * harnessDeadline(). They are not the harness's patience -- they position an action
+ * inside a window the PRODUCT defines (e.g. sleep past a lease TTL, sleep into a
+ * budget's second segment). Scaling them would not stress the harness, it would change
+ * the experiment, which is the one thing tests/_harness/deadline.js says never to do. */
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -241,7 +272,7 @@ function writeRunFixture(projectRoot, runId, parts) {
 }
 
 function runWatchCli(projectRoot, args, opts) {
-  const timeoutMs = (opts && opts.timeoutMs) || 4000;
+  const timeoutMs = harnessDeadline((opts && opts.timeoutMs) || 4000);
   const child = spawn(NODE, [WATCH, ...args], {
     cwd: projectRoot,
     stdio: ["ignore", "pipe", "pipe"],
@@ -290,7 +321,7 @@ function runWatchSync(projectRoot, args, timeoutMs) {
   const r = spawnSync(NODE, [WATCH, ...args], {
     cwd: projectRoot,
     encoding: "utf8",
-    timeout: timeoutMs || 5000,
+    timeout: harnessDeadline(timeoutMs || 5000),
     windowsHide: true,
     env: { ...process.env, NO_COLOR: "1" },
   });
@@ -513,6 +544,17 @@ async function testHaltAndTripwireAndWindow() {
   const after = hashDir(runDir);
   const out = cli.stdout;
 
+  // `watch <runId>` is a continuous tail: it never exits on its own, so the harness
+  // timeout is its NORMAL termination and timedOut alone proves nothing. What matters
+  // is whether a frame was captured before the kill. Empty stdout plus a timeout means
+  // nothing was observed; stdout with content means the render happened and the timeout
+  // was just how the test ended it.
+  if (cli.timedOut && out.length === 0) {
+    inconclusive(name, "the watch CLI was killed by the harness timeout before it " +
+      "emitted a single frame, so whether it shows the HALT was not observed");
+    return;
+  }
+
   const winSum = watch.renderWindowSummary(runDir);
   const checks = {
     haltCli: out.includes("HALTED") || out.includes("max_wall_time_ms"),
@@ -701,6 +743,11 @@ async function testKillMessagePrintedEvenWhenPidMissing() {
     // no lock file
   });
   const cli = runWatchSync(root, [runId, "--kill-run"], 5000);
+  if (cli.timedOut) {
+    inconclusive(name, "--kill-run was killed by the harness timeout before it could " +
+      "print anything, so whether the capability message survives a missing PID was not observed");
+    return;
+  }
   const out = (cli.stdout || "") + (cli.stderr || "");
   // Operator should still learn capability posture even if PID unknown
   const hasMsg =
@@ -789,7 +836,7 @@ setInterval(() => {}, 1000);
   // no guaranteed slack left for the fixed 800ms to cover both delivery and reaping (Shape 1:
   // fixed sleep standing in for a precondition). Poll for the actual precondition (mgr +
   // child both reaped) with a bounded, generous deadline instead.
-  const DEAD_DEADLINE_MS = 10000;
+  const DEAD_DEADLINE_MS = harnessDeadline(10000);
   const deadStart = Date.now();
   let mgrAlive = pidAlive(meta.pid);
   let childAlive = childPid ? pidAlive(childPid) : false;
@@ -810,6 +857,11 @@ setInterval(() => {}, 1000);
   if (childPid) forceKillTree(childPid);
   forceKillTree(mgr.pid);
 
+  if (cli.timedOut) {
+    inconclusive(name, "--kill-run was killed by the harness timeout, so whether the " +
+      "process group was reaped without orphans was not observed");
+    return;
+  }
   if (cli.code !== 0) {
     rec(name, "FAIL", `kill cli exit ${cli.code}: ${(cli.stdout + cli.stderr).slice(0, 200)}`, {
       mgrAlive,
@@ -925,7 +977,7 @@ setTimeout(() => {
       {
         cwd: root,
         encoding: "utf8",
-        timeout: 8000,
+        timeout: harnessDeadline(8000),
         windowsHide: true,
       }
     );
@@ -976,6 +1028,7 @@ async function testMissingCorruptGraceful() {
     const r = runWatchSync(root, ["no-such-run"], 5000);
     cases.push({
       id: "missing-run-dir",
+      starved: r.timedOut,
       ok: r.code !== 0 && r.code !== null && !r.error,
       detail: `code=${r.code} err=${(r.stderr || "").slice(0, 120)}`,
     });
@@ -994,6 +1047,8 @@ async function testMissingCorruptGraceful() {
     const out = r.stdout + r.stderr;
     cases.push({
       id: "missing-budget-state",
+      // Continuous tail: see the note in A3. Only a timeout with NO output observed nothing.
+      starved: r.timedOut && out.length === 0,
       ok: !crashed && (out.includes("No budget") || out.includes("ACTIVE") || r.code === 0 || r.timedOut),
       detail: `crashed=${crashed} code=${r.code} out=${out.slice(0, 100)}`,
     });
@@ -1013,6 +1068,9 @@ async function testMissingCorruptGraceful() {
     const crashed = /throw|SyntaxError|Unexpected token/i.test(r.stderr) && r.code === null;
     cases.push({
       id: "corrupt-budget-json",
+      // Continuous tail: see the note in A3. A hash mutation is a real finding even if
+      // the tail was killed by the timeout, so only an output-less timeout is starved.
+      starved: r.timedOut && (r.stdout + r.stderr).length === 0,
       ok: !crashed && before === after,
       detail: `code=${r.code} hashOk=${before === after} stderr=${(r.stderr || "").slice(0, 80)}`,
     });
@@ -1039,6 +1097,7 @@ async function testMissingCorruptGraceful() {
     const cls = classifyKillMessage((r.stdout || "") + (r.stderr || ""));
     cases.push({
       id: "corrupt-capability-kill",
+      starved: r.timedOut,
       ok: !crashed && r.code !== null,
       detail: `code=${r.code} class=${cls} (expect reconciliation-required)`,
       expectClassFail: cls !== "reconciliation-required" && r.code === 0,
@@ -1051,6 +1110,7 @@ async function testMissingCorruptGraceful() {
     const r = runWatchSync(root, [], 5000);
     cases.push({
       id: "usage-exit",
+      starved: r.timedOut,
       ok: r.code === 2 || r.code === 1,
       detail: `code=${r.code}`,
     });
@@ -1062,18 +1122,33 @@ async function testMissingCorruptGraceful() {
     const r = runWatchSync(root, ["x"], 5000);
     cases.push({
       id: "empty-project",
+      starved: r.timedOut,
       ok: r.code !== 0 && !(r.error && r.error.message.includes("Cannot")),
       detail: `code=${r.code}`,
     });
   }
 
   const failed = cases.filter((c) => !c.ok || c.expectClassFail);
-  if (failed.length) {
+  // A sub-case whose watch process the harness killed says nothing about graceful
+  // degradation. Report the genuine failures if there are any; otherwise the case is
+  // inconclusive rather than a finding -- never a silent pass, because some sub-case
+  // did not execute.
+  const observed = failed.filter((c) => !c.starved);
+  const starved = failed.filter((c) => c.starved);
+  if (observed.length) {
     rec(
       name,
       "FAIL",
-      failed.map((f) => `${f.id}:${f.detail}`).join(" | "),
+      observed.map((f) => `${f.id}:${f.detail}`).join(" | ") +
+        (starved.length ? ` [+${starved.length} sub-case(s) not observed: harness timeout]` : ""),
       { cases }
+    );
+  } else if (starved.length) {
+    inconclusive(
+      name,
+      starved.map((f) => f.id).join(", ") +
+        " were killed by the harness timeout before watch could respond, so graceful " +
+        "degradation was not observed"
     );
   } else {
     rec(name, "PASS", cases.map((c) => c.id).join(","));
@@ -1124,7 +1199,7 @@ async function testWatchContinuousTailUnref() {
   // 600ms is not absurd but is still a guess, not an observation). Wait for the actual
   // observables instead: (1) the process has produced its first frame at all, (2) the mutated
   // marker has actually appeared in stdout — each bounded by a generous deadline, not a stopwatch.
-  const timeoutMs = 15000; // safety net only; we drive completion ourselves below
+  const timeoutMs = harnessDeadline(15000); // safety net only; we drive completion ourselves below
   const { child, done } = runWatchCli(root, [runId], { timeoutMs });
   let liveStdout = "";
   child.stdout.on("data", (d) => {
@@ -1137,7 +1212,7 @@ async function testWatchContinuousTailUnref() {
     doneResult = r;
   });
 
-  const FIRST_FRAME_DEADLINE_MS = 5000;
+  const FIRST_FRAME_DEADLINE_MS = harnessDeadline(5000);
   const firstFrameStart = Date.now();
   while (!liveStdout.length && !doneSettled && Date.now() - firstFrameStart < FIRST_FRAME_DEADLINE_MS) {
     await sleep(25);
@@ -1145,6 +1220,15 @@ async function testWatchContinuousTailUnref() {
   if (!liveStdout.length && !doneSettled) {
     forceKillTree(child.pid);
     await done;
+    // Node process startup plus a first render was measured at 187-211ms on a loaded
+    // 2-core box (see the comment above). Below that floor, "no output yet" is a
+    // statement about the deadline, not about watch.js.
+    if (FIRST_FRAME_DEADLINE_MS < NODE_FIRST_FRAME_FLOOR_MS) {
+      inconclusive(name, `first-frame deadline was ${FIRST_FRAME_DEADLINE_MS}ms, below the ` +
+        `${NODE_FIRST_FRAME_FLOOR_MS}ms node-startup-plus-first-render floor, so no output is ` +
+        `the expected result regardless of watch.js's behaviour`);
+      return;
+    }
     rec(name, "FAIL", `watch produced no output within ${FIRST_FRAME_DEADLINE_MS}ms of the first frame`);
     return;
   }
@@ -1161,7 +1245,7 @@ async function testWatchContinuousTailUnref() {
     })
   );
 
-  const UPDATE_DEADLINE_MS = 6000;
+  const UPDATE_DEADLINE_MS = harnessDeadline(6000);
   const updateStart = Date.now();
   let sawUpdate = liveStdout.includes("99") || liveStdout.includes("SEEN_99_POLL");
   while (!sawUpdate && !doneSettled && Date.now() - updateStart < UPDATE_DEADLINE_MS) {
@@ -1184,6 +1268,13 @@ async function testWatchContinuousTailUnref() {
     return;
   }
   if (!sawUpdate) {
+    // watch.js polls on a 500ms interval. A window shorter than one interval cannot
+    // contain a re-render, so "never re-rendered" inside it is arithmetic, not a finding.
+    if (UPDATE_DEADLINE_MS < POLL_INTERVAL_MS * 2) {
+      inconclusive(name, `update window was ${UPDATE_DEADLINE_MS}ms, under two ` +
+        `${POLL_INTERVAL_MS}ms poll intervals, so no re-render could have landed in it`);
+      return;
+    }
     rec(
       name,
       "FAIL",
@@ -1199,9 +1290,14 @@ async function testSelftestAndExports() {
   const r = spawnSync(NODE, [WATCH, "--selftest"], {
     cwd: ROOT,
     encoding: "utf8",
-    timeout: 15000,
+    timeout: harnessDeadline(15000),
     windowsHide: true,
   });
+  if (r.error && r.error.code === "ETIMEDOUT") {
+    inconclusive(name, "watch.js --selftest was killed by the harness timeout before it " +
+      "produced a report, so its exit status and module surface were not observed");
+    return;
+  }
   let parsed = null;
   try {
     parsed = JSON.parse(r.stdout);
@@ -1275,6 +1371,9 @@ async function testReadOnlyDuringKill() {
   const after = hashDir(runDir);
   if (before !== after) {
     rec(name, "FAIL", "run-state dir hash changed across --kill-run");
+  } else if (cli.timedOut) {
+    inconclusive(name, "--kill-run was killed by the harness timeout, so its exit status " +
+      "was not observed (the hash-stability half of this case did hold)");
   } else if (cli.code !== 0) {
     rec(name, "FAIL", `kill failed code=${cli.code} ${(cli.stderr || "").slice(0, 120)}`);
   } else {
