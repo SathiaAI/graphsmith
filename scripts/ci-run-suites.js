@@ -58,6 +58,35 @@ function discover(root) {
   return suites;
 }
 
+
+// Files that LOOK like committed suites but that discover() will never return,
+// because it matches the literal filename "run-tests.js" and nothing else.
+//
+// Three such files exist in this repo (tests/matrix/claude/tests.js,
+// tests/shadow/gemini/tests.js, tests/banned-lint/gemini/tests.js) and until this
+// was added, nothing anywhere said so: they are committed, they are executable,
+// they were written to be run, and no CI surface ran them. A test that silently
+// does not run is worse than a missing test, because the directory listing implies
+// coverage that does not exist.
+//
+// This does NOT start running them. Auto-adopting unreviewed suites into a gate is
+// how a gate gets disabled the first time one is flaky. It states the gap so the
+// choice -- rename into discovery, wire elsewhere, or delete -- is a decision
+// somebody makes rather than a fact nobody notices.
+function undiscovered(root, discovered) {
+  const seen = new Set(discovered);
+  const out = [];
+  (function walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name).split(path.sep).join("/");
+      if (entry.isDirectory()) walk(p);
+      else if (/(?:^|[-.])(?:tests|battery)\.js$/.test(entry.name) && !seen.has(p)) out.push(p);
+    }
+  })(root);
+  out.sort();
+  return out;
+}
+
 // A prefix list is only safe to match with String#startsWith if every entry is
 // a non-empty string: "".startsWith("") is true for ANY suite path, so a stray
 // empty-string (or non-string) entry in evidence_only would silently swallow
@@ -166,6 +195,16 @@ function main() {
 
   console.log("Discovered " + suites.length + " suite(s):");
   for (const s of suites) console.log("  " + s + "  [" + classify(s) + "]");
+
+  const notRun = undiscovered(args.root, suites);
+  if (notRun.length) {
+    console.log("");
+    console.log("NOT DISCOVERED -- " + notRun.length + " committed file(s) under " + args.root +
+      " look like suites but are not named run-tests.js, so this runner never executes them.");
+    console.log("This is stated, not acted on: they are NOT run and do NOT gate. Rename them into");
+    console.log("discovery, confirm they are run by another CI step, or delete them.");
+    for (const f of notRun) console.log("  " + f);
+  }
 
   const failedGating = [];
   const failedEvidence = [];

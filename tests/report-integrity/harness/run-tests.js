@@ -49,6 +49,7 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const ROOT = path.resolve(__dirname, "..", "..", "..");
 const SCRIPTS = path.join(ROOT, "scripts");
@@ -102,7 +103,7 @@ function viaPipe(scriptPath, args) {
   const r = spawnSync(process.execPath, [scriptPath].concat(args), {
     cwd: ROOT,
     encoding: "utf8",
-    timeout: 300000,
+    timeout: harnessDeadline(300000),
     maxBuffer: 32 * 1024 * 1024,
     windowsHide: true,
   });
@@ -118,7 +119,7 @@ function viaFile(scriptPath, args, tmpdir) {
     r = spawnSync(process.execPath, [scriptPath].concat(args), {
       cwd: ROOT,
       stdio: ["ignore", fd, "ignore"],
-      timeout: 300000,
+      timeout: harnessDeadline(300000),
       windowsHide: true,
     });
   } finally {
@@ -283,8 +284,20 @@ function main() {
       const expectedDocs = expectedJson.documents || 1;
       let brokenRun = -1;
       let why = "";
+      let starvedRun = -1;
       for (let i = 0; i < REPEATS; i += 1) {
         const got = viaPipe(scriptPath, c.args);
+        // A CLI killed by THIS HARNESS'S timeout never got to finish writing, so
+        // "report LOST through the pipe -- the CLI must hand every byte to the kernel
+        // before it exits" would be a product verdict drawn from harness impatience.
+        // Found by tests/harness-honesty/starvation/ pointed at this very file, which
+        // is the outcome that justifies the sweep existing.
+        if (got.error && got.error.code === "ETIMEDOUT") {
+          starvedRun = i;
+          why = "the CLI was killed by the harness timeout on run " + (i + 1) +
+            " of " + REPEATS + ", so nothing was observed about its report";
+          break;
+        }
         if (got.error) {
           brokenRun = i;
           why = "spawnSync errored: " + String(got.error.message || got.error);
@@ -309,7 +322,9 @@ function main() {
       }
 
       const mode = "parses, " + expectedDocs + " document(s) as on the file path";
-      if (brokenRun === -1) {
+      if (starvedRun !== -1) {
+        report(false, id, "INCONCLUSIVE (harness): " + why);
+      } else if (brokenRun === -1) {
         report(true, id, "report survived spawnSync " + REPEATS + "/" + REPEATS + " runs, " + mode + " (" + expected.length + "B)");
       } else {
         report(

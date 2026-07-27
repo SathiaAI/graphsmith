@@ -40,6 +40,23 @@ function assertNotMatch(output, matchStr, msg) {
   }
 }
 
+/* Fixtures live under a path that reads like a tracked fixtures/ directory but is
+ * generated per run. The cleanup at the end of the file covers normal completion
+ * and assertion failures; it does NOT cover an external kill -- a CI job timeout or
+ * a Ctrl-C -- which leaves the generated tree behind looking like committed
+ * fixtures someone deleted. Register cleanup on the exit paths a process can still
+ * observe. (SIGKILL cannot be caught by anything; nothing to do there.) */
+let cleanedUp = false;
+function cleanupOnce() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+  cleanup();
+}
+process.on("exit", cleanupOnce);
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => { cleanupOnce(); process.exit(130); });
+}
+
 cleanup();
 fs.mkdirSync(FIXTURES_DIR, { recursive: true });
 

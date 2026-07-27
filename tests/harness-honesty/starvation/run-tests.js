@@ -86,6 +86,9 @@ const TARGETS = [
   "tests/attacks/toctou/run-tests.js",
   "tests/attacks/module-escape/run-tests.js",
   "tests/adopt/grok/run-tests.js",
+  "tests/report-integrity/harness/run-tests.js",
+  "tests/heal/deepseek/run-tests.js",
+  "tests/evalenv/gpt-sol-pro/run-tests.js",
 ];
 
 let pass = 0;

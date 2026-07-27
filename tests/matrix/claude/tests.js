@@ -9,6 +9,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const M = require("../../../scripts/matrix.js");
 const {
@@ -38,7 +39,8 @@ function check(name, cond, detail) {
 }
 
 // ---- temp fixture helpers ---------------------------------------------
-const TMP = "tests/matrix/claude/.tmp";
+// Was a repo-tree-relative path, so a run left .tmp inside tests/ if it died early.
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "gs-matrix-claude-"));
 function freshTmp() {
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) {}
   fs.mkdirSync(TMP, { recursive: true });

@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 
 const docsLint = require("../../../scripts/docs-lint.js");
@@ -26,7 +27,8 @@ function assert(cond, msg) {
 }
 
 function runAdversarialTests() {
-  const tmpDir = "tests/banned-lint/gemini/tmp-gs-adversarial";
+  // Was a repo-tree-relative path; see the note in tests/matrix/claude/tests.js.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-banned-lint-gemini-"));
   if (fs.existsSync(tmpDir)) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

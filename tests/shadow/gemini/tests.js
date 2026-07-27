@@ -1,4 +1,6 @@
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const { execSync } = require("child_process");
 
 const shadow = require("../../../scripts/shadow.js");
@@ -19,7 +21,10 @@ function runTests() {
   console.log("--- STARTING ADVERSARIAL TESTS FOR shadow.js ---");
 
   // Attack 1: SHADOW-ONLY
-  const projectRoot = "./.tmp-gs-shadow-test-" + Date.now();
+  // Was "./.tmp-gs-shadow-test-<ts>", relative to CWD -- run from the repo root, as
+  // anyone would, that lands the temp tree directly in the REPO ROOT, and there is
+  // no try/finally, so an early failure leaves it there.
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gs-shadow-gemini-"));
   fs.mkdirSync(projectRoot + "/.graphsmith/evolvable", { recursive: true });
   fs.mkdirSync(projectRoot + "/.graphsmith/state", { recursive: true });
   const activePath = projectRoot + "/.graphsmith/evolvable/ACTIVE";

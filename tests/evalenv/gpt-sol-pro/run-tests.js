@@ -4,6 +4,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 const { spawnSync } = require("child_process");
 
 const REPO = path.resolve(__dirname, "../../..");
@@ -17,8 +18,29 @@ function record(status, name, reason) {
   process.stdout.write(status + " " + name + " - " + reason.replace(/\s+/g, " ") + "\n");
 }
 
+/* Once the harness has demonstrably run out of patience even ONCE, no later
+ * negative verdict in this run can be attributed to the product: the runs are
+ * sequential against the same box, and a machine slow enough to blow one deadline
+ * is slow enough to blow the next. Rather than thread a timedOut flag through every
+ * one of the 3 call sites -- which would be the same edit repeated until one got
+ * missed -- latch the fact once and tag every subsequent failure.
+ *
+ * This is deliberately conservative in the safe direction: it can only downgrade a
+ * FAIL to an INCONCLUSIVE-tagged FAIL. It never turns a failure into a pass, the
+ * exit code is unchanged, and a run with no timeout at all behaves exactly as
+ * before. */
+let harnessStarved = false;
+
 function pass(name, reason) { record("PASS", name, reason); }
-function fail(name, reason) { record("FAIL", name, reason); }
+function fail(name, reason) {
+  if (harnessStarved) {
+    record("FAIL", name, "INCONCLUSIVE (harness): a probe in this run was killed by the " +
+      "harness timeout, so this verdict cannot be attributed to the product" +
+      (reason ? " [original: " + reason + "]" : ""));
+    return;
+  }
+  record("FAIL", name, reason);
+}
 function skipped(name, reason) { record("SKIPPED", name, reason); }
 
 function test(name, body) {
@@ -89,12 +111,19 @@ function createStandard(src, parent, extra) {
 function runProbe(handle, source) {
   const probe = path.join(handle.dir, ".evalenv-test-probe.js");
   fs.writeFileSync(probe, source);
-  return spawnSync(process.execPath, [probe], {
+  const r = spawnSync(process.execPath, [probe], {
     cwd: handle.dir,
     env: handle.env,
     encoding: "utf8",
-    timeout: 10000,
+    timeout: harnessDeadline(10000),
   });
+  if (r.error && r.error.code === "ETIMEDOUT" && !harnessStarved) {
+    harnessStarved = true;
+    fail("harness/probe-timed-out",
+      "a probe exceeded the harness timeout; every failing verdict from here on is " +
+      "tagged INCONCLUSIVE rather than attributed to the product");
+  }
+  return r;
 }
 
 function testFullCopy() {
