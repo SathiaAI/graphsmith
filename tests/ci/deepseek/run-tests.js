@@ -7,6 +7,69 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 
 const REPO = path.resolve(__dirname, "..", "..", "..");
+
+/* A whole-file `secrets\.` regex reports a leak for a workflow whose only secrets
+ * step is guarded `if: github.event_name != 'pull_request'` -- which is exactly how
+ * ci.yml's List B hygiene step is written. The guard is the control; ignoring it
+ * turns a correctly-secured workflow into a standing false alarm, and a check that
+ * always fires is a check nobody reads.
+ *
+ * Attribute every secrets reference to its enclosing step and ask whether THAT step
+ * can run on a pull_request. A reference with no guard is still a finding. */
+/* Follow the invocation: if a CI step runs `node scripts/<x>.js`, that script IS the
+ * runner, and any check about the runner's behaviour must read it rather than the
+ * YAML the logic used to live in. */
+function runnerSourceFor(stepText) {
+  var m = stepText.match(/node\s+(scripts\/[\w.-]+\.js)/);
+  if (!m) return "";
+  var abs = path.join(REPO, m[1]);
+  return fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+}
+
+/* Body of one top-level job: from its key to the next key at the same indent.
+ * Naming the following job by hand breaks silently whenever jobs are reordered. */
+function jobBody(yaml, jobName) {
+  var start = yaml.indexOf("\n  " + jobName + ":");
+  if (start === -1) return "";
+  var rest = yaml.slice(start + 1);
+  var next = rest.slice(1).search(/\n {2}[A-Za-z_][\w-]*:\r?\n/);
+  return next === -1 ? rest : rest.slice(0, next + 1);
+}
+
+/* True when SOME ONE script invoked by `text` satisfies every pattern. Checking
+ * each invoked script separately (rather than concatenating them all) keeps the
+ * assertion tight: three patterns spread across three unrelated scripts must not
+ * add up to a pass. Order-independent, so reordering CI steps cannot break it -- the
+ * failure mode that made the previous version report the wrong file. */
+function someInvokedScriptMatches(text, patterns) {
+  var re = /node\s+(scripts\/[\w.-]+\.js)/g;
+  var m;
+  var seen = {};
+  while ((m = re.exec(text)) !== null) {
+    if (seen[m[1]]) continue;
+    seen[m[1]] = true;
+    var abs = path.join(REPO, m[1]);
+    if (!fs.existsSync(abs)) continue;
+    var src = fs.readFileSync(abs, "utf8");
+    if (patterns.every(function (rx) { return rx.test(src); })) return m[1];
+  }
+  return "";
+}
+
+function unguardedSecretRefs(source) {
+  const lines = source.split("\n");
+  const bad = [];
+  let stepStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*-\s+(name|uses|run)\s*:/.test(lines[i])) stepStart = i;
+    if (!/\bsecrets\s*\./.test(lines[i])) continue;
+    const step = lines.slice(stepStart, i + 1).join("\n");
+    const guarded = /if\s*:.*github\.event_name\s*!==?\s*'pull_request'/.test(step) ||
+      /if\s*:.*github\.event_name\s*!==?\s*"pull_request"/.test(step);
+    if (!guarded) bad.push((i + 1) + ": " + lines[i].trim().slice(0, 90));
+  }
+  return bad;
+}
 const GUARD = path.join(REPO, "scripts", "ci-check-pr-separation.js");
 const CI = path.join(REPO, ".github", "workflows", "ci.yml");
 const PUBLISH = path.join(REPO, ".github", "workflows", "publish.yml");
@@ -260,10 +323,12 @@ function workflowHardeningAudit() {
 
     var hasPrTrigger = /^\s{2}pull_request\s*:/m.test(source);
     check(
-      rel + ": no secrets in pull_request-triggered workflow",
-      !(hasPrTrigger && /\bsecrets\s*\./.test(source)),
-      hasPrTrigger ? "pull_request trigger present, no secrets.* reference found" : "no pull_request trigger (secrets not exposed)",
-      "pull_request-triggered workflow references secrets — potential secret leak from fork PRs"
+      rel + ": no UNGUARDED secrets in pull_request-triggered workflow",
+      !hasPrTrigger || unguardedSecretRefs(source).length === 0,
+      hasPrTrigger
+        ? "every secrets.* reference sits in a step guarded against pull_request"
+        : "no pull_request trigger (secrets not exposed)",
+      "secrets.* reachable on a pull_request run at " + unguardedSecretRefs(source).join(" | ")
     );
 
     check(
@@ -276,8 +341,12 @@ function workflowHardeningAudit() {
 
   var ciSrc = fs.readFileSync(CI, "utf8");
 
-  var prGuardJob = section(ciSrc, "  pr-separation-guard:", "phase-a-selftests:");
-  if (prGuardJob === "") prGuardJob = ciSrc.slice(ciSrc.indexOf("  pr-separation-guard:"));
+  /* The end marker used to be "phase-a-selftests:", which appears BEFORE
+   * pr-separation-guard in ci.yml -- so section() found nothing, the fallback sliced
+   * to end-of-file, and this "job" swallowed docs-hygiene, whose guarded secrets step
+   * then read as a secret leak in the PR guard. Cut at the next top-level job key
+   * instead of naming one, so job reordering cannot resurrect this. */
+  var prGuardJob = jobBody(ciSrc, "pr-separation-guard");
 
   var guardRunsFromPrHead = /node\s+scripts\/ci-check-pr-separation\.js/.test(prGuardJob);
   check(
@@ -381,9 +450,15 @@ function matrixHonestyAudit() {
   );
 
   var suites = walkRunTests(path.join(REPO, "tests"));
-  var dynamicDiscovery = phaseA.indexOf("e.name === 'run-tests.js'") >= 0 &&
-    phaseA.indexOf("walk(p)") >= 0 &&
-    phaseA.indexOf("spawnSync(process.execPath, [s]") >= 0;
+  /* Discovery moved out of the YAML into the script the step invokes. runnerStep
+   * already carries that script's source appended above, so look there too -- else
+   * this reports "no recursive discovery pattern found" about a runner that walks
+   * tests/ recursively. */
+  var phaseARunnerStart = phaseA.indexOf("Run every committed suite");
+  var phaseARunnerStep = phaseARunnerStart === -1 ? phaseA : phaseA.slice(phaseARunnerStart);
+  var discoverer = someInvokedScriptMatches(phaseARunnerStep,
+    [/run-tests\.js/, /walk\(/, /spawnSync\(\s*process\.execPath/]);
+  var dynamicDiscovery = discoverer !== "";
   check(
     "phase-a-selftests dynamically discovers tests/**/run-tests.js",
     dynamicDiscovery,
@@ -471,6 +546,28 @@ function evidenceOnlyManifestAndRunnerAudit() {
   var ciSrc = fs.readFileSync(CI, "utf8");
   var runnerStep = section(ciSrc, "Run every committed suite", "pr-separation-guard:");
   if (!runnerStep) runnerStep = ciSrc.slice(ciSrc.indexOf("Run every committed suite"));
+
+  /* The suite-runner logic used to be an inline `node -e "..."` one-liner in this
+   * step, and every B3-runner check below greps `runnerStep` for it. It has since
+   * moved into scripts/ci-run-suites.js, which the step now simply invokes. Greping
+   * only the YAML made those checks report the gate MISSING -- "gating failures do
+   * NOT cause job exit" -- when scripts/ci-run-suites.js does exactly that. The
+   * assertions were right; they were pointed at the wrong file.
+   *
+   * Follow the invocation instead of assuming the location. If the step invokes a
+   * script, that script IS the runner and its source belongs in what we inspect. A
+   * step that invokes a runner we cannot find is itself a finding, not a silent pass. */
+  var invoked = runnerStep.match(/node\s+(scripts\/[\w.-]+\.js)/);
+  if (invoked) {
+    var invokedSrc = runnerSourceFor(runnerStep);
+    check(
+      "B3-runner: the script the step invokes exists",
+      invokedSrc.length > 0,
+      invoked[1] + " is present and is what these checks inspect",
+      invoked[1] + " is invoked by the CI step but does not exist in the repo"
+    );
+    runnerStep += "\n/* ---- source of " + invoked[1] + ", invoked by the step above ---- */\n" + invokedSrc;
+  }
 
   check(
     "B3-runner: step reads ci-suite-manifest.json",
@@ -585,11 +682,14 @@ function gitlabTemplateAudit() {
     "missing from GitLab: " + missingFromGitlab.join(", ")
   );
 
+  /* Same relocation as the GitHub side: the template invokes
+   * scripts/ci-run-suites.js rather than inlining discovery. Read what it runs. */
+  var glDiscoverer = someInvokedScriptMatches(source,
+    [/run-tests\.js/, /walk\(/, /spawnSync\(\s*process\.execPath/]);
   check(
     "GitLab recursively discovers and runs committed suites",
-    source.indexOf("e.name === 'run-tests.js'") >= 0 &&
-      source.indexOf("spawnSync(process.execPath, [s]") >= 0,
-    "recursive run-tests.js discovery present in template",
+    glDiscoverer !== "",
+    "recursive run-tests.js discovery present via " + glDiscoverer,
     "committed suite discovery missing from GitLab template"
   );
 
