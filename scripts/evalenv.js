@@ -434,12 +434,35 @@ function detectPermissionModel(copyDir) {
       permission: supported,
       allow_fs_read: has("--allow-fs-read"),
       allow_fs_write: has("--allow-fs-write"),
+      // Detected because their ABSENCE from an argv is what denies subprocess
+      // and worker access. A detector that only looked for the --allow-fs-*
+      // pair could not tell whether the subprocess class was expressible at
+      // all, which is the class contract 04 B10 leans on hardest.
+      allow_child_process: has("--allow-child-process"),
+      allow_worker: has("--allow-worker"),
     },
-    recommended_argv: supported
-      ? ["--permission", "--allow-fs-read=" + copyDir + "/*", "--allow-fs-write=" + copyDir + "/*"]
-      : null,
+    // NOT argv, and deliberately no longer named as though it were.
+    //
+    // This function used to return `recommended_argv`, a ready-made
+    // "--permission --allow-fs-read=<copy>/* --allow-fs-write=<copy>/*". Nothing
+    // in the repo ever consumed it. That is worse than it sounds: it named a
+    // security control, in the returned object of the module whose job is
+    // isolation, and applied nothing -- the shape a reader mistakes for
+    // enforcement.
+    //
+    // It was also unsafe as written. Applying those flags to a copy without
+    // first proving the copy is symlink-clean does not produce a filesystem
+    // boundary: a symlink already inside the tree is followed straight out of
+    // it (measured; see scripts/capability-enforce.js). Building the argv here,
+    // where the symlink audit's result is not in scope, is precisely where that
+    // precondition gets lost.
+    //
+    // So detection stays here (it is a fact about the runtime) and argv
+    // construction moved to capability-enforce.js, which requires a grant and
+    // this copy's checkIsolation() evidence before it will emit anything.
+    argv_builder: "scripts/capability-enforce.js plan({ grant, targetDir, isolation })",
     detail: supported
-      ? `Node Permission Model flags detected on this runtime (${process.version}).`
+      ? `Node Permission Model flags detected on this runtime (${process.version}). Detection only -- no flags are applied by evalenv itself; see capability-enforce.js, which will not emit them without a capability grant and a symlink-clean audit of the target tree.`
       : `Node Permission Model flags are not recognized by this runtime (${process.version}) -- proceeding without OS-enforced FS permission restriction on top of the copy's own directory isolation; documented limitation, not a silent claim of enforcement.`,
   };
 }
@@ -501,6 +524,67 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
 // supplying a PATH that excludes any container runtime, independent of
 // whatever happens to be installed on the host running this file.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Container containment argv, beyond network denial and the read-only mount.
+//
+// Until this was added, the container profile ran untrusted code as ROOT with
+// the default Linux capability set and a writable root filesystem. Measured
+// inside the profile as it stood (docker 29.4.3, alpine:3.20):
+//
+//   uid                0 (root)
+//   CapEff             a80425fb  -- 14 capabilities, including CAP_MKNOD,
+//                                   CAP_SETUID, CAP_DAC_OVERRIDE, CAP_NET_RAW
+//   mknod /tmp/d c 1 3 ALLOWED    -- device nodes creatable
+//   NoNewPrivs         0         -- a setuid binary in the image can escalate
+//   write to rootfs    ALLOWED
+//
+// The read-only source mount held and network egress was denied, so the two
+// controls contract 04 B10 names were real. Everything AROUND them was open.
+// For the one code path whose entire job is running code we do not trust, that
+// is the wrong default: the mount protects OUR source, not the box.
+//
+// Same argv with the flags below, measured the same way:
+//
+//   uid                65534 (nobody)
+//   CapEff             0000000000000000  -- all dropped
+//   mknod              DENIED
+//   NoNewPrivs         1
+//   rootfs             read-only (a noexec/nosuid tmpfs at /tmp for scratch)
+//
+// Each flag, and why it is not optional here:
+//
+//   --user 65534:65534        root in the container is root on the host under
+//                             any escape; nobody is not
+//   --cap-drop=ALL            untrusted code has no business with CAP_MKNOD or
+//                             CAP_NET_RAW; nothing evalenv runs needs any
+//   --security-opt=no-new-privileges
+//                             closes setuid escalation from inside the image,
+//                             which --user alone does NOT
+//   --read-only               the rootfs is not a scratch space
+//   --tmpfs /tmp:...          because --read-only leaves nowhere to write;
+//                             noexec+nosuid so it cannot become a staging area
+//                             for a dropped binary
+//   --pids-limit=256          a fork bomb here is a denial of service against
+//                             the CI runner, not just this run
+//   --memory / --cpus         same reasoning, for the other two resources
+//
+// These are DEFAULTS on the untrusted-code path and are deliberately not
+// configurable: a knob that turns off containment on the one path that exists
+// to provide it is a knob that eventually gets turned off. A caller needing a
+// different posture should not be using runUntrustedCode().
+// ---------------------------------------------------------------------------
+
+const CONTAINMENT_ARGV = [
+  "--user", "65534:65534",
+  "--cap-drop=ALL",
+  "--security-opt=no-new-privileges",
+  "--read-only",
+  "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+  "--pids-limit=256",
+  "--memory=512m",
+  "--cpus=1",
+];
 
 function detectContainerRuntime(envOverride) {
   const env = envOverride || process.env;
@@ -689,8 +773,7 @@ function createContainer(options) {
       "--network", "none", // network denial (contract 04 B10)
       "-v", `${base.dir}:/workspace:ro`, // read-only source mount (contract 04 B10)
       "-w", "/workspace",
-      runOpts.image,
-    ].concat(Array.isArray(cmd) ? cmd : [String(cmd)]);
+    ].concat(CONTAINMENT_ARGV, [runOpts.image], Array.isArray(cmd) ? cmd : [String(cmd)]);
     return spawnSync(detection.runtime, argv, Object.assign({ env: base.env, stdio: "pipe", timeout: runOpts.timeoutMs || 60000 }, runOpts.spawnOptions || {}));
   }
 
@@ -699,10 +782,11 @@ function createContainer(options) {
     available: true,
     runtime: detection.runtime,
     claims: {
-      isolation_level: `container (${detection.runtime}): network denied (--network none), read-only source mount, plus everything the standard profile provides`,
+      isolation_level: `container (${detection.runtime}): network denied (--network none), read-only source mount, non-root (uid 65534), all Linux capabilities dropped, no-new-privileges, read-only rootfs with a noexec/nosuid tmpfs, and pid/memory/cpu caps, plus everything the standard profile provides`,
       confidentiality: "partial",
       network_containment: true,
-      note: "container profile: network denial and read-only source mount are enforced by the container runtime at run time (runUntrustedCode), not merely declared.",
+      containment_argv: CONTAINMENT_ARGV.slice(),
+      note: "container profile: every control listed above is enforced by the container runtime at run time (runUntrustedCode), not merely declared. 'partial' confidentiality is unchanged and deliberate -- this is a process/kernel boundary, not a proof of confidentiality, and a container escape remains a container escape.",
     },
     runUntrustedCode,
   });
@@ -743,6 +827,9 @@ module.exports = {
   detectContainerRuntime,
   detectPermissionModel,
   checkIsolation,
+  // Exported so a test can assert the containment flags are actually passed to
+  // the runtime, rather than trusting a comment that says they are.
+  CONTAINMENT_ARGV,
 };
 
 // ---------------------------------------------------------------------------
