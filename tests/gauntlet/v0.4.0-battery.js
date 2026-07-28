@@ -21,47 +21,25 @@ const root = path.join(__dirname, "..", "..");
 // (the component's own JSON verdict) — see adjudicate.js.
 const SUITES = [
   // tests/v040/caps/ADJUDICATION.md
-  ["tests/v040/caps/deepseek/run-tests.js", ["allowlist network verified"]],
-  ["tests/v040/caps/mistral/run-tests.js", ["malformed-bigint unexpected result"]],
+  ["tests/v040/caps/deepseek/run-tests.js", []],
+  ["tests/v040/caps/mistral/run-tests.js", []],
   // tests/v040/receipts/ADJUDICATION.md
-  ["tests/v040/receipts/deepseek/run-tests.js", ["6.5 BigInt in receipt expected=failed got=unavailable"]],
-  ["tests/v040/receipts/mistral/run-tests.js", ["forged-success-non-string-external_id false"]],
+  ["tests/v040/receipts/deepseek/run-tests.js", []],
+  ["tests/v040/receipts/mistral/run-tests.js", []],
   // tests/v040/signer/ADJUDICATION.md — malformed-registry hostile inputs (C1/C2).
   ["tests/v040/signer/mistral/run-tests.js", []],
-  ["tests/v040/signer/qwen/run-tests.js", [
-    "malformed-registry-hostile-getter", "malformed-registry-bigint",
-    "malformed-registry-proto-pollution", "malformed-registry-proxy",
-  ]],
+  ["tests/v040/signer/qwen/run-tests.js", []],
   // tests/v040/trace/ADJUDICATION.md — declared recall/precision boundary + inert input.
-  ["tests/v040/trace/mistral/run-tests.js", [
-    "leak-bypass-generic-hex-token Generic hex token leaked but passed",
-    "leak-bypass-secret-spread-across-fields Secret spread across fields leaked but passed",
-    "leak-bypass-base64-encoded-secret Base64-encoded secret leaked but passed",
-    "leak-bypass-ipv4-as-pii IPv4 leaked but passed",
-  ]],
-  ["tests/v040/trace/deepseek/run-tests.js", [
-    "ipv4-bypass expected=failed actual=verified reason=none",
-    "split-secret-bypass expected=failed actual=verified reason=none",
-    "base64-encoded-bypass expected=failed actual=verified reason=none",
-    "bigint-trace expected=failed actual=verified reason=none",
-    "hostile-getter expected=failed actual=verified reason=none",
-    "proto-pollution expected=failed actual=verified reason=none",
-  ]],
+  ["tests/v040/trace/mistral/run-tests.js", []],
+  ["tests/v040/trace/deepseek/run-tests.js", []],
   // tests/v040/provenance/ADJUDICATION.md
   ["tests/v040/provenance/mistral/run-tests.js", []],
-  ["tests/v040/provenance/deepseek/run-tests.js", ["proto-pollution returned non-true: false"]],
+  ["tests/v040/provenance/deepseek/run-tests.js", []],
   // tests/v040/policy/ADJUDICATION.md — reason-string over-specification of correct fail-closed verdicts.
-  ["tests/v040/policy/mistral/run-tests.js", ["null-context", "hostile-getter-control", "proxy-controls"]],
+  ["tests/v040/policy/mistral/run-tests.js", []],
   ["tests/v040/policy/deepseek/run-tests.js", []],
   // tests/gsa-ext/ADJUDICATION.md — Mistral's own harness-usage errors.
-  ["tests/gsa-ext/mistral/run-tests.js", [
-    "fail-open-capability_grant-missing (unexpected result)",
-    "fail-open-effects-missing (unexpected result)",
-    "fail-open-signer_registry-missing (unexpected result)",
-    "fail-open-build_provenance-missing (unexpected result)",
-    "honest-subset-claim (unexpected result)",
-    "honest-all-true-valid (unexpected result)",
-  ]],
+  ["tests/gsa-ext/mistral/run-tests.js", []],
   ["tests/gsa-ext/deepseek/run-tests.js", []],
   // Orchestrator §9.11 integration regression (all-true valid + per-control lie + malformed/backward-compat).
   ["tests/gsa-ext/validate.js", []],
@@ -143,7 +121,31 @@ console.log("  HOLD:            " + hold + "  (component behaved correctly)");
 console.log("  adjudicated FP:  " + adjudicated + "  (documented tester false-positives; component is correct — see ADJUDICATION.md)");
 console.log("  BREAK:           " + breaks.length + "  (unexpected component failures)");
 console.log("");
-if (staleNotes.length) { console.log("STALE ADJUDICATIONS (informational — a tester assertion was fixed; prune the entry in this battery):"); for (const s of staleNotes) console.log("  - " + s); console.log(""); }
+/* A stale adjudication GATES. It used to print "informational" and pass.
+ *
+ * Every entry here says "this named assertion is a known tester false-positive;
+ * when it fails, classify HOLD rather than BREAK". Stale means the name no
+ * longer fails, so the entry currently matches nothing -- harmless today, and a
+ * live hole tomorrow: a GENUINELY NEW failure carrying that exact name gets
+ * absorbed as HOLD instead of gating. The names in question were the ones you
+ * least want pre-absorbed -- proto-pollution, split-secret-bypass,
+ * fail-open-signer_registry-missing.
+ *
+ * Reported-but-not-gating made pruning a chore, and chores do not get done: 36
+ * dead entries had accumulated across the two batteries. This is the same
+ * discriminator the starvation sweep applies to a WIRING GAP, and the same rule
+ * as contract 10 List C rule 5 -- detection, not inspection. Fixing a tester
+ * assertion is still progress; it just is not finished until its adjudication
+ * goes with it. */
+if (staleNotes.length) {
+  console.log("STALE ADJUDICATIONS — an adjudicated name no longer fails, so its entry now matches");
+  console.log("nothing and would absorb a FUTURE failure of that same name as HOLD. Delete the entry");
+  console.log("from this battery's SUITES table (fixing the assertion is only half the change):");
+  for (const s of staleNotes) console.log("  - " + s);
+  console.log("");
+  console.log("RESULT: FAIL — " + staleNotes.length + " stale adjudication(s)");
+  process.exit(1);
+}
 if (breaks.length) { console.log("BREAKS:"); for (const b of breaks) console.log("  - " + b); console.log(""); console.log("RESULT: FAIL — " + breaks.length + " BREAK(s)"); process.exit(1); }
 console.log("RESULT: " + scenarios + " scenarios, all HOLD, 0 BREAK" + (scenarios >= 100 ? " (>=100 target met)" : " (below 100 target)"));
 process.exit(scenarios >= 100 ? 0 : 1);

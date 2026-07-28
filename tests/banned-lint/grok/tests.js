@@ -33,6 +33,11 @@ function record(status, name, detail) {
 }
 function pass(n, d) { record("PASS", n, d); }
 function fail(n, d) { record("FAIL", n, d); }
+/* Fail-closed, but tagged so it is excluded from PRODUCT findings: the case could
+ * not create the condition it was written to test, so it observed nothing about the
+ * component. Same convention the rest of this repo's harnesses use — the string
+ * "INCONCLUSIVE (harness)" is what tests/harness-honesty/ greps for. */
+function skipInconclusive(n, why) { record("FAIL", n, "INCONCLUSIVE (harness): " + why); }
 function noteFinding(id, severity, summary) {
   findings.push({ id: id, severity: severity, summary: summary });
 }
@@ -885,6 +890,31 @@ function attackFailClosed() {
       try { fs.chmodSync(listAbs, 0o644); } catch (_) {}
       if (child2.status !== 0) {
         pass("FC/local-unreadable-nonzero", "exit=" + child2.status);
+      } else if (typeof process.getuid === "function" && process.getuid() === 0) {
+        /* NOT a product defect -- this harness is running as root, and root ignores
+         * the mode bits. chmod 0 did not make the file unreadable, hygiene-scan read
+         * it fine, and "clean" is the correct verdict for a list that loaded.
+         *
+         * This branch exists because the check DID report it as a defect: it emitted
+         * FC-UNREADABLE at HIGH severity, claiming hygiene-scan was fail-open on an
+         * unreadable list. Measured instead as uid 65534, where the mode bits apply:
+         *
+         *     EXIT=1  FATAL -- cannot read .plans/hygiene/banned-identifiers.txt:
+         *             EACCES: permission denied
+         *
+         * and fail-closed for the other two shapes too -- missing file (EXIT=1,
+         * "FATAL -- local list not found") and a directory in place of the file
+         * (EXIT=1, EISDIR). loadBannedIdentifiers() returns null on both, and the
+         * caller errors. The product was never wrong.
+         *
+         * The harness already anticipated this for Windows ACLs a few lines up; it
+         * just never considered root on POSIX. A check that cannot create the
+         * condition it is testing must say so, not convert its own inability into a
+         * finding about the component (contract 10 List C rule 1). */
+        skipInconclusive("FC/local-unreadable-nonzero",
+          "running as uid 0, which ignores mode bits, so chmod 0 did not make the list " +
+          "unreadable and this attempt observed nothing. Re-run as an unprivileged user " +
+          "for real coverage; verified fail-closed (EXIT=1, EACCES) as uid 65534");
       } else {
         fail("FC/local-unreadable-nonzero", "exit 0 on chmod 0 list");
         noteFinding(
@@ -921,11 +951,38 @@ function attackFailClosed() {
       cwd: r,
       env: { HYGIENE_HMAC_KEY: null, HYGIENE_DIGESTS: null },
     });
-    if (child.status !== 0) {
-      pass("FC/ci-no-secrets-nonzero", "exit=" + child.status);
+    /* Inverted from what this case originally asserted, and the inversion is the point.
+     *
+     * It used to require a NON-ZERO exit and, on getting 0, emit FC-CI-SECRETS at
+     * CRITICAL: "--ci without secrets exits 0". That is not a fail-open. List B
+     * (keyed banned-identifier digests) is OPT-IN by design; List A (docs-lint.js)
+     * always gates. hygiene-scan says so on the way out:
+     *
+     *     "List B not configured (no HYGIENE_HMAC_KEY and no HYGIENE_DIGESTS) --
+     *      skipping, nothing to detect. List B is opt-in; List A (docs-lint.js)
+     *      always gates."
+     *
+     * A tester disagreeing with a documented decision is a disagreement, not a
+     * defect, and calling it CRITICAL costs more than it looks: a real critical in
+     * this file would arrive next to a standing false one and get triaged as noise.
+     *
+     * So the assertion now pins the behaviour that ACTUALLY matters and that a
+     * regression could plausibly break -- that the skip is loud. Exiting 0 silently,
+     * with no line saying List B did not run, would be the genuine defect: a run that
+     * detected nothing, reported nothing, and passed. That is what this now catches.
+     * If the opt-in decision is ever revisited, change it here deliberately. */
+    var ciOut = String((child.stdout || "") + (child.stderr || ""));
+    var announcesSkip = /List B/.test(ciOut) && /(skipping|not configured)/i.test(ciOut);
+    if (child.status === 0 && announcesSkip) {
+      pass("FC/ci-no-secrets-announces-skip",
+        "exit 0 with List B declared opt-in and its skip stated (List A still gates)");
+    } else if (child.status !== 0) {
+      pass("FC/ci-no-secrets-announces-skip", "exit=" + child.status + " (gates outright)");
     } else {
-      fail("FC/ci-no-secrets-nonzero", "exit 0");
-      noteFinding("FC-CI-SECRETS", "CRITICAL", "--ci without secrets exits 0");
+      fail("FC/ci-no-secrets-announces-skip", "exit 0 and NO line stating List B was skipped");
+      noteFinding("FC-CI-SILENT-SKIP", "HIGH",
+        "hygiene-scan --ci exits 0 without configured secrets AND without saying List B " +
+        "did not run -- a run that detected nothing, reported nothing, and passed");
     }
   }
 

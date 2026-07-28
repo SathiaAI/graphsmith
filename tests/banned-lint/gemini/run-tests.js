@@ -155,6 +155,19 @@ function runAdversarialTests() {
     console.log("FINDINGS:");
     findings.forEach(f => console.log(`- ${f}`));
   }
+  return failed;
 }
 
-runAdversarialTests();
+/* This file had NO exit code at all. It printed "Results: N passed, M failed"
+ * and returned, so it exited 0 whatever it found -- a suite that cannot turn
+ * the build red.
+ *
+ * That mattered more than usual here. It was never discovered by
+ * scripts/ci-run-suites.js (which matches the literal filename "run-tests.js"),
+ * so nothing ran it and nobody read the exit code that was not there. Wiring it
+ * into discovery WITHOUT this line would have been the worse outcome of the
+ * two: a green checkmark against hygiene-scan's secret handling and its three
+ * Unicode filter-evasion classes, standing in for a check that can only ever
+ * report success. An absent test is a known gap; a test that cannot fail is a
+ * false assurance, and this repo gates on telling those apart. */
+process.exit(runAdversarialTests() > 0 ? 1 : 0);

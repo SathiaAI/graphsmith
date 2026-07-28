@@ -35,7 +35,11 @@ function runTests() {
 
   try {
     // Trick it into writing to ACTIVE by using --out
-    const shadowScript = "scripts/shadow.js";
+    /* __dirname-relative, not CWD-relative. The old form only worked because
+     * ci-run-suites.js happens to spawn suites with the repo root as cwd; running
+     * this file from anywhere else died with ENOENT. A test whose result depends
+     * on the caller's working directory is a test that will one day be "flaky". */
+    const shadowScript = path.join(__dirname, "..", "..", "..", "scripts", "shadow.js");
     execSync(`node ${shadowScript} --out "${activePath}" --project-root "${projectRoot}"`, { stdio: 'pipe' });
     errors.push("FAIL: shadow-only-abort - CLI did not abort when ACTIVE was modified");
   } catch (e) {
@@ -47,7 +51,7 @@ function runTests() {
   check("shadow-only-log", logContent === "log\n", "adoption-log was byte-unchanged after shadow run");
 
   // Source scan for network APIs
-  const src = fs.readFileSync("scripts/shadow.js", 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "scripts", "shadow.js"), 'utf8');
   const netFindings = shadow.scanSourceForNetworkAPIs(src);
   check("shadow-only-no-network", netFindings.length === 0, "Source has zero network APIs");
   
@@ -93,12 +97,36 @@ function runTests() {
     return originalGate2.apply(this, arguments);
   };
   m = shadow.runShadow({ seeds: [1] });
-  // The harness expects tier <= 2 for its synthetic regression. Let's see if it misses this tier 3 regression.
-  const missed = m.falsification.injected_regression_detected === false;
-  check("regression-detection-misses-tier3", missed, "Harness misses a Tier 3 regression because it strictly looks for critical-slice regressions (tier <= 2)");
-  if (missed) {
-    findings.push("FINDING: The shadow harness falsification check requires a Tier 1/2 regression to trigger `injected_regression_detected`. It does not flag a Tier 3 statistical loss.");
-  }
+
+  /* This case used to assert `injected_regression_detected === false` -- that the
+   * harness FAILS to flag a Tier-3 loss -- and pushed a "FINDING:" line on every
+   * green run.
+   *
+   * Pinning the absence of a detection is backwards. Tier-3 insensitivity is a
+   * DISCLOSED property of the frozen evaluator (contract 03: one predeclared
+   * primary endpoint, one-sided sign test, so a losing candidate reads as
+   * inconclusive rather than as a detected regression), not a defect. Written the
+   * old way, anyone who strengthened shadow.js to also flag Tier-3 losses -- a
+   * strict improvement in sensitivity -- would turn this suite RED for making the
+   * product better. Same inverted-expectation shape as a test asserting that an
+   * escaping function does not escape.
+   *
+   * What is actually worth gating is that the boundary stays DISCLOSED. A silent
+   * narrowing of sensitivity is the real risk; a documented one is the contract.
+   * So: assert the disclosure exists and still describes this boundary, and stay
+   * agnostic about whether detection fires. */
+  const scope = m.falsification.regression_sensitivity_scope;
+  check(
+    "regression-sensitivity-boundary-disclosed",
+    typeof scope === "string" &&
+      /tier[- ]?3/i.test(scope) &&
+      /one-sided/i.test(scope) &&
+      /NOT/.test(scope),
+    "falsification.regression_sensitivity_scope must state plainly that a Tier-3 one-sided " +
+      "statistical loss is NOT reported as a regression. Detection may legitimately be " +
+      "widened later; the disclosure disappearing is the regression this guards. Got: " +
+      (typeof scope === "string" ? JSON.stringify(scope.slice(0, 120)) : String(scope))
+  );
 
 
   // Attack 4: DETERMINISM / NO-CLOCK
