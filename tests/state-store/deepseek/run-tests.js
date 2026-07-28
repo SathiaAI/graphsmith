@@ -963,23 +963,53 @@ async function test11_wallClockCap(tempDir) {
     process.env.GRAPHSMITH_TEST_MODE = "1";
     const store = requireFreshStore(tempDir, { leaseMs: 1000, heartbeatMs: 200 });
 
-    // Admit with short wall time (200ms)
+    /* WALL_MS is a FIXTURE value this test chooses, not a product default — it only has
+     * to be long enough that admit + finalize + get complete inside it, and short enough
+     * that the sleep below outlives it. It was 200ms, which the setup itself cannot
+     * reliably finish inside: those three calls are fsync-backed writes.
+     *
+     * Measured on a 2-core Linux container:
+     *     idle                 admit 19ms + finalize 16ms + get 6ms  = 41ms   -> OBSERVING
+     *     under 32x CPU load   admit 198 + finalize 158 + get 167    = 523ms  -> CLOSED_FLAGGED
+     *
+     * So at 200ms the setup had 5x headroom on an idle box and blew the budget by 2.6x on
+     * a busy one. It failed on Windows in CI run #81 for exactly this reason: the window
+     * expired before the assertion ran, the PRODUCT behaved correctly, and the test called
+     * it a defect.
+     *
+     * Raised to 5000ms — still far below any real window, and now ~120x the measured idle
+     * setup cost. The property under test is unchanged: an expired window closes as
+     * CLOSED_FLAGGED with reason max_window_wall_time. */
+    const WALL_MS = 5000;
+    const setupStart = Date.now();
     store.window.admitPending({
       txid: "tx-wall", fingerprint: "fp-wall", tree_id: "tree-wall", n: 1,
-      max_window_wall_time_ms: 200,
+      max_window_wall_time_ms: WALL_MS,
     });
     store.window.finalize("tx-wall");
 
     const winAfterFinalize = store.window.get();
     if (winAfterFinalize.state !== "OBSERVING") {
-      throw new Error(`Expected OBSERVING after finalize, got ${winAfterFinalize.state}`);
+      /* Belt and braces, per contract 10 List C rule 1. If setup ever outruns the budget
+       * again, this case observed nothing about window expiry and must not report a
+       * product defect. Distinguish the two before drawing any conclusion. */
+      const setupMs = Date.now() - setupStart;
+      if (setupMs >= WALL_MS) {
+        record(name, "FAIL", `INCONCLUSIVE (harness): setup (admit+finalize+get) took ` +
+          `${setupMs}ms, at or beyond the ${WALL_MS}ms window it was supposed to fit inside, ` +
+          `so the window had already expired before the assertion — nothing was observed ` +
+          `about the product`);
+        return;
+      }
+      throw new Error(`Expected OBSERVING after finalize, got ${winAfterFinalize.state} ` +
+        `(setup took ${setupMs}ms of a ${WALL_MS}ms window, so this is not a timing artefact)`);
     }
 
     // Register a run so there's something active
     store.runRegistry.register("run-wall-1", "tree-wall");
 
-    // Wait for wall time to expire
-    const wait = new Promise((r) => setTimeout(r, 300));
+    // Wait for the wall time to expire — must outlive WALL_MS with margin.
+    const wait = new Promise((r) => setTimeout(r, WALL_MS + 500));
     await wait;
 
     // Sweep should detect wall-time expiry and close as CLOSED_FLAGGED
