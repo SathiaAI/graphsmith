@@ -22,6 +22,12 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 const os = require("os");
+// Every report this script emits is the evidence gate.js adjudicates on. Handing it
+// to process.stdout.write() and then calling process.exit() loses whatever libuv had
+// queued -- see scripts/write-report.js for the measurement and the full rationale.
+// scenario.js is the evaluator file, so it could not be changed in the same PR as the
+// behavior scripts; it is the last emitter to adopt the guarantee.
+const { writeReport } = require("./write-report.js");
 
 const SCHEMA_VERSION = "1.0";
 const EVALUATOR_VERSION = "1.0.0";
@@ -29,7 +35,7 @@ const SCENARIO_SCHEMA_PATH = path.join(__dirname, "..", "schemas", "scenario.sch
 const DEFAULT_CORPUS_DIR = path.join(__dirname, "..", "scenarios");
 
 const fail = (msg) => { console.error("ERR: " + msg); process.exit(2); };
-const out = (obj) => process.stdout.write(JSON.stringify(obj, null, 2) + "\n");
+const out = (obj) => writeReport(JSON.stringify(obj, null, 2) + "\n");
 
 function sha256(data) {
   return crypto.createHash("sha256").update(typeof data === "string" ? data : JSON.stringify(data)).digest("hex");
