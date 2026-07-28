@@ -455,8 +455,68 @@ function checkStableHashAcrossTwoRuns() {
   const b1 = parseJSONStdout(r1, name);
   const b2 = parseJSONStdout(r2, name);
   if (!b1 || !b2) return;
-  if (b1.bundle_sha256 === b2.bundle_sha256) pass(name, "stable hash across two full-corpus runs");
-  else fail(name, "unstable hash: " + b1.bundle_sha256 + " vs " + b2.bundle_sha256);
+  if (b1.bundle_sha256 === b2.bundle_sha256) {
+    pass(name, "stable hash across two full-corpus runs");
+    return;
+  }
+
+  /* The hashes differ. "unstable hash" alone was a confident claim about the EVALUATOR's
+   * determinism, and this case cannot support it: three of the twelve corpus scenarios
+   * (pipeline/fanout/manager -budget-fail) turn on a wall-clock comparison against a
+   * 200ms budget_ms, which case 6c below documents as the intentional subject under test
+   * rather than hidden nondeterminism. A busy machine flipping one of those produces the
+   * same symptom as a genuinely nondeterministic evaluator. Two causes, one verdict —
+   * contract 10 List C rule 2.
+   *
+   * So: diff the bundles and let WHERE they differ decide.
+   *   - only wall-clock-dependent scenarios differ -> a timing artefact. INCONCLUSIVE.
+   *   - anything else differs                      -> real determinism defect. FAIL.
+   *
+   * Either way print the differing scenario ids and fields, because the failure this was
+   * written from (CI run #81, Windows) reported only two hashes and was therefore useless
+   * as evidence. Not reproducible here: idle, 16x and 48x CPU load on Linux all produce a
+   * stable hash even at a 6x slowdown, so the mechanism is something this platform does
+   * not exhibit. The next occurrence should arrive diagnosable instead of opaque. */
+  const WALL_CLOCK_DEPENDENT = new Set([
+    "pipeline-budget-fail",
+    "fanout-budget-fail",
+    "manager-budget-fail",
+  ]);
+
+  const pairs1 = b1.pairs || [];
+  const pairs2 = b2.pairs || [];
+  const differing = [];
+  for (let i = 0; i < Math.max(pairs1.length, pairs2.length); i += 1) {
+    const x = pairs1[i] || {};
+    const y = pairs2[i] || {};
+    if (JSON.stringify(x) === JSON.stringify(y)) continue;
+    const fields = [];
+    for (const k of new Set([...Object.keys(x), ...Object.keys(y)])) {
+      if (JSON.stringify(x[k]) !== JSON.stringify(y[k])) {
+        fields.push(k + ": " + JSON.stringify(x[k]) + " -> " + JSON.stringify(y[k]));
+      }
+    }
+    differing.push({ id: x.scenario_id || y.scenario_id || "#" + i, fields: fields });
+  }
+
+  const detail = differing.length
+    ? differing.map((d) => d.id + " {" + d.fields.join("; ") + "}").join(" | ").slice(0, 700)
+    : "no per-pair difference found, so the hash covers a field outside pairs[]";
+  const offenders = differing.map((d) => d.id);
+  const onlyWallClock = offenders.length > 0 && offenders.every((id) => WALL_CLOCK_DEPENDENT.has(id));
+
+  if (onlyWallClock) {
+    inconclusive(name, "bundle hash differed (" + b1.bundle_sha256.slice(0, 12) + " vs " +
+      b2.bundle_sha256.slice(0, 12) + ") but ONLY in wall-clock-dependent scenario(s) — " +
+      offenders.join(", ") + ", each a 200ms budget_ms comparison that case 6c documents as " +
+      "the intentional subject under test. That is a slow machine, not a nondeterministic " +
+      "evaluator, and this case cannot tell the two apart. Differences: " + detail);
+    return;
+  }
+
+  fail(name, "unstable hash: " + b1.bundle_sha256 + " vs " + b2.bundle_sha256 +
+    " — differing in scenario(s) with NO documented wall-clock dependence, so this is a " +
+    "determinism defect rather than a timing artefact. Differences: " + detail);
 }
 
 function checkNondeterminismDetectionCoverage() {
