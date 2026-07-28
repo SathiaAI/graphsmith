@@ -157,6 +157,27 @@ function stopLoad(kids) {
 }
 
 function main() {
+  /* OPT-IN. scripts/ci-run-suites.js discovers every run-tests.js, so without this gate
+   * this file would run on every CI job — and it deliberately saturates the CPU and runs
+   * each target three times, which is hours rather than minutes. That would make the gate
+   * unusable and, worse, would itself become a source of the timing flake it exists to
+   * find: a sweep that saturates the box while other suites queue behind it.
+   *
+   * This is a DIAGNOSTIC, run deliberately when investigating a timing failure, not a
+   * per-commit gate. The skip is stated loudly rather than passing silently — an
+   * unexercised check that prints nothing is the shape contract 10 List C rule 4 exists
+   * to prevent.
+   *
+   * Run it with: CONTENTION_SWEEP=1 node tests/harness-honesty/contention/run-tests.js */
+  if (!process.env.CONTENTION_SWEEP) {
+    process.stdout.write(
+      "SKIPPED contention-sweep - NOT RUN. This diagnostic saturates the CPU and runs each\n" +
+      "target several times (hours, not minutes), so it is opt-in rather than a per-commit\n" +
+      "gate. THIS RUN PROVIDES NO CONTENTION COVERAGE. Enable with CONTENTION_SWEEP=1.\n"
+    );
+    return;
+  }
+
   process.stdout.write(
     "contention sweep: " + WORKERS + " CPU-burning workers on " +
       ((os.cpus() || { length: "?" }).length) + " core(s), " + LOADED_PASSES + " loaded pass(es) per target\n" +
