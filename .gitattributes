@@ -1,0 +1,50 @@
+# Line endings.
+#
+# Every text blob in this repo is already stored LF in the index (362 of 362 at
+# the time this file was added), but nothing enforced it. On a Windows checkout
+# with core.autocrlf left at its default the working tree came back CRLF, git
+# reported the entire tree as modified, and every diff arrived with ~360 files
+# of pure line-ending noise sitting on top of the actual change.
+#
+# That is not cosmetic. A review that has to be filtered before it can be read
+# is a review that gets skimmed, and this repo's whole premise is that the
+# gates are actually looked at. It also makes `git add -A` a live grenade: it
+# sweeps 360 unrelated files into a commit that was meant to touch three.
+#
+# text=auto  -> git decides text vs binary per file, normalises text to LF in
+#               the index (already true, now enforced)
+# eol=lf     -> and checks it out as LF on every platform, so the working tree
+#               matches the index regardless of anyone's local git config
+#
+# No renormalisation commit is needed: the index is already clean.
+* text=auto eol=lf
+
+# Binary. Listed explicitly rather than left to the heuristic — a mis-detected
+# asset gets silently corrupted by text conversion, and the failure shows up as
+# a broken image months later rather than as a diff.
+*.png   binary
+*.gif   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.skill binary
+
+# Two source files carry LITERAL NUL BYTES as security fixtures, and must never
+# be run through any text filter:
+#
+#   scripts/ci-check-pr-separation.js  line 216 tests that a path containing a
+#       NUL is rejected; lines 615-616 are the fixtures that exercise it
+#       ("scripts/scenario.js\0.md" — the classic extension-spoofing payload)
+#   tests/watcher/sonnet/run-tests.js  line 187 feeds a NUL-bearing path to the
+#       watcher's projectRoot
+#
+# git's auto-detection already classifies both as binary today, which is why
+# they have survived. But `text=auto` re-runs that heuristic on every future
+# revision: edit either file enough that the NUL/byte ratio shifts and the
+# heuristic can flip to "text", at which point a filter is free to touch it.
+#
+# Marking them binary explicitly removes that path entirely. It costs a
+# non-diffable file in review, which is the correct trade for a fixture whose
+# entire value is that one specific byte survives.
+scripts/ci-check-pr-separation.js binary
+tests/watcher/sonnet/run-tests.js binary
