@@ -70,6 +70,7 @@ if (!detection || !detection.available) {
     "CONTAINER CONTAINMENT CONTROL IS ENFORCED -- only that the flags appear in the argv (case 1). " +
     "Containment coverage requires a leg with a docker/podman daemon.");
 } else {
+  (function behavioural() {
   const RUNTIME = detection.runtime;
   const probe = [
     'printf "uid=%s\\n" "$(id -u)"',
@@ -80,6 +81,35 @@ if (!detection || !detection.available) {
     'if mknod /tmp/devprobe c 1 3 2>/dev/null; then printf "mknod=ALLOWED\\n"; else printf "mknod=DENIED\\n"; fi',
     'if wget -q -T2 -O- http://1.1.1.1 >/dev/null 2>&1; then printf "net=ALLOWED\\n"; else printf "net=DENIED\\n"; fi',
   ].join("; ");
+
+  /* Is the image actually usable before we judge anything by it?
+   *
+   * This suite used to go straight to `docker run`, and treat any bad reading as
+   * INCONCLUSIVE -- which gates. On a runner with a daemon but no way to obtain the
+   * image (an anonymous Docker Hub pull, which GitHub Actions IPs are aggressively
+   * rate-limited on, or an offline/air-gapped runner), that turned a supply problem
+   * into a red gate that no change to this repo could ever clear.
+   *
+   * "The image is not available here" is a platform fact and belongs with the
+   * no-daemon skip. "The container ran and told us something wrong" is a finding.
+   * "The container ran and told us nothing" is a harness malfunction. Only the last
+   * two should stop a merge, and they are handled separately below. */
+  const present = spawnSync(RUNTIME, ["image", "inspect", IMAGE],
+    { encoding: "utf8", timeout: 60000, windowsHide: true });
+  if (present.error || present.status !== 0) {
+    const pull = spawnSync(RUNTIME, ["pull", IMAGE],
+      { encoding: "utf8", timeout: 300000, windowsHide: true });
+    if (pull.error || pull.status !== 0) {
+      skip("2-7. container containment probes",
+        "a " + RUNTIME + " daemon is reachable but the image " + IMAGE + " is neither present locally nor " +
+        "pullable here (" + String((pull.stderr || "").trim().split("\n").pop() || "pull failed").slice(0, 140) +
+        "). THIS RUN PROVIDES NO EVIDENCE THAT ANY CONTAINER CONTAINMENT CONTROL IS ENFORCED. Pre-pull the " +
+        "image, or set GRAPHSMITH_CONTAINMENT_TEST_IMAGE to one available on this host, for real coverage.");
+      process.stdout.write("\nSUMMARY PASS=" + pass + " FAIL=" + fail + " SKIPPED=" + skipped + "\n");
+      process.exitCode = fail > 0 ? 1 : 0;
+      return;
+    }
+  }
 
   const argv = ["run", "--rm", "--network", "none", "-w", "/workspace"]
     .concat(evalenv.CONTAINMENT_ARGV, [IMAGE, "sh", "-c", probe]);
@@ -131,6 +161,7 @@ if (!detection || !detection.available) {
       facts.net === "DENIED" ? "--network none holds (contract 04 B10)"
         : "network reachable from inside a --network none container");
   }
+  })();
 }
 
 process.stdout.write("\nSUMMARY PASS=" + pass + " FAIL=" + fail + " SKIPPED=" + skipped + "\n");

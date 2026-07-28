@@ -110,6 +110,23 @@ const J = JSON.stringify;
     // isolation deliberately omitted
   });
   const ref = r.refusals.find((x) => x.class === "filesystem");
+
+  /* The REASON is only assertable where the Permission Model exists. On a runtime
+   * without it, capability-enforce refuses on the missing flags first and never
+   * reaches the symlink check -- correctly, since there is no enforcement to
+   * qualify. Demanding the symlink wording there asserted a code path that cannot
+   * run, and failed every Node 18 leg of CI while passing locally on Node 22.
+   *
+   * The invariant that holds on EVERY runtime is the one that matters: absent
+   * isolation evidence, the class is not enforced. Assert that unconditionally,
+   * and qualify the reason only where it is reachable. */
+  if (!HAVE_PERMISSION) {
+    assert(name + " (no Permission Model on " + process.version + ")",
+      r.enforced.indexOf("filesystem") === -1,
+      "refused — on this runtime for the earlier reason (no --permission), which is why the " +
+      "symlink wording is not asserted here: " + (ref ? ref.reason.slice(0, 90) : "no refusal recorded"));
+    return;
+  }
   assert(name,
     r.enforced.indexOf("filesystem") === -1 && !!ref && /symlink audit/i.test(ref.reason),
     ref ? "refused: " + ref.reason.slice(0, 110) : "NOT refused -- enforced=" + J(r.enforced));
@@ -149,10 +166,21 @@ const J = JSON.stringify;
     isolation: CLEAN_ISOLATION,
   });
   const ref = r.refusals.find((x) => x.class === "subprocess");
-  assert(name,
-    r.enforced.indexOf("subprocess") === -1 && !!ref && /granularity/i.test(ref.reason),
-    ref ? "refused: --allow-child-process cannot express 'git only'" :
-      "ENFORCED a per-executable allowlist the mechanism cannot express -- this is the fail-open shape D1 forbids");
+  /* Same runtime split as case 1. Without --permission the class is refused for the
+   * earlier reason (nothing is denied at all), so the granularity wording is not
+   * reachable. The part that must hold everywhere -- the allowlist is never silently
+   * widened into an enforcement claim -- is asserted on both paths. */
+  if (!HAVE_PERMISSION) {
+    assert(name + " (no Permission Model on " + process.version + ")",
+      r.enforced.indexOf("subprocess") === -1,
+      "refused — on this runtime for the earlier reason (no --permission): " +
+      (ref ? ref.reason.slice(0, 90) : "no refusal recorded"));
+  } else {
+    assert(name,
+      r.enforced.indexOf("subprocess") === -1 && !!ref && /granularity/i.test(ref.reason),
+      ref ? "refused: --allow-child-process cannot express 'git only'" :
+        "ENFORCED a per-executable allowlist the mechanism cannot express -- this is the fail-open shape D1 forbids");
+  }
   // and the flag must never appear in argv
   assert("4b. --allow-child-process never emitted",
     r.argv.indexOf("--allow-child-process") === -1,
@@ -284,8 +312,28 @@ if (!HAVE_PERMISSION) {
   const link = path.join(COPY, "inputs", "escape-link");
   try { fs.rmSync(link, { force: true }); fs.symlinkSync(OUTSIDE, link); linked = true; } catch (e) { /* see below */ }
   if (!linked) {
-    inconc(name, "could not create a symlink on this filesystem (Windows without developer mode, or a mount " +
-      "that forbids them), so the escape was never attempted and this run says nothing about whether it exists");
+    /* SKIP, not INCONCLUSIVE, and the distinction cost a full red CI matrix to learn.
+     *
+     * This was fail-closed: unable to create a symlink -> INCONCLUSIVE -> gates. But
+     * an unprivileged Windows runner without Developer Mode CANNOT create symlinks
+     * AT ALL. That is a permanent platform property, not a harness malfunction, so
+     * the gate would have been red on every Windows leg forever, for a reason no
+     * amount of fixing could clear.
+     *
+     * The discriminator the rest of this repo already uses: the starvation sweep
+     * fails a WIRING GAP (a defect in its own setup) and passes an INERT target (the
+     * mechanism cannot fire on this platform) while stating it provides no coverage.
+     * Creating a symlink here is the same shape -- where the OS forbids it, this case
+     * is INERT.
+     *
+     * INCONCLUSIVE stays for the case below: the probe RAN and did not report. That
+     * is a harness malfunction and still gates. "The platform cannot do this" and
+     * "I tried and something went wrong" are different facts, and only the second is
+     * a reason to stop a merge. */
+    skip(name, "this filesystem does not permit creating symlinks (Windows without Developer Mode, or a " +
+      "mount that forbids them), so the escape could not be attempted. THIS RUN PROVIDES NO EVIDENCE about " +
+      "whether the Permission Model still follows a pre-existing symlink -- the precondition in " +
+      "capability-enforce.js is neither confirmed nor refuted here. Coverage comes from legs that can symlink");
     return;
   }
   const out = runProbe(["--permission", "--allow-fs-read=" + path.join(COPY, "inputs")],
