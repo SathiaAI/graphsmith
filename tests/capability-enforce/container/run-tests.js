@@ -124,10 +124,34 @@ if (!detection || !detection.available) {
   const need = ["uid", "capeff", "nnp", "rootfs", "mknod", "net"];
   const absent = need.filter((k) => !(k in facts));
 
-  if (res.error || absent.length) {
-    /* Could not observe. The image may be missing with no network to pull it,
-     * the daemon may have gone away mid-run, or the probe died. Whatever the
-     * cause, nothing was learned about containment -- say that, do not guess. */
+  /* Windows containers reject the containment flags outright. Measured on a
+   * windows-latest runner, which DOES have a docker daemon -- just one in Windows
+   * container mode:
+   *
+   *     status=125  docker: Error response from daemon: invalid option:
+   *                 read-only mode is not supported for Windows containers
+   *
+   * --read-only, --cap-drop and --user are Linux-container concepts. The daemon is
+   * reachable and the image resolves, so neither earlier skip fired, and the run
+   * died at argv-parse time with status 125 before any container existed. That was
+   * INCONCLUSIVE -> gates, which made every Windows leg permanently red for a
+   * platform property no change here could alter.
+   *
+   * This is the same distinction as the no-daemon and no-image skips: the
+   * containment model under test is a Linux-container one, and a Windows-container
+   * daemon cannot express it. Say so and provide no coverage, rather than gate. */
+  const stderrText = String((res && res.stderr) || "");
+  if (res.status === 125 && /not supported for Windows containers|invalid option/i.test(stderrText)) {
+    skip("2-7. container containment probes",
+      "the " + RUNTIME + " daemon here is in WINDOWS CONTAINER mode, which does not support the Linux " +
+      "containment flags this profile relies on (--read-only, --cap-drop, --user): " +
+      JSON.stringify(stderrText.trim().split("\n")[0].slice(0, 120)) + ". THIS RUN PROVIDES NO EVIDENCE THAT " +
+      "ANY CONTAINER CONTAINMENT CONTROL IS ENFORCED -- coverage requires a Linux-container daemon.");
+  } else if (res.error || absent.length) {
+    /* Genuinely could not observe on a daemon that SHOULD have worked: the daemon
+     * went away mid-run, or the probe died. Distinct from the three platform skips
+     * above, and still gates -- this one is a harness malfunction, not a property
+     * of the box. */
     inconc("2-7. container containment probes",
       "ran '" + RUNTIME + "' but did not get a full reading" +
       (res.error ? " (" + String(res.error.message || res.error) + ")" : "") +

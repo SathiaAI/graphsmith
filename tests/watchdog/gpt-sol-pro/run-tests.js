@@ -211,6 +211,24 @@ async function testBlockedAndIndependent(tmp) {
     !run.targetAlive && ev.elapsed_ms > BUDGET && run.elapsedWall <= BUDGET + 1200;
   if (ok) record("PASS", "blocked-event-loop-independent-kill",
     `target dead; watchdog exit=3; halt elapsed=${ev.elapsed_ms}ms wall=${run.elapsedWall}ms budget=${BUDGET}ms`);
+  /* The harness ran out of ITS OWN time before the watchdog could act -- so nothing
+   * was observed about whether the watchdog kills a blocked event loop.
+   *
+   * Caught by tests/harness-honesty/starvation on ubuntu CI, which is the whole
+   * point of that sweep: under GRAPHSMITH_DEADLINE_SCALE this case emitted a
+   * CONFIDENT FAIL at wall=7ms, reading as "the watchdog did not kill the target"
+   * when the truth was "I did not wait". A verdict about the most safety-critical
+   * mechanism here, asserted from a 7ms observation window.
+   *
+   * The discriminator is deliberately narrow: the harness deadline expired AND the
+   * watchdog wrote no evidence at all. A timeout with evidence present is a real
+   * product failure and still FAILS confidently -- widening this to `timedOut`
+   * alone would swallow exactly the defect the case exists to catch. */
+  else if (run.wdExit.timedOut && !ev) record("FAIL", "blocked-event-loop-independent-kill",
+    "INCONCLUSIVE (harness): the harness deadline expired before the watchdog produced any evidence " +
+    `(wall=${run.elapsedWall}ms, budget=${BUDGET}ms, targetAlive=${run.targetAlive}). Nothing was observed ` +
+    "about whether a blocked event loop gets killed -- this is the harness running out of patience, not a " +
+    "watchdog defect. Re-run without a scaled deadline for a real verdict");
   else record("FAIL", "blocked-event-loop-independent-kill",
     `exit=${run.wdExit.code} timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} evidence=${JSON.stringify(ev)} wall=${run.elapsedWall}ms`);
 }

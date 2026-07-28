@@ -60,7 +60,13 @@ const HAVE_PERMISSION = FLAGS.permission && FLAGS.allow_fs_read && FLAGS.allow_f
  * reach. The sibling is a sibling on purpose -- "/x/inputs" vs "/x/inputs-evil"
  * is the prefix-overmatch bug that a naive startsWith() grant check produces.
  * ------------------------------------------------------------------------ */
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gs-capenf-"));
+/* realpathSync, not the raw mkdtemp result. On macOS os.tmpdir() is
+ * /var/folders/... and /var is a symlink to /private/var, so the unresolved path
+ * makes every granted prefix wrong the moment Node realpaths the entry script --
+ * the probe child then dies at startup with ERR_ACCESS_DENIED from
+ * internal/modules/helpers, before running a single assertion. Linux /tmp is a real
+ * directory, which is why this passed locally and failed every macOS CI leg. */
+const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gs-capenf-")));
 const COPY = path.join(ROOT, "copy");
 const OUTSIDE = path.join(ROOT, "outside");
 fs.mkdirSync(path.join(COPY, "inputs"), { recursive: true });
