@@ -460,7 +460,7 @@ function detectPermissionModel(copyDir) {
     // So detection stays here (it is a fact about the runtime) and argv
     // construction moved to capability-enforce.js, which requires a grant and
     // this copy's checkIsolation() evidence before it will emit anything.
-    argv_builder: "scripts/capability-enforce.js plan({ grant, targetDir, isolation })",
+    argv_builder: "scripts/capability-enforce.js plan({ grant, targetDir }) — audits targetDir itself; there is no isolation parameter",
     detail: supported
       ? `Node Permission Model flags detected on this runtime (${process.version}). Detection only -- no flags are applied by evalenv itself; see capability-enforce.js, which will not emit them without a capability grant and a symlink-clean audit of the target tree.`
       : `Node Permission Model flags are not recognized by this runtime (${process.version}) -- proceeding without OS-enforced FS permission restriction on top of the copy's own directory isolation; documented limitation, not a silent claim of enforcement.`,
@@ -902,7 +902,17 @@ function createContainer(options) {
       isolation_level: `container (${detection.runtime}): network denied (--network none), read-only source mount, non-root (uid 65534), all Linux capabilities dropped, no-new-privileges, read-only rootfs with a noexec/nosuid tmpfs, and pid/memory/cpu caps, plus everything the standard profile provides`,
       confidentiality: "partial",
       network_containment: true,
-      containment_argv: containmentArgv(base.dir),
+      /* Computed defensively: containmentArgv THROWS when it cannot determine a
+       * non-root user (fail-closed, deliberately). Evaluating it eagerly inside this
+       * `claims` literal meant that throw escaped createContainer AFTER the copy had
+       * been made, so base.destroy() never ran and the disposable copy leaked. The
+       * refusal still has to reach runUntrustedCode -- which it does, since that
+       * calls containmentArgv again at spawn time -- but reporting it here must not
+       * cost a leaked directory. */
+      containment_argv: (function () {
+        try { return containmentArgv(base.dir); }
+        catch (e) { return { unavailable: String((e && e.message) || e) }; }
+      })(),
       note: "container profile: every control listed above is enforced by the container runtime at run time (runUntrustedCode), not merely declared. 'partial' confidentiality is unchanged and deliberate -- this is a process/kernel boundary, not a proof of confidentiality, and a container escape remains a container escape.",
     },
     runUntrustedCode,

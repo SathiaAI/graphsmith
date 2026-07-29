@@ -183,6 +183,41 @@ function auditTree(root) {
     return q === r || q.startsWith(r.endsWith(path.sep) ? r : r + path.sep);
   };
 
+  /* st_dev of the root. A bind mount inside the tree is a real directory whose
+   * realpath is inside, so nothing above notices it -- but it sits on a DIFFERENT
+   * device, and that is cheap to see. Measured: a bind mount of an outside
+   * directory onto a granted path gave error:null, 0 suspects, filesystem enforced,
+   * and a child that read and wrote outside targetDir entirely. */
+  let rootDev = null;
+  try { rootDev = fs.lstatSync(root).dev; } catch (e) { /* handled by the walk */ }
+
+  /* st_dev alone is NOT enough, and I checked rather than assumed: a bind mount
+   * within the SAME filesystem keeps the same device number.
+   *
+   *     stat -c %D  <grant>/inputs        -> fe00
+   *     stat -c %D  <grant>/inputs/sub    -> fe00   (bind mount of an outside dir)
+   *
+   * So the dev check catches only cross-filesystem mounts. /proc/self/mountinfo is
+   * the signal that actually works on Linux -- every mount point appears there with
+   * its mount target as a field. Read once per audit.
+   *
+   * Where mountinfo does not exist (macOS, Windows) this returns an empty set and
+   * same-filesystem bind mounts are NOT detected. That is a real, stated gap rather
+   * than a silent one: it needs privileges to create, so the adversary who can do it
+   * can generally do worse, but it is not covered and should not be implied to be. */
+  const mountTargets = (function readMounts() {
+    try {
+      const out = new Set();
+      for (const line of fs.readFileSync("/proc/self/mountinfo", "utf8").split("\n")) {
+        const f = line.split(" ");
+        if (f.length > 4 && f[4]) out.add(path.resolve(f[4]));
+      }
+      return out;
+    } catch (e) {
+      return null; // no mountinfo on this platform
+    }
+  })();
+
   (function walk(dir, depth) {
     if (error) return;
     if (depth > 64) { error = "directory nesting deeper than 64 levels at " + dir; return; }
@@ -207,6 +242,25 @@ function auditTree(root) {
         hardlink_suspects.push({ path: p, nlink: null, error: String((e && e.code) || e) });
         continue;
       }
+      if (mountTargets && mountTargets.has(path.resolve(p)) && path.resolve(p) !== path.resolve(root)) {
+        hardlink_suspects.push({
+          path: p,
+          nlink: null,
+          error: "is a MOUNT POINT inside the tree (per /proc/self/mountinfo). Its contents come from " +
+            "somewhere this audit cannot vouch for -- a bind mount of an outside directory presents as an " +
+            "ordinary directory of nlink-1 files and keeps the same st_dev on the same filesystem",
+        });
+        continue;
+      }
+      if (rootDev !== null && st.dev !== rootDev) {
+        hardlink_suspects.push({
+          path: p,
+          nlink: null,
+          error: "sits on a different filesystem (st_dev " + String(st.dev) + " vs root " + String(rootDev) +
+            ") -- a mount point inside the tree, whose contents this audit cannot vouch for",
+        });
+        continue;
+      }
       if (st.isDirectory()) {
         /* Descend into the REAL directory. Re-resolving here is what stops a
          * symlinked component from being collapsed away by path.join on the way
@@ -216,9 +270,27 @@ function auditTree(root) {
         if (realDir && inside(realDir)) walk(realDir, depth + 1);
         continue;
       }
-      if (st.isFile() && st.nlink > 1) {
-        hardlink_suspects.push({ path: p, nlink: st.nlink });
+      if (st.isFile()) {
+        if (st.nlink > 1) hardlink_suspects.push({ path: p, nlink: st.nlink });
+        continue;
       }
+      /* ANYTHING ELSE fails closed. This used to fall off the bottom of the loop
+       * with no suspect and no error, so a FIFO, a socket, or a device node inside
+       * a granted path was silently fine -- and so was a BIND MOUNT, which presents
+       * as an ordinary directory of nlink-1 files whose realpath is inside the tree.
+       * A reviewer used one to escape past targetDir entirely with a clean audit.
+       *
+       * A bind mount is not distinguishable from a real directory by lstat alone
+       * (it needs st_dev comparison or /proc/self/mountinfo), so the device check
+       * below is what catches it; this branch catches the rest. Either way the rule
+       * is the same: a disposable source copy contains regular files, directories
+       * and nothing else, so anything else is an anomaly and is refused rather than
+       * ignored. */
+      hardlink_suspects.push({
+        path: p,
+        nlink: null,
+        error: "unexpected file type in a source copy (not a regular file, directory or symlink)",
+      });
     }
   })(root, 0);
 
@@ -250,6 +322,7 @@ function isInside(root, p) {
 function plan(ctx) {
   const refusals = [];
   let auditPerformed = null;
+  const auditedPaths = [];
   const enforced = [];
   const argv = [];
   const notes = [];
@@ -341,23 +414,10 @@ function plan(ctx) {
      * microseconds instead of the lifetime of the copy, and spawnUnderGrant() below
      * closes it further by re-auditing immediately before spawning. It is not zero.
      * Anything claiming otherwise would be the same false confidence again. */
-    const audit = auditTree(realTarget);
-    if (audit.error) {
-      return refuse(CLS, "could not audit targetDir at enforcement time (" + audit.error + "). An audit that " +
-        "did not complete is not a clean audit");
-    }
-    if (audit.symlink_escapes.length > 0) {
-      return refuse(CLS, audit.symlink_escapes.length + " symlink(s) inside targetDir resolve OUTSIDE it, and " +
-        "the Permission Model follows them. Enforcing would attest a boundary the tree already defeats. " +
-        "First: " + JSON.stringify(audit.symlink_escapes[0]).slice(0, 200));
-    }
-    if (audit.hardlink_suspects.length > 0) {
-      return refuse(CLS, audit.hardlink_suspects.length + " file(s) inside targetDir have st_nlink > 1 (or " +
-        "could not be stat'd). Each is a second name for an inode this copy does not exclusively own, and a " +
-        "WRITE through one lands outside the grant (measured). First: " +
-        JSON.stringify(audit.hardlink_suspects[0]).slice(0, 200));
-    }
-    auditPerformed = audit;
+    /* Audited BELOW, once the granted paths are known -- see AUDIT THE GRANT, NOT
+     * THE TREE. Auditing targetDir here was the wrong boundary: plan() attests the
+     * GRANTED paths, which are a strict subset of targetDir, so a symlink that
+     * stays inside targetDir while leaving the grant passed a clean audit. */
 
     const fsGrant = grants[CLS];
     if (!fsGrant || typeof fsGrant !== "object") {
@@ -400,14 +460,57 @@ function plan(ctx) {
         "was granted no filesystem access and therefore cannot run'");
     }
 
+    /* AUDIT THE GRANT, NOT THE TREE.
+     *
+     * The previous version audited targetDir and attested the granted paths. Those
+     * are different boundaries -- case 3 above exists precisely because a grant is a
+     * strict SUBSET of targetDir -- so a link that stayed inside targetDir while
+     * leaving the grant was reported clean. Reproduced end-to-end, no privileges,
+     * no race:
+     *
+     *     <copy>/inputs/data -> ../secrets      (relative; resolves inside <copy>)
+     *     grant = <copy>/inputs
+     *     auditTree(<copy>)  ->  0 symlinks, 0 hardlinks, no error
+     *     child              ->  READ:TOP-SECRET-KEY  WROTE
+     *     and pwned.txt landed in <copy>/secrets, which was never granted
+     *
+     * That also falsified this suite's own case 7a ("sibling directory denied") on a
+     * tree the audit called clean. Third round, same shape as the first two: the
+     * check was about one thing and the claim was about another.
+     *
+     * So every granted path is audited against ITSELF. A symlink inside a granted
+     * directory must resolve within THAT directory, because that is the boundary
+     * --allow-fs-read/write actually draws. */
+    for (const p of reads.concat(writes)) {
+      const a = auditTree(p);
+      if (a.error) {
+        return refuse(CLS, "could not audit granted path " + p + " at enforcement time (" + a.error +
+          "). An audit that did not complete is not a clean audit");
+      }
+      if (a.symlink_escapes.length > 0) {
+        return refuse(CLS, a.symlink_escapes.length + " symlink(s) inside the GRANTED path " + p +
+          " resolve outside it, and the Permission Model follows them. Staying inside targetDir is not " +
+          "enough -- the boundary attested here is the grant. First: " +
+          JSON.stringify(a.symlink_escapes[0]).slice(0, 180));
+      }
+      if (a.hardlink_suspects.length > 0) {
+        return refuse(CLS, a.hardlink_suspects.length + " file(s) under the GRANTED path " + p +
+          " have st_nlink > 1 (or could not be stat'd). Each is a second name for an inode this copy does " +
+          "not exclusively own, and a WRITE through one lands outside the grant (measured). First: " +
+          JSON.stringify(a.hardlink_suspects[0]).slice(0, 180));
+      }
+      auditedPaths.push(a);
+    }
+    auditPerformed = { granted_paths_audited: auditedPaths.map((a) => a.root) };
+
     argv.push("--permission");
     for (const p of reads) argv.push("--allow-fs-read=" + p);
     for (const p of writes) argv.push("--allow-fs-write=" + p);
     enforced.push(CLS);
     notes.push("filesystem: " + reads.length + " read path(s), " + writes.length + " write path(s), " +
-      "all within targetDir, and the tree was audited BY THIS CALL at " + audit.root +
-      " — 0 escaping symlinks, 0 hardlink suspects. Residual window: a link planted between this audit " +
-      "and exec is not caught; spawnUnderGrant() re-audits immediately before spawning to narrow it");
+      "each audited BY THIS CALL against ITSELF (not merely against targetDir) — 0 escaping symlinks, " +
+      "0 hardlink suspects. Residual window: a link planted between this audit and exec is not caught; " +
+      "spawnUnderGrant() re-audits immediately before spawning to narrow it");
   })();
 
   /* ---- subprocess ------------------------------------------------------- */

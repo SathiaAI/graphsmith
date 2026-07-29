@@ -12,6 +12,27 @@ const { harnessDeadline } = require("../../_harness/deadline.js");
  * outcome was observable at all. */
 const WATCHDOG_WAIT_MS = 5000;
 
+/* The shortest harness deadline under which a HEALTHY run can still be observed.
+ *
+ * Comparing the deadline to BUDGET alone was not enough: the watchdog must notice
+ * the breach, kill the tree AND exit, and the harness has to see that exit. At
+ * scale 0.06 (deadline 300ms, budget 240ms) the watchdog did exactly the right
+ * thing -- killed at elapsed_ms=243, wrote complete halt evidence, target dead --
+ * and the suite reported a CONFIDENT PRODUCT FAILURE, because 300ms was not enough
+ * for the exit to land. A confident product verdict from a deadline too short to
+ * observe the product is the precise thing tests/_harness/deadline.js exists to
+ * make impossible.
+ *
+ * BUDGET + 1200 is not a fresh guess: it is the same allowance the PASS condition
+ * above already grants (`run.elapsedWall <= BUDGET + 1200`). Using one number for
+ * "how long a healthy run may take" and another for "how long we must have waited
+ * to judge it" is what opened the gap. Measured healthy wall is ~337-350ms, so the
+ * allowance is ~4x headroom.
+ *
+ * This is only consulted in the FAILURE branch, so a fast healthy run at a modest
+ * scale still PASSES on its own evidence rather than being written off. */
+const OBSERVABLE_MS = 240 + 1200;
+
 const ROOT = path.resolve(__dirname, "../../..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
 const STATE_STORE = path.join(ROOT, "scripts", "state-store.js");
@@ -281,9 +302,10 @@ async function testBlockedAndIndependent(tmp) {
    *
    * tests/_harness/deadline.js has exported isStarved() all along and nothing called
    * it. This is the same idea, expressed against the number that actually matters. */
-  else if (harnessDeadline(WATCHDOG_WAIT_MS) < BUDGET) record("FAIL", "blocked-event-loop-independent-kill",
-    "INCONCLUSIVE (harness): the harness deadline is " + harnessDeadline(WATCHDOG_WAIT_MS) + "ms, shorter than " +
-    "the watchdog's own " + BUDGET + "ms budget, so no outcome was observable here whatever the watchdog did " +
+  else if (harnessDeadline(WATCHDOG_WAIT_MS) < OBSERVABLE_MS) record("FAIL", "blocked-event-loop-independent-kill",
+    "INCONCLUSIVE (harness): the harness deadline is " + harnessDeadline(WATCHDOG_WAIT_MS) + "ms, less than the " +
+    OBSERVABLE_MS + "ms a HEALTHY run needs (budget " + BUDGET + "ms plus watchdog spawn/kill/exit), so no " +
+    "outcome was observable here whatever the watchdog did " +
     `(wall=${run.elapsedWall}ms timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} ` +
     `evidence=${ev ? "present" : "none"}). Re-run without a scaled harness deadline for a real verdict`);
   else record("FAIL", "blocked-event-loop-independent-kill",
