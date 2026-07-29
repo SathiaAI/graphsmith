@@ -31,35 +31,38 @@ The crash/recovery (chaos) harness tests exactly two properties: crash recovery,
 GSA machine-evaluates only typed, schema-validated document/knob edits. **Generated code is never machine-applied** — code repairs are staged for a human through the four-gate pipeline. The `auto_skill_creation_disabled` control attestation records that no autonomously-created, unapproved skill ran in the same trust flow; if one did, the bundle does not verify that control. *Control:* the four-gate promotion pipeline (Gate 3 is propose-only; adoption requires explicit human confirmation) + the recomputed control attestation.
 
 ## 6. Per-skill capability limitations
-GSA attests **only what is actually enforced**, per resource class. As of the capability-enforcement work, that is:
+GSA attests **only what is actually enforced**, per resource class:
 
-| Class | Enforced? | By what | Evidence |
-|---|---|---|---|
-| **network** | yes | supervisor destination allowlist; `--network none` under the container profile | `tests/capability-enforce/container/` case 7 |
-| **filesystem** | yes, **with a precondition** | Node Permission Model (`--permission`, `--allow-fs-read/write`) via [`scripts/capability-enforce.js`](scripts/capability-enforce.js) | `tests/capability-enforce/` cases 6–8 |
-| **subprocess** | **deny-all only** | `--permission` without `--allow-child-process` / `--allow-worker` | `tests/capability-enforce/` cases 9a–9b |
-| **model** | **no** | — no mechanism at this layer | never placed in `enforced` (case 5) |
+| Class | Enforced? | By what |
+|---|---|---|
+| **network** | yes | supervisor destination allowlist; `--network none` under the container profile |
+| **filesystem** | **no** | — see below |
+| **subprocess** | **no** | — see below |
+| **model** | **no** | no mechanism at this layer; needs a chokepoint in the model adapter |
 
-Three boundaries on that table, stated rather than buried:
+**Per-skill filesystem, model and subprocess grants are NOT enforced.** A grant may declare them; nothing applies them, and the GSA capability attestation never marks them satisfied (decision D1: a class is attested only if it appears in the grant's `enforced` list, and only `network` ever does).
 
-**The filesystem precondition is load-bearing, and it has a residual TOCTOU window.** The Permission Model resolves the path it is *given*, so a link that **already exists** inside the granted tree defeats it two ways — both measured:
+### Why this says "no" rather than "yes, with caveats"
 
-| link | effect |
-|---|---|
-| **symlink** pointing outside | followed; read `/etc/passwd` through one |
-| **hardlink** to a file outside | a second *name* for the same inode, so it resolves *inside* and passes any symlink walk — but a **write** through it modifies the file outside the grant |
+An enforcement module was built on Node's Permission Model (`--permission`, `--allow-fs-read/write`) and **withdrawn**. Five rounds of adversarial review found successive ways for code inside the grant to read or write outside it, each round after the previous had been reported as fixed:
 
-`capability-enforce.js` therefore **audits the target tree itself, at enforcement time**, for both shapes, and refuses the filesystem class on either. It does **not** accept an audit from its caller: an earlier design did, and a clean report produced honestly at copy-creation time was reused after a link had been planted, granting enforcement over a tree that had since been tampered with. `spawnUnderGrant()` re-audits immediately before exec to narrow the gap further.
+| # | Escape | Status when found |
+|---|---|---|
+| 1 | pre-existing **symlink** out of the tree | followed by the Permission Model; read `/etc/passwd` through one |
+| 2 | pre-existing **hardlink** — a second *name* for the same inode | resolves *inside*, passes any symlink walk, and a **write** through it modifies the file outside |
+| 3 | **stale audit** — clean at copy time, link planted after | evidence honest when produced, worthless when used |
+| 4 | **forged spelling** — `<dir>/A/../real`, lexical vs physical | clean report for a tree nobody walked |
+| 5 | audit contained against the copy, attestation about the **grant** | a link staying inside the copy while leaving the grant |
+| 6 | **dangling symlink** | `realpath` fails so the audit skips it, but `open(O_CREAT)` follows it and creates the file at the target |
+| 7 | a **granted path that is itself a symlink** | the audit never checked its own root |
 
-**The window is narrowed, not closed.** A link planted between the audit and the child's `exec` is not caught, and no user-space audit can close that — it needs the kernel (a bind mount with `nosuid`/`nodev`, a mount namespace, or a filesystem the enforced process cannot reach under any other name). An earlier version of this page claimed "there is no TOCTOU window"; that was **false** at system level and true only for links minted *by the enforced child*, which the Permission Model does block (`symlinkSync`/`linkSync` outside the write grant are both `ERR_ACCESS_DENIED`).
+The pattern across all seven is one thing: **the check was about a different boundary than the claim.** Each fix was narrower than the last, which is convergence — but the module was shipping a *green attestation*, and a false "enforced" in a signed bundle is worse than an honest "not enforced". So it was removed rather than shipped with a sixth round pending.
 
-**Subprocess is enforceable only as deny-all.** `--allow-child-process` has no per-executable granularity — it is one boolean over every executable on the machine, and Node itself warns it "could invalidate the permission model". A grant of `subprocess.allowed: ["git"]` is therefore **refused**, not honoured by granting everything and reporting the class enforced. Expressing a real subprocess allowlist needs a broker process that owns the allowlist itself; that does not exist and is not claimed.
+**What this costs:** nothing that was previously working. Per-skill grants were never enforced before this attempt either; this section previously said so, briefly said otherwise, and now says so again — accurately.
 
-**Model grants remain unenforceable at this layer.** There is no OS mechanism for "which model may this skill call"; it needs a chokepoint in the model adapter. The class may be *declared* in a grant and is never *attested* (decision D1).
+**What would be needed to do it properly:** the residual hole is a TOCTOU window no user-space audit can close — a link planted between the audit and `exec`. That needs the kernel: a bind mount with `nosuid`/`nodev`, a mount namespace, or a filesystem the enforced process cannot reach under any other name. A path-prefix check applied from user space to a tree an adversary can write to is the wrong tool, and the review history above is what that looks like in practice.
 
-*Controls:* [`scripts/capability-enforce.js`](scripts/capability-enforce.js) (fail-closed: every uncertainty — older runtime, missing flag, absent audit, malformed or unexpressible grant — resolves to "not enforceable", never to permissive argv); [`checks/v040-caps.js`](checks/v040-caps.js) (recomputes `requested ⊆ granted` and refuses to attest a class absent from `enforced`); and the container capability class, which is **required** for anything beyond typed edits and now runs untrusted code non-root, with all Linux capabilities dropped, `no-new-privileges`, a read-only rootfs, and pid/memory/cpu caps — each verified by running a container and reading `/proc/self/status` from inside, not asserted in prose.
-
-**Coverage caveat:** the behavioural halves of both suites only run where the mechanism exists — the Permission Model needs Node ≥ 20, the container probes need a reachable docker/podman daemon. On a leg without them the suites **skip loudly and state that they provide no coverage**; they never pass silently.
+*Control (coarser than per-skill, and real):* the **container capability class** — a whole-run isolation boundary required for anything beyond typed edits (contract 04 B10). It runs untrusted code non-root, with all Linux capabilities dropped, `no-new-privileges`, a read-only rootfs and read-only source mount, network denied, and pid/memory/cpu caps. Each of those is verified by running a container through the real entry point (`evalenv.create("container")` → `runUntrustedCode()`) and reading `/proc/self/status` from inside — see `tests/evalenv/containment/`. That suite also asserts the profile still *functions* (the mount is readable) before making any containment claim, because an envelope nothing can run in is broken rather than secure.
 
 ## 7. Signer-trust limitations
 GSA verification shows a bundle **was signed by the claimed key and is unaltered**. Whether to **trust that key is the verifier's policy** — an allowlist, an org key, or a transparency log (GSA-SPEC §5.5). The default is a local keypair, which attests "signed by *a* key"; cross-organisation non-repudiation is weaker until keyless / transparency-log signing (opt-in, targeted for a later draft). A **privileged local attacker** who can already rewrite the producer, the verifier, and the signing keys on the same machine is **out of scope, stated as such** — local self-verification detects same-user drift and mistakes, not a root adversary; CI cross-checking from a trusted workflow covers shared repositories. *Control:* the verifier-supplied trusted-key set + out-of-band maintainer signature for air-gapped verification (register Lane D, v0.3.0).

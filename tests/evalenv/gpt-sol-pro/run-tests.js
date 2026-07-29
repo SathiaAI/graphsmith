@@ -443,10 +443,9 @@ function testDecisionDeterminism() {
      * Flagged rather than quietly patched: this is a test edited to accommodate a
      * change to the code it tests, which is the shape that lets a real regression
      * through. The justification is that the field is an identifier by the
-     * projection's own stated exclusion rule, and capability-enforce uses it only
-     * to check that evidence describes the directory being enforced -- a
-     * provenance binding, like checking a signature covers the document in hand,
-     * not a judgement about the product. */
+     * projection's own stated exclusion rule, and audited_dir is used only
+     * to say WHICH tree an isolation report describes -- provenance, like a
+     * signature naming the document it covers, not a judgement about the product. */
     isolation: (function stripProvenance(iso) {
       if (!iso || typeof iso !== "object") return iso;
       const out = {};

@@ -62,7 +62,6 @@
     "tests/attacks/constitutional/",
     "tests/attacks/toctou/",
     "tests/attacks/module-escape/",
-    "tests/capability-enforce/",
     "tests/badge/",
     "tests/matrix/",
     "tests/gauntlet/",

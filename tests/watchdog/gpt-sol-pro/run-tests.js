@@ -12,31 +12,28 @@ const { harnessDeadline } = require("../../_harness/deadline.js");
  * outcome was observable at all. */
 const WATCHDOG_WAIT_MS = 5000;
 
-/* The shortest harness deadline under which a HEALTHY run can still be observed.
- *
- * Comparing the deadline to BUDGET alone was not enough: the watchdog must notice
- * the breach, kill the tree AND exit, and the harness has to see that exit. At
- * scale 0.06 (deadline 300ms, budget 240ms) the watchdog did exactly the right
- * thing -- killed at elapsed_ms=243, wrote complete halt evidence, target dead --
- * and the suite reported a CONFIDENT PRODUCT FAILURE, because 300ms was not enough
- * for the exit to land. A confident product verdict from a deadline too short to
- * observe the product is the precise thing tests/_harness/deadline.js exists to
- * make impossible.
- *
- * BUDGET + 1200 is not a fresh guess: it is the same allowance the PASS condition
- * above already grants (`run.elapsedWall <= BUDGET + 1200`). Using one number for
- * "how long a healthy run may take" and another for "how long we must have waited
- * to judge it" is what opened the gap. Measured healthy wall is ~337-350ms, so the
- * allowance is ~4x headroom.
- *
- * This is only consulted in the FAILURE branch, so a fast healthy run at a modest
- * scale still PASSES on its own evidence rather than being written off. */
-const OBSERVABLE_MS = 240 + 1200;
-
 const ROOT = path.resolve(__dirname, "../../..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
 const STATE_STORE = path.join(ROOT, "scripts", "state-store.js");
 const BUDGET = 240;
+
+/* The shortest harness deadline under which a HEALTHY run is still observable.
+ *
+ * DERIVED from BUDGET, deliberately. It was `240 + 1200` -- a literal copy of
+ * BUDGET, declared ABOVE it, so the commit claiming "there is now one number" was
+ * false. A reviewer changed BUDGET to 2000 (a plausible product change) and the
+ * watchdog did everything right -- killed at 2002ms, target dead, complete halt
+ * evidence -- while this case emitted a CONFIDENT PRODUCT FAILURE, because the
+ * guard still compared against 1440. That is the same defect one constant edit
+ * away.
+ *
+ * The +1200 is the same allowance the PASS condition grants
+ * (`run.elapsedWall <= BUDGET + 1200`): the watchdog must notice the breach, kill
+ * the tree AND exit, and the harness has to see that exit. Using one number for
+ * "how long a healthy run may take" and a different one for "how long we must have
+ * waited to judge it" is what opened the gap. */
+const OBSERVABLE_SLACK_MS = 1200;
+const OBSERVABLE_MS = BUDGET + OBSERVABLE_SLACK_MS;
 const results = [];
 
 function sleep(ms) {
@@ -445,6 +442,16 @@ async function testCapabilityMessages(tmp) {
     else mismatches.push(`${i + 1}/${item.kind}: expected kind ${item.expectedKind} with fragments ${JSON.stringify(item.fragments || [])}, got ${JSON.stringify(actual)}`);
   }
   if (matched === cases.length) record("PASS", "capability-message-20-kill-points", `20/20 semantic message kinds at seeded heartbeat points ${killPoints.join(",")}`);
+  /* Same guard as blocked-event-loop-independent-kill, because this case drives the
+   * SAME realBlockedKill with the SAME WATCHDOG_WAIT_MS and had no guard at all.
+   * At scale 0.03 the two lines contradicted each other in one run: the first said
+   * a 150ms deadline made any outcome unobservable, and this one asserted a 20-way
+   * product defect from that same 150ms. Adding the honesty guard to the case under
+   * review and not to its sibling is how a fix looks complete and is not. */
+  else if (harnessDeadline(WATCHDOG_WAIT_MS) < OBSERVABLE_MS) record("FAIL", "capability-message-20-kill-points",
+    `INCONCLUSIVE (harness): the harness deadline is ${harnessDeadline(WATCHDOG_WAIT_MS)}ms, less than the ` +
+    `${OBSERVABLE_MS}ms a healthy kill needs, so these ${cases.length} cases could not have been observed ` +
+    `whatever the watchdog did (${matched}/${cases.length} matched). Re-run without a scaled harness deadline`);
   else record("FAIL", "capability-message-20-kill-points", `${matched}/20 semantic message kinds at seeded heartbeat points ${killPoints.join(",")}; ${mismatches.join(" | ")}`);
 }
 

@@ -1,4 +1,4 @@
-/* tests/capability-enforce/container/run-tests.js — does the container profile
+/* tests/evalenv/containment/run-tests.js — does the container profile
  * actually contain, AND does it still work?
  *
  * REWRITTEN AFTER AN ADVERSARIAL REVIEW FOUND THIS SUITE GREEN ON A BROKEN PROFILE.

@@ -441,28 +441,27 @@ function detectPermissionModel(copyDir) {
       allow_child_process: has("--allow-child-process"),
       allow_worker: has("--allow-worker"),
     },
-    // NOT argv, and deliberately no longer named as though it were.
-    //
-    // This function used to return `recommended_argv`, a ready-made
-    // "--permission --allow-fs-read=<copy>/* --allow-fs-write=<copy>/*". Nothing
-    // in the repo ever consumed it. That is worse than it sounds: it named a
-    // security control, in the returned object of the module whose job is
-    // isolation, and applied nothing -- the shape a reader mistakes for
-    // enforcement.
-    //
-    // It was also unsafe as written. Applying those flags to a copy without
-    // first proving the copy is symlink-clean does not produce a filesystem
-    // boundary: a symlink already inside the tree is followed straight out of
-    // it (measured; see scripts/capability-enforce.js). Building the argv here,
-    // where the symlink audit's result is not in scope, is precisely where that
-    // precondition gets lost.
-    //
-    // So detection stays here (it is a fact about the runtime) and argv
-    // construction moved to capability-enforce.js, which requires a grant and
-    // this copy's checkIsolation() evidence before it will emit anything.
-    argv_builder: "scripts/capability-enforce.js plan({ grant, targetDir }) — audits targetDir itself; there is no isolation parameter",
+    /* DETECTION ONLY. No argv is built here, and none is built anywhere.
+     *
+     * This used to return `recommended_argv` -- a ready-made
+     * "--permission --allow-fs-read=<copy>/*" that nothing consumed. It named a
+     * security control, in the isolation module's own return value, and applied
+     * nothing.
+     *
+     * A per-skill enforcement module was then written to consume it, and WITHDRAWN
+     * after five rounds of adversarial review found successive escapes in it:
+     * pre-existing symlinks, hardlinks (a WRITE escape), stale audits, a forged
+     * targetDir spelling, dangling symlinks, and a granted path that is itself a
+     * symlink. Each round was reported as fixed and the next found another. See
+     * KNOWN-LIMITATIONS.md section 6.
+     *
+     * So this stays a fact about the RUNTIME and nothing more: these flags exist,
+     * and GraphSmith does not currently use them. Building the argv without proving
+     * the tree is clean produces a filesystem boundary that is not there, which is
+     * worse than the honest "not enforced" recorded in the limitations file.
+     */
     detail: supported
-      ? `Node Permission Model flags detected on this runtime (${process.version}). Detection only -- no flags are applied by evalenv itself; see capability-enforce.js, which will not emit them without a capability grant and a symlink-clean audit of the target tree.`
+      ? `Node Permission Model flags exist on this runtime (${process.version}). DETECTION ONLY -- GraphSmith does not apply them; per-skill filesystem/subprocess enforcement is NOT implemented (KNOWN-LIMITATIONS.md section 6).`
       : `Node Permission Model flags are not recognized by this runtime (${process.version}) -- proceeding without OS-enforced FS permission restriction on top of the copy's own directory isolation; documented limitation, not a silent claim of enforcement.`,
   };
 }
@@ -523,7 +522,28 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
           const real = fs.realpathSync(p);
           if (!isInside(copyDir, real)) symlinkEscapes.push({ path: p, target: real });
         } catch (e) {
-          // dangling symlink target -- not an escape, just inert.
+          /* A DANGLING symlink is NOT inert -- that comment was wrong, and an
+           * adversarial review demonstrated a write escape through one.
+           *
+           * realpathSync fails (ENOENT) because the target does not exist YET.
+           * But open(O_CREAT) follows the link and CREATES the file at the target,
+           * so a link inside the copy pointing at a non-existent path outside it is
+           * a write primitive aimed out of the tree. Targets that do not exist yet
+           * and whose parent is writable are exactly the interesting ones:
+           * .git/hooks/*, authorized_keys, a node_modules shim.
+           *
+           * Resolve LEXICALLY against the link's own directory -- realpath cannot
+           * help, the target is not there -- and treat anything leaving the copy as
+           * an escape. An unreadable link is recorded too: unknown is not clean. */
+          try {
+            const raw = fs.readlinkSync(p);
+            const lexical = path.resolve(path.dirname(p), raw);
+            if (!isInside(copyDir, lexical)) {
+              symlinkEscapes.push({ path: p, target: lexical, dangling: true });
+            }
+          } catch (e2) {
+            symlinkEscapes.push({ path: p, target: null, unresolvable: String((e2 && e2.code) || e2) });
+          }
         }
       } else if (entry.isDirectory()) {
         scan(p);
@@ -551,10 +571,9 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
      * second name for an inode this copy does not exclusively own; a write through
      * one leaves the copy. See the audit above for the measured escape. */
     hardlink_suspects: hardlinkSuspects,
-    /* The directory this evidence describes. capability-enforce requires it and
-     * compares it to its own targetDir: without it, an audit of directory A could
-     * authorise enforcement of directory B, and the caller passing the evidence is
-     * the one being checked. */
+    /* The directory this evidence describes. Kept so a consumer can tell WHICH
+     * tree was audited -- evidence that does not name its subject can be applied
+     * to the wrong one. */
     audited_dir: path.resolve(copyDir),
     isolated: !gitPresent && !graphsmithPresent && !nodePathLeaked &&
       symlinkEscapes.length === 0 && hardlinkSuspects.length === 0,
