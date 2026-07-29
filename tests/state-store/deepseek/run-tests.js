@@ -613,7 +613,39 @@ function test6_windowSlots(tempDir) {
   const name = "6. Window slots: N-slot capacity; terminal dispositions required; abandoned → FLAGGED";
   try {
     process.env.GRAPHSMITH_TEST_MODE = "1";
-    const store = requireFreshStore(tempDir, { leaseMs: 1000, heartbeatMs: 200 });
+    // Lease TTL, not a harness deadline: it is a PRODUCT budget and is
+    // deliberately NOT scaled by harnessDeadline() -- see the WHAT IT
+    // DELIBERATELY DOES NOT SCALE note in tests/harness-honesty/starvation.
+    //
+    // It was 1000ms, and 1000ms is a wall-clock proxy for a precondition this
+    // case needs but does not test: that the three slotted runs are STILL LIVE
+    // when their slots are inspected. Every store operation sweeps expired
+    // leases first (_operation -> _sweepExpiredLocked), and a swept run is
+    // terminalized as `abandoned`: window.active is decremented and the FLAG
+    // bit is set. The body below is ~12 lock+fsync operations. On a contended
+    // windows-latest runner those cost ~200ms each, so run-s1's lease lapsed
+    // before the slots were read and the case reported `Expected active=3, got
+    // 2` -- a PRODUCT verdict for a MACHINE-SPEED fact. Worse, a full lapse
+    // terminalizes every slot, which makes window.close() legitimately succeed
+    // and the case then reports "Closing window with active slots was not
+    // refused": a false finding against a fail-closed refusal. Measured
+    // directly: same sequence, 1100ms of induced delay, 1000ms lease ->
+    // active=0, flag=true, close NOT refused; 60000ms lease -> active=3,
+    // flag=false, close refused WINDOW_ACTIVE.
+    //
+    // Two changes, because a bigger number alone is just a bigger proxy:
+    //   1. the lease is the product default (DEFAULT_LEASE_MS, 30s), which is
+    //      ~150x the observed per-operation cost rather than ~5x. Long enough
+    //      to dwarf the body, short enough that a leaked lock still self-heals
+    //      instead of wedging the job (a lock is stolen once age > leaseMs).
+    //   2. the precondition is CHECKED, against the expiry the store itself
+    //      issued -- not recomputed here -- before every assertion that depends
+    //      on the runs being live. If it does not hold, this case cannot tell a
+    //      slow machine from a broken component, and says so: INCONCLUSIVE
+    //      (harness), which still fails closed but is not a product finding.
+    // Lease expiry as a subject is TEST 5's job, on its own short-lease store.
+    const LEASE_MS = 30000;
+    const store = requireFreshStore(tempDir, { leaseMs: LEASE_MS, heartbeatMs: 200 });
 
     // Admit a window with 3 slots
     store.window.admitPending({ txid: "tx-win", fingerprint: "fp-win", tree_id: "tree-win", n: 3 });
@@ -627,13 +659,45 @@ function test6_windowSlots(tempDir) {
     const r3 = store.runRegistry.register("run-s3", "tree-win");
     assert(r3.slot !== null, "Run 3 should get a slot");
 
-    // 4th run should NOT be observed (no slot)
+    // The lease the STORE issued, read back from its own registration records.
+    // The earliest of the three is the first thing a sweep would take.
+    const expiries = [r1, r2, r3].map((r) => r.registration.lease_expires_at);
+    assert(expiries.every((t) => Number.isFinite(t)), "registration did not report lease_expires_at");
+    const earliestExpiry = Math.min.apply(null, expiries);
+    // Attribution, not prediction. Checking the lease BEFORE an observation
+    // cannot work: the lease can lapse during the very operation being
+    // observed. So the check runs only when an assertion has already failed,
+    // against the clock reading taken at the moment of that observation, and
+    // asks whether the runs could still have been live then. `observedAt` is
+    // sampled immediately after each observing call, so the comparison is exact
+    // rather than inflated by everything that happened afterwards. If the two
+    // are ever ambiguous the verdict lands on INCONCLUSIVE, which still exits
+    // non-zero and still gates -- so this can never turn a real defect into a
+    // PASS, only into a louder "I could not attribute this".
+    const assertLive = (condition, observedAt, what, message) => {
+      if (condition) return;
+      const overdue = observedAt - earliestExpiry;
+      if (overdue < 0) throw new Error(message);
+      const e = new Error(
+        "INCONCLUSIVE (harness): " + message + " -- but the earliest slotted run's " + LEASE_MS +
+        "ms lease had already lapsed by " + overdue + "ms when " + what + " was observed, so the store " +
+        "had swept it as `abandoned` and this case cannot tell that apart from a slot-accounting defect. " +
+        "The machine was too slow to finish this case's setup inside a product lease: a harness " +
+        "condition, not a finding.");
+      e.__inconclusive = true;
+      throw e;
+    };
+
+    // 4th run should NOT be observed (no slot). Not lease-sensitive: capacity is
+    // slots.length, and slots are never removed, only terminalized.
     const r4 = store.runRegistry.register("run-s4", "tree-win");
     assert(r4.slot === null, "Run 4 should NOT get a slot");
 
     // Window active count should be 3
     const win = store.window.get();
-    assert(win.window.active === 3, `Expected active=3, got ${win.window.active}`);
+    const winAt = Date.now();
+    assertLive(win.window.active === 3, winAt, "the active-slot count",
+      `Expected active=3, got ${win.window.active}`);
     assert(win.window.admitted === 3, `Expected admitted=3, got ${win.window.admitted}`);
     assert(win.window.slots.length === 3, `Expected 3 slots, got ${win.window.slots.length}`);
 
@@ -644,14 +708,22 @@ function test6_windowSlots(tempDir) {
     } catch (e) {
       closeActiveRefused = e.code === "WINDOW_ACTIVE";
     }
-    assert(closeActiveRefused, "Closing window with active slots was not refused");
+    const closeAt = Date.now();
+    assertLive(closeActiveRefused, closeAt, "the close-while-active refusal",
+      "Closing window with active slots was not refused");
 
     // Dispose runs with terminal dispositions
     store.window.dispose("run-s1", { disposition: "completed_pass" });
     store.window.dispose("run-s2", { disposition: "completed_soft_wobble" });
 
-    // Check soft_wobble sets FLAG
+    // Check soft_wobble sets FLAG. Lease-sensitive in the other direction: a
+    // swept `abandoned` run ALSO sets the flag, so a lapse would make this
+    // assertion pass for the wrong reason. Attributed the same way -- if the
+    // lease had lapsed, the flag is not evidence about soft_wobble.
     const winAfterWobble = store.window.get();
+    const wobbleAt = Date.now();
+    assertLive(wobbleAt < earliestExpiry, wobbleAt, "the soft-wobble FLAG bit",
+      "the FLAG bit could not be attributed to the soft wobble");
     assert(winAfterWobble.flag === true, "Soft wobble should set FLAG bit");
 
     // Deregister run-s3 with abandoned disposition (simulate sweep manually)
@@ -664,19 +736,35 @@ function test6_windowSlots(tempDir) {
     // Now test terminal dispositions required: new window, register 1 run, try close
     store.window.admitPending({ txid: "tx-win2", fingerprint: "fp-win2", tree_id: "tree-win2", n: 1 });
     store.window.finalize("tx-win2");
-    store.runRegistry.register("run-t1", "tree-win2");
+    const t1 = store.runRegistry.register("run-t1", "tree-win2");
 
+    // Same attribution for the second window, against run-t1's own lease.
     let closeIncompleteRefused = false;
     try {
       store.window.close("tx-win2", undefined);
     } catch (e) {
       closeIncompleteRefused = e.code === "WINDOW_ACTIVE";
     }
+    const close2At = Date.now();
+    if (!closeIncompleteRefused && close2At >= t1.registration.lease_expires_at) {
+      const e = new Error(
+        "INCONCLUSIVE (harness): the second window's close was not refused, but run-t1's " + LEASE_MS +
+        "ms lease had already lapsed by " + (close2At - t1.registration.lease_expires_at) +
+        "ms, so its slot was swept terminal before the close was attempted -- a slow machine, not a " +
+        "component that closes over an active slot.");
+      e.__inconclusive = true;
+      throw e;
+    }
     assert(closeIncompleteRefused, "Closing window with active terminal slots was not refused");
 
     record(name, "PASS");
   } catch (e) {
-    record(name, "FAIL", e.message);
+    // The tag is applied here, from the flag, rather than trusting each throw
+    // site to have typed the prefix correctly. INCONCLUSIVE still records FAIL:
+    // it fails closed and still gates; it is only excluded from product findings.
+    const tag = "INCONCLUSIVE (harness): ";
+    const detail = e.__inconclusive && e.message.indexOf(tag) !== 0 ? tag + e.message : e.message;
+    record(name, "FAIL", detail);
   }
 }
 
