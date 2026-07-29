@@ -431,7 +431,28 @@ function testDecisionDeterminism() {
     profile: handle.profile,
     copied: fs.readFileSync(path.join(handle.dir, "app.txt"), "utf8"),
     excluded: manifest.excluded,
-    isolation: manifest.isolation,
+    /* `audited_dir` is dropped for the same reason this projection already drops
+     * identifiers, timestamps and elapsed evidence: it NAMES the copy that was
+     * audited (a fresh mkdtemp path per create), so it differs between two
+     * identical creates by construction. It is provenance, not a decision.
+     *
+     * The security DECISIONS in this record -- git_absent, graphsmith_state_absent,
+     * node_path_stripped, symlink_escapes, hardlink_suspects, isolated -- all stay
+     * in and must still match exactly.
+     *
+     * Flagged rather than quietly patched: this is a test edited to accommodate a
+     * change to the code it tests, which is the shape that lets a real regression
+     * through. The justification is that the field is an identifier by the
+     * projection's own stated exclusion rule, and capability-enforce uses it only
+     * to check that evidence describes the directory being enforced -- a
+     * provenance binding, like checking a signature covers the document in hand,
+     * not a judgement about the product. */
+    isolation: (function stripProvenance(iso) {
+      if (!iso || typeof iso !== "object") return iso;
+      const out = {};
+      for (const k of Object.keys(iso)) { if (k !== "audited_dir") out[k] = iso[k]; }
+      return out;
+    })(manifest.isolation),
     env: Object.fromEntries(Object.entries(handle.env).filter(([key]) => key !== "NODE_OPTIONS")),
     claims: handle.claims,
     budgetValues: handle.budgets.values,
