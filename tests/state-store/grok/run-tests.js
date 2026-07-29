@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 const { spawnSync, spawn } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "../../..");
@@ -752,9 +753,29 @@ function attackWindowSlots() {
   }
 }
 
+/* How long a worker keeps retrying a CONTENDED lock before giving up.
+ *
+ * This is the HARNESS's patience, not a product budget: nothing about the store is
+ * measured by it. The product assertions are the ok counts, the journal record
+ * counts and the monotonic revisions.
+ *
+ * It was a bare `Date.now() + 10000` and it failed CI on windows-latest/node 22 --
+ * `a=1 b=0 codes a=["lock-starved-10s"]` -- with the runner's own re-run passing,
+ * i.e. FLAKY. Two Node processes hammering a file lock 40 times each on a shared
+ * Windows runner, with process creation and a virus scanner in the path, can exceed
+ * 10s of contention with nothing wrong. Flake taxonomy shape 1: a fixed deadline
+ * used as a precondition proxy.
+ *
+ * Widened, and routed through harnessDeadline() so the starvation sweep can actually
+ * exercise this suite -- it was not wired to that knob at all. Widening a harness
+ * patience budget cannot make a failing test pass: every product assertion is
+ * downstream of it, and the retry loop exits the moment the lock is acquired. */
+const LOCK_RETRY_BUDGET_MS = harnessDeadline(60000);
+
 function attackConcurrencySync() {
   // bridge so main can be sync: run blocking joins via spawnSync instead
   const name = "concurrency.two-process-register-deregister";
+  let inconclusive = null;
   const root = tempRoot("conc");
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
@@ -808,6 +829,7 @@ const root = process.argv[2];
 const prefix = process.argv[3];
 const n = Number(process.argv[4] || 40);
 const outFile = process.argv[5];
+const LOCK_RETRY_BUDGET_MS = Number(process.argv[6] || 60000);
 const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
 let ok = 0, busy = 0, other = 0;
 // otherCodes: a bare count made a failure unactionable -- "errors a=0 b=1" said
@@ -821,7 +843,7 @@ for (let i = 0; i < n; i++) {
   // attempts x <=25ms backoff (~1.6s) was a *proxy* for time, and on a loaded
   // 2-core runner two hammering processes exhausted it, reporting the retry
   // budget as an error. A wall-clock deadline states the intent directly.
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + LOCK_RETRY_BUDGET_MS;
   for (let attempt = 0; !done; attempt++) {
     try {
       store.runRegistry.register(id, "tree-conc");
@@ -831,7 +853,7 @@ for (let i = 0; i < n; i++) {
     } catch (e) {
       if (e.code === "LOCKED" || e.code === "LOCK_CONTENTION") {
         busy++;
-        if (Date.now() >= deadline) { other++; otherCodes.push("lock-starved-10s"); done = true; }
+        if (Date.now() >= deadline) { other++; otherCodes.push("lock-starved-" + LOCK_RETRY_BUDGET_MS + "ms"); done = true; }
         else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 + Math.min(attempt, 20));
       } else {
         other++;
@@ -845,13 +867,13 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }
 `
       );
 
-      const ca = spawn(process.execPath, [worker, root, "a", String(n), outA], {
+      const ca = spawn(process.execPath, [worker, root, "a", String(n), outA, String(LOCK_RETRY_BUDGET_MS)], {
         env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" },
         stdio: "ignore",
         detached: true,
       });
       ca.unref();
-      const cb = spawn(process.execPath, [worker, root, "b", String(n), outB], {
+      const cb = spawn(process.execPath, [worker, root, "b", String(n), outB, String(LOCK_RETRY_BUDGET_MS)], {
         env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" },
         stdio: "ignore",
         detached: true,
@@ -869,7 +891,21 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }
       assert(fs.existsSync(outA) && fs.existsSync(outB), "workers did not finish in time");
       const ra = JSON.parse(fs.readFileSync(outA, "utf8"));
       const rb = JSON.parse(fs.readFileSync(outB, "utf8"));
-      assert(ra.other === 0 && rb.other === 0, `errors a=${ra.other} b=${rb.other} codes a=${JSON.stringify(ra.otherCodes || [])} b=${JSON.stringify(rb.otherCodes || [])}`);
+      /* Lock STARVATION is separated from real errors. A worker that exhausted its
+       * retry budget observed nothing about whether the store serialises correctly --
+       * it stopped asking. Reporting that as a store error is a confident product
+       * verdict from an observation the harness cut short (contract 10 List C rule 1),
+       * and it is what turned a slow Windows runner into a red gate. */
+      const allCodes = [].concat(ra.otherCodes || [], rb.otherCodes || []);
+      const starved = allCodes.filter((c) => String(c).indexOf("lock-starved") === 0);
+      const realErrors = allCodes.filter((c) => String(c).indexOf("lock-starved") !== 0);
+      assert(realErrors.length === 0, `errors a=${ra.other} b=${rb.other} codes ${JSON.stringify(realErrors)}`);
+      if (starved.length > 0) {
+        inconclusive = `${starved.length} worker(s) exhausted the ${LOCK_RETRY_BUDGET_MS}ms lock-retry budget ` +
+          `under contention (ok a=${ra.ok}/${n} b=${rb.ok}/${n}, busy a=${ra.busy} b=${rb.busy}). The harness ` +
+          "stopped retrying; nothing was observed about whether the store serialises correctly";
+        return;
+      }
       assert(ra.ok === n && rb.ok === n, `incomplete ok a=${ra.ok} b=${rb.ok} busy a=${ra.busy} b=${rb.busy}`);
 
       const raw = readRaw(root, "run-registry.jsonl");
@@ -886,7 +922,8 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }
       assert(deregCount === n * 2, `deregistered ${deregCount} want ${n * 2}`);
       assertMonotonic(journalRevs(root));
     });
-    report(name, "PASS");
+    if (inconclusive) report(name, "FAIL", "INCONCLUSIVE (harness): " + inconclusive);
+    else report(name, "PASS");
   } catch (e) {
     report(name, "FAIL", e.message);
   } finally {

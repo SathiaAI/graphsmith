@@ -90,6 +90,11 @@ const TARGETS = [
   "tests/heal/deepseek/run-tests.js",
   "tests/evalenv/gpt-sol-pro/run-tests.js",
   "tests/scenario/run-tests.js",
+  // Added after a windows-latest/node-22 CI failure: its 10s lock-retry budget was a
+  // bare Date.now()+10000, invisible to this sweep. Now routed through
+  // harnessDeadline(); the store's own leaseMs/heartbeatMs are product budgets and
+  // remain unscaled.
+  "tests/state-store/grok/run-tests.js",
 ];
 
 let pass = 0;
