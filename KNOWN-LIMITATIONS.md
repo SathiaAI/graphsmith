@@ -42,7 +42,16 @@ GSA attests **only what is actually enforced**, per resource class. As of the ca
 
 Three boundaries on that table, stated rather than buried:
 
-**The filesystem precondition is load-bearing.** The Permission Model resolves the path it is *given*. A symlink that **already exists** inside a granted tree and points outside it is followed, and the read succeeds — measured, including reading `/etc/passwd` through one. `capability-enforce.js` therefore **refuses** the filesystem class unless it is handed a symlink audit of the target tree showing zero escapes (evalenv `checkIsolation()`, contract 04 B14). The hole is bounded to links present when the process starts: a skill **cannot** create a symlink or hardlink out at runtime (both `ERR_ACCESS_DENIED`), so there is no TOCTOU window. Two controls compose here and **neither is sufficient alone** — applying `--permission` to an unaudited tree produces a *false* enforcement claim, which is worse than no claim.
+**The filesystem precondition is load-bearing, and it has a residual TOCTOU window.** The Permission Model resolves the path it is *given*, so a link that **already exists** inside the granted tree defeats it two ways — both measured:
+
+| link | effect |
+|---|---|
+| **symlink** pointing outside | followed; read `/etc/passwd` through one |
+| **hardlink** to a file outside | a second *name* for the same inode, so it resolves *inside* and passes any symlink walk — but a **write** through it modifies the file outside the grant |
+
+`capability-enforce.js` therefore **audits the target tree itself, at enforcement time**, for both shapes, and refuses the filesystem class on either. It does **not** accept an audit from its caller: an earlier design did, and a clean report produced honestly at copy-creation time was reused after a link had been planted, granting enforcement over a tree that had since been tampered with. `spawnUnderGrant()` re-audits immediately before exec to narrow the gap further.
+
+**The window is narrowed, not closed.** A link planted between the audit and the child's `exec` is not caught, and no user-space audit can close that — it needs the kernel (a bind mount with `nosuid`/`nodev`, a mount namespace, or a filesystem the enforced process cannot reach under any other name). An earlier version of this page claimed "there is no TOCTOU window"; that was **false** at system level and true only for links minted *by the enforced child*, which the Permission Model does block (`symlinkSync`/`linkSync` outside the write grant are both `ERR_ACCESS_DENIED`).
 
 **Subprocess is enforceable only as deny-all.** `--allow-child-process` has no per-executable granularity — it is one boolean over every executable on the machine, and Node itself warns it "could invalidate the permission model". A grant of `subprocess.allowed: ["git"]` is therefore **refused**, not honoured by granting everything and reporting the class enforced. Expressing a real subprocess allowlist needs a broker process that owns the allowlist itself; that does not exist and is not claimed.
 

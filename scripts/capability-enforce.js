@@ -146,6 +146,85 @@ function canonicalAbsolute(p) {
   return p;
 }
 
+/* auditTree(root) — walk `root` and report the two escape shapes the Permission
+ * Model does not stop by itself.
+ *
+ * PHYSICAL, not lexical, and that distinction is the whole point of this function
+ * existing separately from evalenv.checkIsolation(). checkIsolation computes its
+ * own `audited_dir` with path.resolve() -- which collapses ".." lexically -- while
+ * walking the path with readdir, which the kernel resolves physically. Given a
+ * symlink component followed by "..", those two disagree: `<dir>/A/../real`
+ * lexically equals `<dir>/real`, but if `A` is a symlink the kernel reads a
+ * different directory entirely. An adversarial reviewer used exactly that to get a
+ * clean audit for a tree nobody walked.
+ *
+ * Here `root` is already fs.realpathSync()'d by the caller, and every descendant is
+ * re-resolved rather than rebuilt with path.join, so the thing audited and the thing
+ * named are the same thing by construction.
+ *
+ * What it looks for:
+ *   symlink escape  -- a link whose realpath leaves the tree. The Permission Model
+ *                      follows it; measured reading /etc/passwd through one.
+ *   hardlink        -- st_nlink > 1 on a regular file. A second NAME for the same
+ *                      inode, so realpath stays inside and the symlink walk sees
+ *                      nothing, but a WRITE through it lands outside. Fresh copies
+ *                      have nlink 1, so anything higher is an anomaly and fails
+ *                      closed; proving WHERE the other name is would mean scanning
+ *                      the filesystem for the inode.
+ * An unreadable directory or unstattable file is an ERROR, not a clean result. */
+function auditTree(root) {
+  const symlink_escapes = [];
+  const hardlink_suspects = [];
+  let error = null;
+
+  const inside = (p) => {
+    const r = path.resolve(root);
+    const q = path.resolve(p);
+    return q === r || q.startsWith(r.endsWith(path.sep) ? r : r + path.sep);
+  };
+
+  (function walk(dir, depth) {
+    if (error) return;
+    if (depth > 64) { error = "directory nesting deeper than 64 levels at " + dir; return; }
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      error = "cannot read " + dir + ": " + String((e && e.code) || e);
+      return;
+    }
+    for (const entry of entries) {
+      if (error) return;
+      const p = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) {
+        let real = null;
+        try { real = fs.realpathSync(p); } catch (e) { continue; } // dangling: inert
+        if (!inside(real)) symlink_escapes.push({ path: p, target: real });
+        continue;
+      }
+      let st;
+      try { st = fs.lstatSync(p); } catch (e) {
+        hardlink_suspects.push({ path: p, nlink: null, error: String((e && e.code) || e) });
+        continue;
+      }
+      if (st.isDirectory()) {
+        /* Descend into the REAL directory. Re-resolving here is what stops a
+         * symlinked component from being collapsed away by path.join on the way
+         * down -- the mixture-of-two-trees walk the reviewer exploited. */
+        let realDir = null;
+        try { realDir = fs.realpathSync(p); } catch (e) { realDir = null; }
+        if (realDir && inside(realDir)) walk(realDir, depth + 1);
+        continue;
+      }
+      if (st.isFile() && st.nlink > 1) {
+        hardlink_suspects.push({ path: p, nlink: st.nlink });
+      }
+    }
+  })(root, 0);
+
+  return { root, symlink_escapes, hardlink_suspects, error };
+}
+
 /* Is `p` the target dir, or strictly under it? Segment-boundary containment, so
  * a grant of "/copy" never admits "/copy-evil". */
 function isInside(root, p) {
@@ -170,6 +249,7 @@ function isInside(root, p) {
  * ------------------------------------------------------------------------- */
 function plan(ctx) {
   const refusals = [];
+  let auditPerformed = null;
   const enforced = [];
   const argv = [];
   const notes = [];
@@ -234,55 +314,50 @@ function plan(ctx) {
         " -- the Permission Model cannot be applied, so no filesystem boundary is enforced");
     }
 
-    /* The symlink precondition. Refuse on absent evidence as firmly as on bad
-     * evidence: "nobody checked" and "the check failed" are the same amount of
-     * knowledge about whether a symlink escapes, and both are less than enough. */
-    const iso = ctx.isolation;
-    if (!iso || typeof iso !== "object" || !Array.isArray(iso.symlink_escapes)) {
-      return refuse(CLS, "no symlink audit supplied for targetDir. A symlink that ALREADY EXISTS inside a " +
-        "granted tree and points outside it is followed by the Permission Model and the read succeeds " +
-        "(measured), so --allow-fs-read alone is not a filesystem boundary. Pass evalenv checkIsolation() " +
-        "evidence (contract 04 B14) for this directory");
+    /* THE AUDIT IS PERFORMED HERE, NOW, BY THIS MODULE. It is not supplied.
+     *
+     * The previous design took a caller-provided `isolation` object. Two adversarial
+     * reviews broke it, and the second one broke it through the product's own entry
+     * points with completely honest, unedited evidence:
+     *
+     *     evalenv.create()        -> hardlink_suspects: []  isolated: true   (true!)
+     *     attacker plants a hardlink AFTER the audit
+     *     plan(..., isolation)    -> enforced: [filesystem, subprocess]  refusals: 0
+     *     child writes through it -> a file OUTSIDE the copy reads "PWNED"
+     *
+     * checkIsolation ran once, at create time, on a tree that is clean BY
+     * CONSTRUCTION (copyFileSync always yields nlink 1; symlinks are skipped). So
+     * the evidence was accurate when produced and worthless when used, and nothing
+     * re-checked. The evidence was also forgeable by spelling: a caller could audit
+     * `<dir>/A/../real`, which resolves lexically to targetDir but reads a different
+     * tree physically, and get a clean report for a directory nobody walked.
+     *
+     * Both die the same way: the module that grants enforcement now does its own
+     * looking, against its own resolved path, at the moment of the decision. There
+     * is no evidence parameter left to be stale, forged, or about somewhere else.
+     *
+     * RESIDUAL WINDOW, stated rather than papered over: a hardlink planted between
+     * this audit and the child's exec is still not caught. That window is
+     * microseconds instead of the lifetime of the copy, and spawnUnderGrant() below
+     * closes it further by re-auditing immediately before spawning. It is not zero.
+     * Anything claiming otherwise would be the same false confidence again. */
+    const audit = auditTree(realTarget);
+    if (audit.error) {
+      return refuse(CLS, "could not audit targetDir at enforcement time (" + audit.error + "). An audit that " +
+        "did not complete is not a clean audit");
     }
-
-    /* The evidence must describe THIS directory. The caller supplying it is the
-     * party being checked, so without this an audit of directory A -- clean, real,
-     * honestly produced -- authorises enforcement of directory B, which nobody
-     * looked at. A precondition that does not name its subject is not a
-     * precondition. Older evidence without `audited_dir` is refused rather than
-     * assumed to match: absent provenance is not matching provenance. */
-    if (typeof iso.audited_dir !== "string" || iso.audited_dir.length === 0) {
-      return refuse(CLS, "isolation evidence carries no `audited_dir`, so there is nothing to prove it " +
-        "describes this targetDir rather than some other directory. Re-run evalenv checkIsolation() " +
-        "against " + targetDir);
+    if (audit.symlink_escapes.length > 0) {
+      return refuse(CLS, audit.symlink_escapes.length + " symlink(s) inside targetDir resolve OUTSIDE it, and " +
+        "the Permission Model follows them. Enforcing would attest a boundary the tree already defeats. " +
+        "First: " + JSON.stringify(audit.symlink_escapes[0]).slice(0, 200));
     }
-    if (path.resolve(iso.audited_dir) !== path.resolve(targetDir)) {
-      return refuse(CLS, "isolation evidence describes " + iso.audited_dir + ", not targetDir " + targetDir +
-        ". An audit of one directory cannot authorise enforcement of another");
+    if (audit.hardlink_suspects.length > 0) {
+      return refuse(CLS, audit.hardlink_suspects.length + " file(s) inside targetDir have st_nlink > 1 (or " +
+        "could not be stat'd). Each is a second name for an inode this copy does not exclusively own, and a " +
+        "WRITE through one lands outside the grant (measured). First: " +
+        JSON.stringify(audit.hardlink_suspects[0]).slice(0, 200));
     }
-
-    if (iso.symlink_escapes.length > 0) {
-      return refuse(CLS, iso.symlink_escapes.length + " symlink(s) inside targetDir resolve OUTSIDE it, and the " +
-        "Permission Model follows them. Enforcing here would attest a boundary the tree already defeats. First: " +
-        JSON.stringify(iso.symlink_escapes[0]).slice(0, 200));
-    }
-
-    /* Hardlinks. A second NAME for the same inode resolves inside the copy, so the
-     * symlink walk sees nothing -- but a WRITE through it lands outside. Measured:
-     * a grant scoped entirely to the copy overwrote a file outside it while the
-     * isolation report said clean. Required, and absent evidence is refused: an
-     * audit that did not look for hardlinks cannot certify their absence. */
-    if (!Array.isArray(iso.hardlink_suspects)) {
-      return refuse(CLS, "isolation evidence has no `hardlink_suspects` array, so the tree was audited for " +
-        "symlinks only. A pre-existing HARDLINK is a second name for the same inode: it resolves inside the " +
-        "copy, passes the symlink walk, and a write through it modifies a file OUTSIDE the grant (measured). " +
-        "Re-run evalenv checkIsolation() from a build that performs the hardlink audit");
-    }
-    if (iso.hardlink_suspects.length > 0) {
-      return refuse(CLS, iso.hardlink_suspects.length + " file(s) inside targetDir have st_nlink > 1 (or could " +
-        "not be stat'd). Each is a second name for an inode this copy does not exclusively own, and a write " +
-        "through one leaves the grant. First: " + JSON.stringify(iso.hardlink_suspects[0]).slice(0, 200));
-    }
+    auditPerformed = audit;
 
     const fsGrant = grants[CLS];
     if (!fsGrant || typeof fsGrant !== "object") {
@@ -330,8 +405,9 @@ function plan(ctx) {
     for (const p of writes) argv.push("--allow-fs-write=" + p);
     enforced.push(CLS);
     notes.push("filesystem: " + reads.length + " read path(s), " + writes.length + " write path(s), " +
-      "all within targetDir, tree verified symlink-clean (" + (iso.symlinks_skipped_at_copy || 0) +
-      " symlink(s) skipped at copy, 0 escaping)");
+      "all within targetDir, and the tree was audited BY THIS CALL at " + audit.root +
+      " — 0 escaping symlinks, 0 hardlink suspects. Residual window: a link planted between this audit " +
+      "and exec is not caught; spawnUnderGrant() re-audits immediately before spawning to narrow it");
   })();
 
   /* ---- subprocess ------------------------------------------------------- */
@@ -385,10 +461,10 @@ function plan(ctx) {
       "other's attestation standing");
   }
 
-  return result(argv, enforced, refusals, notes);
+  return result(argv, enforced, refusals, notes, auditPerformed);
 }
 
-function result(argv, enforced, refusals, notes) {
+function result(argv, enforced, refusals, notes, audit) {
   return {
     schema_version: SCHEMA_VERSION,
     /* argv to prepend to the child's node invocation. Empty => nothing is
@@ -401,6 +477,9 @@ function result(argv, enforced, refusals, notes) {
      * "not enforced" can say which boundary and why, instead of a bare false. */
     refusals,
     notes,
+    /* The audit THIS call performed, or null if the filesystem class never got
+     * that far. Evidence of what was checked and when -- not an input. */
+    audit: audit || null,
     /* Convenience: did anything at all get enforced? */
     any: enforced.length > 0,
   };
@@ -420,11 +499,58 @@ function planChecked(ctx) {
   return r;
 }
 
+/* spawnUnderGrant(ctx, script, args, spawnOptions) — the recommended entry point.
+ *
+ * plan() audits, but between plan() returning and a caller spawning, arbitrary time
+ * can pass; a caller that plans once and spawns repeatedly reintroduces exactly the
+ * staleness that made the previous design exploitable. This wrapper re-audits
+ * immediately before exec and refuses if anything changed, so the window is the gap
+ * between the audit and the spawn syscall rather than however long the caller held
+ * the argv.
+ *
+ * It is NOT a claim that the window is closed. A hardlink planted in that gap is
+ * still not caught, and no user-space audit can close it -- doing that needs the
+ * kernel (a bind mount with nosuid/nodev, a mount namespace, or a filesystem the
+ * enforced process cannot reach by any other name). Said plainly here because the
+ * previous version of this file claimed "there is no TOCTOU window", which was
+ * false at system level and true only for links minted by the enforced child.
+ *
+ * Returns { ok:false, refusals, plan } if enforcement is not available, so a caller
+ * cannot accidentally run unconfined by ignoring a field. */
+function spawnUnderGrant(ctx, script, args, spawnOptions) {
+  const { spawnSync } = require("child_process");
+  const first = planChecked(ctx);
+  if (first.enforced.indexOf("filesystem") === -1) {
+    return { ok: false, refusals: first.refusals, plan: first, result: null };
+  }
+  /* Re-audit. Cheap next to spawning a process, and it is the difference between
+   * "clean when the caller asked" and "clean when the code actually ran". */
+  const second = planChecked(ctx);
+  if (second.enforced.indexOf("filesystem") === -1) {
+    return {
+      ok: false,
+      refusals: second.refusals.concat([{
+        class: "filesystem",
+        reason: "the tree passed the audit at plan() time and FAILED a re-audit immediately before spawn -- " +
+          "it changed in between. Refusing to run: this is the staleness that made caller-supplied evidence " +
+          "exploitable",
+      }]),
+      plan: second,
+      result: null,
+    };
+  }
+  const res = spawnSync(process.execPath, second.argv.concat([script], args || []),
+    Object.assign({ encoding: "utf8" }, spawnOptions || {}));
+  return { ok: true, refusals: [], plan: second, result: res };
+}
+
 module.exports = {
   SCHEMA_VERSION,
   ENFORCEABLE_CLASSES,
   REQUIRED_FLAGS,
   plan: planChecked,
+  spawnUnderGrant,
+  auditTree,
   detectFlags,
   canonicalAbsolute,
   isInside,

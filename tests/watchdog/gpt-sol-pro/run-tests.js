@@ -7,6 +7,11 @@ const path = require("path");
 const { spawn, execFileSync } = require("child_process");
 const { harnessDeadline } = require("../../_harness/deadline.js");
 
+/* The harness's own patience for the watchdog to exit. Named because the
+ * blocked-event-loop case compares it to the product BUDGET to decide whether any
+ * outcome was observable at all. */
+const WATCHDOG_WAIT_MS = 5000;
+
 const ROOT = path.resolve(__dirname, "../../..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
 const STATE_STORE = path.join(ROOT, "scripts", "state-store.js");
@@ -185,7 +190,7 @@ async function realBlockedKill(dir, options = {}) {
     await waitFor(() => fs.existsSync(readyFile), TARGET_READY_MS, "blocked target readiness");
     const started = Date.now();
     watchdog = spawnWatchdog(target.pid, heartbeatFile, capabilityFile, haltFile, options.budget || BUDGET);
-    const wdExit = await waitClose(watchdog, 5000);
+    const wdExit = await waitClose(watchdog, WATCHDOG_WAIT_MS);
     const elapsedWall = Date.now() - started;
     await waitClose(target, 2000);
     return {
@@ -249,11 +254,38 @@ async function testBlockedAndIndependent(tmp) {
    * If it waited past the budget and the watchdog still did nothing, that is the
    * product failing and it fails confidently. Measured: starved-healthy is
    * 6-108ms << 240; the dead watchdog is 5014ms >> 240. */
-  else if (run.elapsedWall < BUDGET) record("FAIL", "blocked-event-loop-independent-kill",
-    "INCONCLUSIVE (harness): the harness gave up after " + run.elapsedWall + "ms, before the watchdog's own " +
-    BUDGET + "ms budget could elapse, so the kill could not have happened yet and nothing was observed " +
-    `(timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} evidence=${ev ? "present" : "none"}). ` +
-    "Re-run without a scaled harness deadline for a real verdict");
+  /* The discriminator is the harness's own DEADLINE against the product's BUDGET,
+   * not elapsed time and not the absence of evidence. Both earlier attempts were
+   * wrong, in opposite directions, and each was caught by an adversarial review:
+   *
+   *   `timedOut && !ev`      A watchdog that HANGS -- never arms, never writes --
+   *                          produced timedOut=true, ev=null, and was labelled
+   *                          "not a watchdog defect" at wall=5014ms against a 240ms
+   *                          budget. It also raced the watchdog's own startup DMS
+   *                          write, so at scales >= 0.005 a HEALTHY watchdog gave a
+   *                          CONFIDENT failure from a ~52ms window.
+   *
+   *   `elapsedWall < BUDGET` Fixed the hang case and broke the other one: a guard
+   *                          that DIES FAST (throw, bad argv, missing module,
+   *                          immediate exit) returns in ~44ms with the target
+   *                          alive, and got labelled inconclusive -- while the
+   *                          version before it had that case right. Fast death is
+   *                          the more common guard failure.
+   *
+   * Elapsed time cannot separate them because starved-healthy and dead-fast both
+   * return quickly. The DEADLINE can: if the harness's own patience is shorter than
+   * the budget the product is allowed to consume, no outcome here is observable BY
+   * CONSTRUCTION, whatever happens. If the harness was willing to wait longer than
+   * the budget and the watchdog still did not act, that is the product failing --
+   * whether it hung or died at 44ms -- and it fails confidently.
+   *
+   * tests/_harness/deadline.js has exported isStarved() all along and nothing called
+   * it. This is the same idea, expressed against the number that actually matters. */
+  else if (harnessDeadline(WATCHDOG_WAIT_MS) < BUDGET) record("FAIL", "blocked-event-loop-independent-kill",
+    "INCONCLUSIVE (harness): the harness deadline is " + harnessDeadline(WATCHDOG_WAIT_MS) + "ms, shorter than " +
+    "the watchdog's own " + BUDGET + "ms budget, so no outcome was observable here whatever the watchdog did " +
+    `(wall=${run.elapsedWall}ms timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} ` +
+    `evidence=${ev ? "present" : "none"}). Re-run without a scaled harness deadline for a real verdict`);
   else record("FAIL", "blocked-event-loop-independent-kill",
     `exit=${run.wdExit.code} timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} evidence=${JSON.stringify(ev)} wall=${run.elapsedWall}ms`);
 }

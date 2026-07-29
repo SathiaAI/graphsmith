@@ -450,7 +450,29 @@ function testDecisionDeterminism() {
     isolation: (function stripProvenance(iso) {
       if (!iso || typeof iso !== "object") return iso;
       const out = {};
-      for (const k of Object.keys(iso)) { if (k !== "audited_dir") out[k] = iso[k]; }
+      for (const k of Object.keys(iso)) {
+        if (k === "audited_dir") continue;
+        /* symlink_escapes and hardlink_suspects carry per-run identity too --
+         * absolute mkdtemp paths and INODE NUMBERS. Excluding only audited_dir
+         * left a commit message promising these "must still match exactly" when
+         * they cannot; they compared equal solely because both arrays are always
+         * EMPTY here (copyFileSync yields nlink 1, symlinks are skipped at copy),
+         * which is a check with no teeth dressed as one with teeth.
+         *
+         * Normalising to the DECISION content -- how many, and of what kind --
+         * keeps the real property (a copy that acquires an escape differs from one
+         * that does not) without pretending a fresh inode number is a security
+         * decision. */
+        if (k === "symlink_escapes" || k === "hardlink_suspects") {
+          out[k] = Array.isArray(iso[k])
+            ? iso[k].map((e) => (e && typeof e === "object"
+              ? { kind: k, has_target: e.target !== undefined, nlink: e.nlink === undefined ? null : e.nlink }
+              : String(e)))
+            : iso[k];
+          continue;
+        }
+        out[k] = iso[k];
+      }
       return out;
     })(manifest.isolation),
     env: Object.fromEntries(Object.entries(handle.env).filter(([key]) => key !== "NODE_OPTIONS")),

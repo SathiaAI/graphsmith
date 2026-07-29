@@ -648,7 +648,16 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
  * Running that code as root is the larger risk of the two. */
 function containerUser(copyDir) {
   const hasUid = typeof process.getuid === "function";
-  if (!hasUid) return null; // Windows: no POSIX uid to map; --user is not applicable
+  if (!hasUid) {
+    /* No POSIX uid to map (Windows host). This previously returned null and the
+     * caller then emitted argv with NO --user at all -- i.e. the container ran as
+     * ROOT, the most permissive possible outcome, from a branch whose comment said
+     * "--user is not applicable". It is applicable: a LINUX container on Docker
+     * Desktop takes --user 65534 perfectly well. Drop to nobody. If that makes the
+     * mount unreadable on some host, the suite's mount-readability case fails --
+     * which is the correct way to find out, rather than silently running as root. */
+    return { spec: "65534:65534", relaxed: false, note: "no host uid (non-POSIX); using nobody" };
+  }
   const uid = process.getuid();
   const gid = typeof process.getgid === "function" ? process.getgid() : uid;
   if (uid !== 0) return { spec: uid + ":" + gid, relaxed: false };
@@ -674,9 +683,23 @@ const CONTAINMENT_ARGV_BASE = [
   "--cpus=1",
 ];
 
+/* FAIL-CLOSED. This used to return the base list -- with NO --user -- whenever
+ * containerUser() could not produce a spec, which meant the container ran as ROOT
+ * on exactly the paths where something had gone wrong. containerUser's own comment
+ * said it "Refuse[s]" and "Report[s] it"; the caller threw the error away and
+ * emitted permissive argv. The most permissive outcome must never be the error
+ * path. */
 function containmentArgv(copyDir) {
   const u = containerUser(copyDir);
-  if (!u || !u.spec) return CONTAINMENT_ARGV_BASE.slice();
+  if (!u || !u.spec) {
+    throw fail(
+      "REFUSED: cannot determine a non-root user for the container profile" +
+        (u && u.error ? " (" + u.error + ")" : "") +
+        ". Running untrusted code as root in the container -- root there is root on the host under any " +
+        "escape -- is not an acceptable fallback, so this refuses rather than dropping --user.",
+      "CONTAINMENT_USER_UNAVAILABLE"
+    );
+  }
   return ["--user", u.spec].concat(CONTAINMENT_ARGV_BASE);
 }
 

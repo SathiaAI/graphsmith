@@ -165,107 +165,108 @@ const J = JSON.stringify;
  * 1. Refusals -- pure decision logic, runs on every platform.
  * ========================================================================== */
 
-(function case1_noIsolationEvidence() {
-  const name = "1. filesystem refused without a symlink audit";
-  const r = enforce.plan({
-    grant: grantOf({ filesystem: { read: [path.join(COPY, "inputs")] } }),
-    targetDir: COPY,
-    // isolation deliberately omitted
-  });
-  const ref = r.refusals.find((x) => x.class === "filesystem");
+/* Cases 1, 2 and 2b replace an earlier set that took caller-supplied isolation
+ * evidence. That parameter is gone: plan() audits targetDir itself, now. These
+ * cases therefore stage REAL trees and let the module look. */
 
-  /* The REASON is only assertable where the Permission Model exists. On a runtime
-   * without it, capability-enforce refuses on the missing flags first and never
-   * reaches the symlink check -- correctly, since there is no enforcement to
-   * qualify. Demanding the symlink wording there asserted a code path that cannot
-   * run, and failed every Node 18 leg of CI while passing locally on Node 22.
-   *
-   * The invariant that holds on EVERY runtime is the one that matters: absent
-   * isolation evidence, the class is not enforced. Assert that unconditionally,
-   * and qualify the reason only where it is reachable. */
-  if (!HAVE_PERMISSION) {
-    assert(name + " (no Permission Model on " + process.version + ")",
-      r.enforced.indexOf("filesystem") === -1,
-      "refused — on this runtime for the earlier reason (no --permission), which is why the " +
-      "symlink wording is not asserted here: " + (ref ? ref.reason.slice(0, 90) : "no refusal recorded"));
-    return;
+(function case1_symlinkEscape() {
+  const name = "1. filesystem refused when the tree contains an escaping symlink";
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gs-sym-")));
+  const copy = path.join(root, "copy");
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(path.join(copy, "inputs"), { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  fs.writeFileSync(path.join(outside, "secret.txt"), "SECRET\n");
+  let linked = false;
+  try { fs.symlinkSync(outside, path.join(copy, "inputs", "escape")); linked = true; } catch (e) { /* win */ }
+  if (!linked) {
+    skip(name, "this filesystem does not permit creating symlinks, so the escape could not be staged. " +
+      "THIS RUN PROVIDES NO EVIDENCE about the symlink precondition.");
+  } else {
+    const r = enforce.plan({ grant: grantOf({ filesystem: { read: [path.join(copy, "inputs")] } }), targetDir: copy });
+    assert(name, r.enforced.indexOf("filesystem") === -1,
+      r.enforced.indexOf("filesystem") === -1
+        ? "refused -- the Permission Model follows a pre-existing symlink out of the grant"
+        : "ENFORCED despite a symlink that leaves the tree");
   }
-  assert(name,
-    r.enforced.indexOf("filesystem") === -1 && !!ref && /symlink audit/i.test(ref.reason),
-    ref ? "refused: " + ref.reason.slice(0, 110) : "NOT refused -- enforced=" + J(r.enforced));
+  fs.rmSync(root, { recursive: true, force: true });
 })();
 
-(function case2_symlinkEscapePresent() {
-  const name = "2. filesystem refused when the tree has an escaping symlink";
-  const r = enforce.plan({
-    grant: grantOf({ filesystem: { read: [path.join(COPY, "inputs")] } }),
-    targetDir: COPY,
-    isolation: { symlink_escapes: [{ path: COPY + "/link", target: OUTSIDE }], symlinks_skipped_at_copy: 0 },
-  });
-  assert(name, r.enforced.indexOf("filesystem") === -1,
-    r.enforced.indexOf("filesystem") === -1
-      ? "refused, as it must -- the Permission Model follows a pre-existing symlink out of the grant"
-      : "ENFORCED despite a known escape: this would attest a boundary the tree defeats");
-})();
-
-/* 2b/2c added after an adversarial review found both holes in the shipped version.
- * Both use the REAL auditor on REAL trees -- a hand-built isolation literal would
- * pin only what I imagined the contract to be. */
-
-(function case2b_hardlinkEscape() {
-  const name = "2b. filesystem refused when a pre-existing HARDLINK is in the tree";
-  const hlRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gs-hl-")));
-  const copy = path.join(hlRoot, "copy");
-  const outside = path.join(hlRoot, "outside");
+(function case2_theRealAttackSequence() {
+  /* THE case the previous design failed. Not a staged tree audited after planting --
+   * the ACTUAL order of events an attacker gets:
+   *
+   *   1. the copy is created clean, and enforcement is legitimately granted
+   *   2. a hardlink is planted AFTERWARDS
+   *   3. enforcement is requested again
+   *
+   * Under caller-supplied evidence, step 3 reused step 1's honest report and
+   * enforced, and a write through the link overwrote a file outside the copy.
+   * The old case 2b passed only because it planted the link BEFORE auditing, which
+   * is an order the real code path cannot produce. */
+  const name = "2. hardlink planted AFTER a clean grant is caught on the next plan()";
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gs-seq-")));
+  const copy = path.join(root, "copy");
+  const outside = path.join(root, "outside");
   fs.mkdirSync(path.join(copy, "inputs"), { recursive: true });
   fs.mkdirSync(outside, { recursive: true });
   fs.writeFileSync(path.join(outside, "secret.txt"), "SECRET-OUTSIDE\n");
+  const grant = grantOf({
+    filesystem: { read: [path.join(copy, "inputs")], write: [path.join(copy, "inputs")] },
+    subprocess: { allowed: [] },
+  });
+
+  const before = enforce.plan({ grant, targetDir: copy });
   let linked = false;
   try { fs.linkSync(path.join(outside, "secret.txt"), path.join(copy, "inputs", "innocent.txt")); linked = true; }
   catch (e) { /* filesystem may forbid hardlinks */ }
 
   if (!linked) {
-    skip(name, "this filesystem does not permit creating hardlinks, so the escape could not be staged. " +
-      "THIS RUN PROVIDES NO EVIDENCE that the hardlink precondition holds.");
+    skip(name, "this filesystem does not permit creating hardlinks, so the attack could not be staged. " +
+      "THIS RUN PROVIDES NO EVIDENCE that the post-grant plant is caught.");
+  } else if (!HAVE_PERMISSION) {
+    /* Without a Permission Model nothing is enforced anywhere, so "refused after"
+     * is true for a reason unrelated to the hardlink. Assert only the part that is
+     * actually about this attack: the audit SAW it. */
+    const audit = enforce.auditTree(copy);
+    assert(name + " (audit only; no Permission Model on " + process.version + ")",
+      audit.hardlink_suspects.length > 0,
+      audit.hardlink_suspects.length > 0
+        ? "the enforcement-time audit detects the planted link"
+        : "the audit MISSED a planted hardlink");
   } else {
-    const iso = evalenv.checkIsolation(copy, {}, []);
-    const r = enforce.plan({
-      grant: grantOf({ filesystem: { read: [path.join(copy, "inputs")], write: [path.join(copy, "inputs")] } }),
-      targetDir: copy,
-      isolation: iso,
-    });
-    /* Why this matters more than the symlink case: a hardlink resolves INSIDE the
-     * copy, so realpath sees nothing wrong -- and a WRITE through it modifies the
-     * file outside. Measured before the fix: a grant scoped entirely to the copy
-     * overwrote outside/secret.txt while checkIsolation reported isolated:true. */
+    const after = enforce.plan({ grant, targetDir: copy });
     assert(name,
-      iso.hardlink_suspects.length > 0 && r.enforced.indexOf("filesystem") === -1,
-      iso.hardlink_suspects.length === 0
-        ? "checkIsolation MISSED the hardlink (symlink-only audit) — a write through it leaves the grant"
-        : (r.enforced.indexOf("filesystem") === -1
-          ? "audit found it (nlink>1) and enforcement refused"
-          : "audit found it but capability-enforce ENFORCED anyway"));
+      before.enforced.indexOf("filesystem") !== -1 && after.enforced.indexOf("filesystem") === -1,
+      before.enforced.indexOf("filesystem") === -1
+        ? "the CLEAN tree was refused, so this case proves nothing about the plant"
+        : (after.enforced.indexOf("filesystem") === -1
+          ? "granted on the clean tree, refused once the link existed -- the audit is at enforcement time"
+          : "STILL ENFORCED after the plant: a write through the link leaves the grant"));
+
+    /* And the end-to-end consequence, which is what actually matters. */
+    const s = enforce.spawnUnderGrant({ grant, targetDir: copy },
+      path.join(copy, "inputs", "in.js"), []);
+    assert("2b. spawnUnderGrant refuses to run against the tampered tree",
+      s.ok === false,
+      s.ok === false ? "refused before spawning" : "SPAWNED under a grant the tree defeats");
   }
-  fs.rmSync(hlRoot, { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true });
 })();
 
-(function case2c_evidenceForAnotherDirectory() {
-  const name = "2c. isolation evidence for a DIFFERENT directory is refused";
-  const other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gs-other-")));
-  fs.mkdirSync(path.join(other, "inputs"), { recursive: true });
-  const isoOther = evalenv.checkIsolation(other, {}, []);
+(function case2c_forgedSpelling() {
+  const name = "2c. a targetDir spelled through a symlink + '..' is refused";
+  /* The forged-provenance attack: <dir>/A/../real resolves LEXICALLY to <dir>/real
+   * but, when A is a symlink, reads a different tree PHYSICALLY. Under the old
+   * design that bought a clean audit for a directory nobody walked. */
   const r = enforce.plan({
     grant: grantOf({ filesystem: { read: [path.join(COPY, "inputs")] } }),
-    targetDir: COPY,
-    isolation: isoOther, // clean, real, honestly produced -- for the WRONG tree
+    targetDir: path.join(COPY, "A", "..", "copy"),
   });
-  /* The caller supplying the evidence is the party being checked. Without binding,
-   * a genuine clean audit of any directory authorises enforcement of any other. */
   assert(name, r.enforced.indexOf("filesystem") === -1,
     r.enforced.indexOf("filesystem") === -1
-      ? "refused — evidence must name the directory it describes"
-      : "ENFORCED on an audit of a different tree that nobody looked at");
-  fs.rmSync(other, { recursive: true, force: true });
+      ? "refused -- '..' never reaches the audit, so lexical and physical cannot diverge"
+      : "ENFORCED on a path whose lexical and physical resolution differ");
 })();
 
 (function case3_grantOutsideTarget() {
@@ -273,7 +274,6 @@ const J = JSON.stringify;
   const r = enforce.plan({
     grant: grantOf({ filesystem: { read: [OUTSIDE] } }),
     targetDir: COPY,
-    isolation: CLEAN_ISOLATION,
   });
   assert(name, r.enforced.indexOf("filesystem") === -1,
     r.enforced.indexOf("filesystem") === -1
@@ -286,7 +286,6 @@ const J = JSON.stringify;
   const r = enforce.plan({
     grant: grantOf({ subprocess: { allowed: ["git"] } }),
     targetDir: COPY,
-    isolation: CLEAN_ISOLATION,
   });
   const ref = r.refusals.find((x) => x.class === "subprocess");
   /* Same runtime split as case 1. Without --permission the class is refused for the
@@ -315,7 +314,6 @@ const J = JSON.stringify;
   const r = enforce.plan({
     grant: grantOf({ model: { allowed: ["claude-opus-5"] }, subprocess: { allowed: [] } }),
     targetDir: COPY,
-    isolation: CLEAN_ISOLATION,
   });
   assert(name, r.enforced.indexOf("model") === -1,
     r.enforced.indexOf("model") === -1
@@ -339,7 +337,6 @@ if (!HAVE_PERMISSION) {
       subprocess: { allowed: [] },
     }),
     targetDir: COPY,
-    isolation: CLEAN_ISOLATION,
   });
 
   if (r.enforced.indexOf("filesystem") === -1 || r.enforced.indexOf("subprocess") === -1) {
