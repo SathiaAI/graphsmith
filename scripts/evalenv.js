@@ -575,8 +575,50 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
 // different posture should not be using runUntrustedCode().
 // ---------------------------------------------------------------------------
 
-const CONTAINMENT_ARGV = [
-  "--user", "65534:65534",
+/* --user is computed, not constant, and getting that wrong BROKE THE PROFILE.
+ *
+ * The first version of this hardcoded "--user 65534:65534". fs.mkdtempSync creates
+ * the copy at mode 0700 owned by the HOST uid (POSIX mandates 0700), so a container
+ * running as nobody could not even traverse its own workspace:
+ *
+ *     --user 65534  ->  ls: can't open '/workspace': Permission denied
+ *     no --user     ->  hello.txt
+ *
+ * Every container-required external tool (scripts/ext-tool-runner.js) would have
+ * seen an empty, unreadable workspace. I added containment and disabled the thing
+ * it was protecting -- and the suite reported 7/7 PASS, because it asserted on this
+ * exported constant instead of calling runUntrustedCode() with a real mount.
+ *
+ * The fix is to run as the HOST's own uid where that is a non-root user: it is
+ * still non-root (the property that matters -- root in the container is root on the
+ * host under any escape), and it can read a 0700 dir it owns.
+ *
+ * When the host IS root -- containerised CI, which is common -- there is no
+ * non-root uid that can read a root-owned 0700 directory, so containerUser() also
+ * relaxes the copy to 0755 and drops to nobody. That is a real trade and it is
+ * stated: the copy becomes readable by other local users. The standard profile
+ * already makes NO confidentiality claim (see `claims`), and the copy is a
+ * disposable clone of a repo that is about to be handed to untrusted code anyway.
+ * Running that code as root is the larger risk of the two. */
+function containerUser(copyDir) {
+  const hasUid = typeof process.getuid === "function";
+  if (!hasUid) return null; // Windows: no POSIX uid to map; --user is not applicable
+  const uid = process.getuid();
+  const gid = typeof process.getgid === "function" ? process.getgid() : uid;
+  if (uid !== 0) return { spec: uid + ":" + gid, relaxed: false };
+  try {
+    fs.chmodSync(copyDir, 0o755);
+    return { spec: "65534:65534", relaxed: true };
+  } catch (e) {
+    /* Could not make the copy readable, so nobody cannot read it. Refuse to drop
+     * privileges into a container that then cannot see its own workspace -- a
+     * broken run is not more secure than an honest one. Report it. */
+    return { spec: null, relaxed: false, error: String((e && e.message) || e) };
+  }
+}
+
+/* Everything except --user, which depends on the copy. */
+const CONTAINMENT_ARGV_BASE = [
   "--cap-drop=ALL",
   "--security-opt=no-new-privileges",
   "--read-only",
@@ -585,6 +627,12 @@ const CONTAINMENT_ARGV = [
   "--memory=512m",
   "--cpus=1",
 ];
+
+function containmentArgv(copyDir) {
+  const u = containerUser(copyDir);
+  if (!u || !u.spec) return CONTAINMENT_ARGV_BASE.slice();
+  return ["--user", u.spec].concat(CONTAINMENT_ARGV_BASE);
+}
 
 function detectContainerRuntime(envOverride) {
   const env = envOverride || process.env;
@@ -773,7 +821,7 @@ function createContainer(options) {
       "--network", "none", // network denial (contract 04 B10)
       "-v", `${base.dir}:/workspace:ro`, // read-only source mount (contract 04 B10)
       "-w", "/workspace",
-    ].concat(CONTAINMENT_ARGV, [runOpts.image], Array.isArray(cmd) ? cmd : [String(cmd)]);
+    ].concat(containmentArgv(base.dir), [runOpts.image], Array.isArray(cmd) ? cmd : [String(cmd)]);
     return spawnSync(detection.runtime, argv, Object.assign({ env: base.env, stdio: "pipe", timeout: runOpts.timeoutMs || 60000 }, runOpts.spawnOptions || {}));
   }
 
@@ -785,7 +833,7 @@ function createContainer(options) {
       isolation_level: `container (${detection.runtime}): network denied (--network none), read-only source mount, non-root (uid 65534), all Linux capabilities dropped, no-new-privileges, read-only rootfs with a noexec/nosuid tmpfs, and pid/memory/cpu caps, plus everything the standard profile provides`,
       confidentiality: "partial",
       network_containment: true,
-      containment_argv: CONTAINMENT_ARGV.slice(),
+      containment_argv: containmentArgv(base.dir),
       note: "container profile: every control listed above is enforced by the container runtime at run time (runUntrustedCode), not merely declared. 'partial' confidentiality is unchanged and deliberate -- this is a process/kernel boundary, not a proof of confidentiality, and a container escape remains a container escape.",
     },
     runUntrustedCode,
@@ -828,8 +876,10 @@ module.exports = {
   detectPermissionModel,
   checkIsolation,
   // Exported so a test can assert the containment flags are actually passed to
-  // the runtime, rather than trusting a comment that says they are.
-  CONTAINMENT_ARGV,
+  // the runtime. containmentArgv(copyDir) is the real one -- it computes --user from
+  // the copy's ownership; the BASE list alone is NOT what runs.
+  CONTAINMENT_ARGV_BASE,
+  containmentArgv,
 };
 
 // ---------------------------------------------------------------------------

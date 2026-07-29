@@ -1,32 +1,57 @@
 /* tests/capability-enforce/container/run-tests.js — does the container profile
- * actually contain?
+ * actually contain, AND does it still work?
  *
- * contract 04 B10 requires the container profile for any untrusted executable.
- * Until the commit that added this suite, that profile passed exactly two
- * containment flags: --network none and a read-only source mount. Both real,
- * both verified here. Everything around them was default, and the default is
- * root with 14 Linux capabilities and a writable root filesystem.
+ * REWRITTEN AFTER AN ADVERSARIAL REVIEW FOUND THIS SUITE GREEN ON A BROKEN PROFILE.
  *
- * That gap was invisible because nothing ever ran a container and looked. The
- * profile's own `claims` object described the isolation level in prose, and
- * prose is not evidence. So this suite does the one thing that settles it: it
- * runs a container under the profile's real argv and reads /proc/self/status
- * from inside.
+ * The first version asserted on evalenv's exported containment-flag CONSTANT and
+ * built its own `docker run` argv with NO MOUNT. It reported 7/7 PASS while the
+ * shipped profile was functionally dead: "--user 65534" against a copy that
+ * fs.mkdtempSync creates at mode 0700 owned by the host uid meant the container
+ * could not traverse its own workspace.
  *
- * WHEN THERE IS NO DAEMON
+ *     --user 65534  ->  ls: can't open '/workspace': Permission denied
+ *     no --user     ->  hello.txt
  *
- * A container runtime is not present on every CI leg (Windows runners, and any
- * sandbox without a daemon). This suite then SKIPS, and says in the skip line
- * that it provides no containment coverage on that leg -- it does not pass.
- * A containment check that reports green because it could not run is the exact
- * shape contract 10 List C rule 4 exists to prevent, and it would be a
- * particularly bad one here: "we could not test the containment" reading as
- * "the containment is fine" is how an unenforced boundary survives a review.
+ * Every container-required external tool (scripts/ext-tool-runner.js) would have
+ * seen an empty workspace. The suite could not see it because it never called
+ * runUntrustedCode() and never mounted anything. Testing the constant instead of
+ * the code path is how a test passes a product that does not work.
+ *
+ * So: this file now drives evalenv.create("container", ...) and runUntrustedCode()
+ * — the exact entry point callers use — and case 2 asserts the mount is READABLE
+ * before any containment claim is made. An envelope nothing can run in is not
+ * secure, it is broken, and the containment assertions below would be vacuous.
+ *
+ * WHAT DECIDES A SKIP (the other half of the review)
+ *
+ * Every skip here is decided by evidence INDEPENDENT of the code under test.
+ * The previous version asked evalenv.detectContainerRuntime() whether to test
+ * evalenv — so breaking the detector made the suite skip and pass, while the
+ * container profile became silently unavailable to every caller. Same shape as
+ * asking a lock whether it should be picked.
+ *
+ * Now the suite probes the runtime itself, and DISAGREEMENT IS A FAILURE: if a
+ * daemon answers but detectContainerRuntime() reports unavailable, that is a
+ * product defect and it fails, loudly. Only genuine platform facts skip:
+ *
+ *   no runtime answers this probe          -> SKIP (no daemon on this leg)
+ *   Windows-container daemon (win32 only)  -> SKIP (cannot express Linux flags)
+ *   image not present and not pullable     -> SKIP (supply, not product)
+ *
+ * The Windows skip is anchored to process.platform === "win32". It used to also
+ * match a bare /invalid option/, which a LINUX daemon emits for an unrelated bad
+ * argv — measured:
+ *     docker: Error response from daemon: create <id>: invalid option: "bogus"
+ * so a containment profile that a Linux daemon refused to start would have been
+ * reported as "Windows container mode" and passed. On Linux. Green.
  */
 
 "use strict";
 
 const { spawnSync } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const evalenv = require("../../../scripts/evalenv.js");
 
 let pass = 0;
@@ -41,152 +66,194 @@ function assert(n, c, d) { if (c) ok(n, d); else bad(n, d); }
 
 const IMAGE = process.env.GRAPHSMITH_CONTAINMENT_TEST_IMAGE || "alpine:3.20";
 
-/* ---- 1. Static: the flags are in the argv the profile will use ------------
- * Cheap, runs everywhere, and catches the regression where someone drops a
- * flag. It is NOT evidence that any flag is enforced -- cases 2+ are. Kept
- * separate and named so the distinction cannot be lost by reading the summary. */
-(function case1_argvComposition() {
-  const argv = evalenv.CONTAINMENT_ARGV;
-  const required = [
-    ["--user", (a) => a.indexOf("--user") !== -1 && /^\d+:\d+$/.test(a[a.indexOf("--user") + 1] || "") &&
-      a[a.indexOf("--user") + 1] !== "0:0"],
-    ["--cap-drop=ALL", (a) => a.indexOf("--cap-drop=ALL") !== -1],
-    ["--security-opt=no-new-privileges", (a) => a.indexOf("--security-opt=no-new-privileges") !== -1],
-    ["--read-only", (a) => a.indexOf("--read-only") !== -1],
-    ["--pids-limit", (a) => a.some((x) => String(x).indexOf("--pids-limit") === 0)],
-  ];
-  const missing = required.filter(([, ok_]) => !ok_(argv)).map(([n]) => n);
-  assert("1. containment flags present in the profile's argv (composition, NOT enforcement)",
-    missing.length === 0,
-    missing.length === 0 ? "all present: " + argv.join(" ") : "MISSING: " + missing.join(", "));
-})();
-
-/* ---- 2+. Behavioural: run a container and look ---------------------------- */
-
-const detection = evalenv.detectContainerRuntime();
-if (!detection || !detection.available) {
-  skip("2-7. container containment probes",
-    "no container runtime with a reachable daemon on this leg. THIS RUN PROVIDES NO EVIDENCE THAT ANY " +
-    "CONTAINER CONTAINMENT CONTROL IS ENFORCED -- only that the flags appear in the argv (case 1). " +
-    "Containment coverage requires a leg with a docker/podman daemon.");
-} else {
-  (function behavioural() {
-  const RUNTIME = detection.runtime;
-  const probe = [
-    'printf "uid=%s\\n" "$(id -u)"',
-    'printf "capeff=%s\\n" "$(awk \'/CapEff/{print $2}\' /proc/self/status)"',
-    'printf "nnp=%s\\n" "$(awk \'/NoNewPrivs/{print $2}\' /proc/self/status)"',
-    'if echo x > /rootfs-probe 2>/dev/null; then printf "rootfs=WRITABLE\\n"; else printf "rootfs=READONLY\\n"; fi',
-    'if echo x > /workspace/mount-probe 2>/dev/null; then printf "mount=WRITABLE\\n"; else printf "mount=READONLY\\n"; fi',
-    'if mknod /tmp/devprobe c 1 3 2>/dev/null; then printf "mknod=ALLOWED\\n"; else printf "mknod=DENIED\\n"; fi',
-    'if wget -q -T2 -O- http://1.1.1.1 >/dev/null 2>&1; then printf "net=ALLOWED\\n"; else printf "net=DENIED\\n"; fi',
-  ].join("; ");
-
-  /* Is the image actually usable before we judge anything by it?
-   *
-   * This suite used to go straight to `docker run`, and treat any bad reading as
-   * INCONCLUSIVE -- which gates. On a runner with a daemon but no way to obtain the
-   * image (an anonymous Docker Hub pull, which GitHub Actions IPs are aggressively
-   * rate-limited on, or an offline/air-gapped runner), that turned a supply problem
-   * into a red gate that no change to this repo could ever clear.
-   *
-   * "The image is not available here" is a platform fact and belongs with the
-   * no-daemon skip. "The container ran and told us something wrong" is a finding.
-   * "The container ran and told us nothing" is a harness malfunction. Only the last
-   * two should stop a merge, and they are handled separately below. */
-  const present = spawnSync(RUNTIME, ["image", "inspect", IMAGE],
-    { encoding: "utf8", timeout: 60000, windowsHide: true });
-  if (present.error || present.status !== 0) {
-    const pull = spawnSync(RUNTIME, ["pull", IMAGE],
-      { encoding: "utf8", timeout: 300000, windowsHide: true });
-    if (pull.error || pull.status !== 0) {
-      skip("2-7. container containment probes",
-        "a " + RUNTIME + " daemon is reachable but the image " + IMAGE + " is neither present locally nor " +
-        "pullable here (" + String((pull.stderr || "").trim().split("\n").pop() || "pull failed").slice(0, 140) +
-        "). THIS RUN PROVIDES NO EVIDENCE THAT ANY CONTAINER CONTAINMENT CONTROL IS ENFORCED. Pre-pull the " +
-        "image, or set GRAPHSMITH_CONTAINMENT_TEST_IMAGE to one available on this host, for real coverage.");
-      process.stdout.write("\nSUMMARY PASS=" + pass + " FAIL=" + fail + " SKIPPED=" + skipped + "\n");
-      process.exitCode = fail > 0 ? 1 : 0;
-      return;
-    }
-  }
-
-  const argv = ["run", "--rm", "--network", "none", "-w", "/workspace"]
-    .concat(evalenv.CONTAINMENT_ARGV, [IMAGE, "sh", "-c", probe]);
-  const res = spawnSync(RUNTIME, argv, { encoding: "utf8", timeout: 180000, windowsHide: true });
-
-  const facts = {};
-  for (const line of String((res && res.stdout) || "").split("\n")) {
-    const m = line.trim().match(/^([a-z]+)=(.+)$/);
-    if (m) facts[m[1]] = m[2];
-  }
-
-  const need = ["uid", "capeff", "nnp", "rootfs", "mknod", "net"];
-  const absent = need.filter((k) => !(k in facts));
-
-  /* Windows containers reject the containment flags outright. Measured on a
-   * windows-latest runner, which DOES have a docker daemon -- just one in Windows
-   * container mode:
-   *
-   *     status=125  docker: Error response from daemon: invalid option:
-   *                 read-only mode is not supported for Windows containers
-   *
-   * --read-only, --cap-drop and --user are Linux-container concepts. The daemon is
-   * reachable and the image resolves, so neither earlier skip fired, and the run
-   * died at argv-parse time with status 125 before any container existed. That was
-   * INCONCLUSIVE -> gates, which made every Windows leg permanently red for a
-   * platform property no change here could alter.
-   *
-   * This is the same distinction as the no-daemon and no-image skips: the
-   * containment model under test is a Linux-container one, and a Windows-container
-   * daemon cannot express it. Say so and provide no coverage, rather than gate. */
-  const stderrText = String((res && res.stderr) || "");
-  if (res.status === 125 && /not supported for Windows containers|invalid option/i.test(stderrText)) {
-    skip("2-7. container containment probes",
-      "the " + RUNTIME + " daemon here is in WINDOWS CONTAINER mode, which does not support the Linux " +
-      "containment flags this profile relies on (--read-only, --cap-drop, --user): " +
-      JSON.stringify(stderrText.trim().split("\n")[0].slice(0, 120)) + ". THIS RUN PROVIDES NO EVIDENCE THAT " +
-      "ANY CONTAINER CONTAINMENT CONTROL IS ENFORCED -- coverage requires a Linux-container daemon.");
-  } else if (res.error || absent.length) {
-    /* Genuinely could not observe on a daemon that SHOULD have worked: the daemon
-     * went away mid-run, or the probe died. Distinct from the three platform skips
-     * above, and still gates -- this one is a harness malfunction, not a property
-     * of the box. */
-    inconc("2-7. container containment probes",
-      "ran '" + RUNTIME + "' but did not get a full reading" +
-      (res.error ? " (" + String(res.error.message || res.error) + ")" : "") +
-      (absent.length ? "; no value for " + JSON.stringify(absent) : "") +
-      ". Image=" + IMAGE + ". status=" + String(res.status) +
-      " stderr=" + JSON.stringify(String(res.stderr || "").slice(0, 240)) +
-      ". No containment control was observed either way");
-  } else {
-    assert("2. runs as a non-root uid", facts.uid !== "0",
-      facts.uid !== "0" ? "uid=" + facts.uid + " (root in the container is root on the host under any escape)"
-        : "uid=0 -- untrusted code is running as root");
-
-    assert("3. all Linux capabilities dropped", /^0+$/.test(facts.capeff),
-      /^0+$/.test(facts.capeff) ? "CapEff=" + facts.capeff
-        : "CapEff=" + facts.capeff + " -- capabilities retained; the default set includes CAP_MKNOD, " +
-          "CAP_SETUID, CAP_DAC_OVERRIDE and CAP_NET_RAW");
-
-    assert("4. no_new_privs set", facts.nnp === "1",
-      facts.nnp === "1" ? "NoNewPrivs=1 -- a setuid binary in the image cannot escalate"
-        : "NoNewPrivs=" + facts.nnp + " -- --user alone does NOT close setuid escalation");
-
-    assert("5. root filesystem is read-only", facts.rootfs === "READONLY",
-      facts.rootfs === "READONLY" ? "rootfs read-only (scratch is a noexec/nosuid tmpfs at /tmp)"
-        : "rootfs WRITABLE -- untrusted code can stage binaries in the image");
-
-    assert("6. capability drop actually bites (mknod denied)", facts.mknod === "DENIED",
-      facts.mknod === "DENIED" ? "mknod DENIED -- this is the behavioural check on case 3, not a re-read of CapEff"
-        : "mknod ALLOWED -- device nodes creatable despite the capability claim");
-
-    assert("7. network egress denied", facts.net === "DENIED",
-      facts.net === "DENIED" ? "--network none holds (contract 04 B10)"
-        : "network reachable from inside a --network none container");
-  }
-  })();
+function done() {
+  process.stdout.write("\nSUMMARY PASS=" + pass + " FAIL=" + fail + " SKIPPED=" + skipped + "\n");
+  process.exitCode = fail > 0 ? 1 : 0;
 }
 
-process.stdout.write("\nSUMMARY PASS=" + pass + " FAIL=" + fail + " SKIPPED=" + skipped + "\n");
-process.exitCode = fail > 0 ? 1 : 0;
+/* ---- Independent runtime probe -------------------------------------------
+ * Deliberately NOT evalenv.detectContainerRuntime(). This asks the daemon a
+ * question of our own so the product's detector can be CHECKED against it rather
+ * than trusted. `version --format {{.Server.Version}}` fails when no daemon is
+ * listening and succeeds when one is, without reusing the detector's own probe. */
+function probeRuntime() {
+  for (const bin of ["docker", "podman"]) {
+    const r = spawnSync(bin, ["version", "--format", "{{.Server.Version}}"],
+      { encoding: "utf8", timeout: 30000, windowsHide: true });
+    if (!r.error && r.status === 0 && String(r.stdout || "").trim()) {
+      return { runtime: bin, version: String(r.stdout).trim() };
+    }
+  }
+  return null;
+}
+
+const probe = probeRuntime();
+const detected = evalenv.detectContainerRuntime();
+const detectorSaysAvailable = !!(detected && detected.available);
+
+/* ---- 1. The detector must agree with reality ------------------------------
+ * This case exists because breaking detectContainerRuntime() used to make the
+ * whole suite skip and pass, while making the contract-04-B10 container profile
+ * unavailable to every caller. A silent downgrade of a required control is
+ * exactly what B10 forbids, so a detector that under-reports must FAIL here. */
+if (probe && !detectorSaysAvailable) {
+  bad("1. detectContainerRuntime agrees with an independent probe",
+    "a " + probe.runtime + " daemon answered an independent probe (server " + probe.version +
+    ") but evalenv.detectContainerRuntime() reports UNAVAILABLE. The container profile is the " +
+    "REQUIRED control for untrusted code (contract 04 B10); a detector that under-reports makes " +
+    "it silently unavailable to every caller while this suite would otherwise skip and pass");
+} else if (!probe && detectorSaysAvailable) {
+  bad("1. detectContainerRuntime agrees with an independent probe",
+    "detectContainerRuntime() reports AVAILABLE but no daemon answered an independent probe. " +
+    "Claiming containment that cannot run is worse than reporting none");
+} else {
+  ok("1. detectContainerRuntime agrees with an independent probe",
+    probe ? "both see " + probe.runtime + " server " + probe.version : "both see no runtime");
+}
+
+if (!probe) {
+  skip("2-8. container containment probes",
+    "no container runtime answered an independent probe on this leg. THIS RUN PROVIDES NO " +
+    "EVIDENCE THAT ANY CONTAINER CONTAINMENT CONTROL IS ENFORCED, and none that the profile " +
+    "still functions. Coverage requires a leg with a reachable docker/podman daemon.");
+  done();
+  return;
+}
+
+/* ---- Image availability: supply, not product ----------------------------- */
+const RUNTIME = probe.runtime;
+const inspect = spawnSync(RUNTIME, ["image", "inspect", IMAGE],
+  { encoding: "utf8", timeout: 60000, windowsHide: true });
+if (inspect.error || inspect.status !== 0) {
+  const pull = spawnSync(RUNTIME, ["pull", IMAGE],
+    { encoding: "utf8", timeout: 300000, windowsHide: true });
+  if (pull.error || pull.status !== 0) {
+    skip("2-8. container containment probes",
+      "a " + RUNTIME + " daemon is reachable but " + IMAGE + " is neither present nor pullable (" +
+      String((pull.stderr || "").trim().split("\n").pop() || "pull failed").slice(0, 120) +
+      "). THIS RUN PROVIDES NO CONTAINMENT EVIDENCE. Pre-pull the image, or set " +
+      "GRAPHSMITH_CONTAINMENT_TEST_IMAGE, for real coverage.");
+    done();
+    return;
+  }
+}
+
+/* ---- Drive the REAL profile, through the REAL entry point ----------------- */
+const SRC = fs.mkdtempSync(path.join(os.tmpdir(), "gs-containment-src-"));
+fs.writeFileSync(path.join(SRC, "sentinel.txt"), "SOURCE-CONTENT\n");
+
+let env = null;
+try {
+  env = evalenv.create("container", { sourceDir: SRC });
+} catch (e) {
+  inconc("2-8. container containment probes",
+    "evalenv.create(\"container\") threw: " + String((e && e.message) || e));
+  fs.rmSync(SRC, { recursive: true, force: true });
+  done();
+  return;
+}
+
+if (!env.available) {
+  bad("2-8. container containment probes",
+    "a daemon answered but evalenv.create(\"container\") returned available:false — " +
+    JSON.stringify(String(env.reason || "").slice(0, 200)));
+  fs.rmSync(SRC, { recursive: true, force: true });
+  done();
+  return;
+}
+
+const probeScript = [
+  'printf "uid=%s\\n" "$(id -u)"',
+  'printf "capeff=%s\\n" "$(awk \'/CapEff/{print $2}\' /proc/self/status)"',
+  'printf "nnp=%s\\n" "$(awk \'/NoNewPrivs/{print $2}\' /proc/self/status)"',
+  // The regression that shipped: can the container actually SEE its workspace?
+  'if cat /workspace/sentinel.txt >/dev/null 2>&1; then printf "mount_readable=YES\\n"; else printf "mount_readable=NO\\n"; fi',
+  'if echo x > /workspace/w-probe 2>/dev/null; then printf "mount=WRITABLE\\n"; else printf "mount=READONLY\\n"; fi',
+  'if echo x > /rootfs-probe 2>/dev/null; then printf "rootfs=WRITABLE\\n"; else printf "rootfs=READONLY\\n"; fi',
+  'if mknod /tmp/devprobe c 1 3 2>/dev/null; then printf "mknod=ALLOWED\\n"; else printf "mknod=DENIED\\n"; fi',
+  'if wget -q -T2 -O- http://1.1.1.1 >/dev/null 2>&1; then printf "net=ALLOWED\\n"; else printf "net=DENIED\\n"; fi',
+].join("; ");
+
+let res = null;
+try {
+  res = env.runUntrustedCode(["sh", "-c", probeScript], { image: IMAGE, timeoutMs: 180000 });
+} catch (e) {
+  bad("2-8. container containment probes",
+    "runUntrustedCode() threw on the documented entry point: " + String((e && e.message) || e));
+  try { env.destroy(); } catch (_) { /* best effort */ }
+  fs.rmSync(SRC, { recursive: true, force: true });
+  done();
+  return;
+}
+
+const stderrText = String((res && res.stderr) || "");
+const facts = {};
+for (const line of String((res && res.stdout) || "").split("\n")) {
+  const m = line.trim().match(/^([a-z_]+)=(.+)$/);
+  if (m) facts[m[1]] = m[2];
+}
+const need = ["uid", "capeff", "nnp", "mount_readable", "mount", "rootfs", "mknod", "net"];
+const absent = need.filter((k) => !(k in facts));
+
+/* Windows containers cannot express the Linux containment flags. Anchored to the
+ * platform: on win32 only, and only for the specific message. The old condition
+ * also matched a bare /invalid option/, which a Linux daemon emits for any bad
+ * argv — so a profile a Linux daemon refused to start read as "Windows mode" and
+ * passed. */
+if (process.platform === "win32" && res.status === 125 &&
+    /not supported for Windows containers/i.test(stderrText)) {
+  skip("2-8. container containment probes",
+    "this " + RUNTIME + " daemon is in WINDOWS CONTAINER mode, which does not support the Linux " +
+    "containment flags the profile relies on: " +
+    JSON.stringify(stderrText.trim().split("\n")[0].slice(0, 110)) + ". THIS RUN PROVIDES NO " +
+    "EVIDENCE THAT ANY CONTAINER CONTAINMENT CONTROL IS ENFORCED — coverage requires a " +
+    "Linux-container daemon.");
+} else if (res.error || absent.length) {
+  inconc("2-8. container containment probes",
+    "runUntrustedCode() ran on " + process.platform + "/" + RUNTIME + " but produced no full reading" +
+    (res.error ? " (" + String(res.error.message || res.error) + ")" : "") +
+    (absent.length ? "; missing " + JSON.stringify(absent) : "") +
+    ". status=" + String(res.status) + " stderr=" + JSON.stringify(stderrText.slice(0, 220)) +
+    ". Nothing was observed about containment either way");
+} else {
+  /* THE case the old suite could not fail. Everything below is vacuous without it:
+   * a container that cannot read its input is contained and useless. */
+  assert("2. the profile still WORKS: /workspace is readable inside the container",
+    facts.mount_readable === "YES",
+    facts.mount_readable === "YES"
+      ? "read the mounted source — containment did not disable the profile"
+      : "the container CANNOT READ ITS OWN WORKSPACE. Every container-required external tool " +
+        "would see an empty source tree. This is what --user against a 0700 mkdtemp copy does");
+
+  assert("3. runs as a non-root uid", facts.uid !== "0",
+    facts.uid !== "0" ? "uid=" + facts.uid + " (root in the container is root on the host under any escape)"
+      : "uid=0 — untrusted code is running as root");
+
+  assert("4. all Linux capabilities dropped", /^0+$/.test(facts.capeff),
+    /^0+$/.test(facts.capeff) ? "CapEff=" + facts.capeff
+      : "CapEff=" + facts.capeff + " — the default set includes CAP_MKNOD, CAP_SETUID, " +
+        "CAP_DAC_OVERRIDE and CAP_NET_RAW");
+
+  assert("5. no_new_privs set", facts.nnp === "1",
+    facts.nnp === "1" ? "NoNewPrivs=1 — a setuid binary in the image cannot escalate"
+      : "NoNewPrivs=" + facts.nnp + " — --user alone does NOT close setuid escalation");
+
+  assert("6. the source mount is read-only", facts.mount === "READONLY",
+    facts.mount === "READONLY" ? "untrusted code cannot write back into the evaluation copy (contract 04 B10)"
+      : "the mounted source is WRITABLE — untrusted code can rewrite the tree under evaluation");
+
+  assert("7. root filesystem is read-only, capability drop bites",
+    facts.rootfs === "READONLY" && facts.mknod === "DENIED",
+    "rootfs=" + facts.rootfs + " mknod=" + facts.mknod +
+      (facts.rootfs === "READONLY" && facts.mknod === "DENIED"
+        ? " (mknod is the behavioural check on case 4, not a re-read of CapEff)"
+        : " — expected READONLY/DENIED"));
+
+  assert("8. network egress denied", facts.net === "DENIED",
+    facts.net === "DENIED" ? "--network none holds (contract 04 B10)"
+      : "network reachable from inside a --network none container");
+}
+
+try { env.destroy(); } catch (e) { /* disposable */ }
+fs.rmSync(SRC, { recursive: true, force: true });
+done();
