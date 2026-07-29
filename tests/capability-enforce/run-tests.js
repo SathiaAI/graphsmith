@@ -25,6 +25,7 @@ const os = require("os");
 const path = require("path");
 
 const enforce = require("../../scripts/capability-enforce.js");
+const evalenv = require("../../scripts/evalenv.js");
 
 let pass = 0;
 let fail = 0;
@@ -52,8 +53,51 @@ function assert(name, cond, detail) {
   if (cond) ok(name, detail); else bad(name, detail);
 }
 
+/* Whether this runtime has a Permission Model is decided BEHAVIOURALLY -- spawn a
+ * child under the real flags and see whether it starts -- not by asking the module
+ * under test.
+ *
+ * It used to be `enforce.detectFlags()`, i.e. the product deciding whether the
+ * product gets tested. An adversarial review broke that detector to `() => false`
+ * on a Node 22 that fully supports --permission, and this suite reported
+ * `PASS=6 FAIL=0` and exited 0 while capability enforcement was dead for every
+ * user -- printing a skip line that named the very version contradicting it.
+ *
+ * A behavioural probe cannot be fooled that way: the flags either work on this
+ * runtime or they do not, independent of what any module claims. And the two
+ * answers are then CROSS-CHECKED below, so a detector that disagrees with reality
+ * is itself a finding rather than a reason to stop looking. */
+function probePermissionModel() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-permprobe-"));
+  try {
+    const r = spawnSync(process.execPath,
+      ["--permission", "--allow-fs-read=" + dir, "-e", "process.stdout.write('ok')"],
+      { encoding: "utf8", timeout: 30000, windowsHide: true });
+    return !r.error && r.status === 0 && String(r.stdout || "").indexOf("ok") !== -1;
+  } catch (e) {
+    return false;
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* temp */ }
+  }
+}
+
+const HAVE_PERMISSION = probePermissionModel();
 const FLAGS = enforce.detectFlags();
-const HAVE_PERMISSION = FLAGS.permission && FLAGS.allow_fs_read && FLAGS.allow_fs_write;
+
+/* Case 0 runs before everything and is the guard on all the skips below: if the
+ * detector and reality disagree, every "this runtime cannot do it" skip in this
+ * file is built on a false premise. */
+(function case0_detectorMatchesReality() {
+  const claims = FLAGS.permission && FLAGS.allow_fs_read && FLAGS.allow_fs_write;
+  assert("0. detectFlags() agrees with a behavioural probe of the Permission Model",
+    claims === HAVE_PERMISSION,
+    claims === HAVE_PERMISSION
+      ? "both say " + (HAVE_PERMISSION ? "supported" : "unsupported") + " on " + process.version
+      : "detectFlags() says " + (claims ? "SUPPORTED" : "unsupported") + " but a spawned child under " +
+        "--permission " + (HAVE_PERMISSION ? "STARTED FINE" : "could not start") + " on " + process.version +
+        ". Every capability skip in this suite is decided by that detector, so a wrong answer makes the " +
+        "whole file pass while enforcing nothing");
+})();
 
 /* --------------------------------------------------------------------------
  * Fixture: a "skill copy" with a granted subtree and a sibling it must never
@@ -76,7 +120,20 @@ fs.writeFileSync(path.join(COPY, "inputs", "in.txt"), "GRANTED\n");
 fs.writeFileSync(path.join(COPY, "inputs-evil", "sibling.txt"), "SIBLING\n");
 fs.writeFileSync(path.join(OUTSIDE, "secret.txt"), "SECRET\n");
 
-const CLEAN_ISOLATION = { symlink_escapes: [], symlinks_skipped_at_copy: 0, isolated: true };
+/* REAL checkIsolation() output for the real fixture tree, not a hand-written stand-in.
+ *
+ * This was `{ symlink_escapes: [], symlinks_skipped_at_copy: 0, isolated: true }` --
+ * a literal shaped like what capability-enforce wanted. That made the two modules
+ * untestable against each other: when checkIsolation grew a hardlink audit and an
+ * `audited_dir` field, and capability-enforce started REQUIRING both, a hand-written
+ * literal would have kept satisfying the old contract forever while the real
+ * producer and the real consumer drifted apart.
+ *
+ * Calling the real auditor means this suite fails the moment the evidence contract
+ * changes on either side -- which is the only way a precondition shared by two
+ * modules stays honest. Same reason the container suite drives runUntrustedCode()
+ * instead of asserting on an exported constant. */
+const CLEAN_ISOLATION = evalenv.checkIsolation(COPY, {}, []);
 
 function grantOf(g) {
   return { schema_version: "1.0", skill_id: "probe-skill", grants: g, enforced: [] };
@@ -149,6 +206,66 @@ const J = JSON.stringify;
     r.enforced.indexOf("filesystem") === -1
       ? "refused, as it must -- the Permission Model follows a pre-existing symlink out of the grant"
       : "ENFORCED despite a known escape: this would attest a boundary the tree defeats");
+})();
+
+/* 2b/2c added after an adversarial review found both holes in the shipped version.
+ * Both use the REAL auditor on REAL trees -- a hand-built isolation literal would
+ * pin only what I imagined the contract to be. */
+
+(function case2b_hardlinkEscape() {
+  const name = "2b. filesystem refused when a pre-existing HARDLINK is in the tree";
+  const hlRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gs-hl-")));
+  const copy = path.join(hlRoot, "copy");
+  const outside = path.join(hlRoot, "outside");
+  fs.mkdirSync(path.join(copy, "inputs"), { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  fs.writeFileSync(path.join(outside, "secret.txt"), "SECRET-OUTSIDE\n");
+  let linked = false;
+  try { fs.linkSync(path.join(outside, "secret.txt"), path.join(copy, "inputs", "innocent.txt")); linked = true; }
+  catch (e) { /* filesystem may forbid hardlinks */ }
+
+  if (!linked) {
+    skip(name, "this filesystem does not permit creating hardlinks, so the escape could not be staged. " +
+      "THIS RUN PROVIDES NO EVIDENCE that the hardlink precondition holds.");
+  } else {
+    const iso = evalenv.checkIsolation(copy, {}, []);
+    const r = enforce.plan({
+      grant: grantOf({ filesystem: { read: [path.join(copy, "inputs")], write: [path.join(copy, "inputs")] } }),
+      targetDir: copy,
+      isolation: iso,
+    });
+    /* Why this matters more than the symlink case: a hardlink resolves INSIDE the
+     * copy, so realpath sees nothing wrong -- and a WRITE through it modifies the
+     * file outside. Measured before the fix: a grant scoped entirely to the copy
+     * overwrote outside/secret.txt while checkIsolation reported isolated:true. */
+    assert(name,
+      iso.hardlink_suspects.length > 0 && r.enforced.indexOf("filesystem") === -1,
+      iso.hardlink_suspects.length === 0
+        ? "checkIsolation MISSED the hardlink (symlink-only audit) — a write through it leaves the grant"
+        : (r.enforced.indexOf("filesystem") === -1
+          ? "audit found it (nlink>1) and enforcement refused"
+          : "audit found it but capability-enforce ENFORCED anyway"));
+  }
+  fs.rmSync(hlRoot, { recursive: true, force: true });
+})();
+
+(function case2c_evidenceForAnotherDirectory() {
+  const name = "2c. isolation evidence for a DIFFERENT directory is refused";
+  const other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gs-other-")));
+  fs.mkdirSync(path.join(other, "inputs"), { recursive: true });
+  const isoOther = evalenv.checkIsolation(other, {}, []);
+  const r = enforce.plan({
+    grant: grantOf({ filesystem: { read: [path.join(COPY, "inputs")] } }),
+    targetDir: COPY,
+    isolation: isoOther, // clean, real, honestly produced -- for the WRONG tree
+  });
+  /* The caller supplying the evidence is the party being checked. Without binding,
+   * a genuine clean audit of any directory authorises enforcement of any other. */
+  assert(name, r.enforced.indexOf("filesystem") === -1,
+    r.enforced.indexOf("filesystem") === -1
+      ? "refused — evidence must name the directory it describes"
+      : "ENFORCED on an audit of a different tree that nobody looked at");
+  fs.rmSync(other, { recursive: true, force: true });
 })();
 
 (function case3_grantOutsideTarget() {

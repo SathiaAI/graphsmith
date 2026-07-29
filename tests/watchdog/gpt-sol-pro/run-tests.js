@@ -224,11 +224,36 @@ async function testBlockedAndIndependent(tmp) {
    * watchdog wrote no evidence at all. A timeout with evidence present is a real
    * product failure and still FAILS confidently -- widening this to `timedOut`
    * alone would swallow exactly the defect the case exists to catch. */
-  else if (run.wdExit.timedOut && !ev) record("FAIL", "blocked-event-loop-independent-kill",
-    "INCONCLUSIVE (harness): the harness deadline expired before the watchdog produced any evidence " +
-    `(wall=${run.elapsedWall}ms, budget=${BUDGET}ms, targetAlive=${run.targetAlive}). Nothing was observed ` +
-    "about whether a blocked event loop gets killed -- this is the harness running out of patience, not a " +
-    "watchdog defect. Re-run without a scaled deadline for a real verdict");
+  /* The discriminator is `elapsedWall < BUDGET`, NOT `timedOut && !ev`.
+   *
+   * The first version used the absence of evidence, and an adversarial review broke
+   * the watchdog so it never armed, never wrote the dead-man switch and never
+   * killed -- with NO deadline scaling at all -- and got:
+   *
+   *     FAIL ... INCONCLUSIVE (harness): ... targetAlive=true ...
+   *              this is the harness running out of patience, not a watchdog defect
+   *
+   * wall was 5014ms against a 240ms budget. The guard was dead, the target alive,
+   * and the harness told the reader the watchdog was fine and advised removing a
+   * scaled deadline that was never applied. ci-run-suites.js then files
+   * INCONCLUSIVE under "NOT product findings ... nothing below says anything about
+   * whether the product is correct". Still red, but pointing away from the defect.
+   *
+   * It also misfired the other way: `!ev` is a race against the watchdog's own
+   * startup DMS write, so at scales >= 0.005 a HEALTHY watchdog produced a
+   * CONFIDENT failure from a ~52ms window -- the original honesty defect, back.
+   * The starvation sweep only ever uses 0.001, so it could not see that.
+   *
+   * Wall time cannot be confused this way. If the harness gave up BEFORE the
+   * product's own budget could even elapse, nothing was observed by construction.
+   * If it waited past the budget and the watchdog still did nothing, that is the
+   * product failing and it fails confidently. Measured: starved-healthy is
+   * 6-108ms << 240; the dead watchdog is 5014ms >> 240. */
+  else if (run.elapsedWall < BUDGET) record("FAIL", "blocked-event-loop-independent-kill",
+    "INCONCLUSIVE (harness): the harness gave up after " + run.elapsedWall + "ms, before the watchdog's own " +
+    BUDGET + "ms budget could elapse, so the kill could not have happened yet and nothing was observed " +
+    `(timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} evidence=${ev ? "present" : "none"}). ` +
+    "Re-run without a scaled harness deadline for a real verdict");
   else record("FAIL", "blocked-event-loop-independent-kill",
     `exit=${run.wdExit.code} timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} evidence=${JSON.stringify(ev)} wall=${run.elapsedWall}ms`);
 }

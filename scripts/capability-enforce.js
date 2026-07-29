@@ -244,10 +244,44 @@ function plan(ctx) {
         "(measured), so --allow-fs-read alone is not a filesystem boundary. Pass evalenv checkIsolation() " +
         "evidence (contract 04 B14) for this directory");
     }
+
+    /* The evidence must describe THIS directory. The caller supplying it is the
+     * party being checked, so without this an audit of directory A -- clean, real,
+     * honestly produced -- authorises enforcement of directory B, which nobody
+     * looked at. A precondition that does not name its subject is not a
+     * precondition. Older evidence without `audited_dir` is refused rather than
+     * assumed to match: absent provenance is not matching provenance. */
+    if (typeof iso.audited_dir !== "string" || iso.audited_dir.length === 0) {
+      return refuse(CLS, "isolation evidence carries no `audited_dir`, so there is nothing to prove it " +
+        "describes this targetDir rather than some other directory. Re-run evalenv checkIsolation() " +
+        "against " + targetDir);
+    }
+    if (path.resolve(iso.audited_dir) !== path.resolve(targetDir)) {
+      return refuse(CLS, "isolation evidence describes " + iso.audited_dir + ", not targetDir " + targetDir +
+        ". An audit of one directory cannot authorise enforcement of another");
+    }
+
     if (iso.symlink_escapes.length > 0) {
       return refuse(CLS, iso.symlink_escapes.length + " symlink(s) inside targetDir resolve OUTSIDE it, and the " +
         "Permission Model follows them. Enforcing here would attest a boundary the tree already defeats. First: " +
         JSON.stringify(iso.symlink_escapes[0]).slice(0, 200));
+    }
+
+    /* Hardlinks. A second NAME for the same inode resolves inside the copy, so the
+     * symlink walk sees nothing -- but a WRITE through it lands outside. Measured:
+     * a grant scoped entirely to the copy overwrote a file outside it while the
+     * isolation report said clean. Required, and absent evidence is refused: an
+     * audit that did not look for hardlinks cannot certify their absence. */
+    if (!Array.isArray(iso.hardlink_suspects)) {
+      return refuse(CLS, "isolation evidence has no `hardlink_suspects` array, so the tree was audited for " +
+        "symlinks only. A pre-existing HARDLINK is a second name for the same inode: it resolves inside the " +
+        "copy, passes the symlink walk, and a write through it modifies a file OUTSIDE the grant (measured). " +
+        "Re-run evalenv checkIsolation() from a build that performs the hardlink audit");
+    }
+    if (iso.hardlink_suspects.length > 0) {
+      return refuse(CLS, iso.hardlink_suspects.length + " file(s) inside targetDir have st_nlink > 1 (or could " +
+        "not be stat'd). Each is a second name for an inode this copy does not exclusively own, and a write " +
+        "through one leaves the grant. First: " + JSON.stringify(iso.hardlink_suspects[0]).slice(0, 200));
     }
 
     const fsGrant = grants[CLS];

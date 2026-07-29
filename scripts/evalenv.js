@@ -483,6 +483,32 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
   // catch a future code path that stops skipping them, or a symlink dropped
   // into the copy by some other means, before it can resolve outside).
   const symlinkEscapes = [];
+
+  /* HARDLINK audit, added after an adversarial review demonstrated a WRITE escape
+   * that the symlink-only audit reported as clean.
+   *
+   * A hardlink is a second NAME for the same inode, so realpath() resolves it to a
+   * path inside the copy and the symlink walk sees nothing wrong. Measured:
+   *
+   *     ln outside/secret.txt copy/inputs/innocent.txt
+   *     checkIsolation ->  symlink_escapes: []   isolated: true
+   *     node --permission --allow-fs-read=copy/inputs  ->  read "SECRET-OUTSIDE"
+   *     node --permission --allow-fs-write=copy/inputs ->  write ALLOWED, and
+   *         outside/secret.txt now reads "PWNED-FROM-INSIDE-GRANT"
+   *
+   * The read is bad; the WRITE is the one that matters. Untrusted code whose grant
+   * is scoped entirely to the disposable copy modified a file outside it, while the
+   * isolation report said the copy was clean. That defeats the filesystem
+   * containment claim in the direction that changes the world.
+   *
+   * st_nlink is the cheap, decisive signal: copyTreeExcluding writes fresh files,
+   * so every regular file in a new copy has nlink === 1. Anything above that is a
+   * second name somewhere, and proving WHERE would mean scanning the filesystem for
+   * the inode -- so this fails closed on the anomaly rather than trying. An internal
+   * duplicate is flagged too; that is the correct trade for a tree that should have
+   * none. */
+  const hardlinkSuspects = [];
+
   (function scan(dir) {
     let entries;
     try {
@@ -501,6 +527,16 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
         }
       } else if (entry.isDirectory()) {
         scan(p);
+      } else if (entry.isFile()) {
+        try {
+          const st = fs.lstatSync(p);
+          if (st.nlink > 1) hardlinkSuspects.push({ path: p, nlink: st.nlink, ino: String(st.ino) });
+        } catch (e) {
+          /* Cannot stat a file inside our own copy. That is not "clean" -- it is
+           * unknown, and unknown must not read as isolated. Record it as a suspect
+           * so `isolated` goes false rather than silently skipping the file. */
+          hardlinkSuspects.push({ path: p, nlink: null, error: String((e && e.code) || e) });
+        }
       }
     }
   })(copyDir);
@@ -511,7 +547,17 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
     node_path_stripped: !nodePathLeaked,
     symlinks_skipped_at_copy: (symlinksSkipped || []).length,
     symlink_escapes: symlinkEscapes,
-    isolated: !gitPresent && !graphsmithPresent && !nodePathLeaked && symlinkEscapes.length === 0,
+    /* Regular files in the copy with st_nlink > 1 (or unstattable). Each is a
+     * second name for an inode this copy does not exclusively own; a write through
+     * one leaves the copy. See the audit above for the measured escape. */
+    hardlink_suspects: hardlinkSuspects,
+    /* The directory this evidence describes. capability-enforce requires it and
+     * compares it to its own targetDir: without it, an audit of directory A could
+     * authorise enforcement of directory B, and the caller passing the evidence is
+     * the one being checked. */
+    audited_dir: path.resolve(copyDir),
+    isolated: !gitPresent && !graphsmithPresent && !nodePathLeaked &&
+      symlinkEscapes.length === 0 && hardlinkSuspects.length === 0,
   };
 }
 
