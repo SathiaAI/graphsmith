@@ -601,6 +601,7 @@ function attackAlphaLedger() {
 function attackRunRegistry() {
   const name = "registry.register-sweep-live-trees-journaled";
   const root = tempRoot("reg");
+  let inconclusive = null;
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
       // Two store instances on the SAME root, so every journal/registry
@@ -616,10 +617,28 @@ function attackRunRegistry() {
       // reported "live trees not queryable". Runs that must STAY live get a
       // comfortable lease; only the run whose expiry is the point gets a short
       // one, and its assertion ("has expired") is a direction load only helps.
+      //
+      // The 300ms short lease below was the SAME defect one step further on, and
+      // the starvation sweep caught it: 300ms was a proxy for "survives the setup,
+      // lapses only during the deliberate sleep". The setup is five lock+fsync
+      // operations, and each registry operation sweeps lapsed leases before it
+      // runs -- so on slow I/O the `list()` two lines down swept `run-expire-me`
+      // itself, `sweepExpired()` then had nothing left to return, and this case
+      // reported `sweep missed run-expire-me: []`: the component's sweep accused
+      // of missing a run it had in fact already swept. Reproduced exactly, at
+      // 25-40ms of induced latency per fs write.
+      //
+      // Now the expiry is not guessed. The lease is long enough that no setup
+      // operation can reach it, and the sleep runs until the expiry the store
+      // ITSELF issued, read back from the registration record. Not routed through
+      // harnessDeadline(): waiting for a product TTL to elapse is not harness
+      // patience, and scaling a lease TTL is the one thing that file forbids.
       const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
-      const shortLease = createStore(root, { leaseMs: 300, heartbeatMs: 50 });
+      const shortLease = createStore(root, { leaseMs: 2000, heartbeatMs: 50 });
       store.runRegistry.register("run-live", "tree-A");
-      shortLease.runRegistry.register("run-expire-me", "tree-B");
+      const expiring = shortLease.runRegistry.register("run-expire-me", "tree-B");
+      const expiresAt = expiring.registration.lease_expires_at;
+      assert(Number.isFinite(expiresAt), "registration did not report lease_expires_at");
       const liveBefore = store.runRegistry.list();
       assert(liveBefore.length === 2, "register failed");
       assert(
@@ -630,17 +649,43 @@ function attackRunRegistry() {
       store.runRegistry.deregister("run-live", { disposition: "completed_pass" });
       assert(!store.runRegistry.list().some((r) => r.run_id === "run-live"), "deregister left run");
 
-      sleep(400);   // > the 300ms short lease; oversleeping only helps
+      // Sleep past the issued expiry, not past a guess. Oversleeping only helps.
+      sleep(Math.max(1, expiresAt - Date.now()) + 100);
+
+      // Sampled BEFORE the sweep, with a plain file read that cannot itself sweep.
+      // This is what separates the two causes of an empty return value, and it has
+      // to be observed rather than inferred: "the EXPIRED record exists afterwards"
+      // is true in both cases and therefore discriminates nothing.
+      //   already recorded before the call -> an earlier operation swept it, this
+      //                                       case never got to observe the return
+      //                                       value. INCONCLUSIVE.
+      //   not recorded before, recorded after, but absent from the return value
+      //                                    -> the sweep did the work and reported
+      //                                       it wrongly. A real defect. FAIL.
+      const expiredRecord = (r) => r.record_type === "EXPIRED" && r.run_id === "run-expire-me";
+      const sweptEarlier = readJsonl(root, "run-registry.jsonl").some(expiredRecord);
       const journalBefore = readRaw(root, "state-journal.jsonl");
       const swept = store.runRegistry.sweepExpired();
-      assert(swept.includes("run-expire-me"), `sweep missed run-expire-me: ${JSON.stringify(swept)}`);
-      assert(!store.runRegistry.list().some((r) => r.run_id === "run-expire-me"), "expired still live");
 
       const registry = readJsonl(root, "run-registry.jsonl");
-      assert(
-        registry.some((r) => r.record_type === "EXPIRED" && r.run_id === "run-expire-me"),
-        "EXPIRED record missing from registry"
-      );
+      assert(registry.some(expiredRecord), "EXPIRED record missing from registry");
+      if (!swept.includes("run-expire-me")) {
+        if (!sweptEarlier) {
+          assert(false,
+            "sweepExpired() wrote the EXPIRED record for run-expire-me but did not return it: " +
+            JSON.stringify(swept) + ". Nothing had swept it before this call, so the return " +
+            "value is simply wrong -- a caller cannot learn what was swept.");
+        }
+        inconclusive =
+          "run-expire-me had already been swept before sweepExpired() was called (its EXPIRED " +
+          "record was on disk beforehand), so the return value could not name it: " +
+          JSON.stringify(swept) + ". Its " + (Date.now() - expiresAt) + "ms-lapsed lease expired " +
+          "during this case's own setup rather than during the deliberate wait, which is machine " +
+          "speed, not a component that misses expired runs. Nothing was observed about " +
+          "sweepExpired()'s return value.";
+        return;
+      }
+      assert(!store.runRegistry.list().some((r) => r.run_id === "run-expire-me"), "expired still live");
 
       const journalAfter = readRaw(root, "state-journal.jsonl");
       assert(journalAfter.length > journalBefore.length, "sweep did not append journal");
@@ -661,7 +706,8 @@ function attackRunRegistry() {
       const trees = new Set(store.runRegistry.list().map((r) => r.tree_id));
       assert(trees.has("tree-keep-1") && trees.has("tree-keep-2"), "live trees not queryable");
     });
-    report(name, "PASS");
+    if (inconclusive) report(name, "FAIL", "INCONCLUSIVE (harness): " + inconclusive);
+    else report(name, "PASS");
   } catch (e) {
     report(name, "FAIL", e.message);
   } finally {
