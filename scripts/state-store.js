@@ -162,6 +162,33 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+/* LEASE TIME vs OPERATIONAL TIME -- the distinction this seam exists to preserve.
+ *
+ * A lease is a PRODUCT budget whose only meaning is arithmetic: given a stored
+ * `lease_expires_at` and a current instant, is this run still live. Tests of that
+ * arithmetic do not need a real clock; they need to CHOOSE the instant. Six
+ * separate defects on this branch came from tests that instead raced real elapsed
+ * time against ~200ms-per-operation Windows I/O and reported losing the race as a
+ * product defect -- one of them accusing a fail-closed refusal of letting a window
+ * close over active slots. See KNOWN-LIMITATIONS and the branch history.
+ *
+ * So `leaseNow()` is injectable. What is NOT injectable, and must never be:
+ *
+ *   - lock staleness (`Date.now() - observed.stat.mtimeMs`): compares against an
+ *     mtime the OPERATING SYSTEM wrote. A frozen clock there makes every lock look
+ *     infinitely stale or never stale -- silently testing a different product.
+ *   - `proc_start_hint`: process identity, derived from process.uptime().
+ *
+ * Injecting one global clock over both is the obvious mistake here, and it is worse
+ * than the bug it would fix: it would turn the lock protocol into a no-op while every
+ * test still passed. Lease time is chosen; operational time is observed.
+ */
+function systemLeaseClock() {
+  return { now: () => Date.now() };
+}
+
+const REQUIRE_EXPLICIT_CLOCK_ENV = "GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK";
+
 class StateStore {
   constructor(projectRoot = process.cwd(), options = {}) {
     this.projectRoot = path.resolve(projectRoot);
@@ -169,6 +196,30 @@ class StateStore {
     this.lockPath = path.join(this.stateDir, "state.lock");
     this.journalPath = path.join(this.stateDir, "state-journal.jsonl");
     const testMode = process.env.GRAPHSMITH_TEST_MODE === "1";
+
+    /* Runtime enforcement, not a lint. A source scan for `new StateStore(` cannot see
+     * through aliasing, helper factories, or a store constructed inside a spawned
+     * worker written to a temp file -- all three of which this repo's suites do. This
+     * throws on the executed path instead, so a test that relies on wall-clock lease
+     * time cannot pass anywhere, including the Windows-only cases a Linux audit is
+     * structurally blind to. Off unless the env var is set, so production is untouched. */
+    if (process.env[REQUIRE_EXPLICIT_CLOCK_ENV] === "1" && !options.clock) {
+      throw fail(
+        "StateStore was constructed without an explicit lease clock while " +
+        REQUIRE_EXPLICIT_CLOCK_ENV + "=1. Lease-dependent tests must choose their own " +
+        "instants (tests/_harness/clock.js -> createManualClock) rather than race real " +
+        "elapsed time. If this construction genuinely needs the wall clock, pass " +
+        "{ clock: systemLeaseClock() } explicitly so the choice is visible.",
+        "LEASE_CLOCK_REQUIRED"
+      );
+    }
+    const clock = options.clock || systemLeaseClock();
+    if (typeof clock.now !== "function") throw fail("clock.now must be a function", "BAD_LEASE_CLOCK");
+    this.leaseNow = () => {
+      const t = clock.now();
+      if (!Number.isFinite(t)) throw fail("clock.now() returned a non-finite instant", "BAD_LEASE_CLOCK");
+      return t;
+    };
     this.leaseMs = testMode
       ? positiveInteger(options.leaseMs || process.env.GRAPHSMITH_LEASE_MS, DEFAULT_LEASE_MS)
       : DEFAULT_LEASE_MS;
@@ -522,7 +573,7 @@ class StateStore {
     const registryRaw = this._read(FILES.registry);
     const registryRecords = parseJsonLines(registryRaw, FILES.registry);
     const active = this._registryState(registryRecords);
-    const now = Date.now();
+    const now = this.leaseNow();
     const expired = [...active.values()].filter((record) => record.lease_expires_at <= now).sort((a, b) => a.run_id.localeCompare(b.run_id));
     const windowRaw = this._read(FILES.window);
     const windowRecord = parseWindow(windowRaw);
@@ -596,7 +647,7 @@ class StateStore {
               tree_id: requiredString(tx.tree_id || tx.treeId, "tree_id"),
               n,
               baseline_metric: tx.baseline_metric === undefined ? null : clone(tx.baseline_metric),
-              created_at: Date.now(),
+              created_at: this.leaseNow(),
               max_window_wall_time_ms: positiveInteger(tx.max_window_wall_time_ms, DEFAULT_WINDOW_MS),
               admitted: 0,
               active: 0,
@@ -725,7 +776,7 @@ class StateStore {
         if (existing.tree_id !== treeId) throw fail("runId is already registered to another tree", "RUN_CONFLICT");
         return { registration: clone(existing), slot: null, existing: true };
       }
-      const leaseExpiresAt = Date.now() + this.leaseMs;
+      const leaseExpiresAt = this.leaseNow() + this.leaseMs;
       let registration;
       let slot = null;
       this._commit([
@@ -768,7 +819,7 @@ class StateStore {
           const records = parseJsonLines(raw, FILES.registry);
           record = {
             schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "HEARTBEAT", run_id: runId,
-            lease_expires_at: Date.now() + this.leaseMs,
+            lease_expires_at: this.leaseNow() + this.leaseMs,
           };
           records.push(record);
           return jsonLines(records);

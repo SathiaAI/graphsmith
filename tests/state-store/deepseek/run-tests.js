@@ -193,10 +193,45 @@ function record(name, status, detail = "") {
   console.log(line);
 }
 
+/* ONE clock for this process, shared by every store this suite builds.
+ *
+ * Time is global, so a per-store clock would be a fiction: two stores on the same
+ * directory must agree about whether a lease has lapsed. Sharing it also means a case
+ * that advances time affects every store it has open, which is what really happens.
+ *
+ * The point of this seam is that a lease precondition becomes an ASSIGNMENT. Before it,
+ * a case that needed three runs still live established that by hoping ~12 lock+fsync
+ * operations fit inside a 1000ms lease; on a contended Windows runner they cost ~200ms
+ * each and did not, and the case reported losing that race as a product defect. Now
+ * nothing lapses unless a case says so. */
+const { createManualClock, systemLeaseClock } = require("../../_harness/clock.js");
+const CLOCK = createManualClock();
+
 function requireFreshStore(dir, opts = {}) {
   const { StateStore } = require(STATE_STORE_PATH);
-  return new StateStore(dir, opts);
+  return new StateStore(dir, Object.assign({ clock: CLOCK }, opts));
 }
+
+/* CROSS-PROCESS cases (tests 3 and 7, both Windows-only) spawn a child that builds its own
+ * store. A clock thunk does not survive a spawn, and a parent on a frozen clock reading
+ * records a child stamped with the real one is strictly WORSE than both using the real
+ * clock -- the child's sweep sees every parent-written lease as expired by decades and
+ * terminalizes it. So both sides take the real clock, explicitly, and pay for it with a
+ * lease no test-length body can reach. Neither case asserts lease liveness: their subjects
+ * are journal roll-forward and lost-update freedom.
+ *
+ * These are precisely the cases a Linux audit cannot see, which is why the proof is the
+ * runtime enforcement in tests/harness-honesty/lease-determinism rather than a source scan
+ * run on one platform. */
+const CROSS_PROCESS_LEASE_MS = 600000;
+function requireRealClockStore(dir, opts = {}) {
+  const { StateStore } = require(STATE_STORE_PATH);
+  return new StateStore(dir, Object.assign(
+    { leaseMs: CROSS_PROCESS_LEASE_MS, heartbeatMs: 5000 }, opts, { clock: systemLeaseClock() }));
+}
+/* Injected into generated worker scripts so the child is explicit too -- required once
+ * GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK=1 is on. */
+const CHILD_REAL_CLOCK = '{ now: function () { return Date.now(); } }';
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -301,8 +336,13 @@ function test2_pidReuseAndTestMode(tempDir) {
         throw new Error(`TEST_MODE not set but lease=${storeNoTest.leaseMs} heartbeat=${storeNoTest.heartbeatMs} (expected 30000/5000)`);
       }
 
-      // Also verify that options leaseMs/heartbeatMs are ignored without TEST_MODE
-      const storeOptsNoTest = new (require(STATE_STORE_PATH).StateStore)(tempDir, { leaseMs: 123, heartbeatMs: 50 });
+      /* Also verify that options leaseMs/heartbeatMs are ignored without TEST_MODE.
+       * Routed through requireFreshStore rather than constructing StateStore directly:
+       * the direct call bypassed this suite's clock injection, and the lease-determinism
+       * sweep caught it on its first run -- which is the point of that sweep. A source
+       * scan for `new StateStore(` would have found this one, but not the two inside
+       * generated worker scripts; runtime enforcement finds all three. */
+      const storeOptsNoTest = requireFreshStore(tempDir, { leaseMs: 123, heartbeatMs: 50 });
       if (storeOptsNoTest.leaseMs !== 30000 || storeOptsNoTest.heartbeatMs !== 5000) {
         throw new Error(`options lease=${storeOptsNoTest.leaseMs} (expected 30000)`);
       }
@@ -384,7 +424,7 @@ function test3_crashRecovery(tempDir) {
   process.env.GRAPHSMITH_TEST_MODE = "1";
   try {
     // Prepare the temp dir with an admitted window
-    const prepStore = requireFreshStore(tempDir, { leaseMs: 1000, heartbeatMs: 200 });
+    const prepStore = requireRealClockStore(tempDir);
     prepStore.window.admitPending({ txid: "tx-crash", fingerprint: "fp-crash", tree_id: "tree-crash", n: 1 });
     prepStore.window.finalize("tx-crash");
 
@@ -393,7 +433,7 @@ function test3_crashRecovery(tempDir) {
     fs.writeFileSync(childScript,
 '"use strict";\n' +
 'var { StateStore } = require(' + JSON.stringify(STATE_STORE_PATH) + ');\n' +
-'var store = new StateStore(' + JSON.stringify(tempDir) + ', { leaseMs: 200, heartbeatMs: 50 });\n' +
+'var store = new StateStore(' + JSON.stringify(tempDir) + ', { leaseMs: ' + CROSS_PROCESS_LEASE_MS + ', heartbeatMs: 5000, clock: ' + CHILD_REAL_CLOCK + ' });\n' +
 'store._testing.crashNextMutationAfter(1);\n' +
 'try {\n' +
 '  store.runRegistry.register("run-crash-recover", "tree-crash");\n' +
@@ -414,7 +454,7 @@ function test3_crashRecovery(tempDir) {
     try { fs.unlinkSync(lockPath); } catch {}
 
     // Now open a new store — recovery should roll forward
-    const recoveryStore = requireFreshStore(tempDir, { leaseMs: 200, heartbeatMs: 50 });
+    const recoveryStore = requireRealClockStore(tempDir);
 
     // The run should have been registered (roll forward)
     const runs = recoveryStore.runRegistry.list();
@@ -577,15 +617,20 @@ async function test5_runRegistry(tempDir) {
     const runsAfterDereg = store.runRegistry.list();
     assert(runsAfterDereg.length === 1 && runsAfterDereg[0].run_id === "run-r1", "List after dereg should have 1 run");
 
-    // Expired sweep, on its OWN store with a deliberately tiny lease. Only ONE
-    // registry operation precedes the wait, and the assertion is that the lease
-    // HAS expired -- so a slow or descheduled runner makes this more certain, not
-    // less. The 60ms wait is 1.5x the 40ms lease.
+    /* Expired sweep, on its OWN store. Expiry is the subject here, so time must move
+     * -- but it moves because this case says so, not because a timer fired. The wait
+     * was `setTimeout(60)` against a 40ms lease, which is a 1.5x margin against a
+     * runner whose lock+fsync cycle can cost 200ms; it also cost 60ms of real CI time
+     * per run. `advance` is exact and free.
+     *
+     * The live store below shares CLOCK, so this advance moves ITS leases too -- which
+     * is the point: the assertion that run-r1 survives there is now a statement about
+     * lease arithmetic (2000ms lease, 41ms elapsed) rather than about machine speed. */
     const expiryDir = path.join(tempDir, "expiry-store");
     fs.mkdirSync(expiryDir, { recursive: true });
     const expiryStore = requireFreshStore(expiryDir, { leaseMs: 40, heartbeatMs: 5 });
     expiryStore.runRegistry.register("run-r1", "tree-alpha");
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    CLOCK.advance(41);
 
     const swept = expiryStore.runRegistry.sweepExpired();
     assert(swept.includes("run-r1"), "Expired run was not swept");
@@ -610,42 +655,26 @@ async function test5_runRegistry(tempDir) {
 /* ---- TEST 6: Window slots — N+1 refusal; terminal dispositions; abandoned → FLAG + CLOSED_FLAGGED ---- */
 
 function test6_windowSlots(tempDir) {
-  const name = "6. Window slots: N-slot capacity; terminal dispositions required; abandoned → FLAGGED";
+  const name = "6. Window slots: N-slot capacity; terminal dispositions required; abandoned \u2192 FLAGGED";
   try {
     process.env.GRAPHSMITH_TEST_MODE = "1";
-    // Lease TTL, not a harness deadline: it is a PRODUCT budget and is
-    // deliberately NOT scaled by harnessDeadline() -- see the WHAT IT
-    // DELIBERATELY DOES NOT SCALE note in tests/harness-honesty/starvation.
-    //
-    // It was 1000ms, and 1000ms is a wall-clock proxy for a precondition this
-    // case needs but does not test: that the three slotted runs are STILL LIVE
-    // when their slots are inspected. Every store operation sweeps expired
-    // leases first (_operation -> _sweepExpiredLocked), and a swept run is
-    // terminalized as `abandoned`: window.active is decremented and the FLAG
-    // bit is set. The body below is ~12 lock+fsync operations. On a contended
-    // windows-latest runner those cost ~200ms each, so run-s1's lease lapsed
-    // before the slots were read and the case reported `Expected active=3, got
-    // 2` -- a PRODUCT verdict for a MACHINE-SPEED fact. Worse, a full lapse
-    // terminalizes every slot, which makes window.close() legitimately succeed
-    // and the case then reports "Closing window with active slots was not
-    // refused": a false finding against a fail-closed refusal. Measured
-    // directly: same sequence, 1100ms of induced delay, 1000ms lease ->
-    // active=0, flag=true, close NOT refused; 60000ms lease -> active=3,
-    // flag=false, close refused WINDOW_ACTIVE.
-    //
-    // Two changes, because a bigger number alone is just a bigger proxy:
-    //   1. the lease is the product default (DEFAULT_LEASE_MS, 30s), which is
-    //      ~150x the observed per-operation cost rather than ~5x. Long enough
-    //      to dwarf the body, short enough that a leaked lock still self-heals
-    //      instead of wedging the job (a lock is stolen once age > leaseMs).
-    //   2. the precondition is CHECKED, against the expiry the store itself
-    //      issued -- not recomputed here -- before every assertion that depends
-    //      on the runs being live. If it does not hold, this case cannot tell a
-    //      slow machine from a broken component, and says so: INCONCLUSIVE
-    //      (harness), which still fails closed but is not a product finding.
-    // Lease expiry as a subject is TEST 5's job, on its own short-lease store.
-    const LEASE_MS = 30000;
-    const store = requireFreshStore(tempDir, { leaseMs: LEASE_MS, heartbeatMs: 200 });
+    /* This case's subject is slot CAPACITY and terminal dispositions. It is not a
+     * test of lease expiry -- that is TEST 5's job.
+     *
+     * It used to run at leaseMs 1000 and assert three runs were still slotted. Every
+     * store operation sweeps lapsed leases first, so on a contended Windows runner
+     * (~200ms per lock+fsync, ~12 of them here) the first run lapsed mid-body and the
+     * case reported `Expected active=3, got 2` -- a product verdict for a machine-speed
+     * fact. A full lapse was worse: every slot goes terminal, window.close() then
+     * legitimately succeeds, and the case accused a fail-closed refusal of allowing a
+     * close over active slots.
+     *
+     * The lease is still a real product budget. What changed is that time no longer
+     * moves on its own: CLOCK only advances when a case says so, so "the three runs are
+     * still live" is true by construction rather than by winning a race. The previous
+     * fix here detected the lost race and reported INCONCLUSIVE; that was containment.
+     * This makes the false product verdict unreachable. */
+    const store = requireFreshStore(tempDir, { leaseMs: 1000, heartbeatMs: 200 });
 
     // Admit a window with 3 slots
     store.window.admitPending({ txid: "tx-win", fingerprint: "fp-win", tree_id: "tree-win", n: 3 });
@@ -659,112 +688,59 @@ function test6_windowSlots(tempDir) {
     const r3 = store.runRegistry.register("run-s3", "tree-win");
     assert(r3.slot !== null, "Run 3 should get a slot");
 
-    // The lease the STORE issued, read back from its own registration records.
-    // The earliest of the three is the first thing a sweep would take.
-    const expiries = [r1, r2, r3].map((r) => r.registration.lease_expires_at);
-    assert(expiries.every((t) => Number.isFinite(t)), "registration did not report lease_expires_at");
-    const earliestExpiry = Math.min.apply(null, expiries);
-    // Attribution, not prediction. Checking the lease BEFORE an observation
-    // cannot work: the lease can lapse during the very operation being
-    // observed. So the check runs only when an assertion has already failed,
-    // against the clock reading taken at the moment of that observation, and
-    // asks whether the runs could still have been live then. `observedAt` is
-    // sampled immediately after each observing call, so the comparison is exact
-    // rather than inflated by everything that happened afterwards. If the two
-    // are ever ambiguous the verdict lands on INCONCLUSIVE, which still exits
-    // non-zero and still gates -- so this can never turn a real defect into a
-    // PASS, only into a louder "I could not attribute this".
-    const assertLive = (condition, observedAt, what, message) => {
-      if (condition) return;
-      const overdue = observedAt - earliestExpiry;
-      if (overdue < 0) throw new Error(message);
-      const e = new Error(
-        "INCONCLUSIVE (harness): " + message + " -- but the earliest slotted run's " + LEASE_MS +
-        "ms lease had already lapsed by " + overdue + "ms when " + what + " was observed, so the store " +
-        "had swept it as `abandoned` and this case cannot tell that apart from a slot-accounting defect. " +
-        "The machine was too slow to finish this case's setup inside a product lease: a harness " +
-        "condition, not a finding.");
-      e.__inconclusive = true;
-      throw e;
-    };
-
-    // 4th run should NOT be observed (no slot). Not lease-sensitive: capacity is
-    // slots.length, and slots are never removed, only terminalized.
+    // 4th run should NOT be observed (no slot). Capacity is slots.length, and slots are
+    // terminalized rather than removed, so this never depended on the lease anyway.
     const r4 = store.runRegistry.register("run-s4", "tree-win");
     assert(r4.slot === null, "Run 4 should NOT get a slot");
 
-    // Window active count should be 3
     const win = store.window.get();
-    const winAt = Date.now();
-    assertLive(win.window.active === 3, winAt, "the active-slot count",
-      `Expected active=3, got ${win.window.active}`);
+    assert(win.window.active === 3, `Expected active=3, got ${win.window.active}`);
     assert(win.window.admitted === 3, `Expected admitted=3, got ${win.window.admitted}`);
     assert(win.window.slots.length === 3, `Expected 3 slots, got ${win.window.slots.length}`);
 
-    // Attempt to close window while runs are active → must fail
+    // Attempt to close window while runs are active \u2192 must fail. This is the
+    // fail-closed refusal the old proxy could falsely indict.
     let closeActiveRefused = false;
     try {
       store.window.close("tx-win", undefined);
     } catch (e) {
       closeActiveRefused = e.code === "WINDOW_ACTIVE";
     }
-    const closeAt = Date.now();
-    assertLive(closeActiveRefused, closeAt, "the close-while-active refusal",
-      "Closing window with active slots was not refused");
+    assert(closeActiveRefused, "Closing window with active slots was not refused");
 
     // Dispose runs with terminal dispositions
     store.window.dispose("run-s1", { disposition: "completed_pass" });
     store.window.dispose("run-s2", { disposition: "completed_soft_wobble" });
 
-    // Check soft_wobble sets FLAG. Lease-sensitive in the other direction: a
-    // swept `abandoned` run ALSO sets the flag, so a lapse would make this
-    // assertion pass for the wrong reason. Attributed the same way -- if the
-    // lease had lapsed, the flag is not evidence about soft_wobble.
+    // Check soft_wobble sets FLAG. A swept `abandoned` run would ALSO set this bit, so
+    // under the old proxy a passing assertion here could be right for the wrong reason.
+    // With time frozen, nothing can have been swept, so the flag is attributable.
     const winAfterWobble = store.window.get();
-    const wobbleAt = Date.now();
-    assertLive(wobbleAt < earliestExpiry, wobbleAt, "the soft-wobble FLAG bit",
-      "the FLAG bit could not be attributed to the soft wobble");
     assert(winAfterWobble.flag === true, "Soft wobble should set FLAG bit");
 
     // Deregister run-s3 with abandoned disposition (simulate sweep manually)
     store.window.dispose("run-s3", { disposition: "abandoned" });
 
-    // All slots now terminal → can close
+    // All slots now terminal \u2192 can close
     const closed = store.window.close("tx-win", "flagged");
     assert(closed.state === "CLOSED_FLAGGED", `Expected CLOSED_FLAGGED, got ${closed.state}`);
 
     // Now test terminal dispositions required: new window, register 1 run, try close
     store.window.admitPending({ txid: "tx-win2", fingerprint: "fp-win2", tree_id: "tree-win2", n: 1 });
     store.window.finalize("tx-win2");
-    const t1 = store.runRegistry.register("run-t1", "tree-win2");
+    store.runRegistry.register("run-t1", "tree-win2");
 
-    // Same attribution for the second window, against run-t1's own lease.
     let closeIncompleteRefused = false;
     try {
       store.window.close("tx-win2", undefined);
     } catch (e) {
       closeIncompleteRefused = e.code === "WINDOW_ACTIVE";
     }
-    const close2At = Date.now();
-    if (!closeIncompleteRefused && close2At >= t1.registration.lease_expires_at) {
-      const e = new Error(
-        "INCONCLUSIVE (harness): the second window's close was not refused, but run-t1's " + LEASE_MS +
-        "ms lease had already lapsed by " + (close2At - t1.registration.lease_expires_at) +
-        "ms, so its slot was swept terminal before the close was attempted -- a slow machine, not a " +
-        "component that closes over an active slot.");
-      e.__inconclusive = true;
-      throw e;
-    }
     assert(closeIncompleteRefused, "Closing window with active terminal slots was not refused");
 
     record(name, "PASS");
   } catch (e) {
-    // The tag is applied here, from the flag, rather than trusting each throw
-    // site to have typed the prefix correctly. INCONCLUSIVE still records FAIL:
-    // it fails closed and still gates; it is only excluded from product findings.
-    const tag = "INCONCLUSIVE (harness): ";
-    const detail = e.__inconclusive && e.message.indexOf(tag) !== 0 ? tag + e.message : e.message;
-    record(name, "FAIL", detail);
+    record(name, "FAIL", e.message);
   }
 }
 
@@ -779,7 +755,7 @@ async function test7_concurrency(tempDir) {
 
   try {
     process.env.GRAPHSMITH_TEST_MODE = "1";
-    const prepStore = requireFreshStore(tempDir, { leaseMs: 10000, heartbeatMs: 2000 });
+    const prepStore = requireRealClockStore(tempDir);
 
     // Worker script — each worker creates a fresh StateStore per attempt with randomized backoff
     //
@@ -808,7 +784,7 @@ async function test7_concurrency(tempDir) {
 '  var deadline = Date.now() + 10000;\n' +
 '  for (var attempt = 0; !done; attempt++) {\n' +
 '    try {\n' +
-'      var store = new StateStore(' + JSON.stringify(tempDir) + ', { leaseMs: 5000, heartbeatMs: 500 });\n' +
+'      var store = new StateStore(' + JSON.stringify(tempDir) + ', { leaseMs: ' + CROSS_PROCESS_LEASE_MS + ', heartbeatMs: 5000, clock: ' + CHILD_REAL_CLOCK + ' });\n' +
 '      store.runRegistry.register(runId, "tree-conc");\n' +
 '      store.runRegistry.deregister(runId);\n' +
 '      results.ops++;\n' +
@@ -878,7 +854,7 @@ async function test7_concurrency(tempDir) {
     if (totalErrors > 0) throw new Error(`${totalErrors} operations failed across ${workers.length} workers (${totalOps} succeeded); codes=${JSON.stringify(allErrorCodes)}`);
 
     // After all deregistrations, verify data integrity
-    const finalStore = requireFreshStore(tempDir, { leaseMs: 200, heartbeatMs: 50 });
+    const finalStore = requireRealClockStore(tempDir);
     
     // Check registry JSONL is parseable (no corruption)
     const regPath = path.join(tempDir, ".graphsmith", "state", "run-registry.jsonl");
@@ -1051,25 +1027,24 @@ async function test11_wallClockCap(tempDir) {
     process.env.GRAPHSMITH_TEST_MODE = "1";
     const store = requireFreshStore(tempDir, { leaseMs: 1000, heartbeatMs: 200 });
 
-    /* WALL_MS is a FIXTURE value this test chooses, not a product default — it only has
-     * to be long enough that admit + finalize + get complete inside it, and short enough
-     * that the sleep below outlives it. It was 200ms, which the setup itself cannot
-     * reliably finish inside: those three calls are fsync-backed writes.
+    /* WALL_MS is a FIXTURE value this case chooses, not a product default.
      *
-     * Measured on a 2-core Linux container:
-     *     idle                 admit 19ms + finalize 16ms + get 6ms  = 41ms   -> OBSERVING
-     *     under 32x CPU load   admit 198 + finalize 158 + get 167    = 523ms  -> CLOSED_FLAGGED
+     * It was 200ms, then 5000ms, then it grew an INCONCLUSIVE guard -- three rounds of
+     * making the same wall-clock race less likely. Measured on a 2-core Linux container,
+     * the setup (admit + finalize + get, all fsync-backed) cost 41ms idle and 523ms under
+     * 32x CPU load, so at 200ms it blew its own budget by 2.6x on a busy box; the window
+     * expired before the assertion, the PRODUCT behaved correctly, and the case called it
+     * a defect (CI run #81, Windows).
      *
-     * So at 200ms the setup had 5x headroom on an idle box and blew the budget by 2.6x on
-     * a busy one. It failed on Windows in CI run #81 for exactly this reason: the window
-     * expired before the assertion ran, the PRODUCT behaved correctly, and the test called
-     * it a defect.
+     * None of that is a risk now. The window's created_at and the sweep's comparison both
+     * read the injected clock, so the setup consumes exactly zero of the budget no matter
+     * how slow the disk is, and the expiry happens because this case advances time. The
+     * guard that distinguished "setup outran the budget" from a product defect is gone
+     * with the race it was containing.
      *
-     * Raised to 5000ms — still far below any real window, and now ~120x the measured idle
-     * setup cost. The property under test is unchanged: an expired window closes as
-     * CLOSED_FLAGGED with reason max_window_wall_time. */
+     * The property under test is unchanged: an expired window closes as CLOSED_FLAGGED
+     * with reason max_window_wall_time. */
     const WALL_MS = 5000;
-    const setupStart = Date.now();
     store.window.admitPending({
       txid: "tx-wall", fingerprint: "fp-wall", tree_id: "tree-wall", n: 1,
       max_window_wall_time_ms: WALL_MS,
@@ -1077,28 +1052,15 @@ async function test11_wallClockCap(tempDir) {
     store.window.finalize("tx-wall");
 
     const winAfterFinalize = store.window.get();
-    if (winAfterFinalize.state !== "OBSERVING") {
-      /* Belt and braces, per contract 10 List C rule 1. If setup ever outruns the budget
-       * again, this case observed nothing about window expiry and must not report a
-       * product defect. Distinguish the two before drawing any conclusion. */
-      const setupMs = Date.now() - setupStart;
-      if (setupMs >= WALL_MS) {
-        record(name, "FAIL", `INCONCLUSIVE (harness): setup (admit+finalize+get) took ` +
-          `${setupMs}ms, at or beyond the ${WALL_MS}ms window it was supposed to fit inside, ` +
-          `so the window had already expired before the assertion — nothing was observed ` +
-          `about the product`);
-        return;
-      }
-      throw new Error(`Expected OBSERVING after finalize, got ${winAfterFinalize.state} ` +
-        `(setup took ${setupMs}ms of a ${WALL_MS}ms window, so this is not a timing artefact)`);
-    }
+    assert(winAfterFinalize.state === "OBSERVING",
+      `Expected OBSERVING after finalize, got ${winAfterFinalize.state} (time has not moved, ` +
+      `so the window cannot have expired -- this is a product verdict)`);
 
     // Register a run so there's something active
     store.runRegistry.register("run-wall-1", "tree-wall");
 
-    // Wait for the wall time to expire — must outlive WALL_MS with margin.
-    const wait = new Promise((r) => setTimeout(r, WALL_MS + 500));
-    await wait;
+    // Past the wall-time cap. Chosen, not waited for.
+    CLOCK.advance(WALL_MS + 1);
 
     // Sweep should detect wall-time expiry and close as CLOSED_FLAGGED
     store.runRegistry.sweepExpired();
