@@ -209,11 +209,10 @@ function checkEnforcedRun(target) {
 const DECLARED_REAL_CLOCK_SITES = {
   "tests/state-store/grok/run-tests.js": {
     sites: [
-      "child-crash.js",
-      "hammer.js",
-      "tests/state-store/grok/run-tests.js:55 <- tests/state-store/grok/run-tests.js:456",
-      "tests/state-store/grok/run-tests.js:55 <- tests/state-store/grok/run-tests.js:862",
-      "tests/state-store/grok/run-tests.js:55 <- tests/state-store/grok/run-tests.js:996",
+      "child-crash.js#anon",
+      "hammer.js#anon",
+      "tests/state-store/grok/run-tests.js#createRealClockStore <- tests/state-store/grok/run-tests.js#anon",
+      "tests/state-store/grok/run-tests.js#createRealClockStore <- tests/state-store/grok/run-tests.js#mk",
     ],
     why:
       "crash.journal-roll-forward-monotonic-no-tear and concurrency.two-process-register-" +
@@ -226,42 +225,44 @@ const DECLARED_REAL_CLOCK_SITES = {
   },
   "tests/state-store/deepseek/run-tests.js": {
     sites: [
-      /* The four callers of requireRealClockStore. All are WINDOWS-ONLY: a linux leg
-       * returns from tests 3 and 7 before building a store, so it observes none of them.
-       * They were enumerated by running this sweep on real Windows -- the platform blind
-       * spot that produced this whole line of work is now an explicit list. */
-      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:427",
-      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:457",
-      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:758",
-      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:857",
-      "child-crash.js", "worker-concurrency.js",
+      "child-crash.js#anon",
+      "worker-concurrency.js#anon",
+      "tests/state-store/deepseek/run-tests.js#requireRealClockStore <- tests/state-store/deepseek/run-tests.js#test2_pidReuseAndTestMode",
+      "tests/state-store/deepseek/run-tests.js#requireRealClockStore <- tests/state-store/deepseek/run-tests.js#test3_crashRecovery",
+      "tests/state-store/deepseek/run-tests.js#requireRealClockStore <- tests/state-store/deepseek/run-tests.js#test7_concurrency",
     ],
     why:
-      "test 3 (crash recovery) and test 7 (two-process contention), both windows-only, both " +
-      "spawning children. Same reasoning, same 10-minute lease, same invariant-only " +
-      "assertions. On a non-windows leg these cases return before building a store, so the " +
-      "observed site set there is empty -- a subset is fine, a NEW site is not.",
+      "test 3 (crash recovery) and test 7 (two-process contention) spawn children, so a " +
+      "manual clock cannot reach them; both are windows-only, so a linux leg observes " +
+      "neither. test 2's busy-owner check is real-clock on purpose: it asserts that a lock " +
+      "being RENEWED is not stolen, and lock renewal writes an mtime the OS stamps -- there " +
+      "is nothing to inject. All three assert invariants, never lease liveness.",
   },
 };
 
-/* Site identity.
+/* Site identity: FILE plus FUNCTION, no line numbers.
  *
- * This returned a BASENAME, which an adversarial review pointed out bounds a few file
- * names rather than the residual surface: a NEW wall-clock construction added to an
- * already-declared run-tests.js was accepted automatically. Repo files now carry their
- * repo-relative path AND line, so a new construction in a declared file is a new site.
+ * This has now been wrong twice in opposite directions. A basename bounded file names
+ * rather than sites -- a new wall-clock construction inside an already-declared
+ * run-tests.js was accepted. Adding line numbers fixed that and made the declaration
+ * unmaintainable: every edit above a site shifts its line, so an unrelated change to a
+ * comment invalidates the inventory and the next person "fixes" it by pasting in whatever
+ * the run printed, which is how a gate becomes a rubber stamp.
  *
- * Generated worker scripts live in randomly-named temp directories, so their absolute
- * path is per-run noise and their line number moves whenever the generator's template is
- * edited; those keep basename identity, which is honest about what it bounds -- the
- * generator is repo code and its own construction line is covered by the repo-file rule. */
+ * The function is the stable identity of a construction site. A new factory, a new file, or
+ * a new named caller of an existing factory is caught; a second construction inside an
+ * already-declared function is not, and that is the honest limit of this check. */
 function normaliseSite(site) {
-  const m = String(site || "").match(/([^()\s]+\.js):(\d+):\d+/);
-  if (!m) return "(unknown)";
-  const file = m[1];
+  const raw = String(site || "");
+  const fileMatch = raw.match(/([^()\s]+\.js):\d+:\d+/);
+  if (!fileMatch) return "(unknown)";
+  const file = fileMatch[1];
   const rel = path.relative(ROOT, file);
   const inRepo = rel && !rel.startsWith("..") && !path.isAbsolute(rel);
-  return inRepo ? `${rel.split(path.sep).join("/")}:${m[2]}` : path.basename(file);
+  const name = inRepo ? rel.split(path.sep).join("/") : path.basename(file);
+  const fnMatch = raw.match(/^\s*at\s+([^\s(]+)\s+\(/);
+  const fn = fnMatch && fnMatch[1] !== "Object.<anonymous>" ? fnMatch[1] : "anon";
+  return `${name}#${fn}`;
 }
 
 function checkDeclaredResidual(target, audit) {

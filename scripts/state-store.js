@@ -333,6 +333,7 @@ class StateStore {
       : DEFAULT_HEARTBEAT_MS;
     if (this.heartbeatMs >= this.leaseMs) this.heartbeatMs = Math.max(1, Math.floor(this.leaseMs / 3));
     this._crashAfterEffects = 0;
+    this._heldOwnerToken = null;
 
     this.window = {
       get: () => this.getWindow(),
@@ -462,9 +463,38 @@ class StateStore {
     }
   }
 
+  /* Liveness for lock ownership. Two corrections, both found by adversarial review with
+   * working reproductions:
+   *
+   *   EPERM means ALIVE, not dead. A bare `catch { return false }` conflated "no such
+   *   process" with "cannot determine". A lock held by another USER was therefore reported
+   *   as ownerless and stolen -- demonstrated cross-uid on a lock 107ms old against a
+   *   30s lease, i.e. the freshness of the lock could not save it.
+   *
+   *   A ZOMBIE is DEAD for this purpose. kill(pid, 0) succeeds on a process that has
+   *   exited but not been reaped, so an unreaped owner looked alive. That is not academic
+   *   here: scripts/watchdog.js SIGKILLs runs, and a killed child whose parent has not
+   *   reaped it is exactly a zombie. Treating it as alive makes crash recovery fail in
+   *   the one scenario the product itself manufactures. Only /proc can tell us, so this
+   *   is a Linux-only refinement; elsewhere the lease fallback covers it.
+   *
+   * ESRCH from a DIFFERENT PID NAMESPACE is indistinguishable from a genuinely absent
+   * process and this cannot fix that. It is why the lease remains a second gate rather
+   * than this being the sole authority. */
   _pidAlive(pid) {
     if (!Number.isSafeInteger(pid) || pid < 1) return false;
-    try { process.kill(pid, 0); return true; } catch { return false; }
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "EPERM") return true;   // exists, we may not signal it
+      return false;                               // ESRCH, or a platform that cannot say
+    }
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close !== -1 && stat.slice(close + 2).split(" ")[0] === "Z") return false;
+    } catch (error) { /* no /proc: signal 0 is the best answer available */ }
+    return true;
   }
 
   _unlinkLockIfOwner(ownerToken) {
@@ -493,11 +523,22 @@ class StateStore {
       validateStateRecord(record, path.basename(this.lockPath));
       try {
         this._createLockFile(record);
-        const heartbeat = setInterval(() => {
-          try { this._renewLock(ownerToken); } catch {}
-        }, this.heartbeatMs);
-        heartbeat.unref();
-        return { ownerToken, heartbeat };
+        /* NO setInterval here any more.
+         *
+         * There was one, renewing the lock's mtime every heartbeatMs. It could never fire:
+         * `_operation` and every caller of `_testing.acquireLock` (promote.js holds the lock
+         * across an entire fsync-heavy adoption transaction) are FULLY SYNCHRONOUS, so the
+         * event loop is blocked for the whole critical section and `clearInterval` runs in
+         * the `finally` before the timer could ever run. Reproduced: 300ms lease, 800ms of
+         * synchronous work, lock mtime unchanged (delta 0ms), a second store ACQUIRED the
+         * lock while the first still held it, and the owner's release then failed
+         * LOCK_OWNER_MISMATCH.
+         *
+         * A timer that cannot fire is worse than no timer: it tells a reader the lock is
+         * kept fresh when nothing keeps it fresh. Renewal is now explicit and synchronous,
+         * at the durable writes in `_commit`, where the time actually goes. */
+        this._heldOwnerToken = ownerToken;
+        return { ownerToken, heartbeat: null };
       } catch (error) {
         if (error.code !== "EEXIST") throw error;
         // A lock file that EXISTS but does not parse is either being BORN (the
@@ -523,9 +564,53 @@ class StateStore {
         }
         unreadableLock = null;
         if (!observed) continue;
+        /* TWO GATES, and the renewal above is what makes the second one mean something.
+         *
+         * The original defect: `age > leaseMs || !pidAlive` stole a lock from a live owner
+         * purely because its mtime was old -- and with the renewal timer unable to fire,
+         * "old mtime" was simply "a transaction longer than leaseMs". Two writers then
+         * entered _commit and recovery reached AMBIGUOUS_RECOVERY. promote.js holds this
+         * lock across an entire fsync-heavy adoption, so it was reachable in production.
+         *
+         * The first attempt at a fix deleted the age gate entirely, leaving _pidAlive as
+         * the sole authority. Adversarial review demolished that: a crashed owner in a PID
+         * namespace leaves a lock whose pid is the NEXT run's own pid, so the store bricked
+         * permanently after any container crash -- including `status` and `sweep`, the two
+         * commands an operator would use to diagnose it. Trading split-brain for a brick is
+         * not a fix.
+         *
+         * Both gates, in the right order:
+         *   owner observably alive AND the lock is being renewed  -> refuse. This is the
+         *     long-transaction case, and it is now safe BECAUSE _commit renews at every
+         *     durable step: a working owner's mtime cannot go stale.
+         *   otherwise, once the lock has gone unrenewed for longer than the lease -> steal.
+         *     A stale mtime now means "this owner has made no progress", not "this owner
+         *     started a while ago", which is the fact the steal actually needs. Zombies,
+         *     stopped processes, foreign namespaces and reused pids all self-heal here.
+         *
+         * What this still does NOT cover, stated rather than papered over: a holder that
+         * does long work WITHOUT touching the store renews nothing, so a sufficiently long
+         * non-store phase can still be stolen from. The durable answer is an OS-level lock
+         * whose lifetime is tied to the owner's file descriptor rather than to an mtime and
+         * a pid; that is a protocol change, not a patch. Tracked separately. */
         const age = Date.now() - observed.stat.mtimeMs;
-        const expired = age > this.leaseMs || !this._pidAlive(observed.record.pid);
-        if (!expired) throw fail(`State store is actively locked by pid ${observed.record.pid}`, "LOCKED");
+        const ownerAlive = this._pidAlive(observed.record.pid);
+        const unrenewed = age > this.leaseMs;
+        if (ownerAlive && !unrenewed) {
+          throw fail(
+            `State store is locked by pid ${observed.record.pid} (renewed ${age}ms ago, ` +
+            `lease ${this.leaseMs}ms). That owner is alive and making progress.`,
+            "LOCKED");
+        }
+        if (!ownerAlive && !unrenewed) {
+          throw fail(
+            `State store lock at ${this.lockPath} names pid ${observed.record.pid}, which is ` +
+            `not observable, but the lock was renewed only ${age}ms ago (lease ` +
+            `${this.leaseMs}ms). Refusing to steal a lock that is still being kept fresh: ` +
+            "the owner may simply be invisible from here (another user, another PID " +
+            "namespace). It becomes stealable once it goes unrenewed.",
+            "LOCKED");
+        }
         requiredString(observed.record.owner_token, "state.lock owner_token");
         try {
           if (!this._unlinkLockIfOwner(observed.record.owner_token)) continue;
@@ -539,6 +624,29 @@ class StateStore {
     if (unreadableLock)
       throw fail(`State lock ${this.lockPath} existed but never became readable across ${ATTEMPTS} attempts (${unreadableLock.message}). A crash between creating and writing the lock leaves exactly this; remove the file after confirming no run holds it.`, "CORRUPT_STATE");
     throw fail("Could not acquire state-store lock after bounded contention", "LOCK_CONTENTION");
+  }
+
+  /* Renew the lock AND prove we still own it, synchronously, at the points where the time
+   * actually goes. Replaces the timer that could never fire.
+   *
+   * The second half matters more than the first: if the lock is gone or now belongs to
+   * someone else, this run has been superseded and must stop BEFORE writing anything more.
+   * Previously that was discovered at release, after the writes had already landed. */
+  _assertStillOwned(context) {
+    const ownerToken = this._heldOwnerToken;
+    if (!ownerToken) return;   // no lock held by this instance: nothing to assert
+    try {
+      this._renewLock(ownerToken);
+    } catch (error) {
+      if (error.code === "LOCK_OWNER_MISMATCH" || error.code === "ENOENT") {
+        throw fail(
+          `Lost the state-store lock during ${context}: it is ${error.code === "ENOENT" ? "gone" : "now held by another owner"}. ` +
+          "Refusing to continue writing -- two writers in the same mutation is how the " +
+          "journal becomes ambiguous. Re-run the operation.",
+          "LOCK_LOST");
+      }
+      throw error;
+    }
   }
 
   _renewLock(ownerToken) {
@@ -558,6 +666,11 @@ class StateStore {
     if (!current) return false;
     if (current.record.owner_token !== ownerToken) throw fail("Refusing to release a lock owned by another token", "LOCK_OWNER_MISMATCH");
     if (!this._unlinkLockIfOwner(ownerToken)) throw fail("Lock owner changed during release", "LOCK_OWNER_MISMATCH");
+    /* Cleared only AFTER the release is verified. It was cleared on ENTRY, so a release
+     * that THREW still disarmed _assertStillOwned -- and promote.js swallows release
+     * failures, so a run whose lock had been taken carried on committing with the guard
+     * silently off. Found by adversarial review with a working reproduction. */
+    if (this._heldOwnerToken === ownerToken) this._heldOwnerToken = null;
     return true;
   }
 
@@ -573,6 +686,12 @@ class StateStore {
   }
 
   _recoverJournal() {
+    /* Roll-forward rewrites whole state files from a journal that may have been written by
+     * ANOTHER process, and appends MUTATION_DONE. It had no ownership check at all -- the
+     * most dangerous write path in the file was the one the new guard did not cover, which
+     * an adversarial review demonstrated by rolling another writer's mutation forward with
+     * no lock held. It is called first inside _operation and directly by promote.js. */
+    this._assertStillOwned("journal recovery");
     const records = this._journalRecords();
     const completed = new Set(records.filter((record) => record.record_type === "MUTATION_DONE").map((record) => record.mutation_id));
     for (const intent of records) {
@@ -614,6 +733,7 @@ class StateStore {
     });
     if (effects.every((effect) => effect.before_sha256 === effect.after_sha256)) return stateRev - 1;
     const mutationId = `${stateRev}-${stableId(effects.map((effect) => `${effect.file}:${effect.after_sha256}`))}`;
+    this._assertStillOwned("the pre-intent check of a mutation");
     this._appendDurable(this.journalPath, {
       schema_version: SCHEMA_VERSION,
       record_type: "MUTATION_INTENT",
@@ -623,6 +743,10 @@ class StateStore {
     });
     let applied = 0;
     for (const effect of effects) {
+      /* Before EVERY effect, not once per transaction. This is what makes the lock's mtime
+       * mean "this owner is making progress" rather than "this owner started recently", and
+       * it is the granularity at which a lost lock is detected. */
+      this._assertStillOwned(`writing ${effect.file}`);
       if (effect.before_sha256 !== effect.after_sha256) this._atomicReplace(effect.file, effect.after);
       applied++;
       if (this._crashAfterEffects && applied >= this._crashAfterEffects) {
@@ -630,6 +754,7 @@ class StateStore {
         throw fail("Simulated crash after journaled effect", "SIMULATED_CRASH");
       }
     }
+    this._assertStillOwned("completing a mutation");
     this._appendDurable(this.journalPath, {
       schema_version: SCHEMA_VERSION,
       record_type: "MUTATION_DONE",

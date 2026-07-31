@@ -321,7 +321,7 @@ function test1_lockStealMismatch(tempDir) {
 /* ---- TEST 2: Pid-reuse + TEST_MODE check ---- */
 
 function test2_pidReuseAndTestMode(tempDir) {
-  const name = "2. Pid-reuse: alive-pid stale lease stealable; fresh heartbeat refused; TEST_MODE required";
+  const name = "2. Pid-reuse: unrenewed lock stealable, RENEWING owner not; fresh refused; TEST_MODE required";
   const savedTestMode = process.env.GRAPHSMITH_TEST_MODE;
   try {
     // First: WITHOUT GRAPHSMITH_TEST_MODE=1, custom lease values should be IGNORED
@@ -365,7 +365,19 @@ function test2_pidReuseAndTestMode(tempDir) {
     const store = requireFreshStore(tempDir, { leaseMs: 2000, heartbeatMs: 200 });
     store._ensureStateDir();
 
-    // Create a stale lock with OUR pid (alive) but expired lease
+    /* Two properties, and the second is the one the original defect broke.
+     *
+     * (1) A lock that has gone UNRENEWED past its lease is stealable even if its recorded
+     *     pid is alive -- a pid can be reused, or belong to another user, PID namespace, or
+     *     a zombie, so "the pid answers" is not evidence the owner still holds anything.
+     *     Removing this in an earlier attempt bricked the store permanently after a crash
+     *     inside a container, where the dead owner's pid is the next run's own pid.
+     *
+     * (2) An owner that is MAKING PROGRESS is never stolen from, however long it holds.
+     *     Before the fix, `age > leaseMs || !pidAlive` stole a lock purely because its
+     *     mtime was old, and the renewal timer meant to keep it fresh could never fire from
+     *     a synchronous critical section. _commit now renews at every durable step, so a
+     *     stale mtime means "no progress" rather than "started a while ago". */
     const staleToken = randHex(32);
     fs.writeFileSync(store.lockPath, JSON.stringify({
       schema_version: "1.0", pid: process.pid, proc_start_hint: "pid-reuse-stale", owner_token: staleToken,
@@ -373,9 +385,35 @@ function test2_pidReuseAndTestMode(tempDir) {
     const oldTime = new Date(Date.now() - 5000);
     fs.utimesSync(store.lockPath, oldTime, oldTime);
 
-    // Should be stealable even though pid is alive (lease expired)
     const stolen = store._testing.acquireLock();
-    assert(stolen && stolen.ownerToken, "Failed to steal expired lock from alive pid");
+    assert(stolen && stolen.ownerToken && stolen.ownerToken !== staleToken,
+      "an unrenewed lock past its lease was not stolen");
+    store._testing.releaseLock(stolen.ownerToken);
+
+    // (2) a busy owner, on its own directory so it does not contend with the above
+    const busyDir = path.join(tempDir, "busy-owner");
+    fs.mkdirSync(busyDir, { recursive: true });
+    const busy = requireRealClockStore(busyDir, { leaseMs: 300, heartbeatMs: 100 });
+    busy._ensureStateDir();
+    const busyHeld = busy._testing.acquireLock();
+    const busyStart = Date.now();
+    let commits = 0;
+    while (Date.now() - busyStart < 1000) {
+      busy._commit([{ file: "run-registry.jsonl", make: (raw, rev) => raw + JSON.stringify({
+        schema_version: "1.0", state_rev: rev, record_type: "REGISTERED",
+        run_id: "busy-" + (commits++), tree_id: "tree-busy", lease_expires_at: Date.now() + 600000,
+      }) + "\n" }]);
+    }
+    const heldFor = Date.now() - busyStart;
+    let busyRefused = false;
+    try {
+      requireRealClockStore(busyDir, { leaseMs: 300, heartbeatMs: 100 })._testing.acquireLock();
+    } catch (e) { busyRefused = e.code === "LOCKED"; }
+    assert(busyRefused,
+      `a lock held for ${heldFor}ms of continuous store work (${commits} commits, 300ms lease) ` +
+      "was stolen from its live owner");
+    assert(heldFor > 900, `busy hold only lasted ${heldFor}ms`);
+    busy._testing.releaseLock(busyHeld.ownerToken);
 
     // Release it
     store._testing.releaseLock(stolen.ownerToken);

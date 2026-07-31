@@ -82,6 +82,21 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+
+/* A pid that is definitely gone: spawn a process, wait for it to exit, reuse its id.
+ * Needed because "stealable" now means "the owner process is gone" rather than "the lock
+ * file's mtime is old", so a case about stealing must produce a genuinely dead owner
+ * instead of backdating an mtime. */
+function deadPid() {
+  const r = spawnSync(process.execPath, ["-e", "process.exit(0)"], { encoding: "utf8" });
+  if (typeof r.pid !== "number") throw new Error("could not spawn a probe process");
+  for (let i = 0; i < 200; i++) {
+    try { process.kill(r.pid, 0); } catch (e) { if (e.code === "ESRCH") return r.pid; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+  throw new Error(`probe pid ${r.pid} never became unobservable`);
+}
+
 function tempRoot(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `gs-ss-grok-${label}-`));
 }
@@ -268,12 +283,19 @@ function attackLockStealAndTokenMismatch() {
       const store = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
       store.status(); // ensure dir
 
+      /* The owner must be GONE for a lock to be stealable. This wrote `pid: 1` and
+       * backdated the mtime, asserting that an old lock is taken -- but pid 1 is the most
+       * alive process on the machine, so under the old rule this case was really asserting
+       * "a lock is stolen once its mtime is old, no matter who holds it". That rule is what
+       * let a second writer take the lock from a live owner mid-transaction. It now uses a
+       * genuinely dead pid, which is the condition that actually makes a steal safe. */
       const staleToken = crypto.randomBytes(16).toString("hex");
+      const gonePid = deadPid();
       fs.writeFileSync(
         store.lockPath,
         JSON.stringify({
           schema_version: SCHEMA_VERSION,
-          pid: 1,
+          pid: gonePid,
           proc_start_hint: "dead-pid",
           owner_token: staleToken,
         })
@@ -282,7 +304,49 @@ function attackLockStealAndTokenMismatch() {
       fs.utimesSync(store.lockPath, old, old);
 
       const stolen = store._testing.acquireLock();
-      assert(stolen && stolen.ownerToken && stolen.ownerToken !== staleToken, "steal failed");
+      assert(stolen && stolen.ownerToken && stolen.ownerToken !== staleToken,
+        "a lock left by a DEAD owner was not stolen -- crash recovery depends on this");
+
+      /* THE GUARANTEE THAT MATTERS, and the one the original defect broke: an owner that is
+       * MAKING PROGRESS is never stolen from, however long it holds the lock.
+       *
+       * Before the fix, `age > leaseMs || !pidAlive` stole a lock purely because its mtime
+       * was old, and the renewal timer that was supposed to keep it fresh could never fire
+       * (setInterval, fully synchronous critical section). So "old mtime" meant "a
+       * transaction longer than leaseMs". Reproduced: 300ms lease, 800ms of synchronous
+       * work, second store acquired the lock, owner's release failed LOCK_OWNER_MISMATCH,
+       * recovery reached AMBIGUOUS_RECOVERY. promote.js holds this lock across an entire
+       * fsync-heavy adoption.
+       *
+       * _commit now renews at every durable step, so a stale mtime means "this owner has
+       * made no progress" rather than "this owner started a while ago". This case holds a
+       * lock for several times its lease while doing real store work and requires a
+       * concurrent acquirer to be refused. */
+      const busyRoot = tempRoot("busy");
+      const busy = createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 });
+      busy.status();
+      const busyHeld = busy._testing.acquireLock();
+      const busyStart = Date.now();
+      let commits = 0;
+      while (Date.now() - busyStart < 1000) {
+        busy._commit([{ file: "run-registry.jsonl", make: (raw, rev) => raw + JSON.stringify({
+          schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "REGISTERED",
+          run_id: "busy-" + (commits++), tree_id: "tree-busy",
+          lease_expires_at: Date.now() + 600000,
+        }) + "\n" }]);
+      }
+      const heldFor = Date.now() - busyStart;
+      let busyRefused = false;
+      let busyError = "";
+      try {
+        createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 })._testing.acquireLock();
+      } catch (e) { busyError = e.code; busyRefused = e.code === "LOCKED"; }
+      assert(busyRefused,
+        `a lock held for ${heldFor}ms of CONTINUOUS store work (${commits} commits, 300ms lease) ` +
+        `was stolen from its live owner: ${busyError || "no error"}`);
+      assert(heldFor > 300 * 3, `the busy hold only lasted ${heldFor}ms; it must outlast the lease severalfold`);
+      busy._testing.releaseLock(busyHeld.ownerToken);
+      rmrf(busyRoot);
 
       let freshRefused = false;
       try {
@@ -355,7 +419,20 @@ function attackPidReuseAndEnvOverride() {
       const store = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
       store.status();
 
-      // pid alive (self) but lease stale → stealable
+      /* A lock that has gone UNRENEWED past its lease is stealable even if its recorded pid
+       * is alive. That is deliberate and it is what keeps the store self-healing: a pid can
+       * be reused, can belong to another user or PID namespace, or can be a zombie, and
+       * "the pid answers" is not evidence that the original owner still holds anything.
+       *
+       * An earlier attempt at fixing the split-brain bug removed exactly this, making
+       * liveness the sole authority. Adversarial review showed that bricks the store
+       * permanently after a crash inside a container -- where the dead owner's pid is the
+       * next run's own pid -- including `status` and `sweep`, the commands an operator
+       * would use to diagnose it. Trading split-brain for a brick is not a fix.
+       *
+       * The split-brain case is closed instead by RENEWAL: a working owner keeps its lock
+       * fresh, so this branch cannot fire against it. That guarantee is asserted in
+       * lock.steal-expired-refuse-fresh-token-mismatch. */
       const tok = crypto.randomBytes(16).toString("hex");
       fs.writeFileSync(
         store.lockPath,
@@ -369,8 +446,7 @@ function attackPidReuseAndEnvOverride() {
       const old = new Date(Date.now() - 5000);
       fs.utimesSync(store.lockPath, old, old);
       const stolen = store._testing.acquireLock();
-      assert(stolen.ownerToken !== tok, "stale same-pid lock not stolen");
-      clearInterval(stolen.heartbeat);
+      assert(stolen.ownerToken !== tok, "an unrenewed lock past its lease was not stolen");
       store._testing.releaseLock(stolen.ownerToken);
 
       // fresh heartbeat (recent mtime, pid alive) → refuse
