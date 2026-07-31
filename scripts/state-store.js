@@ -188,6 +188,7 @@ function systemLeaseClock() {
 }
 
 const REQUIRE_EXPLICIT_CLOCK_ENV = "GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK";
+const LEASE_CLOCK_AUDIT_ENV = "GRAPHSMITH_LEASE_CLOCK_AUDIT";
 
 class StateStore {
   constructor(projectRoot = process.cwd(), options = {}) {
@@ -203,6 +204,42 @@ class StateStore {
      * throws on the executed path instead, so a test that relies on wall-clock lease
      * time cannot pass anywhere, including the Windows-only cases a Linux audit is
      * structurally blind to. Off unless the env var is set, so production is untouched. */
+    /* AUDIT BREADCRUMB, written BEFORE the refusal below and never conditional on it.
+     *
+     * The first version of the determinism sweep detected wall-clock construction by
+     * grepping the target's output for the refusal message. An adversarial review broke
+     * that in one line: tests/state-store/grok has a case whose catch block treats ANY
+     * throw as its success signal, so the refusal was swallowed, the suite exited 0, and
+     * the sweep reported "no wall-clock lease construction on any executed path" while a
+     * wall-clock store was being built on that very path. A detector a `catch` can defeat
+     * is not a detector.
+     *
+     * So the record is written here, at construction, where no downstream handler can
+     * intercept it -- and it records the KIND of clock rather than merely its presence,
+     * because an inline `{ now: () => Date.now() }` satisfies a presence check while
+     * reintroducing the exact race. Append-only and best-effort: this must never be able
+     * to fail a run it is only observing. Inert unless the env var is set. */
+    const auditPath = process.env[LEASE_CLOCK_AUDIT_ENV];
+    if (auditPath) {
+      /* The first frame OUTSIDE this file. Taking a fixed stack index named the local
+       * factory every time -- `at createStore (state-store.js:...)` for all nine
+       * constructions -- which is an inventory that cannot tell you where to look. */
+      let site = "(no stack)";
+      try {
+        const frames = String(new Error().stack || "").split("\n").slice(1);
+        const here = path.basename(__filename);
+        site = (frames.find((f) => f.indexOf(here) === -1) || frames[1] || "").trim();
+      } catch (e) { /* best effort */ }
+      try {
+        fs.appendFileSync(auditPath, JSON.stringify({
+          explicit: Boolean(options.clock),
+          kind: options.clock ? (options.clock.__leaseClockKind || "custom") : "wall",
+          site: site.slice(0, 240),
+          pid: process.pid,
+        }) + "\n");
+      } catch (e) { /* observation must never break the run it observes */ }
+    }
+
     if (process.env[REQUIRE_EXPLICIT_CLOCK_ENV] === "1" && !options.clock) {
       throw fail(
         "StateStore was constructed without an explicit lease clock while " +
@@ -215,9 +252,18 @@ class StateStore {
     }
     const clock = options.clock || systemLeaseClock();
     if (typeof clock.now !== "function") throw fail("clock.now must be a function", "BAD_LEASE_CLOCK");
+    /* An instant must be a non-negative safe integer, not merely finite. A fractional or
+     * negative value reaches the schema and surfaces as CORRUPT_STATE -- a bad clock
+     * misdiagnosed as on-disk corruption, which in this repo is the HALT-class signal that
+     * sends an operator to inspect state files that are fine. Rejecting it here names the
+     * actual fault. (An adversarial review demonstrated both, plus a single 1e15 reading
+     * driving an OBSERVING window to CLOSED_FLAGGED through the wall-time cap.) */
     this.leaseNow = () => {
       const t = clock.now();
-      if (!Number.isFinite(t)) throw fail("clock.now() returned a non-finite instant", "BAD_LEASE_CLOCK");
+      if (!Number.isSafeInteger(t) || t < 0) {
+        throw fail(`clock.now() returned ${JSON.stringify(t)}; a lease instant must be a ` +
+          "non-negative safe integer of epoch milliseconds", "BAD_LEASE_CLOCK");
+      }
       return t;
     };
     this.leaseMs = testMode

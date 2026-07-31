@@ -231,7 +231,7 @@ function requireRealClockStore(dir, opts = {}) {
 }
 /* Injected into generated worker scripts so the child is explicit too -- required once
  * GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK=1 is on. */
-const CHILD_REAL_CLOCK = '{ now: function () { return Date.now(); } }';
+const CHILD_REAL_CLOCK = '{ __leaseClockKind: "system", now: function () { return Date.now(); } }';
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);

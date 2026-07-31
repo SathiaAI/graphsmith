@@ -57,6 +57,13 @@ function createManualClock(startMs = DEFAULT_EPOCH_MS) {
   let current = startMs;
   let advances = 0;
   return {
+    /* Tagged so the lease-clock audit can record WHICH KIND of clock a construction
+     * used, not merely that one was passed. Presence alone is not the property: an
+     * inline `{ now: () => Date.now() }` satisfies a presence check while
+     * reintroducing exactly the wall-clock race this file exists to remove. The audit
+     * classifies an untagged object as "custom", which the determinism sweep treats as
+     * undeclared residual surface. */
+    __leaseClockKind: "manual",
     now: () => current,
     /** Move time forward. Refuses to go backward: a lease that un-expires is not a
      * scenario the product can produce, and a test that needs one is testing a fiction. */
@@ -84,7 +91,7 @@ function createManualClock(startMs = DEFAULT_EPOCH_MS) {
  * silent default. Under GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK=1 a StateStore
  * construction must pass one of these two explicitly. */
 function systemLeaseClock() {
-  return { now: () => Date.now() };
+  return { __leaseClockKind: "system", now: () => Date.now() };
 }
 
 module.exports = { createManualClock, systemLeaseClock, DEFAULT_EPOCH_MS };

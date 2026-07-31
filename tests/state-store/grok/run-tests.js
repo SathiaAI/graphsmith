@@ -57,7 +57,7 @@ function createRealClockStore(root, opts = {}) {
 }
 /* Injected into generated worker scripts so a child is explicit about its clock too --
  * required once GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK=1 is on. */
-const CHILD_REAL_CLOCK = '{ now: () => Date.now() }';
+const CHILD_REAL_CLOCK = '{ __leaseClockKind: "system", now: () => Date.now() }';
 
 let failures = 0;
 const results = [];
@@ -1115,17 +1115,33 @@ function attackSchema() {
       poisoned.unexpected_hostile_key = "boom";
       fs.writeFileSync(path.join(root, ".graphsmith", "state", "window.json"), JSON.stringify(poisoned));
 
+      /* Assert on the error's IDENTITY, not merely that one occurred.
+       *
+       * This was `catch (e) { rejectedOnRead = true }` -- any throw counted as the
+       * success signal, and the captured message was assigned to a variable nothing
+       * ever read. An adversarial review broke the lease-determinism sweep through
+       * exactly this line: a store built here on the wall clock throws
+       * LEASE_CLOCK_REQUIRED, this catch swallowed it, the suite exited 0, and the
+       * sweep certified "no wall-clock lease construction on any executed path".
+       *
+       * The audit breadcrumb in StateStore now records the construction before any
+       * handler can intercept it, so that particular bypass is closed at the source.
+       * This is the second half: an inverted catch that accepts any exception proves
+       * only that SOMETHING went wrong, which is the same defect class as a test
+       * asserting a boundary other than the one it claims. */
       let rejectedOnRead = false;
       let readError = "";
       try {
         createStore(root, { leaseMs: 1000, heartbeatMs: 100 }).window.get();
       } catch (e) {
-        rejectedOnRead = true;
         readError = e.message || String(e);
+        rejectedOnRead = e.code === "CORRUPT_STATE";
       }
       if (!rejectedOnRead) {
         throw new Error(
-          "DEFECT: unknown keys accepted on window read (parseWindow does not enforce schema additionalProperties:false)"
+          "DEFECT: unknown keys accepted on window read (parseWindow does not enforce " +
+          "schema additionalProperties:false). Observed instead: " +
+          (readError ? `a non-CORRUPT_STATE error -- ${readError}` : "no error at all")
         );
       }
 
