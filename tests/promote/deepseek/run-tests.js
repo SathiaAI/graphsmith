@@ -926,7 +926,12 @@ function attack3_casHostileMutation() {
     // Verify the CLI handler maps HALT to exit code 3
     // (tested structurally via the promote.js line 823: error.code === "HALT" ? 3)
 
-    pass("cas/halt-exit-code-3", "promote.js:823 maps HALT → exit 3");
+    // This never spawned the CLI -- there is no child_process invocation anywhere in
+    // this case. It asserted an exit-code mapping by citing a line number, which stops
+    // being true the moment the line moves.
+    skip("cas/halt-exit-code-3-NOT-exercised",
+      "the CLI was never invoked here; HALT -> exit 3 is asserted from a source line " +
+      "reference only. tests/attacks/toctou exercises the real mapping");
     pass("cas/clean-abort-pre-begin", "stale proposal before TX_BEGIN → STALE_PROPOSAL clean abort");
 
     return true;
@@ -1228,12 +1233,15 @@ function attack8_diskDiscipline() {
     createFixture(root);
 
     // The free-space check requires statfsSync to be available (Node >= 18.15)
+    // Both branches used to pass, and neither forced a low-disk condition or checked
+    // that promote() refuses under one. This observes whether the platform offers the
+    // API the check depends on -- it does not exercise the refusal, and must not be
+    // counted as evidence that the refusal works.
     const hasStatfs = typeof fs.statfsSync === "function";
-    if (hasStatfs) {
-      pass("disk/free-space-check-path-exists", "statfsSync is available");
-    } else {
-      pass("disk/free-space-check-path-exists", "statfsSync not available — same-volume check still enforced");
-    }
+    skip("disk/free-space-refusal-NOT-exercised",
+      "statfsSync " + (hasStatfs ? "is" : "is not") + " available on this platform; this " +
+      "case only observes that, it never forces a low-free-space condition, so the " +
+      "fail-closed refusal in diskPreflight() is unproven here");
 
     /* Test: abandoned staging trees cleaned on recover.
      * If a crash happens after STAGE_DONE, the staged tree should be deleted during recovery. */
@@ -1315,8 +1323,9 @@ function attack9_platformHonesty() {
 
     // Verify the code structure: diskPreflight checks same-volume then statfsSync
     // The contract says "unprovable filesystem ... → refuse promotion at LEASED"
-    pass("platform/unprovable-fs-refuses-fail-closed",
-      "diskPreflight() enforces same-volume via dev comparison and statfsSync availability check");
+    skip("platform/unprovable-fs-refuses-fail-closed-NOT-exercised",
+      "verified by reading diskPreflight()'s source, not by running it against an " +
+      "unprovable filesystem; a source read cannot show the refusal fires");
 
     return true;
   } finally {

@@ -12,6 +12,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const REPO = path.resolve(__dirname, "..", "..", "..");
 const promoteMod = require(path.join(REPO, "scripts", "promote.js"));
@@ -37,6 +38,22 @@ function record(name, status, detail) {
   console.log(`${status}\t${name}${detail ? "\t" + String(detail).replace(/\s+/g, " ").slice(0, 300) : ""}`);
 }
 function pass(n, d) { record(n, "PASS", d); }
+
+/* A verdict this case could not have observed must never read as either a
+ * guarantee upheld or a defect found. spawnSync kills the child with SIGTERM when
+ * its own `timeout` elapses and reports error.code === "ETIMEDOUT" with
+ * status === null -- that is the HARNESS running out of patience, not the product
+ * answering. It still counts as a failure (fail-closed: a case that did not run
+ * must never read as green), but the tag keeps it out of the product findings, and
+ * tests/harness-honesty/starvation/ requires it.
+ *
+ * status === null alone is NOT the test: a process killed by a signal for any other
+ * reason also reports null, and calling that a harness timeout would hide a real
+ * crash. */
+function timedOutByHarness(r) {
+  return !!(r && r.error && r.error.code === "ETIMEDOUT");
+}
+function inconclusive(n, d) { record(n, "FAIL", "INCONCLUSIVE (harness): " + d); }
 function fail(n, d) { record(n, "FAIL", d); }
 function unavailable(n, d) { record(n, "UNAVAILABLE", d); }
 function mk(tag) {
@@ -236,8 +253,13 @@ function race_postBeginActiveMutation() {
     const cli = spawnSync(
       process.execPath,
       [path.join(REPO, "scripts", "promote.js"), "recover"],
-      { cwd: root, encoding: "utf8", timeout: 30000, env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" } }
+      { cwd: root, encoding: "utf8", timeout: harnessDeadline(30000), env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" } }
     );
+    if (timedOutByHarness(cli)) {
+      inconclusive(name, `recover was killed by the harness timeout, so its exit code was ` +
+        `not observed (in-process mappedExit=${mappedExit})`);
+      return;
+    }
     if (mappedExit !== 3 || cli.status !== 3) {
       fail(name, `HALT mappedExit=${mappedExit} cli.status=${cli.status} (both must be 3)`);
       return;
@@ -528,15 +550,20 @@ function race_lockHeldSecondWriter() {
         {
           encoding: "utf8",
           env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" },
-          timeout: 15000,
+          timeout: harnessDeadline(15000),
         }
       );
     } finally {
       clearInterval(lock.heartbeat);
       store._testing.releaseLock(lock.ownerToken);
     }
-    /* Second writer must not exit 0 DONE while lock held */
-    if (child.status === 0) {
+    /* Second writer must not exit 0 DONE while lock held.
+     * A harness timeout kills the child before it can either violate or honour the
+     * lock, and the old `else` reported that as the guarantee holding. */
+    if (timedOutByHarness(child)) {
+      inconclusive(name, "the second writer was killed by the harness timeout before it " +
+        "exited, so whether it respected the held lock was not observed");
+    } else if (child.status === 0) {
       fail(name, `second writer exit 0 while lock held stdout=${(child.stdout || "").slice(0, 80)}`);
     } else {
       pass(name, `exit=${child.status}`);

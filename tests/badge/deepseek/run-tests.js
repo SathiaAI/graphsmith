@@ -355,6 +355,19 @@ console.log("\n=== ATTACK 3: INJECTION DEFENSE ===");
 
 // 3g — Attack: XML entity injection via safe/xmlEscape bypass attempt
 {
+  /* Exact-match contract, salvaged from tests/badge/gemini/tests.js:135 before that
+   * file was deleted as a subset of this one. Everything else here is a NEGATIVE
+   * check ("output contains no raw <"), which a function returning the empty string
+   * would also satisfy. This pins the full mapping positively.
+   *
+   * Keep it. tests/badge/grok/tests.js:326 asserted the exact opposite --
+   * `xmlEscape('<script>') === '<script>'`, i.e. no escaping at all -- and failed
+   * BECAUSE the code is correct. That file was deleted rather than repaired: anyone
+   * reconciling it toward the code would have introduced an XSS into an SVG that
+   * GitHub renders. This line is the unambiguous statement of which direction is
+   * right, so the next person does not have to reason it out. */
+  assert(xmlEscape('<>"&\'') === "&lt;&gt;&quot;&amp;&#39;",
+    "ATTACK 3g: xmlEscape maps every XML special char exactly (< > \" & ')");
   assert(!xmlEscape("&amp;").includes("<"), "ATTACK 3g: xmlEscape output has no raw <");
   assert(!xmlEscape("'").includes("'"), "ATTACK 3g: xmlEscape single quote → &#39;");
   assert(!xmlEscape('"').includes('"'), "ATTACK 3g: xmlEscape double quote → &quot;");

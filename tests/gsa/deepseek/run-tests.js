@@ -1,6 +1,14 @@
 "use strict";
 const crypto = require("crypto");
-const { verifyBundle } = require("../../../scripts/gsa-verify.js");
+/* canonicalize, not JSON.stringify: gsa-verify.js hashes the manifest preimage with
+ * RFC-8785-ish canonical JSON (sorted keys, compact). Every re-sign in this file used
+ * JSON.stringify, producing a different digest, so each tampered bundle died at the
+ * SIGNATURE step and never reached the check it was written to exercise. One case
+ * (profile_confusion) failed outright; three others -- false_control,
+ * conditional_presence and revoked_skill -- reported PASS for the same wrong reason,
+ * and were verified to still report PASS with their target checks neutered. Zero
+ * coverage, printed green. */
+const { verifyBundle, canonicalize } = require("../../../scripts/gsa-verify.js");
 const { produceBundle } = require("../../../scripts/gsa-produce.js");
 
 let pass = 0, fail = 0;
@@ -85,7 +93,7 @@ async function createValidBundle() {
   // Change control and re-sign to make it a pure control lie
   bundle.manifest.control_attestations.adversarial_batteries_passed = false;
   const preimage = { ...bundle.manifest }; delete preimage.bundle_signature;
-  const manifestSha = crypto.createHash("sha256").update(JSON.stringify(preimage)).digest("hex");
+  const manifestSha = crypto.createHash("sha256").update(canonicalize(preimage)).digest("hex");
   bundle.manifest.bundle_signature.manifest_sha256 = manifestSha;
   bundle.manifest.bundle_signature.value = crypto.sign(null, Buffer.from(manifestSha, "utf8"), kp.privateKey).toString("base64");
   const result = verifyBundle(bundle, { trustedKeys: { test: pem } });
@@ -97,9 +105,15 @@ async function createValidBundle() {
 (async () => {
   const { bundle, pem, kp } = await createValidBundle();
   bundle.manifest.adversarial.suites[0].blocked = 0; // Make adversarial fail
+  // ...and tell the truth about it in control_attestations. Leaving this true made the
+  // bundle contain an actual LIE, which step 9 correctly rejected before the §9.10
+  // profile-downgrade logic this case is named for ever ran. The scenario under test
+  // is an honest bundle that claims a profile its evidence does not support -- not a
+  // bundle that misreports a control.
+  bundle.manifest.control_attestations.adversarial_batteries_passed = false;
   // Re-sign to make it a pure profile lie
   const preimage = { ...bundle.manifest }; delete preimage.bundle_signature;
-  const manifestSha = crypto.createHash("sha256").update(JSON.stringify(preimage)).digest("hex");
+  const manifestSha = crypto.createHash("sha256").update(canonicalize(preimage)).digest("hex");
   bundle.manifest.bundle_signature.manifest_sha256 = manifestSha;
   bundle.manifest.bundle_signature.value = crypto.sign(null, Buffer.from(manifestSha, "utf8"), kp.privateKey).toString("base64");
   const result = verifyBundle(bundle, { trustedKeys: { test: pem } });
@@ -125,7 +139,7 @@ async function createValidBundle() {
   bundle.manifest.mode = "regulator"; // Change to regulator without summary
   // Re-sign
   const preimage = { ...bundle.manifest }; delete preimage.bundle_signature;
-  const manifestSha = crypto.createHash("sha256").update(JSON.stringify(preimage)).digest("hex");
+  const manifestSha = crypto.createHash("sha256").update(canonicalize(preimage)).digest("hex");
   bundle.manifest.bundle_signature.manifest_sha256 = manifestSha;
   bundle.manifest.bundle_signature.value = crypto.sign(null, Buffer.from(manifestSha, "utf8"), kp.privateKey).toString("base64");
   const result = verifyBundle(bundle, { trustedKeys: { test: pem } });
@@ -172,7 +186,7 @@ async function createValidBundle() {
   }];
   // Re-sign
   const preimage = { ...bundle.manifest }; delete preimage.bundle_signature;
-  const manifestSha = crypto.createHash("sha256").update(JSON.stringify(preimage)).digest("hex");
+  const manifestSha = crypto.createHash("sha256").update(canonicalize(preimage)).digest("hex");
   bundle.manifest.bundle_signature.manifest_sha256 = manifestSha;
   bundle.manifest.bundle_signature.value = crypto.sign(null, Buffer.from(manifestSha, "utf8"), kp.privateKey).toString("base64");
   const result = verifyBundle(bundle, { 

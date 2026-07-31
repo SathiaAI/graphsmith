@@ -9,7 +9,10 @@ function test(name, fn) {
     console.log("PASS " + name);
     pass++;
   } else {
-    console.log("FAIL " + name + " " + (typeof result === 'string' ? result : ""));
+    // Every fn() here returns a boolean, so the old ternary printed an empty detail on
+    // EVERY failure -- three FAIL lines with nothing after them, undiagnosable without
+    // editing the file. Say what actually came back.
+    console.log("FAIL " + name + " (returned " + JSON.stringify(result) + ")");
     fail++;
   }
 }
@@ -322,7 +325,10 @@ test("hostile-getter-control", () => {
     configurable: true
   });
   const result = check.run({ policy, profile: "test", controls });
-  return result.status === "failed" && result.reason.includes("unenforced");
+  // The check catches the throwing getter and fails closed with "exception — failing
+  // closed: hostile getter". "unenforced" is the reason for a control that is simply
+  // NOT enforced; conflating the two hides which of two very different things happened.
+  return result.status === "failed" && result.reason.includes("exception");
 });
 
 test("proto-pollution-policy", () => {
@@ -388,7 +394,8 @@ test("proxy-controls", () => {
     }
   });
   const result = check.run({ policy, profile: "test", controls: proxy });
-  return result.status === "failed" && result.reason.includes("unenforced");
+  // Same as hostile-getter-control: this fails closed via the exception path.
+  return result.status === "failed" && result.reason.includes("exception");
 });
 
 test("valid-satisfied-profile", () => {

@@ -7,6 +7,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 const os = require("os");
 const crypto = require("crypto");
 const cp = require("child_process");
@@ -19,7 +20,27 @@ let failures = 0;
 let skipped = 0;
 let passed = 0;
 
+/* Once the harness has demonstrably run out of patience even ONCE, no later
+ * negative verdict in this run can be attributed to the product: the runs are
+ * sequential against the same box, and a machine slow enough to blow one deadline
+ * is slow enough to blow the next. Rather than thread a timedOut flag through every
+ * one of the ~30 call sites -- which would be the same edit repeated until one got
+ * missed -- latch the fact once and tag every subsequent failure.
+ *
+ * This is deliberately conservative in the safe direction: it can only downgrade a
+ * FAIL to an INCONCLUSIVE-tagged FAIL. It never turns a failure into a pass, the
+ * exit code is unchanged, and a run with no timeout at all behaves exactly as
+ * before. */
+var harnessStarved = false;
+
 function report(name, result, detail) {
+  if (result === false && harnessStarved) {
+    console.log("FAIL: " + name + " -- INCONCLUSIVE (harness): a heal invocation in this " +
+      "run was killed by the harness timeout, so this verdict cannot be attributed to " +
+      "heal.js" + (detail ? " [original: " + detail + "]" : ""));
+    failures++;
+    return;
+  }
   if (result === true) { console.log("PASS: " + name); passed++; }
   else if (result === false) { console.log("FAIL: " + name + (detail ? " -- " + detail : "")); failures++; }
   else if (result === "SKIP") { console.log("SKIP: " + name + (detail ? " -- " + detail : "")); skipped++; }
@@ -55,7 +76,17 @@ function assertUnchanged(prefix, root, files, before) {
     var f = files[i];
     var fp = path.join(root, f);
     var h = fileHash(fp);
-    if (h === null) continue;
+    if (h === null) {
+      // The file is gone or unreadable. That is not "unchanged" -- deleting a file
+      // heal.js must never touch is the most severe mutation available, and the old
+      // `continue` skipped it, letting the run end on "zero-mutation on all
+      // executables". Absence of a hash is absence of an observation, never a pass.
+      report(prefix + ": unreadable " + f, false,
+        "could not hash after the run (deleted or permission-denied); the zero-mutation " +
+        "invariant cannot be evaluated for this file");
+      changed = true;
+      continue;
+    }
     if (h !== before[f]) {
       report(prefix + ": mutated " + f, false, "hash changed: " + (before[f] || "").slice(0, 16) + " -> " + (h || "").slice(0, 16));
       changed = true;
@@ -74,9 +105,15 @@ function runHeal(args, opts) {
     var r = cp.spawnSync(process.execPath, a, {
       cwd: opts.cwd || process.cwd(),
       env: env,
-      timeout: opts.timeout || 20000,
+      timeout: harnessDeadline(opts.timeout || 20000),
       stdio: ["pipe", "pipe", "pipe"],
     });
+    if (r.error && r.error.code === "ETIMEDOUT" && !harnessStarved) {
+      harnessStarved = true;
+      report("harness/heal-invocation-timed-out", false,
+        "a heal invocation exceeded the harness timeout; every failing verdict from " +
+        "here on is tagged INCONCLUSIVE rather than attributed to heal.js");
+    }
     return {
       exitCode: r.status,
       stdout: (r.stdout || "").toString("utf8").trim(),

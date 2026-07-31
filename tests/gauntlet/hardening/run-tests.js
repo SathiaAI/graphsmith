@@ -6,7 +6,7 @@
  */
 "use strict";
 const fs = require("fs"), path = require("path"), os = require("os");
-const S = (n) => path.join(__dirname, "..", "..", "scripts", n);
+const S = (n) => path.join(__dirname, "..", "..", "..", "scripts", n);
 const req = (n) => require(S(n));
 
 let HOLD = 0, BREAK = 0; const breaks = [];
@@ -141,15 +141,15 @@ const SCHEMES = ["javascript:alert(1)", "JavaScript:alert(1)", " javascript:aler
 (function T5() {
   const cls = "T5-honesty";
   // shadow memo discloses Tier-1/2-only regression scope [via minimax facet]
-  const memo = path.join(__dirname, "..", "..", "docs", "EVALUATOR-STABILITY.md");
+  const memo = path.join(__dirname, "..", "..", "..", "docs", "EVALUATOR-STABILITY.md");
   if (fs.existsSync(memo)) { const m = fs.readFileSync(memo, "utf8"); ok(cls, "shadow memo discloses Tier-3 not-detected", /Tier[\s-]?3/.test(m) && /one-sided|not flag|contract 03/i.test(m)); }
   // badge: unavailable/not-applicable/failed never render green; stale downgrades [via command-r-plus facet]
   const badge = req("badge.js");
   for (const st of ["unavailable", "not-applicable", "failed"]) ok(cls, `badge effectiveStatus(${st}) never green`, (() => { try { const e = badge.effectiveStatus(st, "fresh"); return !/green/i.test(JSON.stringify(e)) || st === "verified"; } catch { return true; } })());
   // verify --profiles report carries assumptions + never collapses T axes (contract 09)
   const v = req("verify.js");
-  ok(cls, "verify T axes independent (release_verified + self_consistent surfaced)", (() => { const r = v.runProfiles(path.join(__dirname, "..", ".."), {}); const T = r.profiles && r.profiles.T; return T && "release_verified" in T && "self_consistent" in T; })());
-  ok(cls, "verify profiles carry assumptions[]", (() => { const r = v.runProfiles(path.join(__dirname, "..", ".."), {}); return Object.values(r.profiles).every(p => Array.isArray(p.assumptions) || Array.isArray(p.evidence) || p.status === "not-applicable"); })());
+  ok(cls, "verify T axes independent (release_verified + self_consistent surfaced)", (() => { const r = v.runProfiles(path.join(__dirname, "..", "..", ".."), {}); const T = r.profiles && r.profiles.T; return T && "release_verified" in T && "self_consistent" in T; })());
+  ok(cls, "verify profiles carry assumptions[]", (() => { const r = v.runProfiles(path.join(__dirname, "..", "..", ".."), {}); return Object.values(r.profiles).every(p => Array.isArray(p.assumptions) || Array.isArray(p.evidence) || p.status === "not-applicable"); })());
 })();
 
 /* ===================== EXPANSION — deeper parameterized coverage (well-understood components) ===================== */

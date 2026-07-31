@@ -162,6 +162,38 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+/* LEASE TIME vs OPERATIONAL TIME -- the distinction this seam exists to preserve.
+ *
+ * A lease is a PRODUCT budget whose only meaning is arithmetic: given a stored
+ * `lease_expires_at` and a current instant, is this run still live. Tests of that
+ * arithmetic do not need a real clock; they need to CHOOSE the instant. Six
+ * separate defects on this branch came from tests that instead raced real elapsed
+ * time against ~200ms-per-operation Windows I/O and reported losing the race as a
+ * product defect -- one of them accusing a fail-closed refusal of letting a window
+ * close over active slots. See KNOWN-LIMITATIONS and the branch history.
+ *
+ * So `leaseNow()` is injectable. What is NOT injectable, and must never be:
+ *
+ *   - lock staleness (`Date.now() - observed.stat.mtimeMs`): compares against an
+ *     mtime the OPERATING SYSTEM wrote. A frozen clock there makes every lock look
+ *     infinitely stale or never stale -- silently testing a different product.
+ *   - `proc_start_hint`: process identity, derived from process.uptime().
+ *
+ * Injecting one global clock over both is the obvious mistake here, and it is worse
+ * than the bug it would fix: it would turn the lock protocol into a no-op while every
+ * test still passed. Lease time is chosen; operational time is observed.
+ */
+/* ONE definition, tagged. There were two -- this one untagged and a tagged copy in
+ * tests/_harness/clock.js -- so a caller passing THIS one was recorded as an untagged
+ * "custom" clock and would fail the determinism gate for doing the right thing. Two
+ * near-identical helpers differing only in a metadata field is a foot-gun, not a choice. */
+function systemLeaseClock() {
+  return { __leaseClockKind: "system", now: () => Date.now() };
+}
+
+const REQUIRE_EXPLICIT_CLOCK_ENV = "GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK";
+const LEASE_CLOCK_AUDIT_ENV = "GRAPHSMITH_LEASE_CLOCK_AUDIT";
+
 class StateStore {
   constructor(projectRoot = process.cwd(), options = {}) {
     this.projectRoot = path.resolve(projectRoot);
@@ -169,6 +201,130 @@ class StateStore {
     this.lockPath = path.join(this.stateDir, "state.lock");
     this.journalPath = path.join(this.stateDir, "state-journal.jsonl");
     const testMode = process.env.GRAPHSMITH_TEST_MODE === "1";
+
+    /* Runtime enforcement, not a lint. A source scan for `new StateStore(` cannot see
+     * through aliasing, helper factories, or a store constructed inside a spawned
+     * worker written to a temp file -- all three of which this repo's suites do. This
+     * throws on the executed path instead, so a test that relies on wall-clock lease
+     * time cannot pass anywhere, including the Windows-only cases a Linux audit is
+     * structurally blind to. Off unless the env var is set, so production is untouched. */
+    /* AUDIT BREADCRUMB, written BEFORE the refusal below and never conditional on it.
+     *
+     * The first version of the determinism sweep detected wall-clock construction by
+     * grepping the target's output for the refusal message. An adversarial review broke
+     * that in one line: tests/state-store/grok has a case whose catch block treats ANY
+     * throw as its success signal, so the refusal was swallowed, the suite exited 0, and
+     * the sweep reported "no wall-clock lease construction on any executed path" while a
+     * wall-clock store was being built on that very path. A detector a `catch` can defeat
+     * is not a detector.
+     *
+     * So the record is written here, at construction, where no downstream handler can
+     * intercept it -- and it records the KIND of clock rather than merely its presence,
+     * because an inline `{ now: () => Date.now() }` satisfies a presence check while
+     * reintroducing the exact race. Append-only and best-effort: this must never be able
+     * to fail a run it is only observing. Inert unless the env var is set. */
+    const auditPath = process.env[LEASE_CLOCK_AUDIT_ENV];
+    if (auditPath) {
+      /* The first frame OUTSIDE this file. Taking a fixed stack index named the local
+       * factory every time -- `at createStore (state-store.js:...)` for all nine
+       * constructions -- which is an inventory that cannot tell you where to look. */
+      /* TWO frames outside this file, not one.
+       *
+       * One frame collapses every caller of a test-local factory to the factory itself --
+       * a hole an adversarial review named after the equivalent hole inside this file was
+       * fixed. With the caller recorded too, a NEW caller of an existing real-clock factory
+       * is a new site rather than an invisible reuse. */
+      let site = "(no stack)";
+      let caller = "";
+      try {
+        const here = path.basename(__filename);
+        const external = String(new Error().stack || "").split("\n").slice(1)
+          .filter((f) => f.indexOf(here) === -1);
+        site = String(external[0] || "").trim();
+        caller = String(external[1] || "").trim();
+      } catch (e) { /* best effort */ }
+      /* PROVENANCE IS OBSERVED, NOT DECLARED.
+       *
+       * The first version recorded `options.clock.__leaseClockKind`, i.e. a string the
+       * caller supplies. An adversarial review pointed out that
+       * `{ __leaseClockKind: "manual", now: () => Date.now() }` then passes every check
+       * while being exactly the wall-clock race the seam exists to remove -- the tag is
+       * an assertion, not evidence.
+       *
+       * So the clock is MEASURED: read it, burn a little real time, read it again. A
+       * chosen clock does not move on its own; a wall clock does. A forged tag cannot
+       * lie about that. The tag is still recorded, and a disagreement between claim and
+       * behaviour is itself reportable. */
+      let advancedUnderRealTime = null;
+      if (options.clock && typeof options.clock.now === "function") {
+        try {
+          const a = options.clock.now();
+          const until = Date.now() + 2;
+          while (Date.now() < until) { /* burn real time, no yield: the clock must not
+                                        * advance because we waited politely */ }
+          advancedUnderRealTime = options.clock.now() !== a;
+        } catch (e) { advancedUnderRealTime = null; }
+      }
+      const claimed = options.clock
+        ? (typeof options.clock.now !== "function" ? "malformed" : (options.clock.__leaseClockKind || "custom"))
+        : "wall";
+      /* Observed wins. "manual" is only granted to a clock that demonstrably did not move. */
+      const kind = claimed === "wall" || claimed === "malformed" ? claimed
+        : advancedUnderRealTime === true ? "system"
+          : advancedUnderRealTime === false ? (claimed === "system" ? "system-frozen" : "manual")
+            : "custom";
+      const line = JSON.stringify({
+        explicit: Boolean(options.clock),
+        kind, claimed, advancedUnderRealTime,
+        site: site.slice(0, 240),
+        caller: caller.slice(0, 240),
+        pid: process.pid,
+      }) + "\n";
+      /* FAIL CLOSED. This was best-effort, and the gate then treated a partial audit as
+       * complete evidence: one dropped append among twenty made the other nineteen
+       * certify the run. A missing record is indistinguishable from no construction, so
+       * in audit mode an unrecordable construction has to stop the run. Audit mode is
+       * opt-in and never on in production. */
+      fs.appendFileSync(auditPath, line);
+    }
+
+    if (process.env[REQUIRE_EXPLICIT_CLOCK_ENV] === "1" && !options.clock) {
+      throw fail(
+        "StateStore was constructed without an explicit lease clock while " +
+        REQUIRE_EXPLICIT_CLOCK_ENV + "=1. Lease-dependent tests must choose their own " +
+        "instants (tests/_harness/clock.js -> createManualClock) rather than race real " +
+        "elapsed time. If this construction genuinely needs the wall clock, pass " +
+        "{ clock: systemLeaseClock() } explicitly so the choice is visible.",
+        "LEASE_CLOCK_REQUIRED"
+      );
+    }
+    const clock = options.clock || systemLeaseClock();
+    if (typeof clock.now !== "function") throw fail("clock.now must be a function", "BAD_LEASE_CLOCK");
+    /* An instant must be a non-negative safe integer, not merely finite. A fractional or
+     * negative value reaches the schema and surfaces as CORRUPT_STATE -- a bad clock
+     * misdiagnosed as on-disk corruption, which in this repo is the HALT-class signal that
+     * sends an operator to inspect state files that are fine. Rejecting it here names the
+     * actual fault. (An adversarial review demonstrated both, plus a single 1e15 reading
+     * driving an OBSERVING window to CLOSED_FLAGGED through the wall-time cap.) */
+    this.leaseNow = () => {
+      const t = clock.now();
+      if (!Number.isSafeInteger(t) || t < 0) {
+        throw fail(`clock.now() returned ${JSON.stringify(t)}; a lease instant must be a ` +
+          "non-negative safe integer of epoch milliseconds", "BAD_LEASE_CLOCK");
+      }
+      return t;
+    };
+    /* The instant is validated; the SUM was not. A large leaseMs plus a large instant can
+     * leave the safe-integer range and serialise without error, producing a record that
+     * later reads as expired decades ago. */
+    this._leaseExpiryFrom = (now) => {
+      const expiry = now + this.leaseMs;
+      if (!Number.isSafeInteger(expiry)) {
+        throw fail(`lease expiry ${expiry} (now ${now} + leaseMs ${this.leaseMs}) is outside ` +
+          "the safe-integer range", "BAD_LEASE_CLOCK");
+      }
+      return expiry;
+    };
     this.leaseMs = testMode
       ? positiveInteger(options.leaseMs || process.env.GRAPHSMITH_LEASE_MS, DEFAULT_LEASE_MS)
       : DEFAULT_LEASE_MS;
@@ -177,6 +333,7 @@ class StateStore {
       : DEFAULT_HEARTBEAT_MS;
     if (this.heartbeatMs >= this.leaseMs) this.heartbeatMs = Math.max(1, Math.floor(this.leaseMs / 3));
     this._crashAfterEffects = 0;
+    this._heldOwnerToken = null;
 
     this.window = {
       get: () => this.getWindow(),
@@ -306,9 +463,38 @@ class StateStore {
     }
   }
 
+  /* Liveness for lock ownership. Two corrections, both found by adversarial review with
+   * working reproductions:
+   *
+   *   EPERM means ALIVE, not dead. A bare `catch { return false }` conflated "no such
+   *   process" with "cannot determine". A lock held by another USER was therefore reported
+   *   as ownerless and stolen -- demonstrated cross-uid on a lock 107ms old against a
+   *   30s lease, i.e. the freshness of the lock could not save it.
+   *
+   *   A ZOMBIE is DEAD for this purpose. kill(pid, 0) succeeds on a process that has
+   *   exited but not been reaped, so an unreaped owner looked alive. That is not academic
+   *   here: scripts/watchdog.js SIGKILLs runs, and a killed child whose parent has not
+   *   reaped it is exactly a zombie. Treating it as alive makes crash recovery fail in
+   *   the one scenario the product itself manufactures. Only /proc can tell us, so this
+   *   is a Linux-only refinement; elsewhere the lease fallback covers it.
+   *
+   * ESRCH from a DIFFERENT PID NAMESPACE is indistinguishable from a genuinely absent
+   * process and this cannot fix that. It is why the lease remains a second gate rather
+   * than this being the sole authority. */
   _pidAlive(pid) {
     if (!Number.isSafeInteger(pid) || pid < 1) return false;
-    try { process.kill(pid, 0); return true; } catch { return false; }
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "EPERM") return true;   // exists, we may not signal it
+      return false;                               // ESRCH, or a platform that cannot say
+    }
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close !== -1 && stat.slice(close + 2).split(" ")[0] === "Z") return false;
+    } catch (error) { /* no /proc: signal 0 is the best answer available */ }
+    return true;
   }
 
   _unlinkLockIfOwner(ownerToken) {
@@ -337,11 +523,22 @@ class StateStore {
       validateStateRecord(record, path.basename(this.lockPath));
       try {
         this._createLockFile(record);
-        const heartbeat = setInterval(() => {
-          try { this._renewLock(ownerToken); } catch {}
-        }, this.heartbeatMs);
-        heartbeat.unref();
-        return { ownerToken, heartbeat };
+        /* NO setInterval here any more.
+         *
+         * There was one, renewing the lock's mtime every heartbeatMs. It could never fire:
+         * `_operation` and every caller of `_testing.acquireLock` (promote.js holds the lock
+         * across an entire fsync-heavy adoption transaction) are FULLY SYNCHRONOUS, so the
+         * event loop is blocked for the whole critical section and `clearInterval` runs in
+         * the `finally` before the timer could ever run. Reproduced: 300ms lease, 800ms of
+         * synchronous work, lock mtime unchanged (delta 0ms), a second store ACQUIRED the
+         * lock while the first still held it, and the owner's release then failed
+         * LOCK_OWNER_MISMATCH.
+         *
+         * A timer that cannot fire is worse than no timer: it tells a reader the lock is
+         * kept fresh when nothing keeps it fresh. Renewal is now explicit and synchronous,
+         * at the durable writes in `_commit`, where the time actually goes. */
+        this._heldOwnerToken = ownerToken;
+        return { ownerToken, heartbeat: null };
       } catch (error) {
         if (error.code !== "EEXIST") throw error;
         // A lock file that EXISTS but does not parse is either being BORN (the
@@ -367,9 +564,53 @@ class StateStore {
         }
         unreadableLock = null;
         if (!observed) continue;
+        /* TWO GATES, and the renewal above is what makes the second one mean something.
+         *
+         * The original defect: `age > leaseMs || !pidAlive` stole a lock from a live owner
+         * purely because its mtime was old -- and with the renewal timer unable to fire,
+         * "old mtime" was simply "a transaction longer than leaseMs". Two writers then
+         * entered _commit and recovery reached AMBIGUOUS_RECOVERY. promote.js holds this
+         * lock across an entire fsync-heavy adoption, so it was reachable in production.
+         *
+         * The first attempt at a fix deleted the age gate entirely, leaving _pidAlive as
+         * the sole authority. Adversarial review demolished that: a crashed owner in a PID
+         * namespace leaves a lock whose pid is the NEXT run's own pid, so the store bricked
+         * permanently after any container crash -- including `status` and `sweep`, the two
+         * commands an operator would use to diagnose it. Trading split-brain for a brick is
+         * not a fix.
+         *
+         * Both gates, in the right order:
+         *   owner observably alive AND the lock is being renewed  -> refuse. This is the
+         *     long-transaction case, and it is now safe BECAUSE _commit renews at every
+         *     durable step: a working owner's mtime cannot go stale.
+         *   otherwise, once the lock has gone unrenewed for longer than the lease -> steal.
+         *     A stale mtime now means "this owner has made no progress", not "this owner
+         *     started a while ago", which is the fact the steal actually needs. Zombies,
+         *     stopped processes, foreign namespaces and reused pids all self-heal here.
+         *
+         * What this still does NOT cover, stated rather than papered over: a holder that
+         * does long work WITHOUT touching the store renews nothing, so a sufficiently long
+         * non-store phase can still be stolen from. The durable answer is an OS-level lock
+         * whose lifetime is tied to the owner's file descriptor rather than to an mtime and
+         * a pid; that is a protocol change, not a patch. Tracked separately. */
         const age = Date.now() - observed.stat.mtimeMs;
-        const expired = age > this.leaseMs || !this._pidAlive(observed.record.pid);
-        if (!expired) throw fail(`State store is actively locked by pid ${observed.record.pid}`, "LOCKED");
+        const ownerAlive = this._pidAlive(observed.record.pid);
+        const unrenewed = age > this.leaseMs;
+        if (ownerAlive && !unrenewed) {
+          throw fail(
+            `State store is locked by pid ${observed.record.pid} (renewed ${age}ms ago, ` +
+            `lease ${this.leaseMs}ms). That owner is alive and making progress.`,
+            "LOCKED");
+        }
+        if (!ownerAlive && !unrenewed) {
+          throw fail(
+            `State store lock at ${this.lockPath} names pid ${observed.record.pid}, which is ` +
+            `not observable, but the lock was renewed only ${age}ms ago (lease ` +
+            `${this.leaseMs}ms). Refusing to steal a lock that is still being kept fresh: ` +
+            "the owner may simply be invisible from here (another user, another PID " +
+            "namespace). It becomes stealable once it goes unrenewed.",
+            "LOCKED");
+        }
         requiredString(observed.record.owner_token, "state.lock owner_token");
         try {
           if (!this._unlinkLockIfOwner(observed.record.owner_token)) continue;
@@ -383,6 +624,29 @@ class StateStore {
     if (unreadableLock)
       throw fail(`State lock ${this.lockPath} existed but never became readable across ${ATTEMPTS} attempts (${unreadableLock.message}). A crash between creating and writing the lock leaves exactly this; remove the file after confirming no run holds it.`, "CORRUPT_STATE");
     throw fail("Could not acquire state-store lock after bounded contention", "LOCK_CONTENTION");
+  }
+
+  /* Renew the lock AND prove we still own it, synchronously, at the points where the time
+   * actually goes. Replaces the timer that could never fire.
+   *
+   * The second half matters more than the first: if the lock is gone or now belongs to
+   * someone else, this run has been superseded and must stop BEFORE writing anything more.
+   * Previously that was discovered at release, after the writes had already landed. */
+  _assertStillOwned(context) {
+    const ownerToken = this._heldOwnerToken;
+    if (!ownerToken) return;   // no lock held by this instance: nothing to assert
+    try {
+      this._renewLock(ownerToken);
+    } catch (error) {
+      if (error.code === "LOCK_OWNER_MISMATCH" || error.code === "ENOENT") {
+        throw fail(
+          `Lost the state-store lock during ${context}: it is ${error.code === "ENOENT" ? "gone" : "now held by another owner"}. ` +
+          "Refusing to continue writing -- two writers in the same mutation is how the " +
+          "journal becomes ambiguous. Re-run the operation.",
+          "LOCK_LOST");
+      }
+      throw error;
+    }
   }
 
   _renewLock(ownerToken) {
@@ -402,6 +666,11 @@ class StateStore {
     if (!current) return false;
     if (current.record.owner_token !== ownerToken) throw fail("Refusing to release a lock owned by another token", "LOCK_OWNER_MISMATCH");
     if (!this._unlinkLockIfOwner(ownerToken)) throw fail("Lock owner changed during release", "LOCK_OWNER_MISMATCH");
+    /* Cleared only AFTER the release is verified. It was cleared on ENTRY, so a release
+     * that THREW still disarmed _assertStillOwned -- and promote.js swallows release
+     * failures, so a run whose lock had been taken carried on committing with the guard
+     * silently off. Found by adversarial review with a working reproduction. */
+    if (this._heldOwnerToken === ownerToken) this._heldOwnerToken = null;
     return true;
   }
 
@@ -417,6 +686,12 @@ class StateStore {
   }
 
   _recoverJournal() {
+    /* Roll-forward rewrites whole state files from a journal that may have been written by
+     * ANOTHER process, and appends MUTATION_DONE. It had no ownership check at all -- the
+     * most dangerous write path in the file was the one the new guard did not cover, which
+     * an adversarial review demonstrated by rolling another writer's mutation forward with
+     * no lock held. It is called first inside _operation and directly by promote.js. */
+    this._assertStillOwned("journal recovery");
     const records = this._journalRecords();
     const completed = new Set(records.filter((record) => record.record_type === "MUTATION_DONE").map((record) => record.mutation_id));
     for (const intent of records) {
@@ -458,6 +733,7 @@ class StateStore {
     });
     if (effects.every((effect) => effect.before_sha256 === effect.after_sha256)) return stateRev - 1;
     const mutationId = `${stateRev}-${stableId(effects.map((effect) => `${effect.file}:${effect.after_sha256}`))}`;
+    this._assertStillOwned("the pre-intent check of a mutation");
     this._appendDurable(this.journalPath, {
       schema_version: SCHEMA_VERSION,
       record_type: "MUTATION_INTENT",
@@ -467,6 +743,10 @@ class StateStore {
     });
     let applied = 0;
     for (const effect of effects) {
+      /* Before EVERY effect, not once per transaction. This is what makes the lock's mtime
+       * mean "this owner is making progress" rather than "this owner started recently", and
+       * it is the granularity at which a lost lock is detected. */
+      this._assertStillOwned(`writing ${effect.file}`);
       if (effect.before_sha256 !== effect.after_sha256) this._atomicReplace(effect.file, effect.after);
       applied++;
       if (this._crashAfterEffects && applied >= this._crashAfterEffects) {
@@ -474,6 +754,7 @@ class StateStore {
         throw fail("Simulated crash after journaled effect", "SIMULATED_CRASH");
       }
     }
+    this._assertStillOwned("completing a mutation");
     this._appendDurable(this.journalPath, {
       schema_version: SCHEMA_VERSION,
       record_type: "MUTATION_DONE",
@@ -500,7 +781,19 @@ class StateStore {
     const active = new Map();
     for (const record of records) {
       if (record.record_type === "REGISTERED") active.set(record.run_id, clone(record));
-      else if (record.record_type === "HEARTBEAT" && active.has(record.run_id)) active.get(record.run_id).lease_expires_at = record.lease_expires_at;
+      else if (record.record_type === "HEARTBEAT" && active.has(record.run_id)) {
+        /* A heartbeat RENEWS a lease; it must never revoke one. This was an unconditional
+         * overwrite, so a wall clock stepping backward (NTP correction) across a heartbeat
+         * wrote an EARLIER expiry than the one it replaced, and a live, heartbeating run
+         * was then swept as `abandoned` -- which also sets the window FLAG bit. Reproduced
+         * by an adversarial review on the default clock.
+         *
+         * Math.max also makes replay safe: a delayed or duplicated heartbeat record can no
+         * longer shorten a newer lease. It does not weaken "expire promptly" -- it grants
+         * no time beyond a deadline the store had already issued. */
+        const current = active.get(record.run_id);
+        current.lease_expires_at = Math.max(current.lease_expires_at, record.lease_expires_at);
+      }
       else if (record.record_type === "DEREGISTERED" || record.record_type === "EXPIRED") active.delete(record.run_id);
     }
     return active;
@@ -522,7 +815,7 @@ class StateStore {
     const registryRaw = this._read(FILES.registry);
     const registryRecords = parseJsonLines(registryRaw, FILES.registry);
     const active = this._registryState(registryRecords);
-    const now = Date.now();
+    const now = this.leaseNow();
     const expired = [...active.values()].filter((record) => record.lease_expires_at <= now).sort((a, b) => a.run_id.localeCompare(b.run_id));
     const windowRaw = this._read(FILES.window);
     const windowRecord = parseWindow(windowRaw);
@@ -596,7 +889,7 @@ class StateStore {
               tree_id: requiredString(tx.tree_id || tx.treeId, "tree_id"),
               n,
               baseline_metric: tx.baseline_metric === undefined ? null : clone(tx.baseline_metric),
-              created_at: Date.now(),
+              created_at: this.leaseNow(),
               max_window_wall_time_ms: positiveInteger(tx.max_window_wall_time_ms, DEFAULT_WINDOW_MS),
               admitted: 0,
               active: 0,
@@ -725,7 +1018,7 @@ class StateStore {
         if (existing.tree_id !== treeId) throw fail("runId is already registered to another tree", "RUN_CONFLICT");
         return { registration: clone(existing), slot: null, existing: true };
       }
-      const leaseExpiresAt = Date.now() + this.leaseMs;
+      const leaseExpiresAt = this._leaseExpiryFrom(this.leaseNow());
       let registration;
       let slot = null;
       this._commit([
@@ -768,7 +1061,7 @@ class StateStore {
           const records = parseJsonLines(raw, FILES.registry);
           record = {
             schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "HEARTBEAT", run_id: runId,
-            lease_expires_at: Date.now() + this.leaseMs,
+            lease_expires_at: this._leaseExpiryFrom(this.leaseNow()),
           };
           records.push(record);
           return jsonLines(records);
@@ -1069,6 +1362,10 @@ const api = {
     humanAck: (fingerprint, acknowledgement) => singleton().ackRollback(fingerprint, acknowledgement),
   },
 };
+
+/* Exported so tests use the SAME real clock the product uses, rather than a second
+ * near-identical copy that differs only in a metadata tag. */
+api.systemLeaseClock = systemLeaseClock;
 
 module.exports = api;
 

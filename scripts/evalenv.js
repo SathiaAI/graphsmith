@@ -434,12 +434,34 @@ function detectPermissionModel(copyDir) {
       permission: supported,
       allow_fs_read: has("--allow-fs-read"),
       allow_fs_write: has("--allow-fs-write"),
+      // Detected because their ABSENCE from an argv is what denies subprocess
+      // and worker access. A detector that only looked for the --allow-fs-*
+      // pair could not tell whether the subprocess class was expressible at
+      // all, which is the class contract 04 B10 leans on hardest.
+      allow_child_process: has("--allow-child-process"),
+      allow_worker: has("--allow-worker"),
     },
-    recommended_argv: supported
-      ? ["--permission", "--allow-fs-read=" + copyDir + "/*", "--allow-fs-write=" + copyDir + "/*"]
-      : null,
+    /* DETECTION ONLY. No argv is built here, and none is built anywhere.
+     *
+     * This used to return `recommended_argv` -- a ready-made
+     * "--permission --allow-fs-read=<copy>/*" that nothing consumed. It named a
+     * security control, in the isolation module's own return value, and applied
+     * nothing.
+     *
+     * A per-skill enforcement module was then written to consume it, and WITHDRAWN
+     * after five rounds of adversarial review found successive escapes in it:
+     * pre-existing symlinks, hardlinks (a WRITE escape), stale audits, a forged
+     * targetDir spelling, dangling symlinks, and a granted path that is itself a
+     * symlink. Each round was reported as fixed and the next found another. See
+     * KNOWN-LIMITATIONS.md section 6.
+     *
+     * So this stays a fact about the RUNTIME and nothing more: these flags exist,
+     * and GraphSmith does not currently use them. Building the argv without proving
+     * the tree is clean produces a filesystem boundary that is not there, which is
+     * worse than the honest "not enforced" recorded in the limitations file.
+     */
     detail: supported
-      ? `Node Permission Model flags detected on this runtime (${process.version}).`
+      ? `Node Permission Model flags exist on this runtime (${process.version}). DETECTION ONLY -- GraphSmith does not apply them; per-skill filesystem/subprocess enforcement is NOT implemented (KNOWN-LIMITATIONS.md section 6).`
       : `Node Permission Model flags are not recognized by this runtime (${process.version}) -- proceeding without OS-enforced FS permission restriction on top of the copy's own directory isolation; documented limitation, not a silent claim of enforcement.`,
   };
 }
@@ -460,6 +482,32 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
   // catch a future code path that stops skipping them, or a symlink dropped
   // into the copy by some other means, before it can resolve outside).
   const symlinkEscapes = [];
+
+  /* HARDLINK audit, added after an adversarial review demonstrated a WRITE escape
+   * that the symlink-only audit reported as clean.
+   *
+   * A hardlink is a second NAME for the same inode, so realpath() resolves it to a
+   * path inside the copy and the symlink walk sees nothing wrong. Measured:
+   *
+   *     ln outside/secret.txt copy/inputs/innocent.txt
+   *     checkIsolation ->  symlink_escapes: []   isolated: true
+   *     node --permission --allow-fs-read=copy/inputs  ->  read "SECRET-OUTSIDE"
+   *     node --permission --allow-fs-write=copy/inputs ->  write ALLOWED, and
+   *         outside/secret.txt now reads "PWNED-FROM-INSIDE-GRANT"
+   *
+   * The read is bad; the WRITE is the one that matters. Untrusted code whose grant
+   * is scoped entirely to the disposable copy modified a file outside it, while the
+   * isolation report said the copy was clean. That defeats the filesystem
+   * containment claim in the direction that changes the world.
+   *
+   * st_nlink is the cheap, decisive signal: copyTreeExcluding writes fresh files,
+   * so every regular file in a new copy has nlink === 1. Anything above that is a
+   * second name somewhere, and proving WHERE would mean scanning the filesystem for
+   * the inode -- so this fails closed on the anomaly rather than trying. An internal
+   * duplicate is flagged too; that is the correct trade for a tree that should have
+   * none. */
+  const hardlinkSuspects = [];
+
   (function scan(dir) {
     let entries;
     try {
@@ -474,10 +522,41 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
           const real = fs.realpathSync(p);
           if (!isInside(copyDir, real)) symlinkEscapes.push({ path: p, target: real });
         } catch (e) {
-          // dangling symlink target -- not an escape, just inert.
+          /* A DANGLING symlink is NOT inert -- that comment was wrong, and an
+           * adversarial review demonstrated a write escape through one.
+           *
+           * realpathSync fails (ENOENT) because the target does not exist YET.
+           * But open(O_CREAT) follows the link and CREATES the file at the target,
+           * so a link inside the copy pointing at a non-existent path outside it is
+           * a write primitive aimed out of the tree. Targets that do not exist yet
+           * and whose parent is writable are exactly the interesting ones:
+           * .git/hooks/*, authorized_keys, a node_modules shim.
+           *
+           * Resolve LEXICALLY against the link's own directory -- realpath cannot
+           * help, the target is not there -- and treat anything leaving the copy as
+           * an escape. An unreadable link is recorded too: unknown is not clean. */
+          try {
+            const raw = fs.readlinkSync(p);
+            const lexical = path.resolve(path.dirname(p), raw);
+            if (!isInside(copyDir, lexical)) {
+              symlinkEscapes.push({ path: p, target: lexical, dangling: true });
+            }
+          } catch (e2) {
+            symlinkEscapes.push({ path: p, target: null, unresolvable: String((e2 && e2.code) || e2) });
+          }
         }
       } else if (entry.isDirectory()) {
         scan(p);
+      } else if (entry.isFile()) {
+        try {
+          const st = fs.lstatSync(p);
+          if (st.nlink > 1) hardlinkSuspects.push({ path: p, nlink: st.nlink, ino: String(st.ino) });
+        } catch (e) {
+          /* Cannot stat a file inside our own copy. That is not "clean" -- it is
+           * unknown, and unknown must not read as isolated. Record it as a suspect
+           * so `isolated` goes false rather than silently skipping the file. */
+          hardlinkSuspects.push({ path: p, nlink: null, error: String((e && e.code) || e) });
+        }
       }
     }
   })(copyDir);
@@ -488,7 +567,16 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
     node_path_stripped: !nodePathLeaked,
     symlinks_skipped_at_copy: (symlinksSkipped || []).length,
     symlink_escapes: symlinkEscapes,
-    isolated: !gitPresent && !graphsmithPresent && !nodePathLeaked && symlinkEscapes.length === 0,
+    /* Regular files in the copy with st_nlink > 1 (or unstattable). Each is a
+     * second name for an inode this copy does not exclusively own; a write through
+     * one leaves the copy. See the audit above for the measured escape. */
+    hardlink_suspects: hardlinkSuspects,
+    /* The directory this evidence describes. Kept so a consumer can tell WHICH
+     * tree was audited -- evidence that does not name its subject can be applied
+     * to the wrong one. */
+    audited_dir: path.resolve(copyDir),
+    isolated: !gitPresent && !graphsmithPresent && !nodePathLeaked &&
+      symlinkEscapes.length === 0 && hardlinkSuspects.length === 0,
   };
 }
 
@@ -501,6 +589,138 @@ function checkIsolation(copyDir, scrubbedEnv, symlinksSkipped) {
 // supplying a PATH that excludes any container runtime, independent of
 // whatever happens to be installed on the host running this file.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Container containment argv, beyond network denial and the read-only mount.
+//
+// Until this was added, the container profile ran untrusted code as ROOT with
+// the default Linux capability set and a writable root filesystem. Measured
+// inside the profile as it stood (docker 29.4.3, alpine:3.20):
+//
+//   uid                0 (root)
+//   CapEff             a80425fb  -- 14 capabilities, including CAP_MKNOD,
+//                                   CAP_SETUID, CAP_DAC_OVERRIDE, CAP_NET_RAW
+//   mknod /tmp/d c 1 3 ALLOWED    -- device nodes creatable
+//   NoNewPrivs         0         -- a setuid binary in the image can escalate
+//   write to rootfs    ALLOWED
+//
+// The read-only source mount held and network egress was denied, so the two
+// controls contract 04 B10 names were real. Everything AROUND them was open.
+// For the one code path whose entire job is running code we do not trust, that
+// is the wrong default: the mount protects OUR source, not the box.
+//
+// Same argv with the flags below, measured the same way:
+//
+//   uid                65534 (nobody)
+//   CapEff             0000000000000000  -- all dropped
+//   mknod              DENIED
+//   NoNewPrivs         1
+//   rootfs             read-only (a noexec/nosuid tmpfs at /tmp for scratch)
+//
+// Each flag, and why it is not optional here:
+//
+//   --user 65534:65534        root in the container is root on the host under
+//                             any escape; nobody is not
+//   --cap-drop=ALL            untrusted code has no business with CAP_MKNOD or
+//                             CAP_NET_RAW; nothing evalenv runs needs any
+//   --security-opt=no-new-privileges
+//                             closes setuid escalation from inside the image,
+//                             which --user alone does NOT
+//   --read-only               the rootfs is not a scratch space
+//   --tmpfs /tmp:...          because --read-only leaves nowhere to write;
+//                             noexec+nosuid so it cannot become a staging area
+//                             for a dropped binary
+//   --pids-limit=256          a fork bomb here is a denial of service against
+//                             the CI runner, not just this run
+//   --memory / --cpus         same reasoning, for the other two resources
+//
+// These are DEFAULTS on the untrusted-code path and are deliberately not
+// configurable: a knob that turns off containment on the one path that exists
+// to provide it is a knob that eventually gets turned off. A caller needing a
+// different posture should not be using runUntrustedCode().
+// ---------------------------------------------------------------------------
+
+/* --user is computed, not constant, and getting that wrong BROKE THE PROFILE.
+ *
+ * The first version of this hardcoded "--user 65534:65534". fs.mkdtempSync creates
+ * the copy at mode 0700 owned by the HOST uid (POSIX mandates 0700), so a container
+ * running as nobody could not even traverse its own workspace:
+ *
+ *     --user 65534  ->  ls: can't open '/workspace': Permission denied
+ *     no --user     ->  hello.txt
+ *
+ * Every container-required external tool (scripts/ext-tool-runner.js) would have
+ * seen an empty, unreadable workspace. I added containment and disabled the thing
+ * it was protecting -- and the suite reported 7/7 PASS, because it asserted on this
+ * exported constant instead of calling runUntrustedCode() with a real mount.
+ *
+ * The fix is to run as the HOST's own uid where that is a non-root user: it is
+ * still non-root (the property that matters -- root in the container is root on the
+ * host under any escape), and it can read a 0700 dir it owns.
+ *
+ * When the host IS root -- containerised CI, which is common -- there is no
+ * non-root uid that can read a root-owned 0700 directory, so containerUser() also
+ * relaxes the copy to 0755 and drops to nobody. That is a real trade and it is
+ * stated: the copy becomes readable by other local users. The standard profile
+ * already makes NO confidentiality claim (see `claims`), and the copy is a
+ * disposable clone of a repo that is about to be handed to untrusted code anyway.
+ * Running that code as root is the larger risk of the two. */
+function containerUser(copyDir) {
+  const hasUid = typeof process.getuid === "function";
+  if (!hasUid) {
+    /* No POSIX uid to map (Windows host). This previously returned null and the
+     * caller then emitted argv with NO --user at all -- i.e. the container ran as
+     * ROOT, the most permissive possible outcome, from a branch whose comment said
+     * "--user is not applicable". It is applicable: a LINUX container on Docker
+     * Desktop takes --user 65534 perfectly well. Drop to nobody. If that makes the
+     * mount unreadable on some host, the suite's mount-readability case fails --
+     * which is the correct way to find out, rather than silently running as root. */
+    return { spec: "65534:65534", relaxed: false, note: "no host uid (non-POSIX); using nobody" };
+  }
+  const uid = process.getuid();
+  const gid = typeof process.getgid === "function" ? process.getgid() : uid;
+  if (uid !== 0) return { spec: uid + ":" + gid, relaxed: false };
+  try {
+    fs.chmodSync(copyDir, 0o755);
+    return { spec: "65534:65534", relaxed: true };
+  } catch (e) {
+    /* Could not make the copy readable, so nobody cannot read it. Refuse to drop
+     * privileges into a container that then cannot see its own workspace -- a
+     * broken run is not more secure than an honest one. Report it. */
+    return { spec: null, relaxed: false, error: String((e && e.message) || e) };
+  }
+}
+
+/* Everything except --user, which depends on the copy. */
+const CONTAINMENT_ARGV_BASE = [
+  "--cap-drop=ALL",
+  "--security-opt=no-new-privileges",
+  "--read-only",
+  "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+  "--pids-limit=256",
+  "--memory=512m",
+  "--cpus=1",
+];
+
+/* FAIL-CLOSED. This used to return the base list -- with NO --user -- whenever
+ * containerUser() could not produce a spec, which meant the container ran as ROOT
+ * on exactly the paths where something had gone wrong. containerUser's own comment
+ * said it "Refuse[s]" and "Report[s] it"; the caller threw the error away and
+ * emitted permissive argv. The most permissive outcome must never be the error
+ * path. */
+function containmentArgv(copyDir) {
+  const u = containerUser(copyDir);
+  if (!u || !u.spec) {
+    throw fail(
+      "REFUSED: cannot determine a non-root user for the container profile" +
+        (u && u.error ? " (" + u.error + ")" : "") +
+        ". Running untrusted code as root in the container -- root there is root on the host under any " +
+        "escape -- is not an acceptable fallback, so this refuses rather than dropping --user.",
+      "CONTAINMENT_USER_UNAVAILABLE"
+    );
+  }
+  return ["--user", u.spec].concat(CONTAINMENT_ARGV_BASE);
+}
 
 function detectContainerRuntime(envOverride) {
   const env = envOverride || process.env;
@@ -689,8 +909,7 @@ function createContainer(options) {
       "--network", "none", // network denial (contract 04 B10)
       "-v", `${base.dir}:/workspace:ro`, // read-only source mount (contract 04 B10)
       "-w", "/workspace",
-      runOpts.image,
-    ].concat(Array.isArray(cmd) ? cmd : [String(cmd)]);
+    ].concat(containmentArgv(base.dir), [runOpts.image], Array.isArray(cmd) ? cmd : [String(cmd)]);
     return spawnSync(detection.runtime, argv, Object.assign({ env: base.env, stdio: "pipe", timeout: runOpts.timeoutMs || 60000 }, runOpts.spawnOptions || {}));
   }
 
@@ -699,10 +918,21 @@ function createContainer(options) {
     available: true,
     runtime: detection.runtime,
     claims: {
-      isolation_level: `container (${detection.runtime}): network denied (--network none), read-only source mount, plus everything the standard profile provides`,
+      isolation_level: `container (${detection.runtime}): network denied (--network none), read-only source mount, non-root (uid 65534), all Linux capabilities dropped, no-new-privileges, read-only rootfs with a noexec/nosuid tmpfs, and pid/memory/cpu caps, plus everything the standard profile provides`,
       confidentiality: "partial",
       network_containment: true,
-      note: "container profile: network denial and read-only source mount are enforced by the container runtime at run time (runUntrustedCode), not merely declared.",
+      /* Computed defensively: containmentArgv THROWS when it cannot determine a
+       * non-root user (fail-closed, deliberately). Evaluating it eagerly inside this
+       * `claims` literal meant that throw escaped createContainer AFTER the copy had
+       * been made, so base.destroy() never ran and the disposable copy leaked. The
+       * refusal still has to reach runUntrustedCode -- which it does, since that
+       * calls containmentArgv again at spawn time -- but reporting it here must not
+       * cost a leaked directory. */
+      containment_argv: (function () {
+        try { return containmentArgv(base.dir); }
+        catch (e) { return { unavailable: String((e && e.message) || e) }; }
+      })(),
+      note: "container profile: every control listed above is enforced by the container runtime at run time (runUntrustedCode), not merely declared. 'partial' confidentiality is unchanged and deliberate -- this is a process/kernel boundary, not a proof of confidentiality, and a container escape remains a container escape.",
     },
     runUntrustedCode,
   });
@@ -743,6 +973,11 @@ module.exports = {
   detectContainerRuntime,
   detectPermissionModel,
   checkIsolation,
+  // Exported so a test can assert the containment flags are actually passed to
+  // the runtime. containmentArgv(copyDir) is the real one -- it computes --user from
+  // the copy's ownership; the BASE list alone is NOT what runs.
+  CONTAINMENT_ARGV_BASE,
+  containmentArgv,
 };
 
 // ---------------------------------------------------------------------------

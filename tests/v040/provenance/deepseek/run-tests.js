@@ -206,11 +206,18 @@ test("actual-map-array", () => {
 });
 
 // Test 20: Proto pollution attempt
+/* Inert by construction: assigning __proto__ only changes what ctx.sbom INHERITS, and
+ * sbom.components is already an OWN property, so nothing the check reads changes. The
+ * context stays valid and "verified" is the correct answer -- expecting "failed" made
+ * this case demand a false alarm. Assert the real property: an inert prototype
+ * decoration must not move the verdict in EITHER direction, which is the C1/C2
+ * invariance the sibling lanes adjudicated the same way. */
 test("proto-pollution", () => {
+    const clean = verifyProvenance(createValidContext()).status;
     const ctx = createValidContext();
     ctx.sbom.__proto__ = { components: [] };
-    const result = verifyProvenance(ctx);
-    return result.status === "failed"; // Should fail for some reason, not crash
+    const polluted = verifyProvenance(ctx).status;
+    return polluted === clean && polluted === "verified";
 });
 
 // Test 21: BigInt in bytes field

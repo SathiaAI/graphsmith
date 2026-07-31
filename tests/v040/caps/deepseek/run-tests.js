@@ -77,9 +77,14 @@ const allowlistTests = [
   { cls: "network", req: "API.example.com", grant: "api.example.com" }
 ];
 for (const { cls, req, grant } of allowlistTests) {
+  // subsetOk() keys the network class on `destinations`, every other class on
+  // `allowed` (checks/v040-caps.js). Building the network case with `allowed` meant
+  // req.destinations was undefined, within() saw nothing requested, and the case
+  // vacuously "verified" -- it never exercised the case-sensitivity check it names.
+  const key = cls === "network" ? "destinations" : "allowed";
   const ctx = {
-    grant: { schema_version: "1.0", skill_id: "s1", grants: { [cls]: { allowed: [grant] } }, enforced: [cls] },
-    requested: { [cls]: { allowed: [req] } },
+    grant: { schema_version: "1.0", skill_id: "s1", grants: { [cls]: { [key]: [grant] } }, enforced: [cls] },
+    requested: { [cls]: { [key]: [req] } },
     attested: { [cls]: true }
   };
   const result = run(ctx);

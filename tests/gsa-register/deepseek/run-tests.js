@@ -157,11 +157,22 @@ test("bigint-values", () => {
   return result.activated === false && !result.reason.includes("throw");
 });
 
+/* `inputs.__proto__ = {...}` rewires only this one clone's prototype -- it never
+ * touches Object.prototype, and nothing in activateRegulatedMode reads
+ * inputs.activated anyway. The input stayed fully valid, so activated:true was the
+ * correct and honest answer, and demanding false made the case require a false alarm.
+ * The sibling suite (tests/gsa-register/mistral) has the real attack:
+ * `inputs.__proto__.polluted = true`, which mutates Object.prototype globally. Do that
+ * here too, and restore it afterwards so the pollution cannot leak into later cases. */
 test("proto-pollution", () => {
   const inputs = clone(goodInputs);
-  inputs.__proto__ = { activated: true };
-  const result = reg.activateRegulatedMode(inputs, policy);
-  return result.activated === false && !result.reason.includes("throw");
+  inputs.__proto__.polluted = true;
+  try {
+    const result = reg.activateRegulatedMode(inputs, policy);
+    return typeof result.activated === "boolean" && !String(result.reason || "").includes("throw");
+  } finally {
+    delete Object.prototype.polluted;
+  }
 });
 
 console.log("# summary PASS="+pass+" FAIL="+fail+" total="+(pass+fail));

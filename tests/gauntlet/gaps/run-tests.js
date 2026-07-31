@@ -5,7 +5,7 @@
  */
 "use strict";
 const fs = require("fs"), path = require("path"), os = require("os");
-const S = (n) => path.join(__dirname, "..", "..", "scripts", n);
+const S = (n) => path.join(__dirname, "..", "..", "..", "scripts", n);
 const req = (n) => require(S(n));
 let HOLD = 0, BREAK = 0; const breaks = [];
 function ok(cls, name, cond, d) { if (cond) HOLD++; else { BREAK++; breaks.push(`[${cls}] ${name}${d ? " :: " + d : ""}`); } console.log(`${cond ? "HOLD " : "BREAK"}  ${cls}  ${name}${d && !cond ? "  :: " + d : ""}`); }

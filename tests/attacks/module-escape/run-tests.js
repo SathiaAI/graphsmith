@@ -16,6 +16,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 const Module = require("module");
 
 const REPO = path.resolve(__dirname, "..", "..", "..");
@@ -43,6 +44,22 @@ function record(name, status, detail) {
   console.log(`${status}\t${name}${detail ? "\t" + String(detail).replace(/\s+/g, " ").slice(0, 300) : ""}`);
 }
 function pass(n, d) { record(n, "PASS", d); }
+
+/* A verdict this case could not have observed must never read as either a
+ * guarantee upheld or a defect found. spawnSync kills the child with SIGTERM when
+ * its own `timeout` elapses and reports error.code === "ETIMEDOUT" with
+ * status === null -- that is the HARNESS running out of patience, not the product
+ * answering. It still counts as a failure (fail-closed: a case that did not run
+ * must never read as green), but the tag keeps it out of the product findings, and
+ * tests/harness-honesty/starvation/ requires it.
+ *
+ * status === null alone is NOT the test: a process killed by a signal for any other
+ * reason also reports null, and calling that a harness timeout would hide a real
+ * crash. */
+function timedOutByHarness(r) {
+  return !!(r && r.error && r.error.code === "ETIMEDOUT");
+}
+function inconclusive(n, d) { record(n, "FAIL", "INCONCLUSIVE (harness): " + d); }
 function fail(n, d) { record(n, "FAIL", d); }
 function sha256(v) {
   return crypto.createHash("sha256").update(v).digest("hex");
@@ -485,9 +502,12 @@ function attack_gateSelftestMirror() {
     const child = spawnSync(
       process.execPath,
       [path.join(SCRIPTS, "gate.js"), "--selftest"],
-      { encoding: "utf8", timeout: 60000 }
+      { encoding: "utf8", timeout: harnessDeadline(60000) }
     );
-    if (child.status === 0) {
+    if (timedOutByHarness(child)) {
+      inconclusive(name, "gate.js --selftest was killed by the harness timeout, so the " +
+        "mirrored selftest result was not observed");
+    } else if (child.status === 0) {
       let body;
       try { body = JSON.parse(child.stdout); } catch (_) { body = null; }
       if (body && body.status === "pass") pass(name, `tests=${(body.tests || []).length}`);
@@ -529,9 +549,18 @@ function attack_nodePathSmuggle() {
       {
         encoding: "utf8",
         env: { ...process.env, NODE_PATH: evil, GS_MESC_MARKER: marker },
-        timeout: 15000,
+        timeout: harnessDeadline(15000),
       }
     );
+    // The attack is only disproved if the child actually REACHED the gate call.
+    // Killed by the harness timeout, an absent marker means the smuggle was never
+    // attempted -- which the old fall-through reported as "no package execution", a
+    // confident PASS on a sandbox-escape guarantee.
+    if (timedOutByHarness(child)) {
+      inconclusive(name, "the NODE_PATH child was killed by the harness timeout before " +
+        "reaching the gate1 call, so the smuggle attempt was never actually made");
+      return;
+    }
     const markerExists = fs.existsSync(marker);
     if (markerExists) {
       fail(name, "evil-pkg executed via NODE_PATH during gate1");
@@ -547,7 +576,11 @@ function attack_nodePathSmuggle() {
     if (out && markerExists === false) {
       pass(name, `pass=${out.pass} findings=${(out.findings || []).join(",")}`);
     } else {
-      pass(name, "no package execution");
+      // Exit 0 with no parseable report means the child never reached the gate call
+      // and reported back. "no package execution" was a claim about the product
+      // drawn from the absence of any evidence at all.
+      inconclusive(name, `child exited ${child.status} without a parseable gate1 report ` +
+        `(stdout ${String(child.stdout || "").length}B), so the smuggle was not observed`);
     }
   } catch (e) {
     fail(name, e.message);

@@ -49,6 +49,7 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 
 const ROOT = path.resolve(__dirname, "..", "..", "..");
 const SCRIPTS = path.join(ROOT, "scripts");
@@ -102,7 +103,7 @@ function viaPipe(scriptPath, args) {
   const r = spawnSync(process.execPath, [scriptPath].concat(args), {
     cwd: ROOT,
     encoding: "utf8",
-    timeout: 300000,
+    timeout: harnessDeadline(300000),
     maxBuffer: 32 * 1024 * 1024,
     windowsHide: true,
   });
@@ -113,17 +114,18 @@ function viaFile(scriptPath, args, tmpdir) {
   // Redirecting to a file is synchronous on POSIX, so this is the complete report.
   const target = path.join(tmpdir, "report.json");
   const fd = fs.openSync(target, "w");
+  let r;
   try {
-    spawnSync(process.execPath, [scriptPath].concat(args), {
+    r = spawnSync(process.execPath, [scriptPath].concat(args), {
       cwd: ROOT,
       stdio: ["ignore", fd, "ignore"],
-      timeout: 300000,
+      timeout: harnessDeadline(300000),
       windowsHide: true,
     });
   } finally {
     fs.closeSync(fd);
   }
-  return fs.readFileSync(target, "utf8");
+  return { text: fs.readFileSync(target, "utf8"), status: r.status, error: r.error };
 }
 
 // Return a truthy marker when `text` carries a well-formed JSON report, else null.
@@ -242,7 +244,23 @@ function main() {
       // not parse, an empty capture does not parse, and a JSON-Lines report clipped
       // at a line boundary changes the document count. Those two checks are
       // sufficient, and unlike byte-equality they cannot fire on a timestamp.
-      const expected = viaFile(scriptPath, c.args, tmpdir);
+      const baseline = viaFile(scriptPath, c.args, tmpdir);
+      const expected = baseline.text;
+      // A CLI that CRASHED before writing anything also produces an empty file, and
+      // the empty-output branch below would have called that "correctly out of scope"
+      // -- this suite quietly not checking, which is the exact defect it exists to
+      // catch. Separate the two before drawing any conclusion.
+      if (baseline.error || (baseline.status !== 0 && expected.trim() === "")) {
+        report(
+          false,
+          id,
+          "INCONCLUSIVE (harness): the baseline file-redirected run did not complete " +
+            "(exit " + baseline.status + (baseline.error ? ", " + baseline.error.code : "") +
+            ") and wrote 0B, so there is no reference report to compare the piped capture " +
+            "against -- this case checked nothing"
+        );
+        continue;
+      }
       const expectedJson = firstJsonValue(expected);
       if (expectedJson === null) {
         // A CLI that emits no JSON on stdout has no report for this suite to
@@ -266,8 +284,20 @@ function main() {
       const expectedDocs = expectedJson.documents || 1;
       let brokenRun = -1;
       let why = "";
+      let starvedRun = -1;
       for (let i = 0; i < REPEATS; i += 1) {
         const got = viaPipe(scriptPath, c.args);
+        // A CLI killed by THIS HARNESS'S timeout never got to finish writing, so
+        // "report LOST through the pipe -- the CLI must hand every byte to the kernel
+        // before it exits" would be a product verdict drawn from harness impatience.
+        // Found by tests/harness-honesty/starvation/ pointed at this very file, which
+        // is the outcome that justifies the sweep existing.
+        if (got.error && got.error.code === "ETIMEDOUT") {
+          starvedRun = i;
+          why = "the CLI was killed by the harness timeout on run " + (i + 1) +
+            " of " + REPEATS + ", so nothing was observed about its report";
+          break;
+        }
         if (got.error) {
           brokenRun = i;
           why = "spawnSync errored: " + String(got.error.message || got.error);
@@ -292,7 +322,9 @@ function main() {
       }
 
       const mode = "parses, " + expectedDocs + " document(s) as on the file path";
-      if (brokenRun === -1) {
+      if (starvedRun !== -1) {
+        report(false, id, "INCONCLUSIVE (harness): " + why);
+      } else if (brokenRun === -1) {
         report(true, id, "report survived spawnSync " + REPEATS + "/" + REPEATS + " runs, " + mode + " (" + expected.length + "B)");
       } else {
         report(

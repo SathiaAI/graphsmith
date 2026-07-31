@@ -22,22 +22,19 @@ const SUITES = [
   ["tests/gsa-mcp/deepseek/run-tests.js", []],
   ["tests/gsa-mcp/mistral/run-tests.js", []],
   // tests/gsa-register/ADJUDICATION.md — inert __proto__ on an otherwise-clean input.
-  ["tests/gsa-register/deepseek/run-tests.js", ["proto-pollution unexpected activation"]],
-  ["tests/gsa-register/mistral/run-tests.js", ["crash - proto pollution unexpected activation"]],
+  ["tests/gsa-register/deepseek/run-tests.js", []],
+  ["tests/gsa-register/mistral/run-tests.js", []],
   // tests/gsa/ADJUDICATION.md — profile-confusion assertions.
-  ["tests/gsa/deepseek/run-tests.js", ["profile_confusion"]],
-  ["tests/gsa/mistral/run-tests.js", ["profile-confusion-X-without-evidence keys is not defined"]],
+  ["tests/gsa/deepseek/run-tests.js", []],
+  ["tests/gsa/mistral/run-tests.js", []],
   // tests/register/airgap/ADJUDICATION.md
   ["tests/register/airgap/codex/run-tests.js", []],
-  ["tests/register/airgap/deepseek/run-tests.js", ["inherited signature fields rejected Expected failed, got verified"]],
+  ["tests/register/airgap/deepseek/run-tests.js", []],
   // tests/register/approver/ADJUDICATION.md — hostile-input crash cases.
   ["tests/register/approver/deepseek/run-tests.js", []],
-  ["tests/register/approver/mistral/run-tests.js", [
-    "crash-bigint BigInt proposer_id did not fail gracefully",
-    "crash-proto-pollution Proto pollution did not fail gracefully",
-  ]],
+  ["tests/register/approver/mistral/run-tests.js", []],
   // tests/register/obligations/ADJUDICATION.md
-  ["tests/register/obligations/deepseek/run-tests.js", ["proto pollution Proto pollution should not affect verification"]],
+  ["tests/register/obligations/deepseek/run-tests.js", []],
   ["tests/register/obligations/qwen/run-tests.js", []],
   // tests/register/retention/ADJUDICATION.md — identity-invariant hostile inputs.
   ["tests/register/retention/mistral/run-tests.js", []],
@@ -115,7 +112,31 @@ console.log("  HOLD:            " + hold + "  (component behaved correctly)");
 console.log("  adjudicated FP:  " + adjudicated + "  (documented tester false-positives; component is correct — see ADJUDICATION.md)");
 console.log("  BREAK:           " + breaks.length + "  (unexpected component failures)");
 console.log("");
-if (staleNotes.length) { console.log("STALE ADJUDICATIONS (informational — a tester assertion was fixed; prune the entry in this battery):"); for (const s of staleNotes) console.log("  - " + s); console.log(""); }
+/* A stale adjudication GATES. It used to print "informational" and pass.
+ *
+ * Every entry here says "this named assertion is a known tester false-positive;
+ * when it fails, classify HOLD rather than BREAK". Stale means the name no
+ * longer fails, so the entry currently matches nothing -- harmless today, and a
+ * live hole tomorrow: a GENUINELY NEW failure carrying that exact name gets
+ * absorbed as HOLD instead of gating. The names in question were the ones you
+ * least want pre-absorbed -- proto-pollution, split-secret-bypass,
+ * fail-open-signer_registry-missing.
+ *
+ * Reported-but-not-gating made pruning a chore, and chores do not get done: 36
+ * dead entries had accumulated across the two batteries. This is the same
+ * discriminator the starvation sweep applies to a WIRING GAP, and the same rule
+ * as contract 10 List C rule 5 -- detection, not inspection. Fixing a tester
+ * assertion is still progress; it just is not finished until its adjudication
+ * goes with it. */
+if (staleNotes.length) {
+  console.log("STALE ADJUDICATIONS — an adjudicated name no longer fails, so its entry now matches");
+  console.log("nothing and would absorb a FUTURE failure of that same name as HOLD. Delete the entry");
+  console.log("from this battery's SUITES table (fixing the assertion is only half the change):");
+  for (const s of staleNotes) console.log("  - " + s);
+  console.log("");
+  console.log("RESULT: FAIL — " + staleNotes.length + " stale adjudication(s)");
+  process.exit(1);
+}
 if (breaks.length) { console.log("BREAKS:"); for (const b of breaks) console.log("  - " + b); console.log(""); console.log("RESULT: FAIL — " + breaks.length + " BREAK(s)"); process.exit(1); }
 console.log("RESULT: " + scenarios + " scenarios, all HOLD, 0 BREAK" + (scenarios >= 180 ? " (>=180 target met)" : " (below 180 target)"));
 process.exit(scenarios >= 180 ? 0 : 1);

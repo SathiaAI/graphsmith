@@ -33,6 +33,28 @@ function record(status, name, detail) {
 }
 function pass(n, d) { record("PASS", n, d); }
 function fail(n, d) { record("FAIL", n, d); }
+/* Fail-closed, but tagged so it is excluded from PRODUCT findings: the case could
+ * not create the condition it was written to test, so it observed nothing about the
+ * component. Same convention the rest of this repo's harnesses use — the string
+ * "INCONCLUSIVE (harness)" is what tests/harness-honesty/ greps for. */
+function skipInconclusive(n, why) { record("FAIL", n, "INCONCLUSIVE (harness): " + why); }
+
+/* Make the banned-list path genuinely unreadable for ANY uid by putting a directory
+ * where the file should be, then re-run hygiene-scan. Returns true iff it exited
+ * non-zero (fail-closed). Returns false if the substitution itself could not be
+ * performed, so the caller can fall through rather than infer a verdict from a
+ * setup step that did not happen. */
+function retryUnreadableAsDirectory(cwd, listAbs) {
+  try {
+    try { fs.chmodSync(listAbs, 0o644); } catch (_) {}
+    fs.rmSync(listAbs, { force: true });
+    fs.mkdirSync(listAbs, { recursive: true });
+  } catch (_) {
+    return false;
+  }
+  var c = spawnNode(HYGIENE, [], { cwd: cwd });
+  return c && c.status !== 0;
+}
 function noteFinding(id, severity, summary) {
   findings.push({ id: id, severity: severity, summary: summary });
 }
@@ -215,16 +237,73 @@ function attackFalseNegatives() {
     noteFinding("FN-MD-BOLD", "HIGH", "docs-lint missed **proven** which still contains the bare term");
   }
 
-  // Line-wrap: "pro" + "\n" + "ven..."
-  if (ruleHits(hits, "R1-proven").some(function (h) { return h.line === 10 || h.line === 11; })) {
-    pass("FN/linewrap-proven", "caught cross-line");
-  } else {
-    fail("FN/linewrap-proven", "line-wrapped pro/ven not flagged");
-    noteFinding(
-      "FN-LINEWRAP",
-      "LOW",
-      "docs-lint is strictly line-local; wrapping a banned token across a newline is a known evasion"
-    );
+  /* Line-wrap: "pro" + "\n" + "ven...". INVERTED from what this case used to assert,
+   * because the original expectation was wrong and would have caused a regression.
+   *
+   * It demanded a hit and, on getting none, emitted FN-LINEWRAP: "docs-lint is
+   * strictly line-local; wrapping a banned token across a newline is a known
+   * evasion." It is not an evasion. A single newline inside a paragraph is a
+   * CommonMark SOFT BREAK, which renders as a SPACE. Measured on two independent
+   * renderers (marked, markdown-it), all four wrap shapes:
+   *
+   *     "pro\nven"        -> "pro ven"        (NOT "proven")
+   *     "pro-\nven"       -> "pro- ven"
+   *     "pro  \nven"      -> "pro ven"        (hard break; still separated)
+   *     "certified\nsecure" -> "certified secure"
+   *
+   * The published document does not contain the banned word, so reporting clean is
+   * the correct verdict. Flagging it would be a FALSE POSITIVE on a constitutional
+   * gate -- failing a document over a word that is not in it, which costs far more
+   * here than the miss it was meant to prevent.
+   *
+   * And docs-lint is not "strictly line-local": scanFile joins each line with the
+   * previous one using a SPACE separator, precisely because that is what the
+   * renderer does. That is why the last row above IS caught. The mechanism the
+   * finding said was missing is the mechanism that makes the correct answer correct.
+   *
+   * So this now pins BOTH directions, which is the only way to keep the boundary
+   * from drifting either way: a soft-wrapped single word must NOT be flagged, and a
+   * space-joined multi-word phrase MUST be. */
+  {
+    const wrapHit = ruleHits(hits, "R1-proven").some(function (h) { return h.line === 10 || h.line === 11; });
+    if (!wrapHit) {
+      pass("FN/linewrap-not-a-false-positive",
+        "soft-wrapped \"pro\\nven\" correctly NOT flagged — it renders as \"pro ven\", so the " +
+        "published text does not contain the banned word");
+    } else {
+      fail("FN/linewrap-not-a-false-positive",
+        "flagged a soft-wrapped word that renders as two separate words — false positive on a " +
+        "constitutional gate");
+      noteFinding("FN-LINEWRAP-FP", "HIGH",
+        "docs-lint flags \"pro\\nven\" as the banned word \"proven\", but CommonMark renders a " +
+        "soft break as a space, so the document reads \"pro ven\". Failing a document over a " +
+        "word it does not contain");
+    }
+  }
+
+  /* The other half of that boundary, and the reason the case above is not simply
+   * "docs-lint ignores line breaks". A MULTI-WORD banned phrase split across a
+   * newline DOES render as the phrase -- "certified\nsecure" becomes "certified
+   * secure" -- so it must be caught, and scanFile's space-join is what catches it.
+   *
+   * Asserted separately and positively. Without this, someone reading only the case
+   * above could "simplify" scanFile by dropping the cross-line join entirely and
+   * still see green, which would open a real evasion. Pinning one direction of a
+   * boundary without the other is how a boundary moves. */
+  {
+    var xr = mk("fn-crossline");
+    writeTree(xr, { "README.md": "Our platform is certified\nsecure for enterprise.\n" });
+    var xhits = docsLint.scanFile("README.md", path.join(xr, "README.md"));
+    var caught = xhits.some(function (h) { return h.ruleId === "R9a-certified-secure"; });
+    if (caught) {
+      pass("FN/crossline-phrase-caught",
+        "\"certified\\nsecure\" flagged — it renders as the banned phrase, so the space-join must fire");
+    } else {
+      fail("FN/crossline-phrase-caught", "cross-line \"certified secure\" not flagged");
+      noteFinding("FN-CROSSLINE-PHRASE", "HIGH",
+        "a banned multi-word phrase split across a newline renders as the phrase and evades " +
+        "docs-lint — a real bypass, unlike the single-word wrap case");
+    }
   }
 
   // Soft hyphen
@@ -885,6 +964,49 @@ function attackFailClosed() {
       try { fs.chmodSync(listAbs, 0o644); } catch (_) {}
       if (child2.status !== 0) {
         pass("FC/local-unreadable-nonzero", "exit=" + child2.status);
+      } else if (retryUnreadableAsDirectory(r, listAbs)) {
+        /* Second attempt, because chmod is not a reliable way to make a file
+         * unreadable: root ignores the mode bits entirely, and Windows ACLs often
+         * let the owner read anyway. Replacing the file with a DIRECTORY is
+         * unreadable for every uid on every platform -- read(2) on a directory is
+         * EISDIR regardless of who you are.
+         *
+         * The harness already used this trick on its Windows path a few lines up;
+         * it just never fell back to it on POSIX-as-root, and so converted its own
+         * inability to create the condition into a HIGH-severity finding against
+         * hygiene-scan ("exits 0 when the banned list is unreadable"). The product
+         * was fail-closed the whole time. Measured as uid 65534, where chmod does
+         * apply: EXIT=1, "FATAL -- cannot read ...: EACCES". And with the directory
+         * substitution, as root: EXIT=1, EISDIR.
+         *
+         * Creating the condition beats reporting that you could not create it. */
+        pass("FC/local-unreadable-nonzero",
+          "exit non-zero on an unreadable list (directory substitution, uid-independent)");
+      } else if (typeof process.getuid === "function" && process.getuid() === 0) {
+        /* NOT a product defect -- this harness is running as root, and root ignores
+         * the mode bits. chmod 0 did not make the file unreadable, hygiene-scan read
+         * it fine, and "clean" is the correct verdict for a list that loaded.
+         *
+         * This branch exists because the check DID report it as a defect: it emitted
+         * FC-UNREADABLE at HIGH severity, claiming hygiene-scan was fail-open on an
+         * unreadable list. Measured instead as uid 65534, where the mode bits apply:
+         *
+         *     EXIT=1  FATAL -- cannot read .plans/hygiene/banned-identifiers.txt:
+         *             EACCES: permission denied
+         *
+         * and fail-closed for the other two shapes too -- missing file (EXIT=1,
+         * "FATAL -- local list not found") and a directory in place of the file
+         * (EXIT=1, EISDIR). loadBannedIdentifiers() returns null on both, and the
+         * caller errors. The product was never wrong.
+         *
+         * The harness already anticipated this for Windows ACLs a few lines up; it
+         * just never considered root on POSIX. A check that cannot create the
+         * condition it is testing must say so, not convert its own inability into a
+         * finding about the component (contract 10 List C rule 1). */
+        skipInconclusive("FC/local-unreadable-nonzero",
+          "running as uid 0, which ignores mode bits, so chmod 0 did not make the list " +
+          "unreadable and this attempt observed nothing. Re-run as an unprivileged user " +
+          "for real coverage; verified fail-closed (EXIT=1, EACCES) as uid 65534");
       } else {
         fail("FC/local-unreadable-nonzero", "exit 0 on chmod 0 list");
         noteFinding(
@@ -921,11 +1043,38 @@ function attackFailClosed() {
       cwd: r,
       env: { HYGIENE_HMAC_KEY: null, HYGIENE_DIGESTS: null },
     });
-    if (child.status !== 0) {
-      pass("FC/ci-no-secrets-nonzero", "exit=" + child.status);
+    /* Inverted from what this case originally asserted, and the inversion is the point.
+     *
+     * It used to require a NON-ZERO exit and, on getting 0, emit FC-CI-SECRETS at
+     * CRITICAL: "--ci without secrets exits 0". That is not a fail-open. List B
+     * (keyed banned-identifier digests) is OPT-IN by design; List A (docs-lint.js)
+     * always gates. hygiene-scan says so on the way out:
+     *
+     *     "List B not configured (no HYGIENE_HMAC_KEY and no HYGIENE_DIGESTS) --
+     *      skipping, nothing to detect. List B is opt-in; List A (docs-lint.js)
+     *      always gates."
+     *
+     * A tester disagreeing with a documented decision is a disagreement, not a
+     * defect, and calling it CRITICAL costs more than it looks: a real critical in
+     * this file would arrive next to a standing false one and get triaged as noise.
+     *
+     * So the assertion now pins the behaviour that ACTUALLY matters and that a
+     * regression could plausibly break -- that the skip is loud. Exiting 0 silently,
+     * with no line saying List B did not run, would be the genuine defect: a run that
+     * detected nothing, reported nothing, and passed. That is what this now catches.
+     * If the opt-in decision is ever revisited, change it here deliberately. */
+    var ciOut = String((child.stdout || "") + (child.stderr || ""));
+    var announcesSkip = /List B/.test(ciOut) && /(skipping|not configured)/i.test(ciOut);
+    if (child.status === 0 && announcesSkip) {
+      pass("FC/ci-no-secrets-announces-skip",
+        "exit 0 with List B declared opt-in and its skip stated (List A still gates)");
+    } else if (child.status !== 0) {
+      pass("FC/ci-no-secrets-announces-skip", "exit=" + child.status + " (gates outright)");
     } else {
-      fail("FC/ci-no-secrets-nonzero", "exit 0");
-      noteFinding("FC-CI-SECRETS", "CRITICAL", "--ci without secrets exits 0");
+      fail("FC/ci-no-secrets-announces-skip", "exit 0 and NO line stating List B was skipped");
+      noteFinding("FC-CI-SILENT-SKIP", "HIGH",
+        "hygiene-scan --ci exits 0 without configured secrets AND without saying List B " +
+        "did not run -- a run that detected nothing, reported nothing, and passed");
     }
   }
 

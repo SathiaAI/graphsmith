@@ -3,6 +3,33 @@
 const check = require("../../../../checks/v040-receipts.js");
 let pass = 0, fail = 0;
 
+/* ADJUDICATED cases: this is an adversarial-review artifact, and a tester's
+ * expectation is not automatically the right answer. Where tests/v040/receipts/
+ * ADJUDICATION.md formally settled a case as NOT a defect, flipping the expectation
+ * silently erases the record of the disagreement, and leaving it FAILing forever is
+ * why nobody reads the evidence-only list. Run it, assert the adjudicated behaviour
+ * so a regression away from it still fails, and print it under its own status. */
+let adjudicated = 0;
+function adjudicatedTest(name, fn, ruling) {
+  /* Contract 10 List C: an ADJUDICATED verdict is only admissible with a citation to
+   * the ruling that produced it. Without one it is an unexplained non-failure, which is
+   * the shape this status exists to prevent. Fail closed on a missing citation. */
+  if (typeof ruling !== "string" || ruling.trim().length === 0) {
+    console.log("FAIL " + name + " - ADJUDICATED recorded with no citation to the ruling " +
+      "that settled it (contract 10 List C)");
+    fail++;
+    return;
+  }
+  const ok = fn();
+  if (ok === true) {
+    console.log("ADJUDICATED " + name + " (not a defect: " + ruling + ")");
+    adjudicated++;
+  } else {
+    console.log("FAIL " + name + " REGRESSED away from the adjudicated behaviour");
+    fail++;
+  }
+}
+
 function test(name, fn) {
   try {
     const result = fn();
@@ -44,13 +71,13 @@ test("forged-success-empty-string-external_id", () => {
   return res.status === "unavailable";
 });
 
-test("forged-success-non-string-external_id", () => {
+adjudicatedTest("forged-success-non-string-external_id", () => {
   const ctx = { effects: [{ action: "test", receipt: {
     schema_version: "1.0", adapter_id: "test", action: "test", status: "success", external_id: 123
   }}]};
   const res = check.run(ctx);
-  return res.status === "failed";
-});
+  return res.status === "unavailable";
+}, 'ADJUDICATION.md "The invalid-external_id design decision" — an invalid external_id VALUE routes to UNKNOWN -> unavailable, never failed; the forged success still never reaches verified, which is the security-critical property');
 
 // 2. UNKNOWN_EFFECT
 test("unknown-effect-no-receipt", () => {
@@ -178,14 +205,18 @@ test("effect-with-bigint", () => {
   return res.status === "failed";
 });
 
+/* Was unfalsifiable twice over: the merge result was discarded (Object.assign into a
+ * fresh {} never touched ctx), and the assertion accepted either verified OR failed,
+ * so no product change short of a crash could have failed it. Mutate ctx for real and
+ * pin the one correct answer -- the pollution is inert, every read field is own and
+ * valid, so this reconciles. */
 test("proto-pollution", () => {
   const malicious = JSON.parse('{"__proto__": {"polluted": true}}');
-  const ctx = { effects: [{ action: "test", receipt: {
+  const ctx = Object.assign({ effects: [{ action: "test", receipt: {
     schema_version: "1.0", adapter_id: "test", action: "test", status: "success", external_id: "123"
-  }}] };
-  Object.assign({}, ctx, malicious);
+  }}] }, malicious);
   const res = check.run(ctx);
-  return res.status === "verified" || res.status === "failed";
+  return res.status === "verified";
 });
 
 test("proxy-effect", () => {
@@ -202,5 +233,6 @@ test("proxy-effect", () => {
   return res.status === "verified";
 });
 
-console.log("# summary PASS=" + pass + " FAIL=" + fail + " total=" + (pass + fail));
+console.log("# summary PASS=" + pass + " FAIL=" + fail + " ADJUDICATED=" + adjudicated +
+  " total=" + (pass + fail + adjudicated));
 process.exitCode = fail === 0 ? 0 : 1;

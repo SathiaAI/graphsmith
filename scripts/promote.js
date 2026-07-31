@@ -404,7 +404,13 @@ function admitWindow(store, packet, txid, tree) {
           window_id: txid, adoption_txid: txid, candidate_fingerprint: packet.fingerprint, tree_id: tree,
           n: Number.isSafeInteger(packet.window_n) && packet.window_n > 0 ? packet.window_n : 5,
           baseline_metric: packet.baseline_metric === undefined ? null : packet.baseline_metric,
-          created_at: Date.now(),
+          /* The store's lease clock, not Date.now(). This record's `created_at` is read
+           * back by _sweepExpiredLocked and compared against the store's own instant for
+           * the max_window_wall_time cap, so writing it from a different time base means
+           * the cap is evaluated across two clocks. An adversarial review found this
+           * second writer after the store's own four sites were converted: it is the one
+           * place outside state-store.js that authors this field. */
+          created_at: store.leaseNow(),
           max_window_wall_time_ms: Number.isSafeInteger(packet.max_window_wall_time_ms) && packet.max_window_wall_time_ms > 0 ? packet.max_window_wall_time_ms : 7 * 24 * 60 * 60 * 1000,
           admitted: 0, active: 0, slots: [],
         },

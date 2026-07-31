@@ -5,13 +5,59 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { harnessDeadline } = require("../../_harness/deadline.js");
 const { spawnSync, spawn } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "../../..");
 const STATE_STORE = path.join(ROOT, "scripts", "state-store.js");
 const SCHEMA_PATH = path.join(ROOT, "schemas", "state-store.schema.json");
-const { createStore, SCHEMA_VERSION } = require(STATE_STORE);
+const { createStore: rawCreateStore, SCHEMA_VERSION } = require(STATE_STORE);
 const schema = JSON.parse(fs.readFileSync(SCHEMA_PATH, "utf8"));
+
+/* ONE clock for this process, shared by every store built in it.
+ *
+ * Time is global: two stores on the same directory must agree about whether a lease has
+ * lapsed, so a per-store clock would be a fiction. Sharing it also means a case that
+ * advances time affects every store it holds open, which is what actually happens.
+ *
+ * Three of this file's cases used to establish "these runs are still live" by hoping the
+ * machine was fast enough. Every store operation sweeps lapsed leases before doing
+ * anything, and a lock+fsync cycle costs ~200ms on a contended Windows runner, so the
+ * hope failed and the cases reported losing that race as a product defect -- once
+ * accusing the component's own sweep of missing a run it had already swept. Now nothing
+ * lapses unless a case says so, and the false verdict is unreachable rather than tagged.
+ *
+ * NOT routed through harnessDeadline(): a lease TTL is a product budget, which the
+ * starvation sweep deliberately does not scale. */
+const { createManualClock, systemLeaseClock } = require("../../_harness/clock.js");
+const CLOCK = createManualClock();
+function createStore(root, opts = {}) {
+  return rawCreateStore(root, Object.assign({ clock: CLOCK }, opts));
+}
+
+/* CROSS-PROCESS cases cannot share a manual clock -- a thunk does not survive a spawn,
+ * and a parent on a frozen clock reading records a child stamped with the real one is
+ * strictly worse than both using the real clock: the child's sweep sees every
+ * parent-written lease as expired by ~85 years and terminalizes it. (Measured, not
+ * assumed: that mismatch made a crash-injection hook fire on the recovery sweep instead
+ * of on the operation under test.)
+ *
+ * So these cases stay on the real clock, explicitly rather than by default, and pay for
+ * it with a lease long enough that no test-length delay can reach it. That is a wall-clock
+ * proxy again -- but a 10-minute one, against bodies that take seconds, and the cases
+ * below assert journal INVARIANTS rather than lease liveness, so nothing here draws a
+ * product conclusion from whether a lease lapsed.
+ *
+ * A large lease is safe for lock staleness too: a lock left by a killed child is stolen
+ * on the `!_pidAlive(pid)` branch immediately, not after the lease. */
+const CROSS_PROCESS_LEASE_MS = 600000;
+function createRealClockStore(root, opts = {}) {
+  return rawCreateStore(root, Object.assign(
+    { leaseMs: CROSS_PROCESS_LEASE_MS, heartbeatMs: 5000 }, opts, { clock: systemLeaseClock() }));
+}
+/* Injected into generated worker scripts so a child is explicit about its clock too --
+ * required once GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK=1 is on. */
+const CHILD_REAL_CLOCK = '{ __leaseClockKind: "system", now: () => Date.now() }';
 
 let failures = 0;
 const results = [];
@@ -34,6 +80,21 @@ function assert(cond, msg) {
 
 function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+
+/* A pid that is definitely gone: spawn a process, wait for it to exit, reuse its id.
+ * Needed because "stealable" now means "the owner process is gone" rather than "the lock
+ * file's mtime is old", so a case about stealing must produce a genuinely dead owner
+ * instead of backdating an mtime. */
+function deadPid() {
+  const r = spawnSync(process.execPath, ["-e", "process.exit(0)"], { encoding: "utf8" });
+  if (typeof r.pid !== "number") throw new Error("could not spawn a probe process");
+  for (let i = 0; i < 200; i++) {
+    try { process.kill(r.pid, 0); } catch (e) { if (e.code === "ESRCH") return r.pid; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+  throw new Error(`probe pid ${r.pid} never became unobservable`);
 }
 
 function tempRoot(label) {
@@ -222,12 +283,19 @@ function attackLockStealAndTokenMismatch() {
       const store = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
       store.status(); // ensure dir
 
+      /* The owner must be GONE for a lock to be stealable. This wrote `pid: 1` and
+       * backdated the mtime, asserting that an old lock is taken -- but pid 1 is the most
+       * alive process on the machine, so under the old rule this case was really asserting
+       * "a lock is stolen once its mtime is old, no matter who holds it". That rule is what
+       * let a second writer take the lock from a live owner mid-transaction. It now uses a
+       * genuinely dead pid, which is the condition that actually makes a steal safe. */
       const staleToken = crypto.randomBytes(16).toString("hex");
+      const gonePid = deadPid();
       fs.writeFileSync(
         store.lockPath,
         JSON.stringify({
           schema_version: SCHEMA_VERSION,
-          pid: 1,
+          pid: gonePid,
           proc_start_hint: "dead-pid",
           owner_token: staleToken,
         })
@@ -236,7 +304,49 @@ function attackLockStealAndTokenMismatch() {
       fs.utimesSync(store.lockPath, old, old);
 
       const stolen = store._testing.acquireLock();
-      assert(stolen && stolen.ownerToken && stolen.ownerToken !== staleToken, "steal failed");
+      assert(stolen && stolen.ownerToken && stolen.ownerToken !== staleToken,
+        "a lock left by a DEAD owner was not stolen -- crash recovery depends on this");
+
+      /* THE GUARANTEE THAT MATTERS, and the one the original defect broke: an owner that is
+       * MAKING PROGRESS is never stolen from, however long it holds the lock.
+       *
+       * Before the fix, `age > leaseMs || !pidAlive` stole a lock purely because its mtime
+       * was old, and the renewal timer that was supposed to keep it fresh could never fire
+       * (setInterval, fully synchronous critical section). So "old mtime" meant "a
+       * transaction longer than leaseMs". Reproduced: 300ms lease, 800ms of synchronous
+       * work, second store acquired the lock, owner's release failed LOCK_OWNER_MISMATCH,
+       * recovery reached AMBIGUOUS_RECOVERY. promote.js holds this lock across an entire
+       * fsync-heavy adoption.
+       *
+       * _commit now renews at every durable step, so a stale mtime means "this owner has
+       * made no progress" rather than "this owner started a while ago". This case holds a
+       * lock for several times its lease while doing real store work and requires a
+       * concurrent acquirer to be refused. */
+      const busyRoot = tempRoot("busy");
+      const busy = createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 });
+      busy.status();
+      const busyHeld = busy._testing.acquireLock();
+      const busyStart = Date.now();
+      let commits = 0;
+      while (Date.now() - busyStart < 1000) {
+        busy._commit([{ file: "run-registry.jsonl", make: (raw, rev) => raw + JSON.stringify({
+          schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "REGISTERED",
+          run_id: "busy-" + (commits++), tree_id: "tree-busy",
+          lease_expires_at: Date.now() + 600000,
+        }) + "\n" }]);
+      }
+      const heldFor = Date.now() - busyStart;
+      let busyRefused = false;
+      let busyError = "";
+      try {
+        createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 })._testing.acquireLock();
+      } catch (e) { busyError = e.code; busyRefused = e.code === "LOCKED"; }
+      assert(busyRefused,
+        `a lock held for ${heldFor}ms of CONTINUOUS store work (${commits} commits, 300ms lease) ` +
+        `was stolen from its live owner: ${busyError || "no error"}`);
+      assert(heldFor > 300 * 3, `the busy hold only lasted ${heldFor}ms; it must outlast the lease severalfold`);
+      busy._testing.releaseLock(busyHeld.ownerToken);
+      rmrf(busyRoot);
 
       let freshRefused = false;
       try {
@@ -309,7 +419,20 @@ function attackPidReuseAndEnvOverride() {
       const store = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
       store.status();
 
-      // pid alive (self) but lease stale → stealable
+      /* A lock that has gone UNRENEWED past its lease is stealable even if its recorded pid
+       * is alive. That is deliberate and it is what keeps the store self-healing: a pid can
+       * be reused, can belong to another user or PID namespace, or can be a zombie, and
+       * "the pid answers" is not evidence that the original owner still holds anything.
+       *
+       * An earlier attempt at fixing the split-brain bug removed exactly this, making
+       * liveness the sole authority. Adversarial review showed that bricks the store
+       * permanently after a crash inside a container -- where the dead owner's pid is the
+       * next run's own pid -- including `status` and `sweep`, the commands an operator
+       * would use to diagnose it. Trading split-brain for a brick is not a fix.
+       *
+       * The split-brain case is closed instead by RENEWAL: a working owner keeps its lock
+       * fresh, so this branch cannot fire against it. That guarantee is asserted in
+       * lock.steal-expired-refuse-fresh-token-mismatch. */
       const tok = crypto.randomBytes(16).toString("hex");
       fs.writeFileSync(
         store.lockPath,
@@ -323,8 +446,7 @@ function attackPidReuseAndEnvOverride() {
       const old = new Date(Date.now() - 5000);
       fs.utimesSync(store.lockPath, old, old);
       const stolen = store._testing.acquireLock();
-      assert(stolen.ownerToken !== tok, "stale same-pid lock not stolen");
-      clearInterval(stolen.heartbeat);
+      assert(stolen.ownerToken !== tok, "an unrenewed lock past its lease was not stolen");
       store._testing.releaseLock(stolen.ownerToken);
 
       // fresh heartbeat (recent mtime, pid alive) → refuse
@@ -404,9 +526,13 @@ function attackPidReuseAndEnvOverride() {
 function attackCrashRecovery() {
   const name = "crash.journal-roll-forward-monotonic-no-tear";
   const root = tempRoot("crash");
+  /* Cross-process: a child is spawned and crashes mid-mutation, so parent and child must
+   * agree about time. See createRealClockStore. Nothing here asserts lease liveness --
+   * the subject is journal roll-forward, slot recovery and monotonic revisions. */
+  const mk = (o) => createRealClockStore(root, o);
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
-      const store = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
+      const store = mk();
       store.window.admitPending({
         txid: "tx-crash",
         fingerprint: "fp-crash",
@@ -435,7 +561,7 @@ function attackCrashRecovery() {
       assert(open.length >= 1, "expected open MUTATION_INTENT after crash");
 
       // Registry should have the first effect applied (or recovered next call)
-      const store2 = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
+      const store2 = mk();
       const w = store2.window.get();
       const runs = store2.runRegistry.list();
       assert(
@@ -457,7 +583,7 @@ function attackCrashRecovery() {
         `
 const { createStore } = require(${JSON.stringify(STATE_STORE)});
 process.env.GRAPHSMITH_TEST_MODE = "1";
-const store = createStore(${JSON.stringify(root)}, { leaseMs: 2000, heartbeatMs: 200 });
+const store = createStore(${JSON.stringify(root)}, { leaseMs: 600000, heartbeatMs: 5000, clock: ${CHILD_REAL_CLOCK} });
 store._testing.crashNextMutationAfter(1);
 try {
   store.alphaLedger.reserve({
@@ -475,7 +601,7 @@ try {
       const child = spawnSync(process.execPath, [childScript], { encoding: "utf8" });
       assert(child.status === 99, `child crash exit ${child.status} stderr=${child.stderr}`);
 
-      const store3 = createStore(root, { leaseMs: 2000, heartbeatMs: 200 });
+      const store3 = mk();
       const alpha = store3.alphaLedger.list("c-crash");
       assert(
         alpha.some((r) => r.record_type === "RESERVED" && r.family === "fam-crash"),
@@ -495,7 +621,7 @@ try {
       fs.writeFileSync(regPath, '{"schema_version":"1.0","evil":true}\n');
       let halted = false;
       try {
-        createStore(root, { leaseMs: 2000, heartbeatMs: 200 }).window.get();
+        mk().window.get();
       } catch (e) {
         halted = e.code === "AMBIGUOUS_RECOVERY" || /HALT|ambiguous/i.test(e.message);
       }
@@ -600,6 +726,7 @@ function attackAlphaLedger() {
 function attackRunRegistry() {
   const name = "registry.register-sweep-live-trees-journaled";
   const root = tempRoot("reg");
+  let inconclusive = null;
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
       // Two store instances on the SAME root, so every journal/registry
@@ -615,10 +742,28 @@ function attackRunRegistry() {
       // reported "live trees not queryable". Runs that must STAY live get a
       // comfortable lease; only the run whose expiry is the point gets a short
       // one, and its assertion ("has expired") is a direction load only helps.
+      /* The lease here is the SUBJECT, so time must move -- but it moves because this
+       * case says so.
+       *
+       * This was a 300ms lease plus sleep(400): a proxy for "survives the setup, lapses
+       * only during the deliberate wait". The setup is five lock+fsync operations and
+       * every registry operation sweeps lapsed leases first, so on slow I/O the list()
+       * below swept `run-expire-me` itself, sweepExpired() had nothing left to return,
+       * and the case accused the component's sweep of missing a run it had already
+       * swept. Reproduced exactly at 25-40ms of induced latency per fs write.
+       *
+       * The fix after that read the expiry the store issued and slept to it, then
+       * attributed an empty return value to a slow setup. That still raced; it just
+       * labelled the loss. Now `run-expire-me` cannot lapse during setup because time
+       * does not move during setup, and it certainly has lapsed afterwards because this
+       * case advanced past the expiry the store itself issued. Both the guard and the
+       * INCONCLUSIVE branch it fed are gone with the race. */
       const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
-      const shortLease = createStore(root, { leaseMs: 300, heartbeatMs: 50 });
+      const shortLease = createStore(root, { leaseMs: 2000, heartbeatMs: 50 });
       store.runRegistry.register("run-live", "tree-A");
-      shortLease.runRegistry.register("run-expire-me", "tree-B");
+      const expiring = shortLease.runRegistry.register("run-expire-me", "tree-B");
+      const expiresAt = expiring.registration.lease_expires_at;
+      assert(Number.isFinite(expiresAt), "registration did not report lease_expires_at");
       const liveBefore = store.runRegistry.list();
       assert(liveBefore.length === 2, "register failed");
       assert(
@@ -629,17 +774,22 @@ function attackRunRegistry() {
       store.runRegistry.deregister("run-live", { disposition: "completed_pass" });
       assert(!store.runRegistry.list().some((r) => r.run_id === "run-live"), "deregister left run");
 
-      sleep(400);   // > the 300ms short lease; oversleeping only helps
+      // Past the expiry the store issued for run-expire-me, and no further, so
+      // `run-live`'s 5000ms lease is untouched. Exact, not a margin.
+      CLOCK.set(expiresAt + 1);
       const journalBefore = readRaw(root, "state-journal.jsonl");
       const swept = store.runRegistry.sweepExpired();
-      assert(swept.includes("run-expire-me"), `sweep missed run-expire-me: ${JSON.stringify(swept)}`);
-      assert(!store.runRegistry.list().some((r) => r.run_id === "run-expire-me"), "expired still live");
+      assert(swept.includes("run-expire-me"),
+        `sweepExpired() did not return run-expire-me: ${JSON.stringify(swept)}. Nothing else ` +
+        `could have swept it -- time did not move until the line above -- so the return ` +
+        `value is wrong and a caller cannot learn what was swept.`);
 
       const registry = readJsonl(root, "run-registry.jsonl");
       assert(
         registry.some((r) => r.record_type === "EXPIRED" && r.run_id === "run-expire-me"),
         "EXPIRED record missing from registry"
       );
+      assert(!store.runRegistry.list().some((r) => r.run_id === "run-expire-me"), "expired still live");
 
       const journalAfter = readRaw(root, "state-journal.jsonl");
       assert(journalAfter.length > journalBefore.length, "sweep did not append journal");
@@ -660,7 +810,8 @@ function attackRunRegistry() {
       const trees = new Set(store.runRegistry.list().map((r) => r.tree_id));
       assert(trees.has("tree-keep-1") && trees.has("tree-keep-2"), "live trees not queryable");
     });
-    report(name, "PASS");
+    if (inconclusive) report(name, "FAIL", "INCONCLUSIVE (harness): " + inconclusive);
+    else report(name, "PASS");
   } catch (e) {
     report(name, "FAIL", e.message);
   } finally {
@@ -728,8 +879,14 @@ function attackWindowSlots() {
         n: 2,
       });
       store2.window.finalize("tx-ab");
-      store2.runRegistry.register("run-abandon", "tree-ab");
-      sleep(400);   // > the 300ms lease
+      const abandoning = store2.runRegistry.register("run-abandon", "tree-ab");
+      /* Expiry is the subject: the run must lapse WHILE slotted so the sweep terminalizes
+       * it as `abandoned`. That was `sleep(400)` against a 300ms lease -- a margin chosen
+       * so the run would survive admitPending + finalize + register (three lock+fsync
+       * operations) and lapse only during the sleep. On a slow enough runner it lapsed
+       * before it was ever slotted, leaving nothing to abandon. Now it cannot: nothing
+       * lapses until this line, which steps exactly past the expiry the store issued. */
+      CLOCK.set(abandoning.registration.lease_expires_at + 1);
       store2.runRegistry.sweepExpired();
       const wAb = store2.window.get();
       assert(wAb.flag === true, "abandoned did not set FLAG");
@@ -752,13 +909,33 @@ function attackWindowSlots() {
   }
 }
 
+/* How long a worker keeps retrying a CONTENDED lock before giving up.
+ *
+ * This is the HARNESS's patience, not a product budget: nothing about the store is
+ * measured by it. The product assertions are the ok counts, the journal record
+ * counts and the monotonic revisions.
+ *
+ * It was a bare `Date.now() + 10000` and it failed CI on windows-latest/node 22 --
+ * `a=1 b=0 codes a=["lock-starved-10s"]` -- with the runner's own re-run passing,
+ * i.e. FLAKY. Two Node processes hammering a file lock 40 times each on a shared
+ * Windows runner, with process creation and a virus scanner in the path, can exceed
+ * 10s of contention with nothing wrong. Flake taxonomy shape 1: a fixed deadline
+ * used as a precondition proxy.
+ *
+ * Widened, and routed through harnessDeadline() so the starvation sweep can actually
+ * exercise this suite -- it was not wired to that knob at all. Widening a harness
+ * patience budget cannot make a failing test pass: every product assertion is
+ * downstream of it, and the retry loop exits the moment the lock is acquired. */
+const LOCK_RETRY_BUDGET_MS = harnessDeadline(60000);
+
 function attackConcurrencySync() {
   // bridge so main can be sync: run blocking joins via spawnSync instead
   const name = "concurrency.two-process-register-deregister";
+  let inconclusive = null;
   const root = tempRoot("conc");
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
-      createStore(root, { leaseMs: 5000, heartbeatMs: 200 }).status();
+      createRealClockStore(root).status();
       const worker = path.join(root, "hammer.js");
       fs.writeFileSync(
         worker,
@@ -768,7 +945,7 @@ process.env.GRAPHSMITH_TEST_MODE = "1";
 const root = process.argv[2];
 const prefix = process.argv[3];
 const n = Number(process.argv[4] || 40);
-const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
+const store = createStore(root, { leaseMs: ${CROSS_PROCESS_LEASE_MS}, heartbeatMs: 5000, clock: ${CHILD_REAL_CLOCK} });
 let ok = 0, busy = 0, other = 0;
 for (let i = 0; i < n; i++) {
   const id = prefix + "-" + i;
@@ -808,7 +985,8 @@ const root = process.argv[2];
 const prefix = process.argv[3];
 const n = Number(process.argv[4] || 40);
 const outFile = process.argv[5];
-const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
+const LOCK_RETRY_BUDGET_MS = Number(process.argv[6] || 60000);
+const store = createStore(root, { leaseMs: ${CROSS_PROCESS_LEASE_MS}, heartbeatMs: 5000, clock: ${CHILD_REAL_CLOCK} });
 let ok = 0, busy = 0, other = 0;
 // otherCodes: a bare count made a failure unactionable -- "errors a=0 b=1" said
 // nothing about WHAT went wrong. Record the code so a future failure names it.
@@ -821,7 +999,7 @@ for (let i = 0; i < n; i++) {
   // attempts x <=25ms backoff (~1.6s) was a *proxy* for time, and on a loaded
   // 2-core runner two hammering processes exhausted it, reporting the retry
   // budget as an error. A wall-clock deadline states the intent directly.
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + LOCK_RETRY_BUDGET_MS;
   for (let attempt = 0; !done; attempt++) {
     try {
       store.runRegistry.register(id, "tree-conc");
@@ -831,7 +1009,7 @@ for (let i = 0; i < n; i++) {
     } catch (e) {
       if (e.code === "LOCKED" || e.code === "LOCK_CONTENTION") {
         busy++;
-        if (Date.now() >= deadline) { other++; otherCodes.push("lock-starved-10s"); done = true; }
+        if (Date.now() >= deadline) { other++; otherCodes.push("lock-starved-" + LOCK_RETRY_BUDGET_MS + "ms"); done = true; }
         else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 + Math.min(attempt, 20));
       } else {
         other++;
@@ -845,13 +1023,13 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }
 `
       );
 
-      const ca = spawn(process.execPath, [worker, root, "a", String(n), outA], {
+      const ca = spawn(process.execPath, [worker, root, "a", String(n), outA, String(LOCK_RETRY_BUDGET_MS)], {
         env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" },
         stdio: "ignore",
         detached: true,
       });
       ca.unref();
-      const cb = spawn(process.execPath, [worker, root, "b", String(n), outB], {
+      const cb = spawn(process.execPath, [worker, root, "b", String(n), outB, String(LOCK_RETRY_BUDGET_MS)], {
         env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" },
         stdio: "ignore",
         detached: true,
@@ -869,7 +1047,21 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }
       assert(fs.existsSync(outA) && fs.existsSync(outB), "workers did not finish in time");
       const ra = JSON.parse(fs.readFileSync(outA, "utf8"));
       const rb = JSON.parse(fs.readFileSync(outB, "utf8"));
-      assert(ra.other === 0 && rb.other === 0, `errors a=${ra.other} b=${rb.other} codes a=${JSON.stringify(ra.otherCodes || [])} b=${JSON.stringify(rb.otherCodes || [])}`);
+      /* Lock STARVATION is separated from real errors. A worker that exhausted its
+       * retry budget observed nothing about whether the store serialises correctly --
+       * it stopped asking. Reporting that as a store error is a confident product
+       * verdict from an observation the harness cut short (contract 10 List C rule 1),
+       * and it is what turned a slow Windows runner into a red gate. */
+      const allCodes = [].concat(ra.otherCodes || [], rb.otherCodes || []);
+      const starved = allCodes.filter((c) => String(c).indexOf("lock-starved") === 0);
+      const realErrors = allCodes.filter((c) => String(c).indexOf("lock-starved") !== 0);
+      assert(realErrors.length === 0, `errors a=${ra.other} b=${rb.other} codes ${JSON.stringify(realErrors)}`);
+      if (starved.length > 0) {
+        inconclusive = `${starved.length} worker(s) exhausted the ${LOCK_RETRY_BUDGET_MS}ms lock-retry budget ` +
+          `under contention (ok a=${ra.ok}/${n} b=${rb.ok}/${n}, busy a=${ra.busy} b=${rb.busy}). The harness ` +
+          "stopped retrying; nothing was observed about whether the store serialises correctly";
+        return;
+      }
       assert(ra.ok === n && rb.ok === n, `incomplete ok a=${ra.ok} b=${rb.ok} busy a=${ra.busy} b=${rb.busy}`);
 
       const raw = readRaw(root, "run-registry.jsonl");
@@ -877,16 +1069,62 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }
         if (line) JSON.parse(line);
       }
       const records = readJsonl(root, "run-registry.jsonl");
-      const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
+      const store = createRealClockStore(root);
       const live = store.runRegistry.list();
       assert(live.length === 0, `expected no live runs, got ${live.length}`);
-      const regCount = records.filter((r) => r.record_type === "REGISTERED").length;
-      const deregCount = records.filter((r) => r.record_type === "DEREGISTERED").length;
-      assert(regCount === n * 2, `registered ${regCount} want ${n * 2}`);
-      assert(deregCount === n * 2, `deregistered ${deregCount} want ${n * 2}`);
+      /* Per-id sequences, not raw counts.
+       *
+       * This was `regCount === n * 2`, and it failed CI on windows-latest/node 18
+       * with `registered 61 want 60` -- the runner's own re-run passing, i.e.
+       * FLAKY. 60 was a proxy for "no id ever needed registering twice", which the
+       * retry loop above can legitimately violate: register succeeds, deregister
+       * loses the lock, retries outlast the 5000ms lease, the store sweeps the run
+       * (correctly) and the retry registers it again. Reproduced by shortening the
+       * lease to 400ms under the same two-process contention: REGISTERED 63 for 60
+       * ids, DEREGISTERED exactly 60, and every duplicate id reading
+       * `REGISTERED -> EXPIRED -> REGISTERED -> DEREGISTERED`. That is the store
+       * being right; the count was asserting something else.
+       *
+       * The per-id sequence is both honest about that and STRICTER than the count
+       * it replaces: `regCount === 60` also passes when one record is lost and
+       * another duplicated, which is exactly the lost-update this case exists to
+       * catch. A second REGISTERED with no intervening EXPIRED/DEREGISTERED still
+       * fails, loudly and by name. */
+      const byId = new Map();
+      for (const r of records) {
+        if (!r.run_id) continue;
+        if (!byId.has(r.run_id)) byId.set(r.run_id, []);
+        byId.get(r.run_id).push(r.record_type);
+      }
+      assert(byId.size === n * 2, `distinct run ids ${byId.size} want ${n * 2}`);
+      let reRegistrations = 0;
+      for (const [id, seq] of byId) {
+        let liveNow = false;
+        for (const type of seq) {
+          if (type === "REGISTERED") {
+            assert(!liveNow,
+              `${id} REGISTERED twice with no intervening DEREGISTERED/EXPIRED -- a lost update: ${seq.join(" -> ")}`);
+            liveNow = true;
+          } else if (type === "DEREGISTERED" || type === "EXPIRED") {
+            assert(liveNow, `${id} ${type} with no live registration: ${seq.join(" -> ")}`);
+            liveNow = false;
+          }
+        }
+        assert(!liveNow, `${id} never terminated: ${seq.join(" -> ")}`);
+        // ra.ok === n and rb.ok === n above mean every id completed a
+        // register+deregister pair, so anything else as the last word is a defect.
+        assert(seq[seq.length - 1] === "DEREGISTERED",
+          `${id} did not end DEREGISTERED: ${seq.join(" -> ")}`);
+        reRegistrations += seq.filter((t) => t === "REGISTERED").length - 1;
+      }
+      if (reRegistrations > 0) {
+        console.log(`# note ${reRegistrations} re-registration(s) after a swept lease under contention ` +
+          "-- expected under load, each preceded by an EXPIRED for the same id");
+      }
       assertMonotonic(journalRevs(root));
     });
-    report(name, "PASS");
+    if (inconclusive) report(name, "FAIL", "INCONCLUSIVE (harness): " + inconclusive);
+    else report(name, "PASS");
   } catch (e) {
     report(name, "FAIL", e.message);
   } finally {
@@ -953,17 +1191,33 @@ function attackSchema() {
       poisoned.unexpected_hostile_key = "boom";
       fs.writeFileSync(path.join(root, ".graphsmith", "state", "window.json"), JSON.stringify(poisoned));
 
+      /* Assert on the error's IDENTITY, not merely that one occurred.
+       *
+       * This was `catch (e) { rejectedOnRead = true }` -- any throw counted as the
+       * success signal, and the captured message was assigned to a variable nothing
+       * ever read. An adversarial review broke the lease-determinism sweep through
+       * exactly this line: a store built here on the wall clock throws
+       * LEASE_CLOCK_REQUIRED, this catch swallowed it, the suite exited 0, and the
+       * sweep certified "no wall-clock lease construction on any executed path".
+       *
+       * The audit breadcrumb in StateStore now records the construction before any
+       * handler can intercept it, so that particular bypass is closed at the source.
+       * This is the second half: an inverted catch that accepts any exception proves
+       * only that SOMETHING went wrong, which is the same defect class as a test
+       * asserting a boundary other than the one it claims. */
       let rejectedOnRead = false;
       let readError = "";
       try {
         createStore(root, { leaseMs: 1000, heartbeatMs: 100 }).window.get();
       } catch (e) {
-        rejectedOnRead = true;
         readError = e.message || String(e);
+        rejectedOnRead = e.code === "CORRUPT_STATE";
       }
       if (!rejectedOnRead) {
         throw new Error(
-          "DEFECT: unknown keys accepted on window read (parseWindow does not enforce schema additionalProperties:false)"
+          "DEFECT: unknown keys accepted on window read (parseWindow does not enforce " +
+          "schema additionalProperties:false). Observed instead: " +
+          (readError ? `a non-CORRUPT_STATE error -- ${readError}` : "no error at all")
         );
       }
 
@@ -983,10 +1237,28 @@ function attackRenewExplicit() {
   const root = tempRoot("renew");
   try {
     withEnv({ GRAPHSMITH_TEST_MODE: "1" }, () => {
-      const store = createStore(root, { leaseMs: 500, heartbeatMs: 100 });
+      /* LOCK staleness, not lease arithmetic -- so the injected clock does NOT help here
+       * and must not: `_acquireLock` compares `Date.now()` against the lock file's mtime,
+       * which the OPERATING SYSTEM wrote. Faking that side would make every lock look
+       * infinitely stale or never stale, i.e. silently test a different product.
+       *
+       * The precondition this case needs is "the held lock is still FRESH when the second
+       * writer tries", and at leaseMs 500 that was a wall-clock proxy: at 250ms of induced
+       * latency per fs write the lock's own mtime aged past 500ms during setup, the lock
+       * became legitimately stealable, and the case reported `second writer not blocked by
+       * fresh lock` -- a product verdict for a slow disk. Found by the latency sweep at
+       * 250ms; it survived 120ms.
+       *
+       * There is no seam for this one, so it gets the honest version of a margin: a lease
+       * far larger than any plausible setup rather than one a slow runner can reach. Safe
+       * despite being large, because this case holds its lock in-process and releases it
+       * below, and a lock left by a dead process is stolen on the `!_pidAlive(pid)` branch
+       * immediately rather than after the lease. */
+      const LOCK_FRESHNESS_LEASE_MS = 600000;
+      const store = createStore(root, { leaseMs: LOCK_FRESHNESS_LEASE_MS, heartbeatMs: 100 });
       const held = store._testing.acquireLock();
       // Use internal renew via release path is enough; peek at module by writing wrong then calling status from another store
-      const other = createStore(root, { leaseMs: 500, heartbeatMs: 100 });
+      const other = createStore(root, { leaseMs: LOCK_FRESHNESS_LEASE_MS, heartbeatMs: 100 });
       let blocked = false;
       try {
         other.status();

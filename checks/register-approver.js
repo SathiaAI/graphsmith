@@ -22,11 +22,27 @@ const SIG_KEYS = ["algo", "signer", "packet_sha256", "value"];
 const ALGO_KEYTYPE = { "ed25519": ["ed25519"], "ecdsa-p256-sha256": ["ec"], "rsa-pss-sha256": ["rsa", "rsa-pss"] };
 const METHODS = new Set(["signed-commit", "os-user", "external-idp"]);
 
+/* The own-key allowlist below used Object.keys(), which sees OWN enumerable keys
+ * only -- so a field supplied through the prototype chain passed straight through
+ * the additionalProperties:false intent, while the doc comment promised it was
+ * rejected. Reproduced: Object.create({ inherited: "field" }) carrying all the
+ * required own keys verified clean.
+ *
+ * Exploitability through the normal path is low, because real callers pass
+ * JSON.parse output, which has an ordinary prototype and no inherited fields. That
+ * is an argument about reachability, not about correctness: this is trusted-core
+ * code whose stated contract is an allowlist, and the alternative resolution --
+ * editing the comment down to match the weaker code -- would be downgrading a
+ * documented security guarantee to make a check pass.
+ *
+ * for...in walks own AND inherited enumerable keys, so the allowlist now means what
+ * it says. Required keys still demand hasOwnProperty: a required field satisfied
+ * from a prototype must never count. */
 /* Own-key allowlist: required subset present, no extra own keys (rejects extra + inherited). */
 function shapeOk(obj, required, allowed) {
   if (!obj || typeof obj !== "object") return false;
   for (const k of required) if (!Object.prototype.hasOwnProperty.call(obj, k)) return false;
-  for (const k of Object.keys(obj)) if (allowed.indexOf(k) === -1) return false;
+  for (const k in obj) if (allowed.indexOf(k) === -1) return false;
   return true;
 }
 
