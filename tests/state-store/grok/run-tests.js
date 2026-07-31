@@ -962,10 +962,55 @@ fs.writeFileSync(outFile, JSON.stringify({ prefix, ok, busy, other, otherCodes }
       const store = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
       const live = store.runRegistry.list();
       assert(live.length === 0, `expected no live runs, got ${live.length}`);
-      const regCount = records.filter((r) => r.record_type === "REGISTERED").length;
-      const deregCount = records.filter((r) => r.record_type === "DEREGISTERED").length;
-      assert(regCount === n * 2, `registered ${regCount} want ${n * 2}`);
-      assert(deregCount === n * 2, `deregistered ${deregCount} want ${n * 2}`);
+      /* Per-id sequences, not raw counts.
+       *
+       * This was `regCount === n * 2`, and it failed CI on windows-latest/node 18
+       * with `registered 61 want 60` -- the runner's own re-run passing, i.e.
+       * FLAKY. 60 was a proxy for "no id ever needed registering twice", which the
+       * retry loop above can legitimately violate: register succeeds, deregister
+       * loses the lock, retries outlast the 5000ms lease, the store sweeps the run
+       * (correctly) and the retry registers it again. Reproduced by shortening the
+       * lease to 400ms under the same two-process contention: REGISTERED 63 for 60
+       * ids, DEREGISTERED exactly 60, and every duplicate id reading
+       * `REGISTERED -> EXPIRED -> REGISTERED -> DEREGISTERED`. That is the store
+       * being right; the count was asserting something else.
+       *
+       * The per-id sequence is both honest about that and STRICTER than the count
+       * it replaces: `regCount === 60` also passes when one record is lost and
+       * another duplicated, which is exactly the lost-update this case exists to
+       * catch. A second REGISTERED with no intervening EXPIRED/DEREGISTERED still
+       * fails, loudly and by name. */
+      const byId = new Map();
+      for (const r of records) {
+        if (!r.run_id) continue;
+        if (!byId.has(r.run_id)) byId.set(r.run_id, []);
+        byId.get(r.run_id).push(r.record_type);
+      }
+      assert(byId.size === n * 2, `distinct run ids ${byId.size} want ${n * 2}`);
+      let reRegistrations = 0;
+      for (const [id, seq] of byId) {
+        let liveNow = false;
+        for (const type of seq) {
+          if (type === "REGISTERED") {
+            assert(!liveNow,
+              `${id} REGISTERED twice with no intervening DEREGISTERED/EXPIRED -- a lost update: ${seq.join(" -> ")}`);
+            liveNow = true;
+          } else if (type === "DEREGISTERED" || type === "EXPIRED") {
+            assert(liveNow, `${id} ${type} with no live registration: ${seq.join(" -> ")}`);
+            liveNow = false;
+          }
+        }
+        assert(!liveNow, `${id} never terminated: ${seq.join(" -> ")}`);
+        // ra.ok === n and rb.ok === n above mean every id completed a
+        // register+deregister pair, so anything else as the last word is a defect.
+        assert(seq[seq.length - 1] === "DEREGISTERED",
+          `${id} did not end DEREGISTERED: ${seq.join(" -> ")}`);
+        reRegistrations += seq.filter((t) => t === "REGISTERED").length - 1;
+      }
+      if (reRegistrations > 0) {
+        console.log(`# note ${reRegistrations} re-registration(s) after a swept lease under contention ` +
+          "-- expected under load, each preceded by an EXPIRED for the same id");
+      }
       assertMonotonic(journalRevs(root));
     });
     if (inconclusive) report(name, "FAIL", "INCONCLUSIVE (harness): " + inconclusive);
