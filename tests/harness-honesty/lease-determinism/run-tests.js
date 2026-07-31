@@ -171,11 +171,21 @@ function checkEnforcedRun(target) {
   /* Exit status is checked only AFTER the audit, so a target that fails for an unrelated
    * reason is not reported as a clock-discipline problem. */
   if (res.status !== 0) {
+    /* Surface the TARGET'S OWN failing lines, not the last two lines of its output.
+     * The tail was `PASS: 11 FAIL: 1 | crashed:SIMULATED_CRASH` -- which says a case failed
+     * and refuses to say which, so the log could not be diagnosed without re-running by
+     * hand. A gate that reports "something failed" is only marginally better than a gate
+     * that says nothing. */
+    const out = String(res.stdout || "") + String(res.stderr || "");
+    const failing = out.split("\n")
+      .filter((line) => /^\s*(FAIL|FAILED)\b|^FAIL[: ]/.test(line))
+      .slice(0, 4).map((line) => line.trim().slice(0, 200));
     record(name, "FAIL",
       `the target exited ${res.status} under ${ENV_FLAG}=1. Every one of its ` +
       `${audit.length} construction(s) passed an explicit clock, so this is NOT a clock ` +
-      "finding -- run the target directly to see its own failure. Tail: " +
-      (String(res.stdout || "") + String(res.stderr || "")).split("\n").filter(Boolean).slice(-2).join(" | ").slice(0, 240));
+      "finding -- the target failed for its own reasons. Its failing case(s): " +
+      (failing.length ? failing.join(" || ") : "(none matched a FAIL pattern; tail: " +
+        out.split("\n").filter(Boolean).slice(-3).join(" | ").slice(0, 200) + ")"));
     return null;
   }
   record(name, "PASS",

@@ -193,6 +193,9 @@ function systemLeaseClock() {
 
 const REQUIRE_EXPLICIT_CLOCK_ENV = "GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK";
 const LEASE_CLOCK_AUDIT_ENV = "GRAPHSMITH_LEASE_CLOCK_AUDIT";
+/* Provenance is a property of the clock OBJECT, so it is measured once and remembered.
+ * WeakMap so a clock that goes out of scope is not retained by the audit. */
+const CLOCK_PROVENANCE = new WeakMap();
 
 class StateStore {
   constructor(projectRoot = process.cwd(), options = {}) {
@@ -255,15 +258,34 @@ class StateStore {
        * chosen clock does not move on its own; a wall clock does. A forged tag cannot
        * lie about that. The tag is still recorded, and a disagreement between claim and
        * behaviour is itself reportable. */
+      /* MEASURED ONCE PER CLOCK OBJECT, not once per construction.
+       *
+       * The first version measured on every construction. A clock's nature does not change
+       * between constructions, so that bought nothing -- and it cost a 2ms busy-wait plus a
+       * file append EVERY time. A windows run of the deepseek suite builds 126 stores, many
+       * of them inside a two-process lock-contention loop that is timing-sensitive by
+       * design, so ~250ms of injected busy-waiting landed inside the very thing being
+       * measured. The suite then failed under the audit while passing without it, and the
+       * gate correctly reported "this is NOT a clock finding" without being able to say
+       * that the AUDIT was the difference.
+       *
+       * An observer that changes the observed is the same defect class this whole gate
+       * exists to catch, one level out. Caching by object identity removes it: 126
+       * measurements become one per distinct clock. */
       let advancedUnderRealTime = null;
       if (options.clock && typeof options.clock.now === "function") {
-        try {
-          const a = options.clock.now();
-          const until = Date.now() + 2;
-          while (Date.now() < until) { /* burn real time, no yield: the clock must not
-                                        * advance because we waited politely */ }
-          advancedUnderRealTime = options.clock.now() !== a;
-        } catch (e) { advancedUnderRealTime = null; }
+        if (CLOCK_PROVENANCE.has(options.clock)) {
+          advancedUnderRealTime = CLOCK_PROVENANCE.get(options.clock);
+        } else {
+          try {
+            const a = options.clock.now();
+            const until = Date.now() + 2;
+            while (Date.now() < until) { /* burn real time, no yield: the clock must not
+                                          * advance because we waited politely */ }
+            advancedUnderRealTime = options.clock.now() !== a;
+          } catch (e) { advancedUnderRealTime = null; }
+          try { CLOCK_PROVENANCE.set(options.clock, advancedUnderRealTime); } catch (e) { /* non-object clock */ }
+        }
       }
       const claimed = options.clock
         ? (typeof options.clock.now !== "function" ? "malformed" : (options.clock.__leaseClockKind || "custom"))
