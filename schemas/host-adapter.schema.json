@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.ai/schemas/host-adapter.schema.json",
+  "title": "GraphSmith Host Adapter",
+  "description": "Contract every Lane D (canonical-to-surfaces generator) adapter implements. An adapter takes GraphSmith's canonical skill definition (repo root SKILL.md) and renders it for one specific agent host. Frozen in v0.5.0 Wave 0 -- see .plans/v0.5.0/WAVE-0-CANONICAL-SOURCE.md for the decision this formalizes.",
+  "type": "object",
+  "required": ["id", "displayName", "targetPath", "placementMode", "outputFormat", "bodyTransform"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Stable adapter identifier, e.g. 'cursor', 'copilot', 'agents-generic'. Matches the directory/file name under generators/adapters/."
+    },
+    "displayName": {
+      "type": "string",
+      "description": "Human-readable host name for docs and CLI output, e.g. 'Cursor'."
+    },
+    "targetPath": {
+      "type": "string",
+      "description": "Repo-relative path this adapter's output goes to in an installed project, e.g. '.cursor/rules/graphsmith.mdc' or 'AGENTS.md'."
+    },
+    "placementMode": {
+      "type": "string",
+      "enum": ["standalone", "reconciled"],
+      "description": "'standalone': the generator owns this file outright and may overwrite it wholesale on every regeneration -- safe only when the file is exclusively GraphSmith's (e.g. a dedicated file inside a rules directory that tolerates multiple files, like .cursor/rules/graphsmith.mdc). 'reconciled': the target file may already contain a user's own unrelated content (e.g. AGENTS.md, .github/copilot-instructions.md) -- the generator's rendered output for this adapter MUST be handed to Lane A's reconciler and never written directly. Getting this wrong on a single-file surface is a data-loss bug, not a cosmetic one."
+    },
+    "outputFormat": {
+      "type": "string",
+      "enum": ["markdown-frontmatter", "markdown-plain"],
+      "description": "'markdown-frontmatter': host expects a YAML frontmatter block (see frontmatterFields) followed by a markdown body. 'markdown-plain': host expects plain markdown with no frontmatter block (the frontmatter, if any, is stripped before writing)."
+    },
+    "frontmatterFields": {
+      "type": "array",
+      "description": "Only present when outputFormat is 'markdown-frontmatter'. Defines how this host's frontmatter fields map from canonical SKILL.md's frontmatter.",
+      "items": {
+        "type": "object",
+        "required": ["name", "source", "required"],
+        "properties": {
+          "name": { "type": "string", "description": "Frontmatter key this host expects, e.g. 'description', 'globs', 'alwaysApply'." },
+          "source": {
+            "type": "string",
+            "description": "Either a canonical SKILL.md frontmatter field name to copy/adapt from (e.g. 'description'), or the literal string 'static' meaning this adapter supplies a fixed, host-specific value via staticValue."
+          },
+          "required": { "type": "boolean" },
+          "maxLength": { "type": "integer", "description": "Optional hard cap this host's field enforces (e.g. a host whose UI truncates long descriptions)." },
+          "staticValue": { "description": "Used only when source is 'static'." }
+        },
+        "additionalProperties": false
+      }
+    },
+    "bodyTransform": {
+      "type": "string",
+      "enum": ["verbatim"],
+      "description": "How the canonical SKILL.md body maps to this surface's body. Only 'verbatim' (copy the body unchanged, ponytail's build-openclaw-skills.js pattern) is defined for v0.5.0 -- GraphSmith's canonical source has no lite/full/ultra mode split the way ponytail's does, so no mode-filtering transform exists yet. If a future need for per-host body variation appears, extend this enum then; do not build a speculative filtering mechanism now with nothing to filter."
+    },
+    "generatedFileHeader": {
+      "type": "string",
+      "description": "A short comment inserted at the top of standalone-mode output, identifying the file as machine-generated, naming the canonical source (SKILL.md) it was rendered from, and warning against hand-editing (a direct edit will be silently overwritten on the next generation run and is exactly the failure mode Lane D's adversarial tests check for). Not used for reconciled-mode output, which is delimited by Lane A's own markers instead."
+    }
+  },
+  "additionalProperties": false
+}
