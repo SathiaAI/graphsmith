@@ -293,10 +293,23 @@ function postBeginOracle(root) {
   const hostile = { ...fixture.pointer, txid: "f".repeat(16) };
   fs.writeFileSync(fixture.paths.active, pointerBytes(hostile));
   const recovered = catchCall(() => modules.promote.recover(project));
-  const hasHaltish = !recovered.ok && (recovered.code === "HALT" || recovered.code === "CORRUPT_STATE");
-  if (hasHaltish || (!recovered.ok && recovered.code)) return true;
-  const second = catchCall(() => modules.promote.promote(packet(project, "second", modules.schemaVersion)));
-  return !(second.ok && second.result && second.result.state === "DONE");
+  /* The guarantee is HALT *with evidence naming the mutated ACTIVE* -- that is what
+   * makes the halt actionable. The old oracle accepted CORRUPT_STATE, and then
+   * accepted literally any thrown code at all, so a mutant that downgrades the
+   * evidence-bearing HALT to an evidence-free CORRUPT_STATE still "passed". This suite
+   * exists to detect exactly that downgrade; it was blind to it.
+   *
+   * Require the specific code AND the evidence field. Anything weaker is a different,
+   * lesser guarantee wearing the same test name. */
+  const halted = !recovered.ok && recovered.code === "HALT" &&
+    recovered.evidence && typeof recovered.evidence === "object" &&
+    Object.prototype.hasOwnProperty.call(recovered.evidence, "activeSha");
+  /* No fallback clause. The old oracle, having failed to see HALT, fell back to "was a
+   * SUBSEQUENT promote refused?" -- a strictly weaker property that the mutant also
+   * satisfies, which is what kept this bite hollow even after the code check was
+   * tightened. A test named ...-HALT must fail when the HALT is gone, whatever else
+   * happens to still hold. */
+  return halted;
 }
 
 function reviewPostBegin() {
@@ -387,7 +400,23 @@ function reviewStaticChecks() {
 }
 
 function childProcessOracle(root) {
-  const gate = load(root, "gate.js");
+  /* Patch child_process BEFORE loading gate.js. gate.js destructures its imports at
+   * module scope, so a binding captured at require time cannot be intercepted
+   * afterwards -- patching first, then loading, is the only ordering that sees the
+   * mutant's spawn. */
+  const cp = require("child_process");
+  const originals = { spawn: cp.spawn, spawnSync: cp.spawnSync, exec: cp.exec, execSync: cp.execSync, fork: cp.fork };
+  let spawned = 0;
+  for (const k of Object.keys(originals)) {
+    cp[k] = function () { spawned += 1; return originals[k].apply(this, arguments); };
+  }
+  let gate;
+  try {
+    gate = load(root, "gate.js");
+  } catch (e) {
+    for (const k of Object.keys(originals)) cp[k] = originals[k];
+    throw e;
+  }
   const pairs = [{
     scenario_id: "child-0",
     seed: 1,
@@ -396,8 +425,17 @@ function childProcessOracle(root) {
   }];
   const bundle = { schema_version: "1.0", corpus_hash: sha256("child"), pairs, slices: [] };
   bundle.bundle_sha256 = sha256(JSON.stringify({ ...bundle, bundle_sha256: undefined }));
-  const result = gate.gate2Behavioral("child", { bundle, cycleSeed: 0, stateStore: null });
-  return !!result && typeof result.pass === "boolean";
+  /* `typeof result.pass === "boolean"` could not see a spawn: the mutant forks a child
+   * and still returns a well-formed decision, so this oracle passed it every time and
+   * reported a bite it never took. The real, working interception already exists in
+   * tests/attacks/module-escape/run-tests.js; a weaker duplicate is worse than none. */
+  let result;
+  try {
+    result = gate.gate2Behavioral("child", { bundle, cycleSeed: 0, stateStore: null });
+  } finally {
+    for (const k of Object.keys(originals)) cp[k] = originals[k];
+  }
+  return !!result && typeof result.pass === "boolean" && spawned === 0;
 }
 
 function reviewChildProcess() {
@@ -409,13 +447,26 @@ function reviewChildProcess() {
     "function gate2Behavioral(candidateId, opts = {}) {\n  const { corpusPath, profile, cycleSeed, bundle, stateStore } = opts;",
     "function gate2Behavioral(candidateId, opts = {}) {\n  spawn(process.execPath, [\"-e\", \"\"], { stdio: \"ignore\" }).unref();\n  const { corpusPath, profile, cycleSeed, bundle, stateStore } = opts;"
   );
-  bite("module-escape/child_process-posture-gate.js", childProcessOracle(good), childProcessOracle(bad), "mutant spawns on the in-memory decision path; oracle only checks for a boolean result");
+  bite("module-escape/child_process-posture-gate.js", childProcessOracle(good), childProcessOracle(bad), "mutant spawns on the in-memory decision path; the oracle now intercepts child_process before loading gate.js");
 }
 
 function reportGaps() {
-  record("GAP", "A2-compromised-dependency", "no attack exercises pinned tool content-hash refusal or commit-SHA-pinned CI actions");
-  record("GAP", "A3-hostile-contributor", "no attack exercises trusted-workflow secret isolation, trusted attestations, or evaluator/corpus PR separation");
-  record("GAP", "A4-artifact-injection", "marker strings are covered, but typed-event source authentication and safety-relevant gap invalidation are not attacked");
+  /* Narrowed: CI actions ARE commit-SHA-pinned today (.github/workflows/ci.yml uses
+   * full 40-char SHAs on every `uses:`). Claiming otherwise in a coverage audit is the
+   * same dishonesty this suite exists to catch, pointed inward. What remains genuinely
+   * unattacked is content-hash refusal for tooling, and any check that the pins STAY
+   * pinned. */
+  record("GAP", "A2-compromised-dependency", "CI actions are commit-SHA-pinned, but no attack exercises pinned-tool content-hash refusal, and nothing verifies the pins stay pinned");
+  /* Narrowed: evaluator/corpus PR separation IS built and CI-enforced
+   * (scripts/ci-check-pr-separation.js, run from the TRUSTED BASE revision in the
+   * pr-separation-guard job) and is attacked directly by tests/ci/gpt-sol-pro's
+   * classifier battery. Secret isolation and trusted attestations remain unattacked. */
+  record("GAP", "A3-hostile-contributor", "evaluator/corpus PR separation is built, CI-enforced from the trusted base, and attacked in tests/ci; trusted-workflow secret isolation and trusted attestations remain unattacked");
+  /* Narrowed: typed-event source authentication IS built and selftested
+   * (scripts/event-compiler.js, wrong-source-adoption-proof). Safety-relevant gap
+   * invalidation exists in the same file but carries no test coverage at all, which is
+   * the sharper and more useful statement of what is missing. */
+  record("GAP", "A4-artifact-injection", "marker strings and typed-event source authentication are covered; safety-relevant gap invalidation is implemented but has zero test coverage and is unattacked");
   record("GAP", "A5-malicious-BYO-tool", "no attack proves container-required refusal/unavailable, network denial, source read-only mounting, or environment scrubbing");
   record("DODGED", "toctou/true-parallel-rename-race", "UNAVAILABLE is not justified: a zero-dependency multi-process harness can synchronize child writers with IPC/barriers and inspect exit codes plus final disk state; platform variance warrants per-platform results, not 'inherently unprovable'");
   record("LOG-ORACLE", "none-found", "reviewed PASS branches use return fields, error codes, process exits, static scan results, marker files, or disk state; stdout JSON in gate selftest is secondary to exit=0");

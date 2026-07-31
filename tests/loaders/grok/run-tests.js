@@ -432,7 +432,10 @@ function attack_capGaming() {
     const ctx = resolveActive(fix.root);
     const out = loadAppendix(ctx);
     if (!out.quarantined) {
-      pass(
+      /* Both branches used to call pass(), so a confirmed bypass of the appendix
+       * token cap printed as a green line and the word DEFECT lived only in the
+       * detail text that no summary or gate reads. */
+      fail(
         "CAP/CJK-no-space-undercount-BYPASS",
         "DEFECT: 3000 CJK chars = 1 word under heuristic; cap not enforceable for CJK (~2 tok est, real>>1500)"
       );
@@ -448,7 +451,7 @@ function attack_capGaming() {
     const ctx = resolveActive(fix.root);
     const out = loadAppendix(ctx);
     if (!out.quarantined) {
-      pass(
+      fail(
         "CAP/monospace-no-space-BYPASS",
         "DEFECT: 50k consecutive letters = 1 word; token cap bypassed via whitespace heuristic"
       );
@@ -969,7 +972,10 @@ function attack_extra() {
     if (out.quarantined && out.reason === "marker-sequence") {
       pass("XTRA/fullwidth-marker-caught", out.detail);
     } else if (!out.quarantined) {
-      pass(
+      /* Same shape as the cap bypasses above: a marker that got through was scored
+       * PASS. It happens to be caught today, so this changes no current verdict --
+       * but it means a regression here would now be visible instead of green. */
+      fail(
         "XTRA/fullwidth-marker-NOT-caught",
         "DEFECT/LIMIT: fullwidth homoglyphs bypass casefold substring marker list"
       );

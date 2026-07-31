@@ -31,7 +31,38 @@ The crash/recovery (chaos) harness tests exactly two properties: crash recovery,
 GSA machine-evaluates only typed, schema-validated document/knob edits. **Generated code is never machine-applied** — code repairs are staged for a human through the four-gate pipeline. The `auto_skill_creation_disabled` control attestation records that no autonomously-created, unapproved skill ran in the same trust flow; if one did, the bundle does not verify that control. *Control:* the four-gate promotion pipeline (Gate 3 is propose-only; adoption requires explicit human confirmation) + the recomputed control attestation.
 
 ## 6. Per-skill capability limitations
-GSA v0.3.0 attests **only what is actually enforced**: network egress (the supervisor's destination allowlist) and external-call presence (the capability-policy scanner). **Per-skill filesystem, model, and subprocess grants are not enforced per skill in v0.3.0** — that enforcement lands in **v0.4.0**; until then it is the container capability class (required for anything beyond typed edits), attested at the profile level, not a per-skill grant. GSA does not attest a boundary it does not enforce. *Control (interim, coarser than per-skill):* the container capability class — a whole-run isolation boundary required for anything beyond typed edits — stands in for per-skill grants until v0.4.0; the enforced-only capability attestation (decision D1) reports honestly what *is* enforced and marks the rest unavailable rather than claiming it.
+GSA attests **only what is actually enforced**, per resource class:
+
+| Class | Enforced? | By what |
+|---|---|---|
+| **network** | yes | supervisor destination allowlist; `--network none` under the container profile |
+| **filesystem** | **no** | — see below |
+| **subprocess** | **no** | — see below |
+| **model** | **no** | no mechanism at this layer; needs a chokepoint in the model adapter |
+
+**Per-skill filesystem, model and subprocess grants are NOT enforced.** A grant may declare them; nothing applies them, and the GSA capability attestation never marks them satisfied (decision D1: a class is attested only if it appears in the grant's `enforced` list, and only `network` ever does).
+
+### Why this says "no" rather than "yes, with caveats"
+
+An enforcement module was built on Node's Permission Model (`--permission`, `--allow-fs-read/write`) and **withdrawn**. Five rounds of adversarial review found successive ways for code inside the grant to read or write outside it, each round after the previous had been reported as fixed:
+
+| # | Escape | Status when found |
+|---|---|---|
+| 1 | pre-existing **symlink** out of the tree | followed by the Permission Model; read `/etc/passwd` through one |
+| 2 | pre-existing **hardlink** — a second *name* for the same inode | resolves *inside*, passes any symlink walk, and a **write** through it modifies the file outside |
+| 3 | **stale audit** — clean at copy time, link planted after | evidence honest when produced, worthless when used |
+| 4 | **forged spelling** — `<dir>/A/../real`, lexical vs physical | clean report for a tree nobody walked |
+| 5 | audit contained against the copy, attestation about the **grant** | a link staying inside the copy while leaving the grant |
+| 6 | **dangling symlink** | `realpath` fails so the audit skips it, but `open(O_CREAT)` follows it and creates the file at the target |
+| 7 | a **granted path that is itself a symlink** | the audit never checked its own root |
+
+The pattern across all seven is one thing: **the check was about a different boundary than the claim.** Each fix was narrower than the last, which is convergence — but the module was shipping a *green attestation*, and a false "enforced" in a signed bundle is worse than an honest "not enforced". So it was removed rather than shipped with a sixth round pending.
+
+**What this costs:** nothing that was previously working. Per-skill grants were never enforced before this attempt either; this section previously said so, briefly said otherwise, and now says so again — accurately.
+
+**What would be needed to do it properly:** the residual hole is a TOCTOU window no user-space audit can close — a link planted between the audit and `exec`. That needs the kernel: a bind mount with `nosuid`/`nodev`, a mount namespace, or a filesystem the enforced process cannot reach under any other name. A path-prefix check applied from user space to a tree an adversary can write to is the wrong tool, and the review history above is what that looks like in practice.
+
+*Control (coarser than per-skill, and real):* the **container capability class** — a whole-run isolation boundary required for anything beyond typed edits (contract 04 B10). It runs untrusted code non-root, with all Linux capabilities dropped, `no-new-privileges`, a read-only rootfs and read-only source mount, network denied, and pid/memory/cpu caps. Each of those is verified by running a container through the real entry point (`evalenv.create("container")` → `runUntrustedCode()`) and reading `/proc/self/status` from inside — see `tests/evalenv/containment/`. That suite also asserts the profile still *functions* (the mount is readable) before making any containment claim, because an envelope nothing can run in is broken rather than secure.
 
 ## 7. Signer-trust limitations
 GSA verification shows a bundle **was signed by the claimed key and is unaltered**. Whether to **trust that key is the verifier's policy** — an allowlist, an org key, or a transparency log (GSA-SPEC §5.5). The default is a local keypair, which attests "signed by *a* key"; cross-organisation non-repudiation is weaker until keyless / transparency-log signing (opt-in, targeted for a later draft). A **privileged local attacker** who can already rewrite the producer, the verifier, and the signing keys on the same machine is **out of scope, stated as such** — local self-verification detects same-user drift and mistakes, not a root adversary; CI cross-checking from a trusted workflow covers shared repositories. *Control:* the verifier-supplied trusted-key set + out-of-band maintainer signature for air-gapped verification (register Lane D, v0.3.0).

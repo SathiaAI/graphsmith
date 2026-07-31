@@ -11,6 +11,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
+const { harnessDeadline } = require("../_harness/deadline.js");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const SCENARIO_JS = path.join(REPO_ROOT, "scripts", "scenario.js");
@@ -29,7 +30,21 @@ function record(name, status, detail) {
   console.log(line);
 }
 function pass(name, detail) { record(name, "PASS", detail); }
-function fail(name, detail) { record(name, "FAIL", detail); }
+function fail(name, detail) {
+  /* Once the harness has run out of patience even once, no later negative verdict in
+   * this sequential run can be attributed to scenario.js. Latching once beats
+   * threading a timedOut check through every call site -- the same edit repeated is
+   * the one that eventually gets missed. Can only downgrade a FAIL to a tagged FAIL:
+   * never a pass, exit code unchanged, and a run with no timeout behaves as before. */
+  if (harnessStarved) {
+    record(name, "FAIL", "INCONCLUSIVE (harness): a scenario.js invocation in this run was " +
+      "killed by the harness timeout, so this verdict cannot be attributed to the product" +
+      (detail ? " [original: " + detail + "]" : ""));
+    return;
+  }
+  record(name, "FAIL", detail);
+}
+let harnessStarved = false;
 function skip(name, detail) { record(name, "SKIPPED", detail); }
 
 function mkRoot(tag) {
@@ -42,13 +57,29 @@ function writeScenario(dir, scenario) {
   fs.writeFileSync(path.join(dir, scenario.id + ".json"), JSON.stringify(scenario, null, 2));
 }
 
+/* Fail-closed, but tagged so it is never read as a product finding -- see
+ * tests/harness-honesty/starvation/ for the convention. Every case in this file draws
+ * its verdict from a runCLI result, so a child killed by the harness's own timeout
+ * would otherwise be reported as scenario.js misbehaving. */
+function inconclusive(name, detail) { record(name, "FAIL", "INCONCLUSIVE (harness): " + detail); }
+
+function timedOutByHarness(r) {
+  return !!(r && r.error && r.error.code === "ETIMEDOUT");
+}
+
 function runCLI(args, opts) {
   const r = spawnSync(process.execPath, [SCENARIO_JS, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
-    timeout: (opts && opts.timeoutMs) || 60000,
+    timeout: harnessDeadline((opts && opts.timeoutMs) || 60000),
     maxBuffer: 64 * 1024 * 1024,
   });
+  if (timedOutByHarness(r) && !harnessStarved) {
+    harnessStarved = true;
+    inconclusive("harness/scenario-cli-timed-out",
+      "a scenario.js invocation exceeded the harness timeout; every failing verdict from " +
+      "here on is tagged INCONCLUSIVE rather than attributed to scenario.js");
+  }
   return r;
 }
 
@@ -424,8 +455,68 @@ function checkStableHashAcrossTwoRuns() {
   const b1 = parseJSONStdout(r1, name);
   const b2 = parseJSONStdout(r2, name);
   if (!b1 || !b2) return;
-  if (b1.bundle_sha256 === b2.bundle_sha256) pass(name, "stable hash across two full-corpus runs");
-  else fail(name, "unstable hash: " + b1.bundle_sha256 + " vs " + b2.bundle_sha256);
+  if (b1.bundle_sha256 === b2.bundle_sha256) {
+    pass(name, "stable hash across two full-corpus runs");
+    return;
+  }
+
+  /* The hashes differ. "unstable hash" alone was a confident claim about the EVALUATOR's
+   * determinism, and this case cannot support it: three of the twelve corpus scenarios
+   * (pipeline/fanout/manager -budget-fail) turn on a wall-clock comparison against a
+   * 200ms budget_ms, which case 6c below documents as the intentional subject under test
+   * rather than hidden nondeterminism. A busy machine flipping one of those produces the
+   * same symptom as a genuinely nondeterministic evaluator. Two causes, one verdict —
+   * contract 10 List C rule 2.
+   *
+   * So: diff the bundles and let WHERE they differ decide.
+   *   - only wall-clock-dependent scenarios differ -> a timing artefact. INCONCLUSIVE.
+   *   - anything else differs                      -> real determinism defect. FAIL.
+   *
+   * Either way print the differing scenario ids and fields, because the failure this was
+   * written from (CI run #81, Windows) reported only two hashes and was therefore useless
+   * as evidence. Not reproducible here: idle, 16x and 48x CPU load on Linux all produce a
+   * stable hash even at a 6x slowdown, so the mechanism is something this platform does
+   * not exhibit. The next occurrence should arrive diagnosable instead of opaque. */
+  const WALL_CLOCK_DEPENDENT = new Set([
+    "pipeline-budget-fail",
+    "fanout-budget-fail",
+    "manager-budget-fail",
+  ]);
+
+  const pairs1 = b1.pairs || [];
+  const pairs2 = b2.pairs || [];
+  const differing = [];
+  for (let i = 0; i < Math.max(pairs1.length, pairs2.length); i += 1) {
+    const x = pairs1[i] || {};
+    const y = pairs2[i] || {};
+    if (JSON.stringify(x) === JSON.stringify(y)) continue;
+    const fields = [];
+    for (const k of new Set([...Object.keys(x), ...Object.keys(y)])) {
+      if (JSON.stringify(x[k]) !== JSON.stringify(y[k])) {
+        fields.push(k + ": " + JSON.stringify(x[k]) + " -> " + JSON.stringify(y[k]));
+      }
+    }
+    differing.push({ id: x.scenario_id || y.scenario_id || "#" + i, fields: fields });
+  }
+
+  const detail = differing.length
+    ? differing.map((d) => d.id + " {" + d.fields.join("; ") + "}").join(" | ").slice(0, 700)
+    : "no per-pair difference found, so the hash covers a field outside pairs[]";
+  const offenders = differing.map((d) => d.id);
+  const onlyWallClock = offenders.length > 0 && offenders.every((id) => WALL_CLOCK_DEPENDENT.has(id));
+
+  if (onlyWallClock) {
+    inconclusive(name, "bundle hash differed (" + b1.bundle_sha256.slice(0, 12) + " vs " +
+      b2.bundle_sha256.slice(0, 12) + ") but ONLY in wall-clock-dependent scenario(s) — " +
+      offenders.join(", ") + ", each a 200ms budget_ms comparison that case 6c documents as " +
+      "the intentional subject under test. That is a slow machine, not a nondeterministic " +
+      "evaluator, and this case cannot tell the two apart. Differences: " + detail);
+    return;
+  }
+
+  fail(name, "unstable hash: " + b1.bundle_sha256 + " vs " + b2.bundle_sha256 +
+    " — differing in scenario(s) with NO documented wall-clock dependence, so this is a " +
+    "determinism defect rather than a timing artefact. Differences: " + detail);
 }
 
 function checkNondeterminismDetectionCoverage() {

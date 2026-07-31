@@ -2378,6 +2378,54 @@ function runSelftest() {
       record("profile-report/all-seven-present", ["R", "E", "B", "T", "G", "Q", "X"].every((k) => report.profiles[k] && typeof report.profiles[k].status === "string"));
       record("profile-report/profile-string", typeof report.profile_string === "string" && report.profile_string.startsWith("R:"));
     }
+    // isWorkflowProject edge cases. Salvaged from tests/verify/deepseek/profiles-tests.js
+    // (ATTACK 13) when that file was deleted: it duplicated this selftest almost
+    // entirely, but these cases were its one piece of genuinely unique coverage and
+    // the classifier had NONE anywhere else. It decides whether profiles Q and X run
+    // at all or report "unavailable", so a wrong answer here silently changes what two
+    // profiles claim -- exactly the false-verified shape contract 10 forbids.
+    {
+      const wfRoot = fs.mkdtempSync(path.join(os.tmpdir(), "graphsmith-verify-wf-"));
+      try {
+        record("profile/isWorkflowProject-nonexistent-false",
+          isWorkflowProject(path.join(wfRoot, "definitely-not-here")) === false);
+
+        const empty = path.join(wfRoot, "empty");
+        fs.mkdirSync(empty);
+        record("profile/isWorkflowProject-empty-dir-false", isWorkflowProject(empty) === false);
+
+        // manager.js alone must not qualify: a lone manager is not a pipeline, and
+        // treating it as one would flip Q/X from "unavailable" to a real verdict on
+        // evidence that does not exist.
+        const mgrOnly = path.join(wfRoot, "mgr-only");
+        fs.mkdirSync(mgrOnly);
+        fs.writeFileSync(path.join(mgrOnly, "manager.js"), "// mock\n");
+        record("profile/isWorkflowProject-manager-only-false", isWorkflowProject(mgrOnly) === false);
+
+        // manager.js as a DIRECTORY -- an existsSync-only check would say "workflow".
+        const mgrDir = path.join(wfRoot, "mgr-dir");
+        fs.mkdirSync(path.join(mgrDir, "manager.js"), { recursive: true });
+        let threw = false;
+        let dirVerdict;
+        try { dirVerdict = isWorkflowProject(mgrDir); } catch (e) { threw = true; }
+        record("profile/isWorkflowProject-manager-as-dir-false-not-throw", threw === false && dirVerdict === false,
+          threw ? "threw instead of returning false" : "verdict=" + String(dirVerdict));
+      } finally {
+        fs.rmSync(wfRoot, { recursive: true, force: true });
+      }
+    }
+    // classifyBudgetHalt shape fuzzing, salvaged from the same file. A classifier that
+    // reads a non-object `evidence` as "no halt" would report a budget as enforced on
+    // a run it never inspected.
+    {
+      for (const [label, ev] of [["not-object", "a string"], ["missing", undefined], ["null", null]]) {
+        let out, threw = false;
+        try { out = classifyBudgetHalt({ evidence: ev }); } catch (e) { threw = true; }
+        record("profile-B/classifyBudgetHalt-" + label + "-not-verified",
+          threw === false && !(out && out.status === "verified"),
+          threw ? "threw" : "status=" + String(out && out.status));
+      }
+    }
     // Envelope honest-negative: with no injection, evaluated_at is "unavailable",
     // never fabricated from a clock.
     {

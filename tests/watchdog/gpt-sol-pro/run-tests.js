@@ -7,10 +7,33 @@ const path = require("path");
 const { spawn, execFileSync } = require("child_process");
 const { harnessDeadline } = require("../../_harness/deadline.js");
 
+/* The harness's own patience for the watchdog to exit. Named because the
+ * blocked-event-loop case compares it to the product BUDGET to decide whether any
+ * outcome was observable at all. */
+const WATCHDOG_WAIT_MS = 5000;
+
 const ROOT = path.resolve(__dirname, "../../..");
 const WATCHDOG = path.join(ROOT, "scripts", "watchdog.js");
 const STATE_STORE = path.join(ROOT, "scripts", "state-store.js");
 const BUDGET = 240;
+
+/* The shortest harness deadline under which a HEALTHY run is still observable.
+ *
+ * DERIVED from BUDGET, deliberately. It was `240 + 1200` -- a literal copy of
+ * BUDGET, declared ABOVE it, so the commit claiming "there is now one number" was
+ * false. A reviewer changed BUDGET to 2000 (a plausible product change) and the
+ * watchdog did everything right -- killed at 2002ms, target dead, complete halt
+ * evidence -- while this case emitted a CONFIDENT PRODUCT FAILURE, because the
+ * guard still compared against 1440. That is the same defect one constant edit
+ * away.
+ *
+ * The +1200 is the same allowance the PASS condition grants
+ * (`run.elapsedWall <= BUDGET + 1200`): the watchdog must notice the breach, kill
+ * the tree AND exit, and the harness has to see that exit. Using one number for
+ * "how long a healthy run may take" and a different one for "how long we must have
+ * waited to judge it" is what opened the gap. */
+const OBSERVABLE_SLACK_MS = 1200;
+const OBSERVABLE_MS = BUDGET + OBSERVABLE_SLACK_MS;
 const results = [];
 
 function sleep(ms) {
@@ -65,6 +88,31 @@ function waitClose(child, timeoutMs) {
     });
   });
 }
+
+/* How long to wait for a freshly SPAWNED target to write its readiness file.
+ *
+ * Six precondition waits in this file sat at a bare 3000ms. That is not a budget the
+ * product is being measured against — nothing under test depends on the target becoming
+ * ready quickly; every assertion in these cases happens AFTER readiness. It is the
+ * harness's patience for Windows process creation plus Node startup plus a file write,
+ * on a shared CI runner with a virus scanner in the path. Windows process creation costs
+ * far more than a POSIX fork/exec, and 3s is a stopwatch guess rather than an
+ * observation.
+ *
+ * It bit on GitHub Actions run #79: `timeout waiting for chaos point 5` on both Windows
+ * legs, correctly reported INCONCLUSIVE (harness) rather than as a watchdog defect, and
+ * the runner's own re-run passed — FLAKY, not a regression. Linux and macOS passed. This
+ * is flake taxonomy shape 1 from the CI remediation plan: a fixed deadline used as a
+ * precondition proxy.
+ *
+ * Widening a PRECONDITION wait cannot make a failing test pass. The product assertions
+ * are downstream of it; all this changes is how long the harness is willing to wait
+ * before admitting it observed nothing. Waits return the moment the predicate holds, so
+ * on a healthy machine this costs nothing. Product-lifecycle waits in this file keep
+ * their own budgets (30000 for the process tree to die, 10000 for the dead-man switch to
+ * arm) — those are measuring the product and are deliberately left alone.
+ */
+const TARGET_READY_MS = 30000;
 
 async function waitFor(predicate, timeoutMs, label) {
   const start = Date.now();
@@ -157,10 +205,10 @@ async function realBlockedKill(dir, options = {}) {
   const target = spawnTarget(targetScript);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(readyFile), 3000, "blocked target readiness");
+    await waitFor(() => fs.existsSync(readyFile), TARGET_READY_MS, "blocked target readiness");
     const started = Date.now();
     watchdog = spawnWatchdog(target.pid, heartbeatFile, capabilityFile, haltFile, options.budget || BUDGET);
-    const wdExit = await waitClose(watchdog, 5000);
+    const wdExit = await waitClose(watchdog, WATCHDOG_WAIT_MS);
     const elapsedWall = Date.now() - started;
     await waitClose(target, 2000);
     return {
@@ -186,6 +234,77 @@ async function testBlockedAndIndependent(tmp) {
     !run.targetAlive && ev.elapsed_ms > BUDGET && run.elapsedWall <= BUDGET + 1200;
   if (ok) record("PASS", "blocked-event-loop-independent-kill",
     `target dead; watchdog exit=3; halt elapsed=${ev.elapsed_ms}ms wall=${run.elapsedWall}ms budget=${BUDGET}ms`);
+  /* The harness ran out of ITS OWN time before the watchdog could act -- so nothing
+   * was observed about whether the watchdog kills a blocked event loop.
+   *
+   * Caught by tests/harness-honesty/starvation on ubuntu CI, which is the whole
+   * point of that sweep: under GRAPHSMITH_DEADLINE_SCALE this case emitted a
+   * CONFIDENT FAIL at wall=7ms, reading as "the watchdog did not kill the target"
+   * when the truth was "I did not wait". A verdict about the most safety-critical
+   * mechanism here, asserted from a 7ms observation window.
+   *
+   * The discriminator is deliberately narrow: the harness deadline expired AND the
+   * watchdog wrote no evidence at all. A timeout with evidence present is a real
+   * product failure and still FAILS confidently -- widening this to `timedOut`
+   * alone would swallow exactly the defect the case exists to catch. */
+  /* The discriminator is `elapsedWall < BUDGET`, NOT `timedOut && !ev`.
+   *
+   * The first version used the absence of evidence, and an adversarial review broke
+   * the watchdog so it never armed, never wrote the dead-man switch and never
+   * killed -- with NO deadline scaling at all -- and got:
+   *
+   *     FAIL ... INCONCLUSIVE (harness): ... targetAlive=true ...
+   *              this is the harness running out of patience, not a watchdog defect
+   *
+   * wall was 5014ms against a 240ms budget. The guard was dead, the target alive,
+   * and the harness told the reader the watchdog was fine and advised removing a
+   * scaled deadline that was never applied. ci-run-suites.js then files
+   * INCONCLUSIVE under "NOT product findings ... nothing below says anything about
+   * whether the product is correct". Still red, but pointing away from the defect.
+   *
+   * It also misfired the other way: `!ev` is a race against the watchdog's own
+   * startup DMS write, so at scales >= 0.005 a HEALTHY watchdog produced a
+   * CONFIDENT failure from a ~52ms window -- the original honesty defect, back.
+   * The starvation sweep only ever uses 0.001, so it could not see that.
+   *
+   * Wall time cannot be confused this way. If the harness gave up BEFORE the
+   * product's own budget could even elapse, nothing was observed by construction.
+   * If it waited past the budget and the watchdog still did nothing, that is the
+   * product failing and it fails confidently. Measured: starved-healthy is
+   * 6-108ms << 240; the dead watchdog is 5014ms >> 240. */
+  /* The discriminator is the harness's own DEADLINE against the product's BUDGET,
+   * not elapsed time and not the absence of evidence. Both earlier attempts were
+   * wrong, in opposite directions, and each was caught by an adversarial review:
+   *
+   *   `timedOut && !ev`      A watchdog that HANGS -- never arms, never writes --
+   *                          produced timedOut=true, ev=null, and was labelled
+   *                          "not a watchdog defect" at wall=5014ms against a 240ms
+   *                          budget. It also raced the watchdog's own startup DMS
+   *                          write, so at scales >= 0.005 a HEALTHY watchdog gave a
+   *                          CONFIDENT failure from a ~52ms window.
+   *
+   *   `elapsedWall < BUDGET` Fixed the hang case and broke the other one: a guard
+   *                          that DIES FAST (throw, bad argv, missing module,
+   *                          immediate exit) returns in ~44ms with the target
+   *                          alive, and got labelled inconclusive -- while the
+   *                          version before it had that case right. Fast death is
+   *                          the more common guard failure.
+   *
+   * Elapsed time cannot separate them because starved-healthy and dead-fast both
+   * return quickly. The DEADLINE can: if the harness's own patience is shorter than
+   * the budget the product is allowed to consume, no outcome here is observable BY
+   * CONSTRUCTION, whatever happens. If the harness was willing to wait longer than
+   * the budget and the watchdog still did not act, that is the product failing --
+   * whether it hung or died at 44ms -- and it fails confidently.
+   *
+   * tests/_harness/deadline.js has exported isStarved() all along and nothing called
+   * it. This is the same idea, expressed against the number that actually matters. */
+  else if (harnessDeadline(WATCHDOG_WAIT_MS) < OBSERVABLE_MS) record("FAIL", "blocked-event-loop-independent-kill",
+    "INCONCLUSIVE (harness): the harness deadline is " + harnessDeadline(WATCHDOG_WAIT_MS) + "ms, less than the " +
+    OBSERVABLE_MS + "ms a HEALTHY run needs (budget " + BUDGET + "ms plus watchdog spawn/kill/exit), so no " +
+    "outcome was observable here whatever the watchdog did " +
+    `(wall=${run.elapsedWall}ms timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} ` +
+    `evidence=${ev ? "present" : "none"}). Re-run without a scaled harness deadline for a real verdict`);
   else record("FAIL", "blocked-event-loop-independent-kill",
     `exit=${run.wdExit.code} timedOut=${run.wdExit.timedOut} targetAlive=${run.targetAlive} evidence=${JSON.stringify(ev)} wall=${run.elapsedWall}ms`);
 }
@@ -217,7 +336,7 @@ async function testProcessTree(tmp) {
   let watchdog;
   let leafPid = null;
   try {
-    await waitFor(() => fs.existsSync(ready) && fs.existsSync(childPidFile), 3000, "process tree readiness");
+    await waitFor(() => fs.existsSync(ready) && fs.existsSync(childPidFile), TARGET_READY_MS, "process tree readiness");
     leafPid = Number(fs.readFileSync(childPidFile, "utf8"));
     watchdog = spawnWatchdog(parent.pid, heartbeat, capability, halt);
     // Deadlines widened after this case went red on ubuntu-18 (run #62) with
@@ -323,6 +442,16 @@ async function testCapabilityMessages(tmp) {
     else mismatches.push(`${i + 1}/${item.kind}: expected kind ${item.expectedKind} with fragments ${JSON.stringify(item.fragments || [])}, got ${JSON.stringify(actual)}`);
   }
   if (matched === cases.length) record("PASS", "capability-message-20-kill-points", `20/20 semantic message kinds at seeded heartbeat points ${killPoints.join(",")}`);
+  /* Same guard as blocked-event-loop-independent-kill, because this case drives the
+   * SAME realBlockedKill with the SAME WATCHDOG_WAIT_MS and had no guard at all.
+   * At scale 0.03 the two lines contradicted each other in one run: the first said
+   * a 150ms deadline made any outcome unobservable, and this one asserted a 20-way
+   * product defect from that same 150ms. Adding the honesty guard to the case under
+   * review and not to its sibling is how a fix looks complete and is not. */
+  else if (harnessDeadline(WATCHDOG_WAIT_MS) < OBSERVABLE_MS) record("FAIL", "capability-message-20-kill-points",
+    `INCONCLUSIVE (harness): the harness deadline is ${harnessDeadline(WATCHDOG_WAIT_MS)}ms, less than the ` +
+    `${OBSERVABLE_MS}ms a healthy kill needs, so these ${cases.length} cases could not have been observed ` +
+    `whatever the watchdog did (${matched}/${cases.length} matched). Re-run without a scaled harness deadline`);
   else record("FAIL", "capability-message-20-kill-points", `${matched}/20 semantic message kinds at seeded heartbeat points ${killPoints.join(",")}; ${mismatches.join(" | ")}`);
 }
 
@@ -351,7 +480,7 @@ async function testForgedHeartbeat(tmp) {
   const target = spawnTarget(script);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(ready), 3000, "forged-heartbeat target");
+    await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, "forged-heartbeat target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
     const started = Date.now();
     let forged = 9007199254740000;
@@ -414,7 +543,7 @@ async function testBudgetBoundary(tmp) {
   const target = spawnTarget(underScript);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(ready), 3000, "under-budget target");
+    await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, "under-budget target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
     const wdExit = await waitClose(watchdog, 5000);
     const targetExit = await waitClose(target, 2000);
@@ -473,7 +602,7 @@ async function testWatchdogDeath(tmp) {
   const target = spawnTarget(script);
   let watchdog;
   try {
-    await waitFor(() => fs.existsSync(ready), 3000, "watchdog-death target");
+    await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, "watchdog-death target");
     watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
     // Wait until the guard has ARMED its dead-man switch, rather than assuming a
     // fixed 60ms is long enough to have started watching. That assumption is what
@@ -536,7 +665,7 @@ async function testChaosResume(tmp) {
     const target = spawnTarget(managerScript, [String(point)]);
     let watchdog;
     try {
-      await waitFor(() => fs.existsSync(ready), 3000, `chaos point ${point}`);
+      await waitFor(() => fs.existsSync(ready), TARGET_READY_MS, `chaos point ${point}`);
       watchdog = spawnWatchdog(target.pid, heartbeat, capability, halt);
       const wdExit = await waitClose(watchdog, 5000);
       await waitClose(target, 1500);

@@ -15,7 +15,12 @@ function subsetOk(cls, req, grant) {
   if (!req) return true;                              // nothing requested for this class
   grant = grant || {};
   const within = (reqList, grantList) => {
-    if (!Array.isArray(reqList)) return true;
+    // Absent is legitimate: a filesystem request may set `read` and not `write`.
+    if (reqList === undefined || reqList === null) return true;
+    // Present-but-not-a-list is NOT "requested nothing" -- it is a request we cannot
+    // read, and this module's stated posture is never coerce, fail closed. Returning
+    // true here made any malformed request vacuously within grant.
+    if (!Array.isArray(reqList)) return false;
     const g = Array.isArray(grantList) ? grantList : [];
     if (cls === "filesystem") return reqList.every((p) => {
       if (typeof p !== "string") return false;

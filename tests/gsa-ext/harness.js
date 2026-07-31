@@ -45,7 +45,38 @@ function buildBundle({ traceBody = '{"step":1,"status":"ok"}', claim, evidence =
   const graphHash = sha256Hex(Buffer.from(c["compiled_graph.json"], "utf8"));
   const policyHash = sha256Hex(Buffer.from(c["policy.yaml"], "utf8"));
   const skillSetHash = sha256Hex(Buffer.from(canonicalize(skills.map((s) => ({ skill_id: s.skill_id, version: s.version, implementation_hash: s.implementation_hash }))), "utf8"));
-  const ev = { ...EVIDENCE, ...evidence };
+  /* Object spread copies OWN ENUMERABLE keys; it cannot propagate a DELETION. Every
+   * fail-open probe in tests/gsa-ext/mistral does `const evidence = {...EVIDENCE};
+   * delete evidence.X` and hands it here -- where {...EVIDENCE, ...evidence} put X
+   * straight back from the defaults. The field was never missing, so four probes
+   * named "-missing" tested nothing, and the eleven lie-detection probes that share
+   * these fixtures were exercising the generic malformed-input path rather than the
+   * specific control each is named for.
+   *
+   * Merge per key so an explicitly-absent key stays absent. A caller that wants a
+   * field present passes it; a caller that deleted it gets it deleted. */
+  /* Object spread copies OWN ENUMERABLE keys; it cannot propagate a DELETION. Every
+   * fail-open probe in tests/gsa-ext/mistral did `const evidence = {...EVIDENCE};
+   * delete evidence.X` and handed it here -- where {...EVIDENCE, ...evidence} put X
+   * straight back from the defaults. The field was never missing, so four probes
+   * named "-missing" tested nothing.
+   *
+   * A plain object cannot express "absent" distinctly from "not overridden", so the
+   * callers now write `evidence.X = undefined` and this treats an explicitly-present
+   * undefined as a deliberate omission. Present-and-undefined is unambiguous; a
+   * deletion is not. */
+  const ev = {};
+  const given = evidence || {};
+  for (const k of Object.keys(EVIDENCE)) {
+    if (Object.prototype.hasOwnProperty.call(given, k)) {
+      if (given[k] !== undefined) ev[k] = given[k];
+    } else {
+      ev[k] = EVIDENCE[k];
+    }
+  }
+  for (const k of Object.keys(given)) {
+    if (!(k in ev) && given[k] !== undefined) ev[k] = given[k];
+  }
   const m = {
     schema_version: "0.1", bundle_id: "gsa-" + "0".repeat(16), created: "unavailable", producer: { name: "graphsmith", version: "0.4.0" },
     mode: "standard", profiles: ["A", "X"], artifacts: art, skills,

@@ -40,6 +40,9 @@ function record(name, status, detail) {
 function pass(n, d) { record(n, "PASS", d); }
 function fail(n, d) { record(n, "FAIL", d); }
 function skip(n, d) { record(n, "SKIPPED", d); }
+/* Fail-closed, but tagged so it is never read as a product finding -- see
+ * tests/harness-honesty/starvation/ for the convention. */
+function inconclusiveEC(n, d) { record(n, "FAIL", "INCONCLUSIVE (harness): " + d); }
 
 function mkRoot(tag) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `gs-ec-grok-${tag}-`));
@@ -411,8 +414,14 @@ function attack_producer_string_leak() {
   if (evJoined.includes(injections.step)) {
     pass("A1.evidence-map-holds-real-step", "injection step present in evidence map");
   } else {
-    // may be dropped if charset fails edge cases
-    pass("A1.evidence-map-holds-real-step", "injection step absent (possibly dropped_refs) — not a producer→proposer leak");
+    // Both branches used to pass, the else excused by "may be dropped if charset
+    // fails edge cases". If evidence-map capture regressed to always-empty this case
+    // would still print PASS. Absent evidence is not evidence of no leak: it means
+    // this case could not check for one.
+    inconclusiveEC("A1.evidence-map-holds-real-step",
+      "the injected step is absent from the evidence map, so this case cannot tell a " +
+      "correctly-captured-and-contained step from an evidence map that captured nothing " +
+      "(charset drop vs capture regression are indistinguishable here)");
   }
 
   // Poison code must not appear as freeform

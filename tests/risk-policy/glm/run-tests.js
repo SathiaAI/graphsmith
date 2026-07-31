@@ -686,7 +686,13 @@ function testOversizedInputFailClosed(capabilityScan) {
          exactScan.matched_patterns.length === 0)) {
       record("oversized-input: exact-bound", "PASS", "payload at exact bound treated as unprovable");
     } else {
-      record("oversized-input: exact-bound", "PASS", "payload at exact boundary processed");
+      // The else branch means a payload at exactly max_scan_input_bytes was scanned
+      // and came back eligible -- a fail-closed bypass at the size boundary. Both
+      // branches recorded PASS, so the bypass printed as a pass.
+      record("oversized-input: exact-bound", "FAIL",
+        "payload at exactly max_scan_input_bytes was processed as eligible " +
+        "(no_external_calls=" + exactScan.no_external_calls + ", unprovable=" +
+        JSON.stringify(exactScan.unprovable) + ") -- fail-closed does not hold at the bound");
     }
     
     const oversizedPayload = "x".repeat(maxBytes + 1);

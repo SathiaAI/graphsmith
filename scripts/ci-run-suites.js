@@ -58,6 +58,57 @@ function discover(root) {
   return suites;
 }
 
+
+// Files that LOOK like committed suites but that discover() will never return,
+// because it matches the literal filename "run-tests.js" and nothing else.
+//
+// Three such files exist in this repo (tests/matrix/claude/tests.js,
+// tests/shadow/gemini/tests.js, tests/banned-lint/gemini/tests.js) and until this
+// was added, nothing anywhere said so: they are committed, they are executable,
+// they were written to be run, and no CI surface ran them. A test that silently
+// does not run is worse than a missing test, because the directory listing implies
+// coverage that does not exist.
+//
+// This does NOT start running them. Auto-adopting unreviewed suites into a gate is
+// how a gate gets disabled the first time one is flaky. It states the gap so the
+// choice -- rename into discovery, wire elsewhere, or delete -- is a decision
+// somebody makes rather than a fact nobody notices.
+/* CI surfaces that may invoke a suite by name. Read once, lazily, and cached: if a
+ * file cannot be read it contributes nothing, so an unreadable workflow can only
+ * ever make this report MORE files as orphaned -- never fewer. Fail-closed in the
+ * direction that matters, since the failure this whole warning exists to prevent is
+ * a suite silently not running. */
+const CI_SURFACES = [".github/workflows/ci.yml", "ci-templates/gitlab-ci.yml", "package.json"];
+let ciSurfaceText = null;
+function citedByAnotherCiSurface(rel) {
+  if (ciSurfaceText === null) {
+    ciSurfaceText = CI_SURFACES.map((f) => {
+      try { return fs.readFileSync(f, "utf8"); } catch (e) { return ""; }
+    }).join("\n");
+  }
+  /* Match the path as written, and the bare basename, because a workflow may cd
+   * first. Basename alone would be too loose for a name like "tests.js"; every file
+   * reaching this check has already been filtered to *-tests.js / *battery.js, and
+   * the distinctive ones (v0.4.0-battery.js) are what actually appear here. */
+  if (ciSurfaceText.indexOf(rel) !== -1) return true;
+  const base = rel.split("/").pop();
+  return base.length > 12 && ciSurfaceText.indexOf(base) !== -1;
+}
+
+function undiscovered(root, discovered) {
+  const seen = new Set(discovered);
+  const out = [];
+  (function walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name).split(path.sep).join("/");
+      if (entry.isDirectory()) walk(p);
+      else if (/(?:^|[-.])(?:tests|battery)\.js$/.test(entry.name) && !seen.has(p)) out.push(p);
+    }
+  })(root);
+  out.sort();
+  return out;
+}
+
 // A prefix list is only safe to match with String#startsWith if every entry is
 // a non-empty string: "".startsWith("") is true for ANY suite path, so a stray
 // empty-string (or non-string) entry in evidence_only would silently swallow
@@ -166,6 +217,46 @@ function main() {
 
   console.log("Discovered " + suites.length + " suite(s):");
   for (const s of suites) console.log("  " + s + "  [" + classify(s) + "]");
+
+  const notRun = undiscovered(args.root, suites);
+  if (notRun.length) {
+    /* Split by whether ANOTHER CI surface names the file explicitly.
+     *
+     * This warning used to lump both cases together and tell a human to "confirm
+     * they are run by another CI step". Nobody confirms; they read a list of file
+     * paths under a NOT DISCOVERED heading and treat every line as a gap. That is
+     * not hypothetical -- a review of this exact output counted 14 unrun files when
+     * the true number was 12, because tests/gauntlet/v0.{3,4}.0-battery.js are
+     * invoked by name in ci.yml and are the designated gate for ten evidence-only
+     * families. Two false alarms in a list of twelve is enough to teach people to
+     * skim the list, and then the ten real ones go unread too.
+     *
+     * The check is grep-shaped and deliberately so: it asks whether the CI config
+     * mentions the filename, not whether the invocation is correct. That is a weaker
+     * claim than "this file is tested", and it is stated as the weaker claim. What
+     * it removes is the false-alarm half, which is what was costing attention. */
+    const wired = [];
+    const orphaned = [];
+    for (const f of notRun) {
+      (citedByAnotherCiSurface(f) ? wired : orphaned).push(f);
+    }
+
+    if (orphaned.length) {
+      console.log("");
+      console.log("NOT DISCOVERED -- " + orphaned.length + " committed file(s) under " + args.root +
+        " look like suites but are not named run-tests.js, so this runner never executes them,");
+      console.log("and no other CI surface names them either. They are NOT run and do NOT gate.");
+      console.log("Rename them into discovery, wire them into a CI step, or delete them.");
+      for (const f of orphaned) console.log("  " + f);
+    }
+    if (wired.length) {
+      console.log("");
+      console.log("NOT DISCOVERED, but RUN ELSEWHERE -- " + wired.length + " file(s) this runner does not");
+      console.log("execute, each named explicitly by another CI surface (checked, not assumed). Listed so");
+      console.log("the count above is not mistaken for a coverage gap; their exit codes gate in that step:");
+      for (const f of wired) console.log("  " + f);
+    }
+  }
 
   const failedGating = [];
   const failedEvidence = [];

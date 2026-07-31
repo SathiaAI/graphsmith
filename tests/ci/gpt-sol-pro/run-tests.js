@@ -7,6 +7,49 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 
 const REPO = path.resolve(__dirname, "..", "..", "..");
+
+/* A whole-file `secrets\.` regex reports a leak for a workflow whose only secrets
+ * step is guarded `if: github.event_name != 'pull_request'` -- which is exactly how
+ * ci.yml's List B hygiene step is written. The guard is the control; ignoring it
+ * turns a correctly-secured workflow into a standing false alarm, and a check that
+ * always fires is a check nobody reads.
+ *
+ * Attribute every secrets reference to its enclosing step and ask whether THAT step
+ * can run on a pull_request. A reference with no guard is still a finding. */
+/* True when SOME ONE script invoked by `text` satisfies every pattern. Checking each
+ * invoked script separately (rather than concatenating them) keeps the assertion
+ * tight -- three patterns spread across three unrelated scripts must not add up to a
+ * pass -- and it is order-independent, so a first-match on `node scripts/manifest.js`
+ * can no longer stand in for the suite runner. */
+function someInvokedScriptMatches(text, patterns) {
+  const re = /node\s+(scripts\/[\w.-]+\.js)/g;
+  const seen = new Set();
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    const abs = path.join(REPO, m[1]);
+    if (!fs.existsSync(abs)) continue;
+    const src = fs.readFileSync(abs, "utf8");
+    if (patterns.every((rx) => rx.test(src))) return m[1];
+  }
+  return "";
+}
+
+function unguardedSecretRefs(source) {
+  const lines = source.split("\n");
+  const bad = [];
+  let stepStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*-\s+(name|uses|run)\s*:/.test(lines[i])) stepStart = i;
+    if (!/\bsecrets\s*\./.test(lines[i])) continue;
+    const step = lines.slice(stepStart, i + 1).join("\n");
+    const guarded = /if\s*:.*github\.event_name\s*!==?\s*'pull_request'/.test(step) ||
+      /if\s*:.*github\.event_name\s*!==?\s*"pull_request"/.test(step);
+    if (!guarded) bad.push((i + 1) + ": " + lines[i].trim().slice(0, 90));
+  }
+  return bad;
+}
 const GUARD = path.join(REPO, "scripts", "ci-check-pr-separation.js");
 const CI = path.join(REPO, ".github", "workflows", "ci.yml");
 const PUBLISH = path.join(REPO, ".github", "workflows", "publish.yml");
@@ -90,9 +133,31 @@ function walkRunTests(root) {
   return found.sort();
 }
 
+/* The phase-a step used to carry the whole suite runner as an inline
+ * `run: node -e "..."` one-liner, and the three behavioural checks below execute
+ * whatever this returns against fixture trees. The logic has since moved into
+ * scripts/ci-run-suites.js. When this returned "" the checks were SILENTLY SKIPPED
+ * -- three gate-behaviour verifications quietly stopped running and the suite said
+ * nothing about it.
+ *
+ * Resolve the runner the way CI does: whatever the step actually invokes. Returns
+ * {argv, label}; argv is what to spawn. */
 function extractSuiteRunner(phaseA) {
-  const match = phaseA.match(/^\s*run:\s*node -e "([^"\r\n]+)"\s*$/m);
-  return match ? match[1] : "";
+  const inline = phaseA.match(/^\s*run:\s*node -e "([^"\r\n]+)"\s*$/m);
+  if (inline) return { argv: ["-e", inline[1]], label: "inline node -e in ci.yml" };
+  // Scope to the suite-runner STEP before matching. phaseA also contains
+  // "Component selftest — manifest.js" style steps, and a bare first-match picks up
+  // `node scripts/manifest.js`, which then runs with no args in the fixture tree and
+  // exits 2 — a confident FAIL about the CI gate caused entirely by grabbing the
+  // wrong line.
+  const stepStart = phaseA.indexOf("Run every committed suite");
+  const runnerStep = stepStart === -1 ? phaseA : phaseA.slice(stepStart);
+  const script = runnerStep.match(/node\s+(scripts\/[\w.-]+\.js)/);
+  if (script) {
+    const abs = path.join(REPO, script[1]);
+    if (fs.existsSync(abs)) return { argv: [abs], label: script[1] };
+  }
+  return { argv: null, label: "" };
 }
 
 function writeExitSuite(root, relative, exitCode) {
@@ -127,7 +192,7 @@ function runSuiteRunnerFixture(runner, suites, probeWarnings = false) {
     env.NODE_OPTIONS = `${env.NODE_OPTIONS || ""} --require=${probe}`.trim();
   }
 
-  const child = spawnSync(process.execPath, ["-e", runner], {
+  const child = spawnSync(process.execPath, runner.argv, {
     cwd: root,
     env,
     encoding: "utf8",
@@ -203,11 +268,14 @@ function workflowAudit() {
       `pull_request_target present at line ${lineOf(source, "pull_request_target")}`
     );
     const hasPrTrigger = /^\s{2}pull_request\s*:/m.test(source);
+    const unguarded = hasPrTrigger ? unguardedSecretRefs(source) : [];
     check(
-      `${relative}: no secrets in pull_request workflow`,
-      !(hasPrTrigger && /\bsecrets\s*\./.test(source)),
-      hasPrTrigger ? "pull_request trigger has no secrets.* reference" : "workflow has no pull_request trigger",
-      "pull_request-triggered workflow references secrets.*"
+      `${relative}: no UNGUARDED secrets in pull_request workflow`,
+      unguarded.length === 0,
+      hasPrTrigger
+        ? "every secrets.* reference sits in a step guarded against pull_request"
+        : "workflow has no pull_request trigger",
+      "secrets.* reachable on a pull_request run at " + unguarded.join(" | ")
     );
     check(
       `${relative}: concurrency cancels superseded runs`,
@@ -235,8 +303,23 @@ function workflowAudit() {
   );
   record("SKIPPED", "3-OS graphlint component selftest", "phase-b-component; graphlint remains self-tested and dogfooded in the verify job");
 
+  const suiteRunner = extractSuiteRunner(phaseA);
+  check(
+    "CI suite runner resolved from ci.yml",
+    suiteRunner.argv !== null,
+    "runner resolved: " + suiteRunner.label,
+    "could not resolve the phase-a suite runner from ci.yml — the three gate-behaviour " +
+      "checks below did NOT run"
+  );
   const suites = walkRunTests(path.join(REPO, "tests"));
-  const dynamicDiscovery = phaseA.includes("e.name === 'run-tests.js'") && phaseA.includes("walk(p)") && phaseA.includes("spawnSync(process.execPath, [s]");
+  /* Discovery used to be inline in the YAML; it now lives in the script the step
+   * invokes. Look where the code actually is, or this reports "recursive discovery
+   * not found" about a runner that discovers recursively. */
+  const discoverySrc = suiteRunner.argv && suiteRunner.argv.length === 1
+    ? phaseA + "\n" + fs.readFileSync(suiteRunner.argv[0], "utf8")
+    : phaseA;
+  const dynamicDiscovery = /run-tests\.js/.test(discoverySrc) && /walk\(/.test(discoverySrc) &&
+    /spawnSync\(\s*process\.execPath/.test(discoverySrc);
   check(
     "3-OS job dynamically invokes every committed tests/**/run-tests.js",
     dynamicDiscovery,
@@ -273,14 +356,7 @@ function workflowAudit() {
     "one or more review harnesses are not covered by evidence_only"
   );
 
-  const suiteRunner = extractSuiteRunner(phaseA);
-  check(
-    "CI suite runner parsed from ci.yml",
-    suiteRunner.length > 0,
-    "embedded node runner extracted from phase-a-selftests",
-    "could not parse the phase-a suite runner"
-  );
-  if (suiteRunner) {
+  if (suiteRunner.argv) {
     const evidenceFailure = runSuiteRunnerFixture(suiteRunner, [
       ["tests/attacks/deepseek/run-tests.js", 7],
       ["tests/gate/probe/run-tests.js", 0],
@@ -328,7 +404,16 @@ function gitlabAudit() {
   const expectedPhaseA = ["manifest.js", "state-store.js", "loaders.js", "scenario.js", "promote.js", "gate.js", "verify.js", "ci-check-pr-separation.js"];
   const missingPhaseA = expectedPhaseA.filter((name) => githubPhaseA.includes(`node scripts/${name} --selftest`) && !source.includes(`node scripts/${name} --selftest`));
   check("GitLab mirrors GitHub Phase A component list", missingPhaseA.length === 0, "all GitHub Phase A component selftests mirrored", `missing: ${missingPhaseA.join(", ")}`);
-  check("GitLab recursively runs committed suites", source.includes("e.name === 'run-tests.js'") && source.includes("spawnSync(process.execPath, [s]"), "recursive run-tests.js discovery present", "committed suite discovery missing");
+  /* The template no longer inlines discovery: it invokes scripts/ci-run-suites.js,
+   * the same script GitHub Actions runs (stated in the template's own comment). Grep
+   * the invoked script, not the YAML, or this reports "committed suite discovery
+   * missing" about a template that discovers every suite. */
+  const glDiscoverer = someInvokedScriptMatches(source,
+    [/run-tests\.js/, /walk\(/, /spawnSync\(\s*process\.execPath/]);
+  check("GitLab recursively runs committed suites",
+    glDiscoverer !== "",
+    "recursive run-tests.js discovery present via " + glDiscoverer,
+    "committed suite discovery missing");
 
   const silentlyMissing = [
     ["syntax check", "--check"],

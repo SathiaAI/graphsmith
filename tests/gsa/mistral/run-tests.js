@@ -181,7 +181,9 @@ test("profile-confusion-A-without-evidence", () => {
 });
 
 test("profile-confusion-X-without-evidence", () => {
-  const { bundle, publicKeyPem } = createValidBundle();
+  // `keys` was missing from this destructure while line ~194 uses keys.privateKey,
+  // so this case died with "keys is not defined" before reaching step 9.
+  const { bundle, publicKeyPem, keys } = createValidBundle();
   const tampered = JSON.parse(JSON.stringify(bundle));
   tampered.manifest.profiles = ["X"];
   tampered.manifest.adversarial.suites[0].blocked = 5; // Not all blocked

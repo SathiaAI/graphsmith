@@ -84,7 +84,12 @@ function verifyPolicy(ctx) {
 const check = {
   id: "v040-policy",
   run(ctx) {
-    const r = verifyPolicy(ctx || {});
+    // Was verifyPolicy(ctx || {}). The coercion made verifyPolicy's own null-guard
+    // dead code for every falsy ctx reachable through this wrapper: a null context
+    // still failed closed, but reported "policy not an object" instead of "no
+    // context". Fail-closed with the wrong reason is still misleading evidence, and
+    // evidence text is what this product sells. Pass it through; the guard handles it.
+    const r = verifyPolicy(ctx);
     const out = { status: r.status, evidence: r.evidence.slice(), assumptions: r.assumptions.slice() };
     if (r.failure_domain) out.failure_domain = r.failure_domain;
     if (r.reason) { out.reason = r.reason; out.evidence.push("reason: " + r.reason); }

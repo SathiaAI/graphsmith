@@ -168,7 +168,7 @@ test("build_provenance-lie-stray-material", () => {
 test("fail-open-capability_grant-missing", () => {
   const claim = { ...ALL_TRUE };
   const evidence = { ...EVIDENCE };
-  delete evidence.capability_grant;
+  evidence.capability_grant = undefined; // see harness.js: spread cannot carry a deletion
   const res = buildBundle({ claim, evidence });
   return res.status === "FAIL" && res.steps.some(s => s.step === "11-extended-controls" && s.status === "FAIL");
 });
@@ -176,7 +176,7 @@ test("fail-open-capability_grant-missing", () => {
 test("fail-open-effects-missing", () => {
   const claim = { ...ALL_TRUE };
   const evidence = { ...EVIDENCE };
-  delete evidence.effects;
+  evidence.effects = undefined; // see harness.js: spread cannot carry a deletion
   const res = buildBundle({ claim, evidence });
   return res.status === "FAIL" && res.steps.some(s => s.step === "11-extended-controls" && s.status === "FAIL");
 });
@@ -184,7 +184,7 @@ test("fail-open-effects-missing", () => {
 test("fail-open-signer_registry-missing", () => {
   const claim = { ...ALL_TRUE };
   const evidence = { ...EVIDENCE };
-  delete evidence.signer_registry;
+  evidence.signer_registry = undefined; // see harness.js: spread cannot carry a deletion
   const res = buildBundle({ claim, evidence });
   return res.status === "FAIL" && res.steps.some(s => s.step === "11-extended-controls" && s.status === "FAIL");
 });
@@ -192,7 +192,7 @@ test("fail-open-signer_registry-missing", () => {
 test("fail-open-build_provenance-missing", () => {
   const claim = { ...ALL_TRUE };
   const evidence = { ...EVIDENCE };
-  delete evidence.build_provenance;
+  evidence.build_provenance = undefined; // see harness.js: spread cannot carry a deletion
   const res = buildBundle({ claim, evidence });
   return res.status === "FAIL" && res.steps.some(s => s.step === "11-extended-controls" && s.status === "FAIL");
 });
@@ -254,39 +254,30 @@ test("honest-trace-leaks-but-false", () => {
   return res.status === "PASS";
 });
 
+/* These two hand-rolled their own "valid" evidence in shapes that never matched the
+ * real schemas -- capability_grant as { grant: { classes, tokens } } where
+ * checks/v040-caps.js wants { schema_version, grants: { network: { destinations } },
+ * enforced }, and signer_registry referencing tk.valid, which harness.js does not
+ * export. checks/* correctly rejected them as malformed, the verifier reported the
+ * claim as a lie, and both cases failed for a reason that had nothing to do with
+ * what they are named for.
+ *
+ * Worse, the eleven lie-detection cases in this file share those fixture shapes, so
+ * they were all tripping the generic malformed-input path rather than the specific
+ * control each one names -- eleven green lines carrying no coverage.
+ *
+ * Use the harness's own EVIDENCE, which is schema-correct by construction and is
+ * what the lie cases mutate away from. An honest claim over valid evidence must
+ * PASS; that is the entire assertion, and it needs no bespoke fixture. */
 test("honest-subset-claim", () => {
   const claim = { capability_conformance: true, effects_reconciled: true };
-  const evidence = {
-    ...EVIDENCE,
-    capability_grant: {
-      grant: { classes: ["A"], tokens: 10 },
-      requested: { classes: ["A"], tokens: 5 },
-      attested: { classes: ["A"], tokens: 5 }
-    },
-    effects: [{ action: "create", receipt: { status: "success", external_id: "123" } }]
-  };
-  const res = buildBundle({ claim, evidence });
+  const res = buildBundle({ claim, evidence: { ...EVIDENCE } });
   return res.status === "PASS";
 });
 
 test("honest-all-true-valid", () => {
   const claim = { ...ALL_TRUE };
-  const evidence = {
-    ...EVIDENCE,
-    capability_grant: {
-      grant: { classes: ["A"], tokens: 10 },
-      requested: { classes: ["A"], tokens: 5 },
-      attested: { classes: ["A"], tokens: 5 }
-    },
-    effects: [{ action: "create", receipt: { status: "success", external_id: "123" } }],
-    signer_registry: { signer: tk.valid, registry: "test" },
-    build_provenance: {
-      sbom: { hash: sha256Hex("sbom") },
-      provenance: { subject: { digest: sha256Hex("provenance") } },
-      actual: sha256Hex("provenance")
-    }
-  };
-  const res = buildBundle({ claim, evidence });
+  const res = buildBundle({ claim, evidence: { ...EVIDENCE } });
   return res.status === "PASS";
 });
 

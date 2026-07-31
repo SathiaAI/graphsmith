@@ -1219,10 +1219,13 @@ function attackGate1() {
     /* Document behavior: after trusted translation, fence runs on canonical paths.
        If raw alias reaches gate1, fence rejects OR alias accepts post-translation.
        Record outcome honestly. */
+    /* This records what gate1Static did; it has no pass condition and never could
+     * fail, so printing PASS put a green line in the summary for an assertion that
+     * does not exist. Report it as what it is: an observation. */
     report(
       "06g-raw-alias-behavior",
-      "PASS",
-      `pass=${r.pass} codes=${r.findings.map((f) => f.code).join(",") || "none"} (documented)`
+      "SKIPPED",
+      `OBSERVATION ONLY (no assertion): pass=${r.pass} codes=${r.findings.map((f) => f.code).join(",") || "none"}`
     );
   } catch (e) {
     report("06g-raw-alias-behavior", "FAIL", e.message);
@@ -1238,8 +1241,8 @@ function attackGate1() {
     /* current impl passes — if alias enforced this becomes fail; that's good */
     report(
       "06h-clean-in-fence-baseline",
-      "PASS",
-      `pass=${r.pass} (if alias-enforced later, expect fail on literal)`
+      "SKIPPED",
+      `OBSERVATION ONLY (no assertion): pass=${r.pass} (if alias-enforced later, expect fail on literal)`
     );
   } catch (e) {
     report("06h-clean-in-fence-baseline", "FAIL", e.message);
@@ -1463,12 +1466,16 @@ function attackPersistenceBoundary() {
         "gate-evidence referenced"
       );
     } else {
+      /* Both branches printed PASS, so this line was green whether or not gate.js
+       * references the write fence. Contract 08 does permit a pure decision path, so
+       * the else is not a failure -- but it is also not a verification of anything. */
       /* No write of evidence bundles yet — decide path is pure. Not a FAIL unless contract
          requires always writing; contract 08 says writes ONLY that dir (permission upper bound). */
       report(
         "08c-gate-evidence-path-present",
-        "PASS",
-        "pure decision path (no evidence write); permitted subset of write-fence"
+        "SKIPPED",
+        "OBSERVATION ONLY (no assertion): pure decision path, no gate-evidence reference; " +
+          "a permitted subset of the write-fence, so nothing was verified here"
       );
     }
     void writesEvidence;

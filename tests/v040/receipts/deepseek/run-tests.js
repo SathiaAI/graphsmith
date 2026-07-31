@@ -3,6 +3,34 @@ const { reconcileEffects } = require("../../../../checks/v040-receipts.js");
 
 let pass = 0, fail = 0;
 
+/* ADJUDICATED cases: this is an adversarial-review artifact, and a tester's
+ * expectation is not automatically the right answer. Where tests/v040/receipts/
+ * ADJUDICATION.md formally settled a case as NOT a defect, flipping the expectation
+ * silently erases the record of the disagreement, and leaving it FAILing forever is
+ * why nobody reads the evidence-only list. Run it, assert the adjudicated behaviour
+ * so a regression away from it still fails, and print it under its own status. */
+let adjudicated = 0;
+function adjudicatedTest(name, ctx, adjudicatedStatus, ruling) {
+  /* Contract 10 List C: an ADJUDICATED verdict is only admissible with a citation to
+   * the ruling that produced it. Without one it is an unexplained non-failure, which is
+   * the shape this status exists to prevent. Fail closed on a missing citation. */
+  if (typeof ruling !== "string" || ruling.trim().length === 0) {
+    console.log("FAIL " + name + " - ADJUDICATED recorded with no citation to the ruling " +
+      "that settled it (contract 10 List C)");
+    fail++;
+    return;
+  }
+  const result = reconcileEffects(ctx);
+  if (result.status === adjudicatedStatus) {
+    console.log("ADJUDICATED " + name + " -> " + adjudicatedStatus + " (not a defect: " + ruling + ")");
+    adjudicated++;
+  } else {
+    console.log("FAIL " + name + " REGRESSED away from the adjudicated behaviour: expected " +
+      adjudicatedStatus + ", got " + result.status);
+    fail++;
+  }
+}
+
 function test(name, ctx, expectedStatus) {
   const result = reconcileEffects(ctx);
   if (result.status === expectedStatus) {
@@ -64,10 +92,12 @@ test("6.1 null ctx", null, "failed");
 test("6.2 non-object ctx", "not an object", "failed");
 test("6.3 effects not array", { effects: "not array" }, "failed");
 test("6.4 hostile getter", { get effects() { throw new Error("boom"); } }, "failed");
-test("6.5 BigInt in receipt", { effects: [{ action: "x", receipt: { schema_version: "1.0", adapter_id: "a", action: "x", status: "success", external_id: 123n } }] }, "failed");
+adjudicatedTest("6.5 BigInt in receipt", { effects: [{ action: "x", receipt: { schema_version: "1.0", adapter_id: "a", action: "x", status: "success", external_id: 123n } }] }, "unavailable",
+  'ADJUDICATION.md "The invalid-external_id design decision" — an invalid external_id VALUE is not valid external evidence, so the effect is UNKNOWN -> unavailable (reconciliation-required). "failed" would be a false claim that the effect failed; it may well have succeeded. The security property holds either way: a forged evidence-less success never reaches verified');
 test("6.6 proto pollution", { effects: [{ __proto__: { polluted: true }, action: "x", receipt: { schema_version: "1.0", adapter_id: "a", action: "x", status: "success", external_id: "real" } }] }, "verified");
 const proxy = new Proxy({ effects: [] }, {});
 test("6.7 proxy ctx", proxy, "not-applicable");
 
-console.log("# summary PASS=" + pass + " FAIL=" + fail + " total=" + (pass + fail));
+console.log("# summary PASS=" + pass + " FAIL=" + fail + " ADJUDICATED=" + adjudicated +
+  " total=" + (pass + fail + adjudicated));
 process.exitCode = fail === 0 ? 0 : 1;

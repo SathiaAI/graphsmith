@@ -3,6 +3,21 @@ const checks = require("../../../../checks/v040-signer.js");
 let pass = 0;
 let fail = 0;
 
+/* ADJUDICATED cases.
+ *
+ * This is an adversarial-review artifact: it records what a tester expected, which is
+ * not always what the product should do. Where a case was formally adjudicated in the
+ * lane's ADJUDICATION.md as NOT a defect, two wrong things could be done with it --
+ * flip the expectation silently, which erases the record that the disagreement ever
+ * happened, or leave it FAILing forever, which is why nobody reads the evidence-only
+ * list any more.
+ *
+ * Third option: run the case, assert the ADJUDICATED behaviour so a regression away
+ * from it still fails, and print it under its own status citing the ruling. The
+ * history survives, and a permanently-red line stops training people to ignore red.
+ */
+let adjudicated = 0;
+
 function test(name, ctx, expected) {
   const result = checks.run(ctx);
   if (result.status === expected) {
@@ -10,6 +25,28 @@ function test(name, ctx, expected) {
     pass++;
   } else {
     console.log("FAIL " + name + " " + JSON.stringify(result));
+    fail++;
+  }
+}
+
+/* @param ruling one-line citation of the ADJUDICATION.md paragraph that settled it. */
+function adjudicatedTest(name, ctx, adjudicatedStatus, ruling) {
+  /* Contract 10 List C: an ADJUDICATED verdict is only admissible with a citation to
+   * the ruling that produced it. Without one it is an unexplained non-failure, which is
+   * the shape this status exists to prevent. Fail closed on a missing citation. */
+  if (typeof ruling !== "string" || ruling.trim().length === 0) {
+    console.log("FAIL " + name + " - ADJUDICATED recorded with no citation to the ruling " +
+      "that settled it (contract 10 List C)");
+    fail++;
+    return;
+  }
+  const result = checks.run(ctx);
+  if (result.status === adjudicatedStatus) {
+    console.log("ADJUDICATED " + name + " -> " + adjudicatedStatus + " (not a defect: " + ruling + ")");
+    adjudicated++;
+  } else {
+    console.log("FAIL " + name + " REGRESSED away from the adjudicated behaviour: expected " +
+      adjudicatedStatus + ", got " + result.status + " " + JSON.stringify(result));
     fail++;
   }
 }
@@ -37,11 +74,16 @@ test("added-at-recalled-at-no-effect", { signer: "k1", registry: { schema_versio
 // Crashes: malformed registry/recalls
 test("malformed-registry-null", { signer: "k1", registry: null }, "failed");
 test("malformed-registry-wrong-type", { signer: "k1", registry: 123 }, "failed");
-test("malformed-registry-hostile-getter", { signer: "k1", registry: { schema_version: "1.0", signers: [{ signer_id: "k1", public_key_pem: "PEM1", status: "active", get added_at() { throw new Error("hostile getter"); } }] } }, "failed");
-test("malformed-registry-bigint", { signer: "k1", registry: { schema_version: "1.0", signers: [{ signer_id: "k1", public_key_pem: "PEM1", status: "active", added_at: 123n }] } }, "failed");
-test("malformed-registry-proto-pollution", { signer: "k1", registry: { schema_version: "1.0", signers: [{ signer_id: "k1", public_key_pem: "PEM1", status: "active", __proto__: { pollute: "polluted" } }] } }, "failed");
-test("malformed-registry-proxy", { signer: "k1", registry: { schema_version: "1.0", signers: new Proxy([{ signer_id: "k1", public_key_pem: "PEM1", status: "active" }], {}) } }, "failed");
+adjudicatedTest("malformed-registry-hostile-getter", { signer: "k1", registry: { schema_version: "1.0", signers: [{ signer_id: "k1", public_key_pem: "PEM1", status: "active", get added_at() { throw new Error("hostile getter"); } }] } }, "verified",
+  'ADJUDICATION.md "Adjudicated NOT defects" — added_at/recalled_at are C1 evidence fields the check deliberately never reads');
+adjudicatedTest("malformed-registry-bigint", { signer: "k1", registry: { schema_version: "1.0", signers: [{ signer_id: "k1", public_key_pem: "PEM1", status: "active", added_at: 123n }] } }, "verified",
+  'ADJUDICATION.md "Adjudicated NOT defects" — added_at/recalled_at are C1 evidence fields the check deliberately never reads');
+adjudicatedTest("malformed-registry-proto-pollution", { signer: "k1", registry: { schema_version: "1.0", signers: [{ signer_id: "k1", public_key_pem: "PEM1", status: "active", __proto__: { pollute: "polluted" } }] } }, "verified",
+  'ADJUDICATION.md — inert __proto__ on an otherwise-valid entry; every read field is own and valid');
+adjudicatedTest("malformed-registry-proxy", { signer: "k1", registry: { schema_version: "1.0", signers: new Proxy([{ signer_id: "k1", public_key_pem: "PEM1", status: "active" }], {}) } }, "verified",
+  'ADJUDICATION.md — a transparent Proxy that Array.isArray sees through and that returns the valid entry');
 test("malformed-registry-duplicate-signer-ids", { signer: "k1", registry: { schema_version: "1.0", signers: [{ signer_id: "k1", public_key_pem: "PEM1", status: "active" }, { signer_id: "k1", public_key_pem: "PEM2", status: "active" }] } }, "failed");
 
-console.log("# summary PASS=" + pass + " FAIL=" + fail + " total=" + (pass + fail));
+console.log("# summary PASS=" + pass + " FAIL=" + fail + " ADJUDICATED=" + adjudicated +
+  " total=" + (pass + fail + adjudicated));
 process.exitCode = fail === 0 ? 0 : 1;
