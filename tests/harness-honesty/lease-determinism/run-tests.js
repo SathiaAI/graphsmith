@@ -226,7 +226,14 @@ const DECLARED_REAL_CLOCK_SITES = {
   },
   "tests/state-store/deepseek/run-tests.js": {
     sites: [
-      "tests/state-store/deepseek/run-tests.js:229",
+      /* The four callers of requireRealClockStore. All are WINDOWS-ONLY: a linux leg
+       * returns from tests 3 and 7 before building a store, so it observes none of them.
+       * They were enumerated by running this sweep on real Windows -- the platform blind
+       * spot that produced this whole line of work is now an explicit list. */
+      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:427",
+      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:457",
+      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:758",
+      "tests/state-store/deepseek/run-tests.js:229 <- tests/state-store/deepseek/run-tests.js:857",
       "child-crash.js", "worker-concurrency.js",
     ],
     why:
