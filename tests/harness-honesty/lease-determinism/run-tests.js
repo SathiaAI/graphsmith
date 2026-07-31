@@ -122,9 +122,17 @@ function readAudit(auditPath) {
 }
 
 function runTarget(target, extraEnv) {
+  /* Both variables are DELETED first, then re-applied from extraEnv. Inheriting
+   * process.env meant a gate launched with the flag already set produced a
+   * "baseline-unflagged" run that still had the flag -- a check named for a condition it
+   * did not establish. Reported by an adversarial review; the same inheritance bug was in
+   * the flag-off half of the control below. */
+  const env = Object.assign({}, process.env);
+  delete env[ENV_FLAG];
+  delete env[AUDIT_ENV];
   return spawnSync(process.execPath, [path.join(ROOT, target)], {
     cwd: ROOT, encoding: "utf8",
-    env: Object.assign({}, process.env, extraEnv),
+    env: Object.assign(env, extraEnv),
     maxBuffer: 64 * 1024 * 1024,
     timeout: 900000,
   });
@@ -200,7 +208,13 @@ function checkEnforcedRun(target) {
  * (/tmp/gs-ss-grok-conc-XXXX/hammer.js) is stable run to run. */
 const DECLARED_REAL_CLOCK_SITES = {
   "tests/state-store/grok/run-tests.js": {
-    sites: ["run-tests.js", "hammer.js", "child-crash.js"],
+    sites: [
+      "child-crash.js",
+      "hammer.js",
+      "tests/state-store/grok/run-tests.js:55 <- tests/state-store/grok/run-tests.js:456",
+      "tests/state-store/grok/run-tests.js:55 <- tests/state-store/grok/run-tests.js:862",
+      "tests/state-store/grok/run-tests.js:55 <- tests/state-store/grok/run-tests.js:996",
+    ],
     why:
       "crash.journal-roll-forward-monotonic-no-tear and concurrency.two-process-register-" +
       "deregister spawn children. A clock thunk does not survive a spawn, and a parent " +
@@ -211,7 +225,10 @@ const DECLARED_REAL_CLOCK_SITES = {
       "generated worker scripts, which is the case a source scan cannot reach at all.",
   },
   "tests/state-store/deepseek/run-tests.js": {
-    sites: ["run-tests.js", "child-crash.js", "worker-concurrency.js"],
+    sites: [
+      "tests/state-store/deepseek/run-tests.js:229",
+      "child-crash.js", "worker-concurrency.js",
+    ],
     why:
       "test 3 (crash recovery) and test 7 (two-process contention), both windows-only, both " +
       "spawning children. Same reasoning, same 10-minute lease, same invariant-only " +
@@ -220,11 +237,24 @@ const DECLARED_REAL_CLOCK_SITES = {
   },
 };
 
-/* The file is the identity of a construction site; absolute paths and temp-directory names
- * are per-run noise. */
+/* Site identity.
+ *
+ * This returned a BASENAME, which an adversarial review pointed out bounds a few file
+ * names rather than the residual surface: a NEW wall-clock construction added to an
+ * already-declared run-tests.js was accepted automatically. Repo files now carry their
+ * repo-relative path AND line, so a new construction in a declared file is a new site.
+ *
+ * Generated worker scripts live in randomly-named temp directories, so their absolute
+ * path is per-run noise and their line number moves whenever the generator's template is
+ * edited; those keep basename identity, which is honest about what it bounds -- the
+ * generator is repo code and its own construction line is covered by the repo-file rule. */
 function normaliseSite(site) {
-  const m = String(site || "").match(/([^\\/(\s]+\.js):\d+:\d+/);
-  return m ? m[1] : "(unknown)";
+  const m = String(site || "").match(/([^()\s]+\.js):(\d+):\d+/);
+  if (!m) return "(unknown)";
+  const file = m[1];
+  const rel = path.relative(ROOT, file);
+  const inRepo = rel && !rel.startsWith("..") && !path.isAbsolute(rel);
+  return inRepo ? `${rel.split(path.sep).join("/")}:${m[2]}` : path.basename(file);
 }
 
 function checkDeclaredResidual(target, audit) {
@@ -240,7 +270,19 @@ function checkDeclaredResidual(target, audit) {
       (custom[0].site || "(no site)"));
     return;
   }
-  const observed = [...new Set(audit.filter((r) => r.kind === "system").map((r) => normaliseSite(r.site)))].sort();
+  /* Identity is the construction site AND its caller. A test-local factory would otherwise
+   * collapse every caller into one site, so a new case reusing an existing real-clock
+   * factory would be invisible -- the same hole, one level out, that the two-frame capture
+   * in state-store.js exists to close. */
+  const identify = (r) => {
+    const at = normaliseSite(r.site);
+    const from = r.caller ? normaliseSite(r.caller) : "";
+    /* A node-internal caller (module loader for a generated worker's top level) carries no
+     * information; the site alone is the identity there. */
+    const useful = from && from !== "(unknown)" && from.indexOf("node:") === -1 && from.indexOf("loader.js") === -1;
+    return useful ? `${at} <- ${from}` : at;
+  };
+  const observed = [...new Set(audit.filter((r) => r.kind === "system" || r.kind === "system-frozen").map(identify))].sort();
   const declared = DECLARED_REAL_CLOCK_SITES[target];
   if (!declared) {
     if (observed.length === 0) { record(name, "PASS", "no real-clock construction, nothing to declare"); return; }
@@ -314,7 +356,10 @@ function checkEnforcementFires() {
   }
   /* And the other direction: the flag must be inert when off, or every ordinary run of the
    * product would be refusing to start. */
-  const off = spawnSync(process.execPath, ["-e", probe], { cwd: ROOT, encoding: "utf8" });
+  const offEnv = Object.assign({}, process.env);
+  delete offEnv[ENV_FLAG];
+  delete offEnv[AUDIT_ENV];
+  const off = spawnSync(process.execPath, ["-e", probe], { cwd: ROOT, encoding: "utf8", env: offEnv });
   if (String(off.stdout || "").trim() !== "NO_THROW") {
     record(name, "FAIL",
       "the enforcement fired with the flag OFF, so it is not test-only and production " +

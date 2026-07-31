@@ -183,8 +183,12 @@ function clone(value) {
  * than the bug it would fix: it would turn the lock protocol into a no-op while every
  * test still passed. Lease time is chosen; operational time is observed.
  */
+/* ONE definition, tagged. There were two -- this one untagged and a tagged copy in
+ * tests/_harness/clock.js -- so a caller passing THIS one was recorded as an untagged
+ * "custom" clock and would fail the determinism gate for doing the right thing. Two
+ * near-identical helpers differing only in a metadata field is a foot-gun, not a choice. */
 function systemLeaseClock() {
-  return { now: () => Date.now() };
+  return { __leaseClockKind: "system", now: () => Date.now() };
 }
 
 const REQUIRE_EXPLICIT_CLOCK_ENV = "GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK";
@@ -224,20 +228,64 @@ class StateStore {
       /* The first frame OUTSIDE this file. Taking a fixed stack index named the local
        * factory every time -- `at createStore (state-store.js:...)` for all nine
        * constructions -- which is an inventory that cannot tell you where to look. */
+      /* TWO frames outside this file, not one.
+       *
+       * One frame collapses every caller of a test-local factory to the factory itself --
+       * a hole an adversarial review named after the equivalent hole inside this file was
+       * fixed. With the caller recorded too, a NEW caller of an existing real-clock factory
+       * is a new site rather than an invisible reuse. */
       let site = "(no stack)";
+      let caller = "";
       try {
-        const frames = String(new Error().stack || "").split("\n").slice(1);
         const here = path.basename(__filename);
-        site = (frames.find((f) => f.indexOf(here) === -1) || frames[1] || "").trim();
+        const external = String(new Error().stack || "").split("\n").slice(1)
+          .filter((f) => f.indexOf(here) === -1);
+        site = String(external[0] || "").trim();
+        caller = String(external[1] || "").trim();
       } catch (e) { /* best effort */ }
-      try {
-        fs.appendFileSync(auditPath, JSON.stringify({
-          explicit: Boolean(options.clock),
-          kind: options.clock ? (options.clock.__leaseClockKind || "custom") : "wall",
-          site: site.slice(0, 240),
-          pid: process.pid,
-        }) + "\n");
-      } catch (e) { /* observation must never break the run it observes */ }
+      /* PROVENANCE IS OBSERVED, NOT DECLARED.
+       *
+       * The first version recorded `options.clock.__leaseClockKind`, i.e. a string the
+       * caller supplies. An adversarial review pointed out that
+       * `{ __leaseClockKind: "manual", now: () => Date.now() }` then passes every check
+       * while being exactly the wall-clock race the seam exists to remove -- the tag is
+       * an assertion, not evidence.
+       *
+       * So the clock is MEASURED: read it, burn a little real time, read it again. A
+       * chosen clock does not move on its own; a wall clock does. A forged tag cannot
+       * lie about that. The tag is still recorded, and a disagreement between claim and
+       * behaviour is itself reportable. */
+      let advancedUnderRealTime = null;
+      if (options.clock && typeof options.clock.now === "function") {
+        try {
+          const a = options.clock.now();
+          const until = Date.now() + 2;
+          while (Date.now() < until) { /* burn real time, no yield: the clock must not
+                                        * advance because we waited politely */ }
+          advancedUnderRealTime = options.clock.now() !== a;
+        } catch (e) { advancedUnderRealTime = null; }
+      }
+      const claimed = options.clock
+        ? (typeof options.clock.now !== "function" ? "malformed" : (options.clock.__leaseClockKind || "custom"))
+        : "wall";
+      /* Observed wins. "manual" is only granted to a clock that demonstrably did not move. */
+      const kind = claimed === "wall" || claimed === "malformed" ? claimed
+        : advancedUnderRealTime === true ? "system"
+          : advancedUnderRealTime === false ? (claimed === "system" ? "system-frozen" : "manual")
+            : "custom";
+      const line = JSON.stringify({
+        explicit: Boolean(options.clock),
+        kind, claimed, advancedUnderRealTime,
+        site: site.slice(0, 240),
+        caller: caller.slice(0, 240),
+        pid: process.pid,
+      }) + "\n";
+      /* FAIL CLOSED. This was best-effort, and the gate then treated a partial audit as
+       * complete evidence: one dropped append among twenty made the other nineteen
+       * certify the run. A missing record is indistinguishable from no construction, so
+       * in audit mode an unrecordable construction has to stop the run. Audit mode is
+       * opt-in and never on in production. */
+      fs.appendFileSync(auditPath, line);
     }
 
     if (process.env[REQUIRE_EXPLICIT_CLOCK_ENV] === "1" && !options.clock) {
@@ -265,6 +313,17 @@ class StateStore {
           "non-negative safe integer of epoch milliseconds", "BAD_LEASE_CLOCK");
       }
       return t;
+    };
+    /* The instant is validated; the SUM was not. A large leaseMs plus a large instant can
+     * leave the safe-integer range and serialise without error, producing a record that
+     * later reads as expired decades ago. */
+    this._leaseExpiryFrom = (now) => {
+      const expiry = now + this.leaseMs;
+      if (!Number.isSafeInteger(expiry)) {
+        throw fail(`lease expiry ${expiry} (now ${now} + leaseMs ${this.leaseMs}) is outside ` +
+          "the safe-integer range", "BAD_LEASE_CLOCK");
+      }
+      return expiry;
     };
     this.leaseMs = testMode
       ? positiveInteger(options.leaseMs || process.env.GRAPHSMITH_LEASE_MS, DEFAULT_LEASE_MS)
@@ -597,7 +656,19 @@ class StateStore {
     const active = new Map();
     for (const record of records) {
       if (record.record_type === "REGISTERED") active.set(record.run_id, clone(record));
-      else if (record.record_type === "HEARTBEAT" && active.has(record.run_id)) active.get(record.run_id).lease_expires_at = record.lease_expires_at;
+      else if (record.record_type === "HEARTBEAT" && active.has(record.run_id)) {
+        /* A heartbeat RENEWS a lease; it must never revoke one. This was an unconditional
+         * overwrite, so a wall clock stepping backward (NTP correction) across a heartbeat
+         * wrote an EARLIER expiry than the one it replaced, and a live, heartbeating run
+         * was then swept as `abandoned` -- which also sets the window FLAG bit. Reproduced
+         * by an adversarial review on the default clock.
+         *
+         * Math.max also makes replay safe: a delayed or duplicated heartbeat record can no
+         * longer shorten a newer lease. It does not weaken "expire promptly" -- it grants
+         * no time beyond a deadline the store had already issued. */
+        const current = active.get(record.run_id);
+        current.lease_expires_at = Math.max(current.lease_expires_at, record.lease_expires_at);
+      }
       else if (record.record_type === "DEREGISTERED" || record.record_type === "EXPIRED") active.delete(record.run_id);
     }
     return active;
@@ -822,7 +893,7 @@ class StateStore {
         if (existing.tree_id !== treeId) throw fail("runId is already registered to another tree", "RUN_CONFLICT");
         return { registration: clone(existing), slot: null, existing: true };
       }
-      const leaseExpiresAt = this.leaseNow() + this.leaseMs;
+      const leaseExpiresAt = this._leaseExpiryFrom(this.leaseNow());
       let registration;
       let slot = null;
       this._commit([
@@ -865,7 +936,7 @@ class StateStore {
           const records = parseJsonLines(raw, FILES.registry);
           record = {
             schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "HEARTBEAT", run_id: runId,
-            lease_expires_at: this.leaseNow() + this.leaseMs,
+            lease_expires_at: this._leaseExpiryFrom(this.leaseNow()),
           };
           records.push(record);
           return jsonLines(records);
@@ -1166,6 +1237,10 @@ const api = {
     humanAck: (fingerprint, acknowledgement) => singleton().ackRollback(fingerprint, acknowledgement),
   },
 };
+
+/* Exported so tests use the SAME real clock the product uses, rather than a second
+ * near-identical copy that differs only in a metadata tag. */
+api.systemLeaseClock = systemLeaseClock;
 
 module.exports = api;
 

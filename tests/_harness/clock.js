@@ -53,7 +53,12 @@ const DEFAULT_EPOCH_MS = 1_700_000_000_000;
  * @param {number} [startMs] initial instant
  */
 function createManualClock(startMs = DEFAULT_EPOCH_MS) {
-  if (!Number.isFinite(startMs)) throw new Error("createManualClock: startMs must be finite");
+  /* The product requires a non-negative safe integer instant. Accepting merely-finite
+   * inputs here let createManualClock(0.5) through and surfaced later as BAD_LEASE_CLOCK
+   * from inside the store -- a HARNESS input error diagnosed as a product clock error. */
+  if (!Number.isSafeInteger(startMs) || startMs < 0) {
+    throw new Error(`createManualClock: startMs must be a non-negative safe integer, got ${startMs}`);
+  }
   let current = startMs;
   let advances = 0;
   return {
@@ -68,7 +73,8 @@ function createManualClock(startMs = DEFAULT_EPOCH_MS) {
     /** Move time forward. Refuses to go backward: a lease that un-expires is not a
      * scenario the product can produce, and a test that needs one is testing a fiction. */
     advance(ms) {
-      if (!Number.isFinite(ms) || ms < 0) throw new Error(`clock.advance: ${ms} is not a non-negative number of ms`);
+      if (!Number.isSafeInteger(ms) || ms < 0) throw new Error(`clock.advance: ${ms} is not a non-negative safe integer of ms`);
+      if (!Number.isSafeInteger(current + ms)) throw new Error("clock.advance: would leave the safe-integer range");
       current += ms;
       advances += 1;
       return current;
@@ -76,7 +82,7 @@ function createManualClock(startMs = DEFAULT_EPOCH_MS) {
     /** Jump to an absolute instant, forward only. Useful for "just past this
      * lease_expires_at the store issued", which is exact rather than a guess. */
     set(ms) {
-      if (!Number.isFinite(ms)) throw new Error("clock.set: ms must be finite");
+      if (!Number.isSafeInteger(ms) || ms < 0) throw new Error(`clock.set: ms must be a non-negative safe integer, got ${ms}`);
       if (ms < current) throw new Error(`clock.set: refusing to move time backward (${ms} < ${current})`);
       current = ms;
       advances += 1;
@@ -87,11 +93,10 @@ function createManualClock(startMs = DEFAULT_EPOCH_MS) {
   };
 }
 
-/* The real clock, named so a deliberate use is visible in review rather than being the
- * silent default. Under GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK=1 a StateStore
- * construction must pass one of these two explicitly. */
-function systemLeaseClock() {
-  return { __leaseClockKind: "system", now: () => Date.now() };
-}
+/* The real clock, re-exported from the product rather than re-implemented here. There were
+ * two near-identical definitions, one tagged and one not, so a caller passing the product's
+ * own copy was recorded as an untagged "custom" clock and failed the determinism gate for
+ * doing the right thing. One definition, one behaviour. */
+const { systemLeaseClock } = require("../../scripts/state-store.js");
 
 module.exports = { createManualClock, systemLeaseClock, DEFAULT_EPOCH_MS };
