@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.ai/schemas/host-adapter.schema.json",
+  "title": "GraphSmith Host Adapter",
+  "description": "Contract every Lane D (canonical-to-surfaces generator) adapter implements. An adapter takes GraphSmith's canonical skill definition (repo root SKILL.md) and renders it for one specific agent host. Frozen in v0.5.0 Wave 0 -- see .plans/v0.5.0/WAVE-0-CANONICAL-SOURCE.md for the decision this formalizes.",
+  "type": "object",
+  "required": ["id", "displayName", "targetPath", "placementMode", "outputFormat", "bodyTransform"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Stable adapter identifier, e.g. 'cursor', 'copilot', 'agents-generic'. Matches the directory/file name under generators/adapters/."
+    },
+    "displayName": {
+      "type": "string",
+      "description": "Human-readable host name for docs and CLI output, e.g. 'Cursor'."
+    },
+    "targetPath": {
+      "type": "string",
+      "description": "Repo-relative path this adapter's output goes to in an installed project, e.g. '.cursor/rules/graphsmith.mdc' or 'AGENTS.md'."
+    },
+    "placementMode": {
+      "type": "string",
+      "enum": ["standalone", "reconciled"],
+      "description": "'standalone': the generator owns this file outright and may overwrite it wholesale on every regeneration -- safe only when the file is exclusively GraphSmith's (e.g. a dedicated file inside a rules directory that tolerates multiple files, like .cursor/rules/graphsmith.mdc). 'reconciled': the target file may already contain a user's own unrelated content (e.g. AGENTS.md, .github/copilot-instructions.md) -- the generator's rendered output for this adapter MUST be handed to Lane A's reconciler and never written directly. Getting this wrong on a single-file surface is a data-loss bug, not a cosmetic one. Lane A's reconciler currently assumes the target file supports HTML-comment markers (<!-- -->) for its begin/end delimited block -- true for both v0.5.0 launch reconciled targets (AGENTS.md, .github/copilot-instructions.md), both plain Markdown. This is a real but bounded assumption: a future reconciled-mode adapter targeting a non-Markdown-comment-compatible surface (e.g. JSON/TOML/YAML config) requires extending this schema with an explicit marker/comment-style field first -- do not assume HTML comments work universally."
+    },
+    "outputFormat": {
+      "type": "string",
+      "enum": ["markdown-frontmatter", "markdown-plain"],
+      "description": "'markdown-frontmatter': host expects a YAML frontmatter block (see frontmatterFields) followed by a markdown body. 'markdown-plain': host expects plain markdown with no frontmatter block (the frontmatter, if any, is stripped before writing)."
+    },
+    "frontmatterFields": {
+      "type": "array",
+      "description": "Only present when outputFormat is 'markdown-frontmatter'. Defines how this host's frontmatter fields map from canonical SKILL.md's frontmatter.",
+      "items": {
+        "type": "object",
+        "required": ["name", "source", "required"],
+        "properties": {
+          "name": { "type": "string", "description": "Frontmatter key this host expects, e.g. 'description', 'globs', 'alwaysApply'." },
+          "source": {
+            "type": "string",
+            "enum": ["name", "description", "static"],
+            "description": "The canonical SKILL.md frontmatter field to copy this value from ('name' or 'description' -- SKILL.md's only two frontmatter fields as of v0.5.0), or the literal string 'static' meaning this adapter supplies a fixed, host-specific value via staticValue. Deliberately an enum, not a free string: a free string lets a typo (e.g. 'desc' instead of 'description') pass schema validation and fail silently at generation time. Extending canonical SKILL.md's frontmatter later requires a version bump to this enum -- that is the intended extension point, not an oversight."
+          },
+          "required": { "type": "boolean" },
+          "maxLength": {
+            "type": "integer",
+            "description": "Optional hard cap this host's field enforces (e.g. a host whose UI or matching behavior degrades on long descriptions -- Cursor's 'description' field is used by its own agent to decide whether to auto-attach the rule, and is expected to be a short summary, not GraphSmith's full canonical description paragraph). Enforcement is a BUILD-TIME VALIDATION ERROR, not silent truncation: if a 'source'-derived value exceeds maxLength, the adapter definition is invalid as written and must instead set source to 'static' with a hand-written value that fits. Silent truncation is explicitly rejected as a policy -- a truncated mid-sentence description is worse than a build failure that tells the adapter author to write a real one."
+          },
+          "staticValue": { "description": "Used only when source is 'static'." }
+        },
+        "additionalProperties": false
+      }
+    },
+    "bodyTransform": {
+      "type": "string",
+      "enum": ["verbatim"],
+      "description": "How the canonical SKILL.md body maps to this surface's body. Only 'verbatim' (copy the body unchanged, ponytail's build-openclaw-skills.js pattern) is defined for v0.5.0 -- GraphSmith's canonical source has no lite/full/ultra mode split the way ponytail's does, so no mode-filtering transform exists yet. If a future need for per-host body variation appears, extend this enum then; do not build a speculative filtering mechanism now with nothing to filter."
+    },
+    "generatedFileHeader": {
+      "type": "string",
+      "description": "A short comment identifying the file as machine-generated, naming the canonical source (SKILL.md) it was rendered from, and warning against hand-editing (a direct edit will be silently overwritten on the next generation run and is exactly the failure mode Lane D's adversarial tests check for). Not used for reconciled-mode output, which is delimited by Lane A's own markers instead. PLACEMENT IS FORMAT-DEPENDENT AND LOAD-BEARING, not a style choice: for outputFormat 'markdown-plain', insert as the first line(s) of the file. For outputFormat 'markdown-frontmatter', the header MUST be inserted as an HTML comment on the line immediately after the closing '---' of the frontmatter block, and MUST NEVER precede the opening '---' -- content preceding the frontmatter block causes at least one launch host (Cursor's .mdc parser) to silently fail to load the file at all (no error, no log -- the rule just never activates). Since Cursor is the only launch adapter that is both standalone and markdown-frontmatter, this placement rule exists specifically for that combination; get it wrong and the failure is invisible until someone notices GraphSmith isn't showing up in Cursor."
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "placementMode": { "const": "reconciled" } } },
+      "then": { "properties": { "outputFormat": { "const": "markdown-plain" } } },
+      "$comment": "Reconciled-mode + markdown-frontmatter is disallowed for v0.5.0: frontmatter must sit at the document's absolute top, but a reconciler only owns its own delimited mid-file block and cannot also own document-start position. None of the four launch adapters need this combination (both reconciled targets -- AGENTS.md, Copilot's instructions file -- are markdown-plain). If a future host genuinely needs reconciled frontmatter, that requires a deliberate schema extension, not silent support via an untested combination."
+    }
+  ]
+}
