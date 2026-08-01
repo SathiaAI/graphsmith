@@ -25,6 +25,7 @@
  * The three tree ids below are not illustrative. Each was searched for and reproduces a
  * specific pre-fix failure mode; they are pinned so a regression names its own symptom. */
 
+const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "../../..");
@@ -179,8 +180,52 @@ function nullTreeIsNeverPerturbed() {
     "a null tree id still altered the fixture");
 }
 
+/* ---- the allow-list must not go dark as the corpus grows ---- */
+
+function everyCorpusOutcomeIsExplicitlyClassified() {
+  /* An allow-list fails SAFE (an unclassified outcome is left unperturbed rather than
+   * perturbed into a wrong verdict) but it fails SILENTLY: add a genuinely
+   * timing-invariant outcome, forget to classify it, and the evaluator quietly stops
+   * varying that whole family with nobody the wiser. Round-5 review named this as the
+   * cost of choosing an allow-list, and it is a fair charge.
+   *
+   * So classification is made mandatory rather than optional. Every distinct
+   * `expected.outcome` in the shipped corpus must be declared in exactly one of two
+   * places: the product's timing-invariant set, or the list below of outcomes whose
+   * expectation IS a wall-clock boundary. A new outcome in neither turns this red and
+   * forces the decision to be made deliberately, which is the only thing that stops the
+   * set rotting. */
+  const KNOWN_TIMING_BOUNDARY_OUTCOMES = new Set(["budget-exceeded"]);
+
+  const corpusDir = path.join(ROOT, "scenarios");
+  const outcomes = new Map();
+  for (const file of fs.readdirSync(corpusDir).filter((f) => f.endsWith(".json"))) {
+    const sc = JSON.parse(fs.readFileSync(path.join(corpusDir, file), "utf8"));
+    const outcome = sc.expected && sc.expected.outcome;
+    if (!outcomes.has(outcome)) outcomes.set(outcome, []);
+    outcomes.get(outcome).push(sc.id || file);
+  }
+
+  const unclassified = [...outcomes.keys()].filter(
+    (o) => !TIMING_INVARIANT_OUTCOMES.has(o) && !KNOWN_TIMING_BOUNDARY_OUTCOMES.has(o));
+
+  check("every-corpus-outcome-is-classified",
+    unclassified.length === 0,
+    `outcome(s) ${JSON.stringify(unclassified)} appear in the corpus but are declared neither ` +
+    "timing-invariant nor timing-boundary. Decide which, in scenario.js and here -- an " +
+    "unclassified outcome is silently left unperturbed, which is safe but invisible. " +
+    `Scenarios: ${JSON.stringify(unclassified.map((o) => outcomes.get(o)).flat())}`);
+
+  /* And the two sets must stay disjoint, or the derivation is incoherent. */
+  const both = [...outcomes.keys()].filter(
+    (o) => TIMING_INVARIANT_OUTCOMES.has(o) && KNOWN_TIMING_BOUNDARY_OUTCOMES.has(o));
+  check("classification-sets-are-disjoint", both.length === 0,
+    `outcome(s) ${JSON.stringify(both)} are declared BOTH timing-invariant and timing-boundary`);
+}
+
 function main() {
   theDecisionIsDerivedNotListed();
+  everyCorpusOutcomeIsExplicitlyClassified();
   pinnedTreesNoLongerMoveTheBoundary();
   invariantScenariosStillVary();
   nullTreeIsNeverPerturbed();
