@@ -722,6 +722,47 @@ function checkCandidateBaselineAreActuallyDifferentiable() {
     return;
   }
   pass(name, `distinct code trees produced a discordant pair from the code itself (cand.pass=${pair.cand.pass}, base.pass=${pair.base.pass}) — no timing dependence`);
+
+  /* COVERAGE THE REWRITE WOULD OTHERWISE HAVE DROPPED.
+   *
+   * Three independent reviewers made the same objection to the rewrite above: the original
+   * X1 ran the FULL corpus twice, so however unsound its assertion was, it did prove the
+   * paired-replay engine could load, materialise and execute every scenario in the corpus.
+   * The rewrite runs one scenario against two tree directories. Stronger about the property
+   * it names, weaker about breadth -- and quietly dropping breadth while claiming to have
+   * strengthened a test is exactly the move this file is meant to catch.
+   *
+   * So breadth is restored as its own check, asserting what a full-corpus run can honestly
+   * assert: every scenario executes and is classified. NOT that verdicts differ between two
+   * tree ids -- that was the unsound proxy, and re-adding it would re-import the defect. */
+  const full = runCLI(["--replay", "--paired", "--candidate", "tree-AAA", "--baseline", "tree-BASE",
+    "--corpus", REAL_CORPUS_DIR, "--seed", "0"], { timeoutMs: 180000 });
+  const fullName = "X1b. paired replay: every scenario in the shipped corpus executes and is classified";
+  if (full.status !== 0) { fail(fullName, `nonzero exit (${full.status}): ${(full.stderr || "").slice(0, 300)}`); return; }
+  const fullBundle = parseJSONStdout(full, fullName);
+  if (!fullBundle) return;
+
+  const expectedCount = fs.readdirSync(REAL_CORPUS_DIR).filter((f) => f.endsWith(".json")).length;
+  const pairs = fullBundle.pairs || [];
+  if (pairs.length !== expectedCount) {
+    fail(fullName, `corpus has ${expectedCount} scenario(s) but the bundle carried ${pairs.length} pair(s) — a scenario was silently dropped`);
+    return;
+  }
+  const unclassified = pairs.filter((p) =>
+    !p.cand || !p.base || typeof p.cand.pass !== "boolean" || typeof p.base.pass !== "boolean"
+    || !p.cand.cause_code || !p.base.cause_code);
+  if (unclassified.length) {
+    fail(fullName, `${unclassified.length} pair(s) came back without a boolean verdict and a cause code on both sides`);
+    return;
+  }
+  /* An infra_fault on every pair would satisfy the two checks above while meaning the
+   * engine never actually ran anything. */
+  const allInfra = pairs.every((p) => p.cand.cause_code === "infra_fault" && p.base.cause_code === "infra_fault");
+  if (allInfra) {
+    fail(fullName, "every pair classified infra_fault on both sides — the engine did not execute the corpus, it failed to set it up");
+    return;
+  }
+  pass(fullName, `${pairs.length}/${expectedCount} scenarios executed and classified on both sides`);
 }
 
 // =====================================================================================
