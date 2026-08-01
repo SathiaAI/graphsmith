@@ -14,16 +14,24 @@
  *   - symlink-out-of-tree write-through refusal
  *   - kill-mid-write atomicity (temp file + rename, never in-place)
  *   - marker-lookalike text in user prose is not misparsed as a real marker
- *   - two concurrent reconcile processes against the same file
+ *     (GROUP 4a-4d), and a marker-lookalike line embedded in the CALLER'S OWN
+ *     renderedBlock body is refused loudly at embed time rather than
+ *     silently corrupting a later read (GROUP 4e-4g)
+ *   - two concurrent reconcile processes against the same file, both for the
+ *     SAME blockId (GROUP 5.1-5.2, torn/merged-file safety) and for
+ *     DIFFERENT blockIds (GROUP 5.3-5.4, silent-data-loss safety -- see the
+ *     CONCURRENCY note in scripts/reconcile.js)
  *   - CRLF / BOM / mixed line endings
  *   - old-schema-version call against an already-newer-spliced file, and the reverse
  *
  * Each of the "confirm this actually catches a regression" tests (atomicity,
- * symlink refusal) was run once against a DELIBERATELY BROKEN copy of
- * scripts/reconcile.js and confirmed to fail, then re-run against the real
- * file and confirmed to pass -- see the accompanying report, not encoded
- * here (that check is inherently a two-run manual process, not something a
- * single automated suite run can self-demonstrate).
+ * symlink refusal, marker-lookalike-in-body refusal (GROUP 4e/4f), and
+ * different-blockId concurrent data loss (GROUP 5.3/5.4)) was run once
+ * against a DELIBERATELY BROKEN copy of scripts/reconcile.js and confirmed
+ * to fail, then re-run against the real file and confirmed to pass -- see
+ * the accompanying report, not encoded here (that check is inherently a
+ * two-run manual process, not something a single automated suite run can
+ * self-demonstrate).
  */
 
 const fs = require("fs");
@@ -322,6 +330,95 @@ function groupMarkerLookalike() {
       const after = fs.readFileSync(target, "utf8");
       report("4d.2 nothing from the original file was deleted", after.startsWith(before.replace(/\s+$/, "")));
     }
+
+    // 4e: a marker-lookalike line INSIDE the renderedBlock's own BODY (not
+    // the surrounding file prose) must be refused loudly at embed time,
+    // never silently written -- a naive future findBlock() scan over the
+    // FILE cannot tell "the real end marker" apart from this lookalike line
+    // once it's embedded, and would truncate the block on every subsequent
+    // reconcile. This is the reverse direction of 4a-4d above: those cover
+    // lookalikes already in the file/prose; this covers a lookalike this
+    // module itself would be asked to embed.
+    {
+      const target = path.join(dir, "bodylookalike.md");
+      const maliciousBody =
+        'Some real content.\n<!-- graphsmith:end id="anything" -->\nMore content that would be silently orphaned.\n';
+      let threw = null;
+      try {
+        reconcile(target, maliciousBody, { blockId: "graphsmith" });
+      } catch (e) {
+        threw = e;
+      }
+      report("4e.1 marker-lookalike line in body throws TypeError", threw instanceof TypeError, threw ? threw.message : "did not throw");
+      report("4e.2 refused write left target file absent (nothing written)", !fs.existsSync(target));
+    }
+
+    // 4f: same as 4e, but the file ALREADY has a real block, and the drift
+    // (splice) path is the one that would embed the malicious body. Must
+    // refuse and leave the existing valid block completely untouched.
+    {
+      const target = path.join(dir, "bodylookalike-splice.md");
+      const original = '<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\nORIGINAL SAFE BODY\n<!-- graphsmith:end id="graphsmith" -->\n';
+      fs.writeFileSync(target, original);
+      const maliciousBody = '<!-- graphsmith:begin id="other-id" schema_version="7" -->\nlooks like a begin marker for a totally different id\n';
+      let threw = null;
+      try {
+        reconcile(target, maliciousBody, { blockId: "graphsmith" });
+      } catch (e) {
+        threw = e;
+      }
+      report("4f.1 marker-lookalike line in drifted-splice body throws TypeError", threw instanceof TypeError, threw ? threw.message : "did not throw");
+      const after = fs.readFileSync(target, "utf8");
+      report("4f.2 refused splice left the existing block completely untouched", after === original);
+    }
+
+    // 4g: a LEGITIMATE need to discuss the marker format in prose -- NOT
+    // anchored at line-start in the exact marker shape -- must still work.
+    // Over-broadening the refusal into rejecting anything that merely
+    // mentions the marker syntax would itself be a regression.
+    {
+      // 4g-i: the marker text appears mid-sentence (inline), not alone on
+      // its own line.
+      const target1 = path.join(dir, "legit-inline.md");
+      const legitBody1 =
+        'Docs note that GraphSmith uses a line like `<!-- graphsmith:begin id="x" schema_version="1" -->` to delimit blocks.\n';
+      let r1 = null;
+      let threw1 = null;
+      try {
+        r1 = reconcile(target1, legitBody1, { blockId: "graphsmith" });
+      } catch (e) {
+        threw1 = e;
+      }
+      report(
+        "4g.1 marker text mid-sentence (not anchored at column 0) is NOT rejected",
+        threw1 === null && r1 && r1.status === "created",
+        threw1 ? threw1.message : JSON.stringify(r1)
+      );
+
+      // 4g-ii: the marker text appears at the start of a line but with
+      // extra leading whitespace, so it does not literally begin the line
+      // at column 0 with "<!--".
+      const target2 = path.join(dir, "legit-indented.md");
+      const legitBody2 = 'Example marker syntax:\n\n    <!-- graphsmith:begin id="x" schema_version="1" -->\n\nThat is indented as a code sample.\n';
+      let r2 = null;
+      let threw2 = null;
+      try {
+        r2 = reconcile(target2, legitBody2, { blockId: "graphsmith" });
+      } catch (e) {
+        threw2 = e;
+      }
+      report(
+        "4g.2 marker text with leading whitespace (not column-0-anchored) is NOT rejected",
+        threw2 === null && r2 && r2.status === "created",
+        threw2 ? threw2.message : JSON.stringify(r2)
+      );
+      if (r2 && r2.status === "created") {
+        const after2 = fs.readFileSync(target2, "utf8");
+        report("4g.3 the indented lookalike text made it into the file verbatim", after2.includes('    <!-- graphsmith:begin id="x" schema_version="1" -->'));
+      } else {
+        report("4g.3 the indented lookalike text made it into the file verbatim", "SKIP", "4g.2 did not create the file");
+      }
+    }
   } finally {
     cleanup(dir);
   }
@@ -370,6 +467,75 @@ async function groupConcurrentReconcile() {
     report("5.2 all trials completed and produced a result", raceOutcomes.every((c) => c !== null), `outcomes: ${JSON.stringify(raceOutcomes)}`);
   } finally {
     cleanup(dir);
+  }
+
+  // -------------------------------------------------------------------------
+  // 5.3+: two concurrent reconcile processes against the same target file
+  // with DIFFERENT blockIds. This is the data-loss bug: same-blockId racing
+  // (above) only ever has to pick one of two equally-valid full outputs, but
+  // a different-blockId race must end up with BOTH blocks present -- a plain
+  // last-rename-wins primitive silently drops whichever call's rename lost,
+  // with no error. The unfixed module reproduced this in roughly 30-60% of
+  // trials; run enough real (child-process, not simulated) trials that a
+  // real fix's pass rate is convincingly different from that base rate.
+  // -------------------------------------------------------------------------
+  const diffDir = tmpDir("concurrent-diffid");
+  try {
+    const target = path.join(diffDir, "AGENTS.md");
+    const scriptForId = (blockId, content) =>
+      [
+        `const { reconcile } = require(${JSON.stringify(RECONCILE_PATH)});`,
+        `reconcile(${JSON.stringify(target)}, ${JSON.stringify(content)}, { blockId: ${JSON.stringify(blockId)} });`,
+      ].join("\n");
+
+    const DIFF_TRIALS = 40;
+    let bothPresentCount = 0;
+    let dataLossCount = 0;
+    const dataLossDetails = [];
+
+    for (let trial = 0; trial < DIFF_TRIALS; trial++) {
+      if (fs.existsSync(target)) fs.rmSync(target);
+      const pAlpha = cp.spawn(process.execPath, ["-e", scriptForId("alpha", "CONTENT ALPHA")], { stdio: "ignore" });
+      const pBeta = cp.spawn(process.execPath, ["-e", scriptForId("beta", "CONTENT BETA")], { stdio: "ignore" });
+      const exitedAlpha = onExit(pAlpha);
+      const exitedBeta = onExit(pBeta);
+      await Promise.race([Promise.all([exitedAlpha, exitedBeta]), delay(5000)]);
+
+      const finalContent = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
+      const hasAlpha = finalContent.includes('id="alpha"') && finalContent.includes("CONTENT ALPHA");
+      const hasBeta = finalContent.includes('id="beta"') && finalContent.includes("CONTENT BETA");
+      if (hasAlpha && hasBeta) {
+        bothPresentCount++;
+      } else {
+        dataLossCount++;
+        dataLossDetails.push({ trial, hasAlpha, hasBeta, finalContent });
+      }
+    }
+
+    report(
+      "5.3 concurrent reconciles with DIFFERENT blockIds never silently drop one block " +
+        `(${bothPresentCount}/${DIFF_TRIALS} trials had both blocks present)`,
+      dataLossCount === 0,
+      dataLossCount === 0 ? undefined : `lost data in ${dataLossCount}/${DIFF_TRIALS} trials: ${JSON.stringify(dataLossDetails.slice(0, 3))}`
+    );
+
+    // Whichever trial's final content we still have on disk, it must also
+    // parse as two well-formed, independently-extractable blocks via the
+    // module's own findBlock() -- not just a string .includes() coincidence.
+    if (fs.existsSync(target)) {
+      const finalRaw = fs.readFileSync(target, "utf8");
+      const alphaBlock = reconcileLib.findBlock(finalRaw, "alpha");
+      const betaBlock = reconcileLib.findBlock(finalRaw, "beta");
+      report(
+        "5.4 final file's last trial output has both blocks well-formed per findBlock()",
+        !!alphaBlock && !!betaBlock && alphaBlock.body === "CONTENT ALPHA\n" && betaBlock.body === "CONTENT BETA\n",
+        JSON.stringify({ alphaBlock, betaBlock })
+      );
+    } else {
+      report("5.4 final file's last trial output has both blocks well-formed per findBlock()", "SKIP", "no file left from last trial");
+    }
+  } finally {
+    cleanup(diffDir);
   }
 }
 
