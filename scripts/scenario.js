@@ -109,6 +109,51 @@ function buildPipelineSteps(f, scenario) {
   return pipelineSteps;
 }
 
+/* Outcomes whose truth does NOT depend on where a wall-clock boundary falls.
+ *
+ * `complete` and `crash-recovered` are reached by finishing; `halt` is reached by an
+ * unresolved intent. None of the three moves if every step is uniformly slower or faster,
+ * so per-tree timing perturbation can vary them safely and is worth keeping there --
+ * that variation is what surfaces genuine timing fragility in the runner.
+ *
+ * `budget-exceeded` is the opposite: the expectation IS a wall-clock boundary, so
+ * perturbing timing decides the verdict. It is deliberately absent from this set.
+ *
+ * The set is written as an ALLOW-list of the invariant outcomes rather than a deny-list of
+ * the sensitive ones, and that direction is the whole point. A deny-list ("skip the
+ * `*-budget-fail` family", or "skip outcome === 'budget-exceeded'") silently starts
+ * perturbing the next timing-sensitive outcome somebody adds, and the failure is a wrong
+ * verdict rather than a red test -- the exact way this defect class keeps regrowing. An
+ * unknown outcome lands OUTSIDE this set and is therefore left unperturbed: the new
+ * scenario is merely deterministic until someone classifies it, instead of quietly
+ * reporting coin flips. */
+const TIMING_INVARIANT_OUTCOMES = new Set(["complete", "crash-recovered", "halt"]);
+
+/* Issue #11. Worker delay was scaled by `sha256("scale:"+treeId)[0]/64` (0 - 3.98x) while
+ * the manager budget was shifted by `sha256("budget:"+treeId)[1]*5-200` (-200 - +1075ms) --
+ * two INDEPENDENT draws, so whether a tree's work fitted its budget was an arbitrary
+ * per-tree coin flip, while the verdict is an ABSOLUTE comparison against the scenario's
+ * frozen `expected` block (see `outcomeVerdict` and the `expected-steps` invariant).
+ *
+ * Measured over 200,000 tree ids on `pipeline-budget-fail` (workers 50/500/50, budget 200):
+ * the expectation was violated for 37.2% of them -- 29.2% where the budget drew so loose
+ * the pipeline never exceeded it at all, 8.0% where it drew so tight the run died at step
+ * one instead of step two. A candidate tree was being marked pass or fail on a boundary
+ * that had nothing to do with the tree.
+ *
+ * The alternative considered and rejected was to scale the BUDGET by the same factor as the
+ * work, which restores the ratio in principle. It does not survive contact with the runner:
+ * `saveCheckpoint` fsyncs once per step and that cost does not scale, so as the factor
+ * shrinks the fixed per-step cost eats the scaled-down budget. Modelled against the same
+ * scenario, correlated scaling is exact at zero I/O latency but wrong for 6.7% of trees at
+ * 40ms per step -- reintroducing this defect class on contended Windows I/O, which is
+ * precisely the environment that produced every flake this component has had. Removing the
+ * perturbation where the expectation is the boundary is 0% at every latency modelled. */
+function perturbationSafe(scenario) {
+  const outcome = scenario && scenario.expected && scenario.expected.outcome;
+  return TIMING_INVARIANT_OUTCOMES.has(outcome);
+}
+
 function materializeFixture(scenario, workDir, treeId) {
   const f = scenario.fixture;
   fs.mkdirSync(path.join(workDir, "workers"), { recursive: true });
@@ -156,8 +201,14 @@ function generateWorker(name, cfg, scenario, treeId) {
   const baseDelay = cfg.delay_ms || 50;
   const behavior = cfg.behavior || "ok";
 
+  /* The gate lives HERE, not in the caller. An earlier draft made the decision in
+   * `materializeFixture` and handed the generators a pre-gated id; the regression suite
+   * caught it immediately by calling the generators directly and getting perturbed numbers
+   * back. One place deciding while another place acts is precisely the split that produced
+   * this defect, so the generators refuse to perturb a boundary scenario no matter what id
+   * they are handed, and every present and future caller inherits that. */
   let delayMs = baseDelay;
-  if (treeId) {
+  if (treeId && perturbationSafe(scenario)) {
     const h = crypto.createHash("sha256").update("scale:" + treeId).digest();
     const scale = h[0] / 64;
     delayMs = Math.max(1, Math.round(baseDelay * scale));
@@ -204,7 +255,10 @@ module.exports.run = async (input, ctx) => {
 
 function generateManager(scenario, treeId) {
   let budgetMs = scenario.fixture.budget_ms || 0;
-  if (treeId && budgetMs > 0) {
+  /* Same gate as generateWorker, for the same reason. These two draws were independent of
+   * each other, which is the defect; they are now jointly disabled on exactly the scenarios
+   * whose verdict a draw would decide. */
+  if (treeId && budgetMs > 0 && perturbationSafe(scenario)) {
     const h = crypto.createHash("sha256").update("budget:" + treeId).digest();
     const offset = h[1] * 5 - 200;
     budgetMs = Math.max(1, budgetMs + offset);
@@ -752,6 +806,15 @@ async function selftest() {
   if (errors.length > 0) process.exit(1);
   process.stderr.write("selftest: PASS (determinism verified, schema valid, " + testScenarios.length + " scenarios)\n");
 }
+
+/* Requiring this file must not run the CLI. The regression suite for issue #11 asserts on
+ * the perturbation DECISION and on the generated sources directly, because asserting on a
+ * replayed outcome would make the test for a timing defect itself timing-dependent. Both
+ * exports are pure functions of their arguments; nothing else is exposed and the CLI path
+ * below is unchanged when this file is executed. */
+module.exports = { perturbationSafe, generateManager, generateWorker, TIMING_INVARIANT_OUTCOMES };
+
+if (require.main !== module) return;
 
 (async () => {
   const args = parseArgs(process.argv.slice(2));
