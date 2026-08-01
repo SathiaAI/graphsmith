@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "graphsmith",
+  "displayName": "GraphSmith",
+  "version": "0.5.0",
+  "description": "SessionStart and SubagentStart hooks that inject the GraphSmith multi-agent discipline (from the repo's canonical SKILL.md) into context for every session and every Task-spawned subagent from the moment it starts.",
+  "author": {
+    "name": "SathiaAI",
+    "url": "https://github.com/SathiaAI"
+  },
+  "homepage": "https://github.com/SathiaAI/graphsmith",
+  "repository": "https://github.com/SathiaAI/graphsmith",
+  "license": "MIT",
+  "keywords": [
+    "agent-skills",
+    "ai-agents",
+    "multi-agent",
+    "orchestration",
+    "hooks",
+    "claude-code-plugin"
+  ],
+  "hooks": "./hooks/graphsmith-hooks.json"
+}

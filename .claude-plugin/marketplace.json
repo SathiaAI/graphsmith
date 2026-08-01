@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "graphsmith-marketplace",
+  "owner": {
+    "name": "SathiaAI",
+    "url": "https://github.com/SathiaAI"
+  },
+  "description": "GraphSmith: lifecycle hooks that keep every Claude Code session and every Task-spawned subagent grounded in the GraphSmith multi-agent discipline from the moment they start.",
+  "plugins": [
+    {
+      "name": "graphsmith",
+      "source": "./plugins/graphsmith-hooks",
+      "description": "SessionStart and SubagentStart hooks that inject the GraphSmith discipline (SKILL.md) into context. Writes nothing into the target repo; all state lives in Claude Code's own config directory.",
+      "version": "0.5.0",
+      "author": {
+        "name": "SathiaAI",
+        "url": "https://github.com/SathiaAI"
+      },
+      "license": "MIT",
+      "keywords": [
+        "agent-skills",
+        "multi-agent",
+        "orchestration",
+        "hooks"
+      ]
+    }
+  ]
+}
