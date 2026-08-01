@@ -164,23 +164,59 @@ function recoverSparesALiveStagingDirectory() {
   const p = paths(root);
   fs.mkdirSync(p.staging, { recursive: true });
 
-  const live = path.join(p.staging, "aaaaaaaaaaaaaaaa.deadbeefdeadbeef");
+  /* Ownership is in the NAME. The first version of this suite put it in a `.claim.json`
+   * inside the directory and pinned only the two easy states -- claim present with a live
+   * pid, and no claim at all. It passed 12/12 while a live stager that had created its
+   * directory but not yet written the claim was being deleted by a concurrent recover().
+   * Reproduced:
+   *
+   *   live stager dir exists before reclaim: true
+   *   reclaimed: [{"dir":"aaaa....deadbeefdeadbeef","txid":null,"pid":null}]
+   *   live stager dir exists AFTER reclaim: false
+   *
+   * Two reviewers found it independently on the shipped diff. The cases below walk the
+   * states that window created, which the file-based version could not express. */
+  const live = path.join(p.staging, `aaaaaaaaaaaaaaaa.deadbeefdeadbeef.${process.pid}`);
   fs.mkdirSync(live, { recursive: true });
-  fs.writeFileSync(path.join(live, ".claim.json"), `${JSON.stringify({
-    schema_version: "1.0", txid: "aaaaaaaaaaaaaaaa", claim: "deadbeefdeadbeef", pid: process.pid,
-  })}\n`);
   fs.writeFileSync(path.join(live, "marker"), "work in progress");
 
-  const dead = path.join(p.staging, "bbbbbbbbbbbbbbbb.cafecafecafecafe");
-  fs.mkdirSync(dead, { recursive: true });
-  fs.writeFileSync(path.join(dead, ".claim.json"), `${JSON.stringify({
-    schema_version: "1.0", txid: "bbbbbbbbbbbbbbbb", claim: "cafecafecafecafe", pid: 999999,
-  })}\n`);
+  /* A live stager that has NOT yet written its claim file -- the exact window that deleted
+   * live work before. There is no claim file here at all, deliberately. */
+  const liveNoClaimFile = path.join(p.staging, `dddddddddddddddd.0f0f0f0f0f0f0f0f.${process.pid}`);
+  fs.mkdirSync(liveNoClaimFile, { recursive: true });
+  fs.writeFileSync(path.join(liveNoClaimFile, "marker"), "mid-window");
 
-  const unclaimed = path.join(p.staging, "cccccccccccccccc.0123456789abcdef");
-  fs.mkdirSync(unclaimed, { recursive: true });
+  /* A live stager whose claim file is truncated. Must not change the verdict, because the
+   * verdict does not read it. */
+  const liveBadClaim = path.join(p.staging, `eeeeeeeeeeeeeeee.1a1a1a1a1a1a1a1a.${process.pid}`);
+  fs.mkdirSync(liveBadClaim, { recursive: true });
+  fs.writeFileSync(path.join(liveBadClaim, ".claim.json"), '{"schema_version":"1.0","txi');
+  fs.writeFileSync(path.join(liveBadClaim, "marker"), "torn claim");
+
+  const dead = path.join(p.staging, "bbbbbbbbbbbbbbbb.cafecafecafecafe.999999");
+  fs.mkdirSync(dead, { recursive: true });
+
+  /* A name this protocol never wrote. Must be left alone and reported, not deleted --
+   * deleting something whose provenance cannot be established is how the previous version
+   * deleted live work. */
+  const foreign = path.join(p.staging, "not-ours-at-all");
+  fs.mkdirSync(foreign, { recursive: true });
+  fs.writeFileSync(path.join(foreign, "marker"), "someone else's");
 
   promoteModule.recover(root);
+
+  check("recover-spares-a-live-stager-that-has-not-written-its-claim-yet",
+    fs.existsSync(liveNoClaimFile) && fs.existsSync(path.join(liveNoClaimFile, "marker")),
+    "a staging directory owned by a live pid was deleted because its claim file did not " +
+    "exist yet -- the mkdir-to-claim window, which is the race that stopped this shipping");
+
+  check("recover-spares-a-live-stager-whose-claim-file-is-torn",
+    fs.existsSync(liveBadClaim) && fs.existsSync(path.join(liveBadClaim, "marker")),
+    "an unparseable claim file changed the reclaim verdict for a live owner");
+
+  check("recover-leaves-a-staging-directory-it-does-not-recognise",
+    fs.existsSync(foreign) && fs.existsSync(path.join(foreign, "marker")),
+    "a directory whose name this protocol never wrote was deleted anyway");
 
   /* THE case the whole restructure turns on. `cleanupAbandonedStaging` deleted every
    * `.staging-*` it found, which was safe only while staging held the lock. Unlocked
@@ -189,17 +225,11 @@ function recoverSparesALiveStagingDirectory() {
     fs.existsSync(live) && fs.existsSync(path.join(live, "marker")),
     "recover() deleted a staging directory claimed by a live process");
 
+  /* And a dead owner is still collected, so a crashed promotion does not leak disk with
+   * nothing able to clear it. */
   check("recover-reclaims-a-staging-directory-whose-owner-is-dead",
     !fs.existsSync(dead),
-    "a staging directory owned by a pid that cannot be running was left behind, so an " +
-    "interrupted promotion leaks disk with no command able to clear it");
-
-  /* A directory created but never claimed is the crash window between `mkdirSync` and the
-   * claim write. Nobody can be running against it. Refusing forever would grow the disk
-   * with nothing able to clear it, which is the worse failure. */
-  check("recover-reclaims-an-unclaimed-staging-directory",
-    !fs.existsSync(unclaimed),
-    "a staging directory with no claim file survived reclamation");
+    "a staging directory owned by a pid that cannot be running was left behind");
 }
 
 /* ---------- a crash during staging must leave nothing that blocks the next run ---------- */
@@ -330,9 +360,137 @@ function preconditionsRefuseBeforeStaging() {
     "promotion that was refused -- the refusal should have happened before any copying");
 }
 
+/* ---------- a REAL live stager, frozen mid-copy, while recover() runs ---------- */
+
+function recoverSparesARealStagerFrozenMidCopy() {
+  const name = "recover-spares-a-REAL-stager-frozen-inside-the-tree-copy";
+  /* The hand-built cases above hand the reclaimer names this file wrote. A mutation control
+   * exposed what that misses: removing the pid from the name the PRODUCT writes did not
+   * fail them, because they kept using names with a pid in. Test and product could drift
+   * apart silently, which is how a suite passes 12/12 while the thing it guards is broken.
+   *
+   * This case never names a directory. It freezes a real promotion inside `fs.cpSync`,
+   * runs `recover()` from this process while it is frozen, and then requires the promotion
+   * to still complete. Whatever naming the product uses, this holds it. */
+  const root = fixture("realstage");
+  const announce = path.join(root, "announce2");
+  const release = path.join(root, "release2");
+  const outcome = path.join(root, "outcome2");
+  const preloadFile = path.join(root, "preload2.js");
+  fs.writeFileSync(preloadFile, PRELOAD);
+  const driver = path.join(root, "driver2.js");
+  fs.writeFileSync(driver, `
+    const fs = require("fs");
+    const { promote, __testing } = require(${JSON.stringify(PROMOTE)});
+    let result;
+    try { result = "STATE:" + promote(__testing.testPacket(${JSON.stringify(root)}, "frozen")).state; }
+    catch (e) { result = "CODE:" + e.code + " " + e.message; }
+    fs.writeFileSync(${JSON.stringify(outcome)}, result);
+  `);
+
+  const child = spawn(process.execPath, ["--require", preloadFile, driver], {
+    env: { ...process.env, GS_STAGE_ANNOUNCE: announce, GS_STAGE_RELEASE: release, GRAPHSMITH_TEST_MODE: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (d) => { stderr += d; });
+
+  const deadline = Date.now() + harnessDeadline(30000);
+  while (!fs.existsSync(announce) && Date.now() < deadline) {
+    try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } catch (e) {}
+  }
+  if (!fs.existsSync(announce)) {
+    try { fs.writeFileSync(release, "go"); } catch (e) {}
+    try { child.kill("SIGKILL"); } catch (e) {}
+    inconclusive(name, `the child never reached fs.cpSync (stderr: ${stderr.slice(0, 200)})`);
+    return;
+  }
+
+  const before = fs.existsSync(paths(root).staging) ? fs.readdirSync(paths(root).staging) : [];
+  /* The promotion is frozen inside the copy right now. This is the interleaving that could
+   * not occur while staging held the lock, and the one that stopped this shipping. */
+  let recoverThrew = null;
+  try { promoteModule.recover(root); } catch (error) { recoverThrew = error.code || error.message; }
+  const after = fs.existsSync(paths(root).staging) ? fs.readdirSync(paths(root).staging) : [];
+
+  fs.writeFileSync(release, "go");
+  const done = Date.now() + harnessDeadline(60000);
+  while (!fs.existsSync(outcome) && Date.now() < done) {
+    try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } catch (e) {}
+  }
+
+  check("recover-did-not-delete-the-frozen-stagers-directory",
+    before.length > 0 && after.length === before.length,
+    `staging went from ${JSON.stringify(before)} to ${JSON.stringify(after)} across a recover() ` +
+    `that ran while a promotion was frozen inside its tree copy (recover threw: ${recoverThrew})`);
+
+  const reported = fs.existsSync(outcome) ? fs.readFileSync(outcome, "utf8").trim() : "(none)";
+  check(name, reported === "STATE:DONE",
+    `the frozen promotion reported ${JSON.stringify(reported)} after a concurrent recover(). ` +
+    "A recover() running beside an unlocked stager must not destroy its work.");
+}
+
+/* ---------- a payload that diverges from its manifest must not be published ---------- */
+
+function aTamperedPayloadIsNotPublished() {
+  const name = "a-payload-modified-after-verification-is-refused-at-install";
+  /* The first version re-hashed only `tree.manifest.json` under the lock and argued that
+   * content-addressing made that enough. Three reviewers rejected it on the same ground:
+   * the tree NAME is derived from the manifest, so a payload that diverges from a manifest
+   * which still hashes correctly publishes a `v-` tree whose name is honest and whose
+   * contents are not. The full closed-inventory verification now runs under the lock, on
+   * what was actually published. This case is what holds it there. */
+  const root = fixture("tamper");
+  const preloadFile = path.join(root, "tamper-preload.js");
+  /* The tamper has to land in the WINDOW: after the unlocked `verifyTree` has passed, and
+   * before the install. Hooking `fs.cpSync` was the first attempt and proved nothing -- the
+   * manifest is generated AFTER the copy, so it was simply generated from the tampered
+   * content and matched it. Nothing diverged and the case reported DONE.
+   *
+   * `fs.renameSync` is the install itself, so wrapping it puts the mutation exactly in the
+   * gap the reviewers named: manifest already written and verified, payload changed, tree
+   * about to be published under a name derived from the untouched manifest. */
+  fs.writeFileSync(preloadFile, `
+    const fs = require("fs");
+    const path = require("path");
+    const realRename = fs.renameSync;
+    let fired = false;
+    fs.renameSync = function (from, to, ...rest) {
+      if (!fired && typeof from === "string" && from.indexOf("staging") !== -1) {
+        fired = true;
+        try {
+          const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) =>
+            e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
+          const victim = walk(from).find((f) => !f.endsWith("tree.manifest.json"));
+          if (victim) fs.appendFileSync(victim, "\\ntampered between verification and install\\n");
+        } catch (e) {}
+      }
+      return realRename.call(this, from, to, ...rest);
+    };
+  `);
+  const driver = path.join(root, "tamper-driver.js");
+  fs.writeFileSync(driver, `
+    const { promote, __testing } = require(${JSON.stringify(PROMOTE)});
+    try { const r = promote(__testing.testPacket(${JSON.stringify(root)}, "tampered")); console.log("STATE:" + r.state); }
+    catch (e) { console.log("CODE:" + e.code); }
+  `);
+  const r = require("child_process").spawnSync(process.execPath, ["--require", preloadFile, driver], {
+    env: { ...process.env, GRAPHSMITH_TEST_MODE: "1" }, timeout: harnessDeadline(60000), encoding: "utf8",
+  });
+  if (r.error && r.error.code === "ETIMEDOUT") { inconclusive(name, "the tamper driver exceeded the harness timeout"); return; }
+  const out = `${r.stdout || ""}`.trim();
+
+  check(name, /CODE:(VALIDATION_FAILED|HALT)/.test(out),
+    `expected the promotion to refuse a tree whose payload no longer matches its manifest, ` +
+    `got ${JSON.stringify(out)} (stderr ${String(r.stderr || "").slice(0, 200)}). Publishing it ` +
+    "would give a v- tree an honest name over dishonest contents.");
+}
+
 function main() {
   lockIsFreeDuringStaging();
   preconditionsRefuseBeforeStaging();
+  recoverSparesARealStagerFrozenMidCopy();
+  aTamperedPayloadIsNotPublished();
   recoverSparesALiveStagingDirectory();
   crashDuringStagingLeavesAReclaimableOrphan();
   stagingAgainstAStaleBaseRefuses();

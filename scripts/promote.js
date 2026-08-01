@@ -355,9 +355,30 @@ function stageUnlocked(paths, packet, txid, currentPointer) {
    * private directory name once staging is concurrent. The random claim makes the
    * directory this ATTEMPT's, and `mkdirSync` without `recursive` is the atomic primitive
    * that proves it: it fails rather than joining an existing directory. */
+  /* THE OWNER'S PID IS IN THE DIRECTORY NAME, not only in a file inside it.
+   *
+   * The first version wrote a `.claim.json` after `mkdirSync` and let the reclaimer read
+   * it, treating "no readable claim" as "nobody can be running against this". That was
+   * wrong and it was reproduced: a stager that had created its directory but not yet
+   * written the claim had its work deleted by a concurrent `recover()` --
+   *
+   *   live stager dir exists before reclaim: true
+   *   reclaimed: [{"dir":"aaaaaaaaaaaaaaaa.deadbeefdeadbeef","txid":null,"pid":null}]
+   *   live stager dir exists AFTER reclaim: false
+   *
+   * -- a race that could not exist while staging held the lock, introduced by the very
+   * change that took staging out of it. Two reviewers named it independently as the reason
+   * not to ship.
+   *
+   * Putting the pid in the name removes the window rather than narrowing it: the evidence
+   * of ownership exists at the instant the directory does, because it IS the directory.
+   * It also answers the rest of that objection at once -- there is no file to be partially
+   * written, unparseable, empty, or stamped with a schema version the reader does not know,
+   * because the reclaim decision reads no file at all. */
   const claim = claimToken();
-  const temporary = path.join(paths.staging, `${txid}.${claim}`);
+  const temporary = path.join(paths.staging, `${txid}.${claim}.${process.pid}`);
   fs.mkdirSync(temporary);
+  /* Still written, but only as a record for the journal -- never as reclaim evidence. */
   fs.writeFileSync(stagingClaimPath(temporary), `${JSON.stringify({
     schema_version: SCHEMA_VERSION, txid, claim, pid: process.pid,
   })}\n`);
@@ -752,10 +773,24 @@ function promote(input) {
       tree: staged.tree, tree_manifest_sha: staged.manifestSha, from_pointer: active.pointer, to_pointer: toPointer,
     });
     phase = "STAGED";
-    /* Verification of the tree's full closed inventory happened in phase 1. What remains is
-     * the identity of what was actually PUBLISHED, which is one small file. */
-    const publishedManifest = sha256(readFile(path.join(staged.treeDir, "tree.manifest.json")));
-    if (publishedManifest !== staged.manifestSha) {
+    /* THE FULL CLOSED-INVENTORY VERIFICATION RUNS HERE, ON WHAT WAS ACTUALLY PUBLISHED.
+     *
+     * An earlier version of this change re-hashed only `tree.manifest.json` under the lock
+     * and argued that content-addressing made that sufficient. Three reviewers rejected the
+     * argument on the same ground and they were right: the tree name is derived from the
+     * MANIFEST, so a payload that diverges from a manifest which still hashes correctly
+     * publishes a `v-` tree whose name is honest and whose contents are not. The check was
+     * about a different boundary than the claim, one more time.
+     *
+     * Measured before restoring it, on a 1000-file / 19MB tree: the copy is 338ms, building
+     * the manifest 105ms, and this verification 98ms. Paying it under the lock costs 18% of
+     * the staging work and leaves the other 82% -- the copy and the manifest build --
+     * outside. That is the whole benefit of the split, kept, without weakening what the
+     * transaction guarantees about what it published. This is also exactly where the
+     * pre-split code verified, so the ordering is restored rather than invented. */
+    const verification = verifyTree(path.join(staged.treeDir, "tree.manifest.json"), staged.treeDir);
+    if (!verification.ok) throw failure("Published tree failed closed-inventory verification", "VALIDATION_FAILED", verification);
+    if (sha256(readFile(path.join(staged.treeDir, "tree.manifest.json"))) !== staged.manifestSha) {
       throw failure(`Published tree ${staged.tree} does not carry the verified manifest`, "HALT");
     }
     expectedState(paths, active.sha, head, "validate");
@@ -898,14 +933,18 @@ function reclaimAbandonedStaging(paths) {
   const reclaimed = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    const dir = path.join(paths.staging, entry.name);
-    let claim = null;
-    try { claim = JSON.parse(fs.readFileSync(stagingClaimPath(dir), "utf8")); }
-    catch (error) { /* unclaimed or unreadable: see above */ }
-
-    if (claim && ownerAlive(claim.pid)) continue;   // someone is still staging into it
-    discardStaging(dir);
-    reclaimed.push({ dir: entry.name, txid: claim && claim.txid, pid: claim && claim.pid });
+    const parsed = /^([0-9a-f]{16})\.([0-9a-f]{16})\.([0-9]{1,10})$/.exec(entry.name);
+    if (!parsed) {
+      /* A name this protocol did not write. Deleting something whose provenance we cannot
+       * establish is how the previous version deleted live work; refusing is the safe
+       * direction, and an operator can see it named in the journal. */
+      reclaimed.push({ dir: entry.name, txid: null, pid: null, action: "left-unrecognised" });
+      continue;
+    }
+    const pid = Number(parsed[3]);
+    if (ownerAlive(pid)) continue;   // someone is still staging into it
+    discardStaging(path.join(paths.staging, entry.name));
+    reclaimed.push({ dir: entry.name, txid: parsed[1], pid, action: "reclaimed" });
   }
   return reclaimed;
 }
