@@ -1,0 +1,573 @@
+"use strict";
+
+/* tests/reconcile/run-tests.js — Lane A adversarial suite for
+ * scripts/reconcile.js.
+ *
+ * Standalone, framework-free, mirrors the repo's own
+ * tests/<component>/<family>/run-tests.js convention (see e.g.
+ * tests/verify/deepseek/run-tests.js): report()/PASS-FAIL-SKIP, exit 1 on
+ * any failure. Discoverable by scripts/ci-run-suites.js's literal
+ * "run-tests.js" filename walk.
+ *
+ * Every ADVERSARIAL TEST listed in the Lane A brief is implemented below as
+ * an executable check, not a description:
+ *   - symlink-out-of-tree write-through refusal
+ *   - kill-mid-write atomicity (temp file + rename, never in-place)
+ *   - marker-lookalike text in user prose is not misparsed as a real marker
+ *   - two concurrent reconcile processes against the same file
+ *   - CRLF / BOM / mixed line endings
+ *   - old-schema-version call against an already-newer-spliced file, and the reverse
+ *
+ * Each of the "confirm this actually catches a regression" tests (atomicity,
+ * symlink refusal) was run once against a DELIBERATELY BROKEN copy of
+ * scripts/reconcile.js and confirmed to fail, then re-run against the real
+ * file and confirmed to pass -- see the accompanying report, not encoded
+ * here (that check is inherently a two-run manual process, not something a
+ * single automated suite run can self-demonstrate).
+ */
+
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const cp = require("child_process");
+
+const RECONCILE_PATH = path.resolve(__dirname, "..", "..", "scripts", "reconcile.js");
+const reconcileLib = require(RECONCILE_PATH);
+const { reconcile } = reconcileLib;
+
+let passed = 0;
+let failed = 0;
+let skipped = 0;
+
+function report(name, ok, detail) {
+  if (ok === true) {
+    console.log(`PASS: ${name}`);
+    passed++;
+  } else if (ok === false) {
+    console.log(`FAIL: ${name}${detail ? " -- " + detail : ""}`);
+    failed++;
+  } else {
+    console.log(`SKIP: ${name}${detail ? " -- " + detail : ""}`);
+    skipped++;
+  }
+}
+
+function tmpDir(label) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), `gs-reconcile-${label}-`));
+}
+
+function cleanup(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (_) {
+    /* best-effort */
+  }
+}
+
+// ===========================================================================
+// GROUP 1: core four-way state machine (sanity baseline the adversarial
+// tests below build on)
+// ===========================================================================
+function groupCoreStateMachine() {
+  console.log("\n=== GROUP 1: core four-way state machine ===");
+  const dir = tmpDir("core");
+  try {
+    const target = path.join(dir, "AGENTS.md");
+
+    // absent -> created
+    let r = reconcile(target, "Hello from GraphSmith.", { blockId: "graphsmith" });
+    report("1.1 absent -> created", r.status === "created", JSON.stringify(r));
+    const afterCreate = fs.readFileSync(target, "utf8");
+    report(
+      "1.2 created content has well-formed markers",
+      afterCreate ===
+        '<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\nHello from GraphSmith.\n<!-- graphsmith:end id="graphsmith" -->\n',
+      JSON.stringify(afterCreate)
+    );
+
+    // present-current -> no-op
+    r = reconcile(target, "Hello from GraphSmith.", { blockId: "graphsmith" });
+    report("1.3 present-current -> unchanged (no-op)", r.status === "unchanged" && r.bytesWritten === 0, JSON.stringify(r));
+    const afterNoop = fs.readFileSync(target, "utf8");
+    report("1.4 unchanged did not touch bytes", afterNoop === afterCreate);
+
+    // present-drifted -> spliced in place
+    r = reconcile(target, "Hello v2 from GraphSmith.", { blockId: "graphsmith" });
+    report("1.5 present-drifted -> spliced", r.status === "spliced", JSON.stringify(r));
+    const afterSplice = fs.readFileSync(target, "utf8");
+    report(
+      "1.6 splice replaced only the block body",
+      afterSplice ===
+        '<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\nHello v2 from GraphSmith.\n<!-- graphsmith:end id="graphsmith" -->\n'
+    );
+
+    // present-no-markers -> append, preserving existing content byte-for-byte
+    const other = path.join(dir, "OTHER.md");
+    fs.writeFileSync(other, "# My repo\n\nSome user prose that has nothing to do with GraphSmith.\n");
+    const beforeAppend = fs.readFileSync(other, "utf8");
+    r = reconcile(other, "Block content.", { blockId: "graphsmith" });
+    report("1.7 present-no-markers -> appended", r.status === "appended", JSON.stringify(r));
+    const afterAppend = fs.readFileSync(other, "utf8");
+    report("1.8 append preserved original bytes as a prefix", afterAppend.startsWith(beforeAppend.replace(/\s+$/, "")));
+    report(
+      "1.9 append added a well-formed block",
+      afterAppend.includes('<!-- graphsmith:begin id="graphsmith" schema_version="1" -->') &&
+        afterAppend.includes('<!-- graphsmith:end id="graphsmith" -->')
+    );
+
+    // re-running reconcile against the appended file with the same block is idempotent
+    r = reconcile(other, "Block content.", { blockId: "graphsmith" });
+    report("1.10 re-reconciling appended file -> unchanged (idempotent)", r.status === "unchanged", JSON.stringify(r));
+
+    // distinct blockIds coexist in one file without colliding
+    r = reconcile(other, "A second, unrelated block.", { blockId: "cursor" });
+    report("1.11 second distinct blockId -> appended alongside first", r.status === "appended", JSON.stringify(r));
+    const afterSecond = fs.readFileSync(other, "utf8");
+    report(
+      "1.12 both blocks present and independently addressable",
+      afterSecond.includes('id="graphsmith"') && afterSecond.includes('id="cursor"')
+    );
+    const rReread = reconcile(other, "Block content.", { blockId: "graphsmith" });
+    report("1.13 first block still unchanged after second block added", rReread.status === "unchanged", JSON.stringify(rReread));
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 2: symlink-out-of-tree refusal (no write-through)
+// ===========================================================================
+function groupSymlinkRefusal() {
+  console.log("\n=== GROUP 2: symlink out-of-tree refusal ===");
+  const dir = tmpDir("symlink");
+  try {
+    const outsideDir = tmpDir("symlink-outside");
+    try {
+      const outsideFile = path.join(outsideDir, "secret.txt");
+      const outsideOriginal = "THIS FILE MUST NEVER BE MODIFIED BY THE RECONCILER\n";
+      fs.writeFileSync(outsideFile, outsideOriginal);
+
+      const target = path.join(dir, "AGENTS.md");
+      fs.symlinkSync(outsideFile, target);
+
+      const r = reconcile(target, "Should never land anywhere.", { blockId: "graphsmith" });
+      report("2.1 symlinked target refused, not written", r.status === "refused" && r.reason === "symlink-refused", JSON.stringify(r));
+
+      const outsideAfter = fs.readFileSync(outsideFile, "utf8");
+      report("2.2 the symlink's real target was never written through", outsideAfter === outsideOriginal);
+
+      const lst = fs.lstatSync(target);
+      report("2.3 the symlink itself was left in place (not unlinked/replaced)", lst.isSymbolicLink());
+    } finally {
+      cleanup(outsideDir);
+    }
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 3: kill-mid-write atomicity. A real child process is started with
+// GRAPHSMITH_RECONCILE_TEST_STALL_MS set (see scripts/reconcile.js's
+// TEST-ONLY HOOK), stalled after the scratch temp file is fsynced but
+// BEFORE the rename onto the target, then SIGKILLed. The target must be
+// left exactly as it was before the run -- never partially written.
+// ===========================================================================
+function onExit(child) {
+  return new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runChildReconcileAndKill(target, blockId, renderedBlock, stallMs, killAfterMs) {
+  const script = [
+    `const { reconcile } = require(${JSON.stringify(RECONCILE_PATH)});`,
+    `reconcile(${JSON.stringify(target)}, ${JSON.stringify(renderedBlock)}, { blockId: ${JSON.stringify(blockId)} });`,
+  ].join("\n");
+  const child = cp.spawn(process.execPath, ["-e", script], {
+    env: Object.assign({}, process.env, { GRAPHSMITH_RECONCILE_TEST_STALL_MS: String(stallMs) }),
+    stdio: "ignore",
+  });
+  const exited = onExit(child); // must be attached before any await, so no 'exit' event is missed
+  const killedAt = Date.now();
+  await delay(killAfterMs); // a REAL (event-loop-yielding) sleep -- unlike Atomics.wait, this lets
+  // libuv's own SIGCHLD/reap machinery run, which matters below: a busy
+  // (event-loop-blocking) wait here previously left killed children as
+  // permanent zombies (Node's async reap never got a turn to run), which
+  // made the *next* liveness check see the OS process table entry as
+  // "still alive" forever and hang the suite. Real awaits fixed that.
+  let killSucceeded = false;
+  try {
+    child.kill("SIGKILL");
+    killSucceeded = true;
+  } catch (_) {
+    /* process may have already exited (raced past the stall) -- surfaced via exit code below */
+  }
+  // Wait for the real 'exit' event (bounded) so no in-flight temp
+  // file/handle from the child leaks into the next assertion.
+  await Promise.race([exited, delay(2000)]);
+  return { killSucceeded, elapsedMs: Date.now() - killedAt };
+}
+
+async function groupKillMidWrite() {
+  console.log("\n=== GROUP 3: kill mid-write atomicity ===");
+  const dir = tmpDir("killmidwrite");
+  try {
+    const target = path.join(dir, "AGENTS.md");
+    const original = '<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\nORIGINAL CONTENT\n<!-- graphsmith:end id="graphsmith" -->\n';
+    fs.writeFileSync(target, original);
+    const beforeStat = fs.statSync(target);
+
+    // Stall 1500ms before rename; kill after 300ms, well inside the stall
+    // window, well before any rename can occur.
+    const { killSucceeded } = await runChildReconcileAndKill(target, "graphsmith", "REPLACEMENT CONTENT that must never land", 1500, 300);
+    if (!killSucceeded) {
+      report("3.1 child process was killed mid-stall", "SKIP", "kill() threw; environment may not support SIGKILL delivery here");
+    } else {
+      report("3.1 child process was killed mid-stall", true);
+    }
+
+    const afterContent = fs.readFileSync(target, "utf8");
+    report("3.2 target file is byte-identical to before the killed run (no partial/corrupted write)", afterContent === original);
+
+    const afterStat = fs.statSync(target);
+    report("3.3 target file size unchanged", afterStat.size === beforeStat.size);
+
+    // No leftover scratch temp file should remain visible under the target's
+    // directory with content from the killed run -- best-effort check; a
+    // leaked temp file is a cleanliness issue, not a corruption issue, so
+    // this is informational rather than a hard requirement of "atomic".
+    const leftovers = fs.readdirSync(dir).filter((f) => f.includes(".graphsmith-reconcile."));
+    report(
+      "3.4 (informational) any leaked scratch temp file is NOT at the target path and target is untouched",
+      afterContent === original,
+      `leftover temp files present: ${leftovers.length}`
+    );
+
+    // Sanity: a NORMAL (non-killed) run after the killed one still
+    // completes and produces the expected spliced content -- proves the
+    // stall hook itself does not permanently break normal operation.
+    const r = reconcile(target, "NEW CONTENT AFTER NORMAL RUN", { blockId: "graphsmith" });
+    report("3.5 normal (non-killed) run after the killed one still succeeds", r.status === "spliced", JSON.stringify(r));
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 4: marker-lookalike text in user prose must not be misparsed
+// ===========================================================================
+function groupMarkerLookalike() {
+  console.log("\n=== GROUP 4: marker-lookalike text is not misparsed ===");
+  const dir = tmpDir("lookalike");
+  try {
+    // 4a: the exact marker text quoted mid-sentence (not alone on its own
+    // line) must not be treated as a real marker.
+    {
+      const target = path.join(dir, "midsentence.md");
+      const prose =
+        "# Docs\n\nThe reconciler looks for a line like `<!-- graphsmith:begin id=\"graphsmith\" schema_version=\"1\" -->` in the file.\n\nMore prose after.\n";
+      fs.writeFileSync(target, prose);
+      const before = fs.readFileSync(target, "utf8");
+      const r = reconcile(target, "Real block content.", { blockId: "graphsmith" });
+      report("4a.1 mid-sentence lookalike -> treated as no-markers (appended)", r.status === "appended", JSON.stringify(r));
+      const after = fs.readFileSync(target, "utf8");
+      report("4a.2 original prose (including the lookalike text) preserved verbatim", after.startsWith(before.replace(/\s+$/, "")));
+      report("4a.3 appended block is well-formed", after.includes('<!-- graphsmith:end id="graphsmith" -->'));
+    }
+
+    // 4b: case-difference lookalike on its own line must not match.
+    {
+      const target = path.join(dir, "wrongcase.md");
+      const prose = '# Docs\n\n<!-- GRAPHSMITH:BEGIN id="graphsmith" schema_version="1" -->\nsome text someone pasted, wrong case\n<!-- GRAPHSMITH:END id="graphsmith" -->\n';
+      fs.writeFileSync(target, prose);
+      const before = fs.readFileSync(target, "utf8");
+      const r = reconcile(target, "Real block content.", { blockId: "graphsmith" });
+      report("4b.1 wrong-case lookalike -> treated as no-markers (appended)", r.status === "appended", JSON.stringify(r));
+      const after = fs.readFileSync(target, "utf8");
+      report("4b.2 original wrong-case text preserved untouched", after.startsWith(before.replace(/\s+$/, "")));
+    }
+
+    // 4c: begin marker for a DIFFERENT blockId must not be treated as a
+    // match for this call's blockId -- it gets its own independent append.
+    {
+      const target = path.join(dir, "differentid.md");
+      fs.writeFileSync(
+        target,
+        '<!-- graphsmith:begin id="cursor" schema_version="1" -->\ncursor block\n<!-- graphsmith:end id="cursor" -->\n'
+      );
+      const r = reconcile(target, "graphsmith block content.", { blockId: "graphsmith" });
+      report("4c.1 different blockId's markers do not match this call", r.status === "appended", JSON.stringify(r));
+      const after = fs.readFileSync(target, "utf8");
+      report(
+        "4c.2 both blocks present afterward, cursor block untouched",
+        after.includes('id="cursor"') && after.includes("cursor block") && after.includes('id="graphsmith"')
+      );
+    }
+
+    // 4d: a begin marker with no matching end (malformed/truncated paste)
+    // must not be misparsed as a valid block to splice into -- falls back
+    // to append, and nothing existing is deleted.
+    {
+      const target = path.join(dir, "unterminated.md");
+      const prose = '# Docs\n\n<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\norphaned body, no end marker follows\n\nMore user prose after the orphan.\n';
+      fs.writeFileSync(target, prose);
+      const before = fs.readFileSync(target, "utf8");
+      const r = reconcile(target, "Real block content.", { blockId: "graphsmith" });
+      report("4d.1 unterminated begin marker -> treated as no valid block (appended)", r.status === "appended", JSON.stringify(r));
+      const after = fs.readFileSync(target, "utf8");
+      report("4d.2 nothing from the original file was deleted", after.startsWith(before.replace(/\s+$/, "")));
+    }
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 5: two concurrent reconcile processes against the same file
+// ===========================================================================
+async function groupConcurrentReconcile() {
+  console.log("\n=== GROUP 5: concurrent reconcile processes ===");
+  const dir = tmpDir("concurrent");
+  try {
+    const target = path.join(dir, "AGENTS.md");
+    // Neither process races the other into a corrupted/merged file: each
+    // computes and atomically installs a COMPLETE, well-formed file. The
+    // final result must be exactly one of the two valid full outputs, never
+    // a byte-level interleaving of both.
+    const scriptFor = (content) =>
+      [
+        `const { reconcile } = require(${JSON.stringify(RECONCILE_PATH)});`,
+        `reconcile(${JSON.stringify(target)}, ${JSON.stringify(content)}, { blockId: "graphsmith" });`,
+      ].join("\n");
+
+    const expectedA = '<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\nCONTENT FROM PROCESS A\n<!-- graphsmith:end id="graphsmith" -->\n';
+    const expectedB = '<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\nCONTENT FROM PROCESS B\n<!-- graphsmith:end id="graphsmith" -->\n';
+
+    const raceOutcomes = [];
+    const TRIALS = 8;
+    for (let trial = 0; trial < TRIALS; trial++) {
+      if (fs.existsSync(target)) fs.rmSync(target);
+      const pA = cp.spawn(process.execPath, ["-e", scriptFor("CONTENT FROM PROCESS A")], { stdio: "ignore" });
+      const pB = cp.spawn(process.execPath, ["-e", scriptFor("CONTENT FROM PROCESS B")], { stdio: "ignore" });
+      const exitedA = onExit(pA);
+      const exitedB = onExit(pB);
+      await Promise.race([Promise.all([exitedA, exitedB]), delay(5000)]);
+      const finalContent = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
+      raceOutcomes.push(finalContent);
+    }
+
+    const allWellFormed = raceOutcomes.every((c) => c === expectedA || c === expectedB);
+    report(
+      "5.1 concurrent reconciles never produce a torn/merged file (always exactly one full valid output)",
+      allWellFormed,
+      `outcomes: ${JSON.stringify(raceOutcomes)}`
+    );
+    report("5.2 all trials completed and produced a result", raceOutcomes.every((c) => c !== null), `outcomes: ${JSON.stringify(raceOutcomes)}`);
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 6: CRLF, BOM, mixed line endings
+// ===========================================================================
+function groupLineEndingsAndBom() {
+  console.log("\n=== GROUP 6: CRLF / BOM / mixed line endings ===");
+  const dir = tmpDir("eol");
+  try {
+    // 6a: pure CRLF file, no existing block -> append; existing CRLF bytes preserved.
+    {
+      const target = path.join(dir, "crlf.md");
+      const content = "# Title\r\n\r\nSome CRLF content.\r\n";
+      fs.writeFileSync(target, content);
+      const r = reconcile(target, "Block body.", { blockId: "graphsmith" });
+      report("6a.1 CRLF file with no markers -> appended without crashing", r.status === "appended", JSON.stringify(r));
+      const after = fs.readFileSync(target, "utf8");
+      report("6a.2 original CRLF bytes preserved as a prefix", after.startsWith(content.replace(/[\r\n]+$/, "")));
+      // Round trip: reconciling again with the same body must be a no-op.
+      const r2 = reconcile(target, "Block body.", { blockId: "graphsmith" });
+      report("6a.3 re-reconciling the CRLF-file result is idempotent (unchanged)", r2.status === "unchanged", JSON.stringify(r2));
+    }
+
+    // 6b: BOM-prefixed file -> BOM preserved across append and splice.
+    {
+      const target = path.join(dir, "bom.md");
+      const content = "﻿# Title\n\nSome content.\n";
+      fs.writeFileSync(target, content);
+      let r = reconcile(target, "Block body.", { blockId: "graphsmith" });
+      report("6b.1 BOM file -> appended", r.status === "appended", JSON.stringify(r));
+      let after = fs.readFileSync(target, "utf8");
+      report("6b.2 BOM preserved at byte 0 after append", after.charCodeAt(0) === 0xfeff);
+      report("6b.3 rest of original content preserved", after.includes("# Title") && after.includes("Some content."));
+
+      r = reconcile(target, "Block body v2.", { blockId: "graphsmith" });
+      report("6b.4 BOM file -> spliced on drift", r.status === "spliced", JSON.stringify(r));
+      after = fs.readFileSync(target, "utf8");
+      report("6b.5 BOM still preserved after splice", after.charCodeAt(0) === 0xfeff);
+    }
+
+    // 6c: mixed line endings (some \n, some \r\n) in a file already carrying
+    // a valid block -- splice must not corrupt the untouched surrounding
+    // mixed-EOL content.
+    {
+      const target = path.join(dir, "mixed.md");
+      const content =
+        "# Title\r\n\nMixed line endings above/below.\r\n\n" +
+        '<!-- graphsmith:begin id="graphsmith" schema_version="1" -->\nold body\n<!-- graphsmith:end id="graphsmith" -->\n' +
+        "\r\nTrailing mixed content.\n";
+      fs.writeFileSync(target, content);
+      const r = reconcile(target, "new body", { blockId: "graphsmith" });
+      report("6c.1 mixed-EOL file with existing block -> spliced", r.status === "spliced", JSON.stringify(r));
+      const after = fs.readFileSync(target, "utf8");
+      report("6c.2 content before the block preserved with its original EOLs", after.startsWith("# Title\r\n\nMixed line endings above/below.\r\n\n"));
+      report("6c.3 content after the block preserved with its original EOLs", after.endsWith("\r\nTrailing mixed content.\n"));
+      report("6c.4 block body actually updated", after.includes("new body") && !after.includes("old body"));
+    }
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 7: schema-version compatibility, both directions
+// ===========================================================================
+function groupSchemaVersionCompat() {
+  console.log("\n=== GROUP 7: schema-version compatibility (old vs. new, both directions) ===");
+  const dir = tmpDir("schemaver");
+  try {
+    // Direction 1: an "old" call (schemaVersion "1") encounters a file
+    // already spliced by a "newer" call (schemaVersion "2"). Must refuse,
+    // must not write.
+    {
+      const target = path.join(dir, "newer-first.md");
+      let r = reconcile(target, "content from the newer schema", { blockId: "graphsmith", schemaVersion: "2" });
+      report("7.1 setup: newer-schema call creates the file", r.status === "created" && r.schemaVersion === "2", JSON.stringify(r));
+      const before = fs.readFileSync(target, "utf8");
+
+      r = reconcile(target, "content an older-schema caller would have written", { blockId: "graphsmith", schemaVersion: "1" });
+      report(
+        "7.2 older-schema call against a newer-spliced file is refused",
+        r.status === "refused" && r.reason === "future-schema-version" && r.foundSchemaVersion === "2",
+        JSON.stringify(r)
+      );
+      const after = fs.readFileSync(target, "utf8");
+      report("7.3 refused call did not modify the file at all", after === before);
+    }
+
+    // Direction 2 (the reverse): a "newer" call (schemaVersion "2")
+    // encounters a file written by an "older" call (schemaVersion "1").
+    // Must succeed (compatible), splice in place, and re-stamp the version.
+    {
+      const target = path.join(dir, "older-first.md");
+      let r = reconcile(target, "content from the older schema", { blockId: "graphsmith", schemaVersion: "1" });
+      report("7.4 setup: older-schema call creates the file", r.status === "created" && r.schemaVersion === "1", JSON.stringify(r));
+
+      r = reconcile(target, "content from the newer schema", { blockId: "graphsmith", schemaVersion: "2" });
+      report(
+        "7.5 newer-schema call against an older-schema file succeeds (splices, does not refuse)",
+        r.status === "spliced" && r.previousSchemaVersion === "1" && r.schemaVersion === "2",
+        JSON.stringify(r)
+      );
+      const after = fs.readFileSync(target, "utf8");
+      report("7.6 file now stamped with the newer schema version", after.includes('schema_version="2"'));
+      report("7.7 file body actually updated to the newer content", after.includes("content from the newer schema"));
+
+      // And now the file is at version 2; an old (version 1) call against
+      // it must again be refused -- confirms the upgrade "stuck" and isn't
+      // silently reversible by an older caller.
+      r = reconcile(target, "should not land", { blockId: "graphsmith", schemaVersion: "1" });
+      report("7.8 after upgrade, an old-schema call is refused again", r.status === "refused" && r.reason === "future-schema-version", JSON.stringify(r));
+    }
+
+    // Same version + same body -> unchanged even across two separately-typed calls.
+    {
+      const target = path.join(dir, "same-version.md");
+      reconcile(target, "stable content", { blockId: "graphsmith", schemaVersion: "3" });
+      const r = reconcile(target, "stable content", { blockId: "graphsmith", schemaVersion: "3" });
+      report("7.9 same schema version + identical body -> unchanged", r.status === "unchanged", JSON.stringify(r));
+    }
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 8: input validation / defensive checks
+// ===========================================================================
+function groupInputValidation() {
+  console.log("\n=== GROUP 8: input validation ===");
+  const dir = tmpDir("validation");
+  try {
+    const target = path.join(dir, "AGENTS.md");
+    let threw = false;
+    try {
+      reconcile(target, "x", { blockId: "Not_Valid_ID" });
+    } catch (e) {
+      threw = e instanceof TypeError;
+    }
+    report("8.1 invalid blockId throws TypeError", threw);
+
+    threw = false;
+    try {
+      reconcile(target, "x", { blockId: "graphsmith", schemaVersion: "not-a-number" });
+    } catch (e) {
+      threw = e instanceof TypeError;
+    }
+    report("8.2 invalid schemaVersion throws TypeError", threw);
+
+    threw = false;
+    try {
+      reconcile(target, 12345, { blockId: "graphsmith" });
+    } catch (e) {
+      threw = e instanceof TypeError;
+    }
+    report("8.3 non-string renderedBlock throws TypeError", threw);
+
+    // Refuse a directory target rather than crashing or writing through it.
+    fs.mkdirSync(target);
+    const r = reconcile(target, "x", { blockId: "graphsmith" });
+    report("8.4 directory at target path is refused, not written into", r.status === "refused" && r.reason === "target-not-a-file", JSON.stringify(r));
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
+// MAIN
+// ===========================================================================
+async function runAll() {
+  console.log("=== Lane A — tests/reconcile/run-tests.js ===");
+  console.log(`Started: ${new Date().toISOString()}\n`);
+
+  groupCoreStateMachine();
+  groupSymlinkRefusal();
+  await groupKillMidWrite();
+  groupMarkerLookalike();
+  await groupConcurrentReconcile();
+  groupLineEndingsAndBom();
+  groupSchemaVersionCompat();
+  groupInputValidation();
+
+  console.log("\n--- SUMMARY ---");
+  console.log(`PASS:  ${passed}`);
+  console.log(`FAIL:  ${failed}`);
+  console.log(`SKIP:  ${skipped}`);
+  console.log(`TOTAL: ${passed + failed + skipped}`);
+
+  if (failed > 0) {
+    console.log(`\n*** ${failed} TEST(S) FAILED ***`);
+    process.exit(1);
+  } else {
+    process.exit(0);
+  }
+}
+
+runAll().catch((e) => {
+  console.error("FATAL:", e && e.stack ? e.stack : e);
+  process.exit(2);
+});
