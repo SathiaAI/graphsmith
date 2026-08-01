@@ -20,7 +20,7 @@
     "lock": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "pid", "proc_start_hint", "owner_token"],
+      "required": ["schema_version", "pid", "owner_token"],
       "properties": {
         "schema_version": { "$ref": "#/$defs/version" },
         "pid": { "type": "integer", "minimum": 1 },
