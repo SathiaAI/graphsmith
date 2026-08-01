@@ -103,6 +103,30 @@
  * directory-entry update at the OS level and cannot itself produce a
  * half-written target. There is never a window where the target path holds
  * partial content.
+ *
+ * CONCURRENCY (two DIFFERENT blockIds racing on one file)
+ *
+ * Atomicity alone does not stop data loss: two concurrent reconcile() calls
+ * against the same targetPath -- even for different blockIds, which the
+ * module's own contract says "can coexist in one file without colliding" --
+ * each read the file once, each compute a COMPLETE new file content
+ * unaware of the other, and a plain atomic rename is a pure last-write-wins:
+ * whichever rename lands second silently discards the other call's block,
+ * with no error. This module uses optimistic concurrency control, not a
+ * lock file (a lock adds stale-lock-cleanup and deadlock surface area this
+ * project's zero-dependency, minimum-code posture would reject for a
+ * problem this narrow). atomicWriteFileSync() accepts an optional
+ * `verifyUnchanged` callback that runs immediately before the rename
+ * (after the new content is already fsynced) and re-checks that the
+ * target's on-disk state still matches what this call read at the START of
+ * its attempt. If it does not -- another process/thread's write landed
+ * first -- the rename is skipped and a ConcurrentModificationError is
+ * thrown instead of overwriting; reconcile() catches that, re-reads the
+ * now-current file, recomputes the block placement against the fresh
+ * content, and retries, up to MAX_CONCURRENT_ATTEMPTS times. Exhausting the
+ * retry budget throws a loud, explicit error rather than ever guessing --
+ * same "fail loud, never guess" posture as the future-schema-version
+ * refusal above.
  */
 
 "use strict";
@@ -116,9 +140,19 @@ const { writeReport } = require("./write-report.js");
 // this, and document why, only when the marker/body CONTRACT itself changes
 // in a way an old reconciler could not safely splice over (see the
 // SCHEMA-VERSION COMPATIBILITY note above). It is NOT this file's package
-// version and NOT GraphSmith's release version -- those change for reasons
+// version and NOT GraphSmith's release version — those change for reasons
 // unrelated to this one narrow contract.
 const DEFAULT_SCHEMA_VERSION = "1";
+
+// Bounded retry budget for the optimistic-concurrency-control loop (see the
+// CONCURRENCY note above): 1 initial attempt + up to 6 retries. Comfortably
+// inside the "small bounded retry count" this is meant to be -- each retry
+// only fires when another process/thread's write is caught landing between
+// this attempt's read and its rename, which real contention resolves in one
+// or two retries in practice. Exhausting the budget means something is
+// writing to targetPath continuously/pathologically fast; reconcile() fails
+// loud in that case rather than looping forever or guessing.
+const MAX_CONCURRENT_ATTEMPTS = 7;
 
 const BLOCK_ID_RE = /^[a-z][a-z0-9-]*$/; // same shape as host-adapter.schema.json's `id`
 const SCHEMA_VERSION_RE = /^[0-9]+$/;
@@ -136,6 +170,48 @@ const LINE_END = "(?:\\r\\n|\\n|$)";
 
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Guards against the CONTENT-EMBEDS-A-MARKER case, distinct from the
+// marker-lookalike-in-surrounding-prose case the exact anchored beginRegex/
+// endRegex above already handle safely. A caller's renderedBlock is not
+// under this module's control (it is Lane D's rendered output) and could
+// itself contain a line that is, verbatim, `<!-- graphsmith:begin ... -->`
+// or `<!-- graphsmith:end ... -->` -- for example because SKILL.md
+// documents this exact marker format elsewhere in the canonical source, and
+// a future edit echoes that documentation into a rendered block. If such a
+// line were embedded as-is, a later findBlock() scan over the FILE (which
+// has no way to distinguish "a real delimiter" from "delimiter-shaped text
+// that happens to be this block's own body") could match that lookalike
+// line as the closing marker instead of the real one, silently truncating
+// the block and orphaning everything after it on every subsequent
+// reconcile call. Anchored the same way beginRegex/endRegex are (line
+// start, "m" flag) but deliberately broader than either -- ANY blockId,
+// ANY schema_version, begin OR end -- because a lookalike for a different
+// id is exactly as corrupting to a naive scanner as one for this call's own
+// id.
+const MARKER_LOOKALIKE_RE = /^<!-- graphsmith:(?:begin|end)\b.*$/m;
+
+/**
+ * Refuse loudly (never guess, never silently corrupt) if `body` contains a
+ * line that could be mistaken for a real graphsmith marker once embedded.
+ * This is the same posture as Lane D's generator refusing to embed a raw
+ * newline in a YAML frontmatter scalar: fail at the point where the caller
+ * can actually do something about it (fix the canonical source), not later
+ * when a naive marker scan silently truncates the block.
+ */
+function assertNoMarkerLookalike(body) {
+  const m = MARKER_LOOKALIKE_RE.exec(body);
+  if (m) {
+    throw new TypeError(
+      "reconcile: renderedBlock contains a line that looks like a graphsmith " +
+        `marker (${JSON.stringify(m[0])}) and cannot be safely embedded as block ` +
+        "body content -- a future marker scan could match this lookalike line " +
+        "instead of the real begin/end delimiter and silently truncate the block. " +
+        "Refusing to write anything; fix the rendered block so no line at column 0 " +
+        'starts with "<!-- graphsmith:begin" or "<!-- graphsmith:end".'
+    );
+  }
 }
 
 function assertValidBlockId(blockId) {
@@ -177,6 +253,7 @@ function normalizeBody(renderedBlock) {
 }
 
 function buildBlock(blockId, schemaVersion, body) {
+  assertNoMarkerLookalike(body);
   return beginLine(blockId, schemaVersion) + body + endLine(blockId);
 }
 
@@ -243,13 +320,44 @@ function testStallBeforeRenameIfRequested() {
 }
 
 /**
- * Write `content` to `targetPath` atomically: full content to a scratch temp
- * file in the same directory, fsync, then a single rename onto the target.
- * Never opens `targetPath` itself for writing, so a symlink or any other
- * existing object at that path is replaced as a whole name-table entry
- * (POSIX rename semantics), never written through.
+ * Thrown by atomicWriteFileSync() when its `verifyUnchanged` callback
+ * reports that targetPath's on-disk state moved between this call's read
+ * and its rename -- i.e. another process/thread won the race. Not a real
+ * failure: reconcile()'s retry loop catches exactly this type and retries
+ * against fresh content. A distinct class (rather than a plain Error) so
+ * that catch site can't accidentally swallow an unrelated error from the
+ * same try block.
  */
-function atomicWriteFileSync(targetPath, content) {
+class ConcurrentModificationError extends Error {}
+
+/**
+ * Write `content` to `targetPath` atomically: full content to a scratch temp
+ * file in the same directory, fsync, then a single rename (or, for
+ * `createOnly`, a single link) onto the target. Never opens `targetPath`
+ * itself for writing, so a symlink or any other existing object at that
+ * path is replaced as a whole name-table entry (POSIX rename semantics),
+ * never written through.
+ *
+ * `verifyUnchanged`, if given, is called with no arguments immediately
+ * before the install (same point as the TEST-ONLY stall hook above, and
+ * after the stall hook if both are active). If it returns false, the
+ * install is skipped, the scratch temp file is cleaned up, and a
+ * ConcurrentModificationError is thrown instead -- see the CONCURRENCY note
+ * in the module docstring.
+ *
+ * `createOnly`, if true, installs via `fs.linkSync(tmpPath, targetPath)`
+ * instead of `fs.renameSync`. Unlike rename (which always succeeds and
+ * silently REPLACES an existing destination), link() is an atomic
+ * test-and-set at the OS level: it fails with EEXIST if targetPath now
+ * exists, with no gap for a second, equally-fast concurrent creator to slip
+ * through between a check and the install the way a `verifyUnchanged`
+ * read-then-write pair unavoidably has one. This closes the one case
+ * (both callers racing to CREATE the same absent target) where that narrow
+ * general-purpose gap was observed to be reachable in practice; the two
+ * dangling directory entries link() leaves behind (tmpPath and targetPath,
+ * same inode) are reconciled by unlinking tmpPath once link() succeeds.
+ */
+function atomicWriteFileSync(targetPath, content, verifyUnchanged, createOnly) {
   const dir = path.dirname(targetPath);
   const tmpPath = path.join(
     dir,
@@ -266,12 +374,37 @@ function atomicWriteFileSync(targetPath, content) {
   }
   try {
     testStallBeforeRenameIfRequested();
-    fs.renameSync(tmpPath, targetPath);
+    if (verifyUnchanged && !verifyUnchanged()) {
+      throw new ConcurrentModificationError(`reconcile: concurrent modification detected for ${targetPath}`);
+    }
+    if (createOnly) {
+      try {
+        fs.linkSync(tmpPath, targetPath);
+      } catch (e) {
+        if (e.code === "EEXIST") {
+          throw new ConcurrentModificationError(`reconcile: concurrent modification detected for ${targetPath}`);
+        }
+        throw e;
+      }
+      // link() succeeded -- targetPath is correctly installed. tmpPath is now
+      // a second directory entry for the SAME inode; remove it best-effort.
+      // A failure here is a cleanliness issue only, never a correctness one,
+      // so it must not be reported as this call's own failure.
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (_) {
+        /* best-effort */
+      }
+    } else {
+      fs.renameSync(tmpPath, targetPath);
+    }
   } catch (e) {
     try {
       fs.unlinkSync(tmpPath);
     } catch (_) {
-      /* best-effort cleanup; the rename error is the one that matters */
+      /* best-effort cleanup (already gone in the createOnly success path,
+       * or never existed to begin with on some other failure); the
+       * original error is the one that matters */
     }
     throw e;
   }
@@ -309,6 +442,11 @@ function baseResult(status, targetPath, blockId, schemaVersion, extra) {
  * @returns {object} a result with at least {status, path, blockId,
  *   schemaVersion}; `status: "refused"` results also carry `reason` and
  *   never write anything.
+ * @throws {Error} if MAX_CONCURRENT_ATTEMPTS is exhausted because another
+ *   process/thread keeps winning the race on targetPath -- see the
+ *   CONCURRENCY note in the module docstring. Nothing is left partially
+ *   written in that case; the target is exactly as some attempt (this call's
+ *   or a concurrent one's) left it.
  */
 function reconcile(targetPath, renderedBlock, options) {
   if (typeof targetPath !== "string" || targetPath.length === 0) {
@@ -321,6 +459,31 @@ function reconcile(targetPath, renderedBlock, options) {
   assertValidSchemaVersion(schemaVersion);
   const desiredBody = normalizeBody(renderedBlock); // validates renderedBlock is a string too
 
+  for (let attempt = 1; attempt <= MAX_CONCURRENT_ATTEMPTS; attempt++) {
+    try {
+      return attemptReconcile(targetPath, blockId, schemaVersion, desiredBody);
+    } catch (e) {
+      if (!(e instanceof ConcurrentModificationError)) throw e;
+      // Another process/thread's write landed between this attempt's read
+      // and its rename. Loop around: the next attemptReconcile() call reads
+      // targetPath fresh and recomputes the block placement against
+      // whatever is there now -- never guesses, never writes over it.
+    }
+  }
+  throw new Error(
+    `reconcile: exceeded ${MAX_CONCURRENT_ATTEMPTS} retries due to concurrent modification of ${targetPath}`
+  );
+}
+
+/**
+ * One attempt at the four-way state machine: read targetPath's current
+ * state, decide created/appended/unchanged/spliced/refused, and (for the
+ * three write outcomes) install the new content with a CAS check against
+ * this SAME attempt's snapshot immediately before the rename. Throws
+ * ConcurrentModificationError -- caught and retried by reconcile() above --
+ * if that check fails; never partially writes.
+ */
+function attemptReconcile(targetPath, blockId, schemaVersion, desiredBody) {
   let lst = null;
   try {
     lst = fs.lstatSync(targetPath);
@@ -342,7 +505,14 @@ function reconcile(targetPath, renderedBlock, options) {
     const dir = path.dirname(targetPath);
     fs.mkdirSync(dir, { recursive: true });
     const content = buildBlock(blockId, schemaVersion, desiredBody);
-    const bytesWritten = atomicWriteFileSync(targetPath, content);
+    // createOnly: true -- targetPath must still be absent when this
+    // installs, or a concurrent call (possibly for a different blockId)
+    // created it first and this write would silently discard that call's
+    // block. Uses fs.linkSync's atomic EEXIST-on-conflict semantics rather
+    // than a separate lstat-then-rename check, which would leave a real
+    // (if narrow) gap for two equally-fast concurrent creators -- see
+    // atomicWriteFileSync's `createOnly` doc above.
+    const bytesWritten = atomicWriteFileSync(targetPath, content, null, /* createOnly */ true);
     return baseResult("created", targetPath, blockId, schemaVersion, { bytesWritten });
   }
 
@@ -350,6 +520,21 @@ function reconcile(targetPath, renderedBlock, options) {
   const hasBom = rawWithBom.charCodeAt(0) === 0xfeff;
   const bom = hasBom ? String.fromCharCode(0xfeff) : "";
   const raw = hasBom ? rawWithBom.slice(1) : rawWithBom;
+
+  // CAS check for the two write outcomes below (appended, spliced): the
+  // full file content (BOM included) must still be byte-identical to
+  // rawWithBom, captured above, right before the rename. Any divergence --
+  // a concurrent call's own write, the file being deleted, replaced by a
+  // symlink, etc. -- fails the check and triggers a retry from fresh state.
+  const verifyUnchanged = () => {
+    let current;
+    try {
+      current = fs.readFileSync(targetPath, "utf8");
+    } catch (_) {
+      return false;
+    }
+    return current === rawWithBom;
+  };
 
   const found = findBlock(raw, blockId);
 
@@ -362,7 +547,7 @@ function reconcile(targetPath, renderedBlock, options) {
     // the file was empty.
     const trimmedRaw = raw.replace(/[ \t\r\n]+$/, "");
     const newRaw = trimmedRaw.length === 0 ? blockText : `${trimmedRaw}\n\n${blockText}`;
-    const bytesWritten = atomicWriteFileSync(targetPath, bom + newRaw);
+    const bytesWritten = atomicWriteFileSync(targetPath, bom + newRaw, verifyUnchanged);
     return baseResult("appended", targetPath, blockId, schemaVersion, { bytesWritten });
   }
 
@@ -389,7 +574,7 @@ function reconcile(targetPath, renderedBlock, options) {
   // splice only the marker-bounded region in place. ----
   const blockText = buildBlock(blockId, schemaVersion, desiredBody);
   const newRaw = raw.slice(0, found.blockStart) + blockText + raw.slice(found.blockEnd);
-  const bytesWritten = atomicWriteFileSync(targetPath, bom + newRaw);
+  const bytesWritten = atomicWriteFileSync(targetPath, bom + newRaw, verifyUnchanged);
   return baseResult("spliced", targetPath, blockId, schemaVersion, {
     bytesWritten,
     previousSchemaVersion: found.schemaVersion,
