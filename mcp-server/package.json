@@ -1,0 +1,35 @@
+{
+  "name": "graphsmith-mcp-server",
+  "version": "0.1.0",
+  "description": "Stateless-native MCP server that hands agent hosts GraphSmith's canonical guidance (SKILL.md) back as a single read-only tool call. Implements the MCP stateless protocol (SEP-2575, 2026-07-28) with a legacy initialize handshake kept as a load-bearing compatibility fallback.",
+  "bin": {
+    "graphsmith-mcp": "bin/graphsmith-mcp.js"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "SKILL.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SathiaAI/graphsmith.git",
+    "directory": "mcp-server"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agent-skills",
+    "graphsmith",
+    "stateless-mcp"
+  ],
+  "license": "MIT",
+  "dependencies": {}
+}
