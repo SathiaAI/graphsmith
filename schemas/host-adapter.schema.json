@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://graphsmith.ai/schemas/host-adapter.schema.json",
   "title": "GraphSmith Host Adapter",
-  "description": "Contract every Lane D (canonical-to-surfaces generator) adapter implements. An adapter takes GraphSmith's canonical skill definition (repo root SKILL.md) and renders it for one specific agent host. Frozen in v0.5.0 Wave 0 -- see .plans/v0.5.0/WAVE-0-CANONICAL-SOURCE.md for the decision this formalizes. Post-Wave-0 addendum (2026-08-01, follow-up to PR #12's adversarial review): added the schemaVersion field below so future extensions (e.g. the 'source' enum bump this doc's own field description already anticipates) have a machine-readable marker to key off, instead of relying on adapters and the generator staying implicitly in sync.",
+  "description": "Contract every Lane D (canonical-to-surfaces generator) adapter implements. An adapter takes GraphSmith's canonical skill definition (repo root SKILL.md) and renders it for one specific agent host. Frozen in v0.5.0 Wave 0 -- see .plans/v0.5.0/WAVE-0-CANONICAL-SOURCE.md for the decision this formalizes. Post-Wave-0 addendum (2026-08-01, extracted from an independent review of cosmtrek/mindwalk's adapter-schema testing discipline): added the schemaVersion field below so future extensions (e.g. the 'source' enum bump this doc's own field description already anticipates) have a machine-readable marker to key off, instead of relying on adapters and the generator staying implicitly in sync.",
   "type": "object",
   "required": ["schemaVersion", "id", "displayName", "targetPath", "placementMode", "outputFormat", "bodyTransform"],
   "properties": {
