@@ -680,18 +680,39 @@ class StateStore {
          * tolerance nothing changes: `unrenewed` is false for a small age, so the two
          * original gates decide exactly as they did before, and the state self-heals as
          * real time passes. */
-        const skewed = age < -LOCK_CLOCK_SKEW_TOLERANCE_MS;
-        if (skewed) {
-          if (!ownerAlive) {
-            requiredString(observed.record.owner_token, "state.lock owner_token");
-            try {
-              if (!this._unlinkLockIfOwner(observed.record.owner_token)) continue;
-            } catch (stealError) {
-              if (stealError.code === "ENOENT") continue;
-              throw stealError;
-            }
-            continue;
+        const future = age < 0;
+        /* OWNER DEATH IS DECISIVE, AND THE TOLERANCE MUST NOT OVERRIDE IT.
+         *
+         * The first version of this gate applied the tolerance to both branches:
+         * `skewed = age < -TOLERANCE`, and anything inside the band fell through to the two
+         * original gates. For a DEAD owner that reproduced the exact wedge this gate exists
+         * to remove -- a negative age is never `> leaseMs`, so `unrenewed` stayed false and
+         * the second gate refused. Measured, dead pid, 30s lease, 5s tolerance:
+         *
+         *   mtime  -60000ms -> ACQUIRED      mtime   +4999ms -> LOCKED   <-- wedged
+         *   mtime      +0ms -> LOCKED        mtime  +20000ms -> ACQUIRED
+         *   mtime   +1000ms -> LOCKED        mtime +86400000ms -> ACQUIRED
+         *
+         * A bounded wedge (skew + lease, ~35s) rather than the original unbounded one, but
+         * the same defect, and the refusal message promised "stealable as soon as that pid
+         * exits" -- which was false inside the band. Found by two independent reviewers on
+         * the shipped diff, not by this file's own tests, which never pinned a dead owner
+         * inside the tolerance.
+         *
+         * So the tolerance is now DIAGNOSTIC ONLY, and only for a live owner: it decides
+         * whether a future mtime is worth naming as clock skew or is just filesystem
+         * timestamp granularity. It never decides whether a dead owner's lock survives. */
+        if (future && !ownerAlive) {
+          requiredString(observed.record.owner_token, "state.lock owner_token");
+          try {
+            if (!this._unlinkLockIfOwner(observed.record.owner_token)) continue;
+          } catch (stealError) {
+            if (stealError.code === "ENOENT") continue;
+            throw stealError;
           }
+          continue;
+        }
+        if (future && age < -LOCK_CLOCK_SKEW_TOLERANCE_MS) {
           throw fail(
             `State store lock at ${this.lockPath} has an mtime ${Math.round(-age)}ms in the FUTURE, so ` +
             "its age cannot be used to decide staleness. Refusing while the named pid " +

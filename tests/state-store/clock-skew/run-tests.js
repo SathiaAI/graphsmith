@@ -94,6 +94,10 @@ function observe({ pid, offsetMs, legacyField = false }) {
   }
 }
 
+function check(name, cond, reason) {
+  if (cond) record(name, "PASS"); else record(name, "FAIL", reason);
+}
+
 function state(name, plant, expected) {
   let got;
   try { got = observe(plant); }
@@ -115,6 +119,34 @@ function preExistingGatesStillHold() {
 
 function futureMtimeDoesNotWedgeADeadOwner() {
   state("dead-owner-future-mtime-stealable", { pid: DEAD_PID, offsetMs: 24 * 60 * 60 * 1000 }, "ACQUIRED");
+
+  /* THE CASE THIS SUITE ORIGINALLY MISSED, AND THE REGRESSION IT LET THROUGH.
+   *
+   * The first version of the gate wrote `skewed = age < -TOLERANCE` and applied it to both
+   * branches, so a dead owner with a mtime INSIDE the tolerance fell through to the two
+   * original gates -- where a negative age is never `> leaseMs`, `unrenewed` stays false,
+   * and the second gate refuses. That reproduced the wedge, bounded at skew + lease rather
+   * than unbounded, while the refusal message still promised "stealable as soon as that pid
+   * exits". Measured on the shipped diff, dead pid, 30s lease, 5s tolerance:
+   *
+   *   +0ms -> LOCKED   +1000ms -> LOCKED   +3000ms -> LOCKED   +4999ms -> LOCKED
+   *   +20000ms -> ACQUIRED   +86400000ms -> ACQUIRED
+   *
+   * The suite passed 12/12 throughout, because every dead-owner case sat OUTSIDE the band.
+   * Two independent reviewers found it by reading the diff. The tolerance is now diagnostic
+   * only and only for a live owner; owner death is decisive at any offset. These cases walk
+   * the band so a reintroduced tolerance-on-the-dead-branch cannot pass. */
+  /* The smallest offset here is 1000ms, not 1ms, and that is a limit of the harness rather
+   * than a gap in the rule. Several milliseconds elapse between planting the mtime and the
+   * observing acquire, so a 1ms-ahead mtime is simply in the PAST by the time it is read --
+   * the case degenerates into "dead owner, fresh mtime", which is a different (and already
+   * pinned) state. A 1ms case was written, failed, and was removed rather than papered over:
+   * it is the third time in this suite that an offset smaller than the plant-to-observe
+   * latency has claimed a boundary it could not reach. Sub-millisecond futures are
+   * indistinguishable from "just written" and the product treats them that way on purpose. */
+  for (const offsetMs of [1_000, 3_000, 4_999]) {
+    state(`dead-owner-${offsetMs}ms-ahead-still-stealable`, { pid: DEAD_PID, offsetMs }, "ACQUIRED");
+  }
 }
 
 function futureMtimeOnALiveOwnerIsNamedNotMisreported() {
@@ -170,9 +202,17 @@ function smallForwardOffsetsAreNotSkew() {
    * its name claimed, which is the defect class this project keeps finding. It was
    * replaced with these, which are deterministic because the offsets are large relative to
    * the elapsed time between plant and observe. */
-  state("mtime-1s-ahead-is-not-skew", { pid: process.pid, offsetMs: 1_000 }, "LOCKED");
-  state("mtime-4s-ahead-is-not-skew", { pid: process.pid, offsetMs: 4_000 }, "LOCKED");
-  state("mtime-30s-ahead-is-skew", { pid: process.pid, offsetMs: 30_000 }, "LOCK_CLOCK_SKEW");
+  state("live-owner-1s-ahead-is-not-skew", { pid: process.pid, offsetMs: 1_000 }, "LOCKED");
+  state("live-owner-4s-ahead-is-not-skew", { pid: process.pid, offsetMs: 4_000 }, "LOCKED");
+  state("live-owner-30s-ahead-is-skew", { pid: process.pid, offsetMs: 30_000 }, "LOCK_CLOCK_SKEW");
+
+  /* The tolerance is now asymmetric by design, so the asymmetry itself is pinned: the SAME
+   * offset must be an ordinary LOCKED for a live owner and a steal for a dead one. A single
+   * test that only walked one liveness value would have missed the regression above. */
+  check("tolerance-applies-to-live-owners-only",
+    observe({ pid: process.pid, offsetMs: 3_000 }) === "LOCKED"
+    && observe({ pid: DEAD_PID, offsetMs: 3_000 }) === "ACQUIRED",
+    "the same in-tolerance offset must be LOCKED for a live owner and stealable for a dead one");
 }
 
 /* ---- upgrade compatibility for the removed field ---- */
