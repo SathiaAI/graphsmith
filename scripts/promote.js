@@ -40,6 +40,17 @@ function locations(root) {
     journal: path.join(state, "journal.jsonl"),
     adoption: path.join(state, "adoption-log.jsonl"),
     projectManifest: path.join(state, "project.manifest.json"),
+    /* Staging is a SIBLING of state/ and evolvable/, not a child of evolvable/.
+     *
+     * Two reasons, and the second is why it is not somewhere further away. First,
+     * `cleanupAbandonedStaging` treats every `.staging-*` under evolvable/ as disposable,
+     * which is safe only while staging holds the lock; once staging runs unlocked, a
+     * concurrent `recover()` would delete a live promotion's work. Leaving live work in a
+     * namespace another routine is entitled to erase means fighting that assumption
+     * forever. Second, installing a staged tree is a single `renameSync` into evolvable/,
+     * which is only atomic within one filesystem -- a sibling under the same `.graphsmith`
+     * parent keeps that true where a temp directory elsewhere would not. */
+    staging: path.join(root, ".graphsmith", "staging"),
   };
 }
 
@@ -273,50 +284,168 @@ function diskPreflight(paths, source) {
   const sourceStat = fs.statSync(source);
   const evolvableStat = fs.statSync(paths.evolvable);
   if (sourceStat.dev !== evolvableStat.dev) throw failure("Cannot prove staging and ACTIVE are on the same filesystem volume", "PLATFORM_REFUSED");
+  /* Staging moved out of evolvable/, so "same volume as ACTIVE" is no longer implied by
+   * being inside it. Checked HERE, before the copy, because the failure it prevents --
+   * a cross-device rename at install time -- would otherwise be discovered after the whole
+   * tree had been copied and hashed, under the lock, with nothing to do but refuse. */
+  const stagingStat = fs.statSync(paths.staging);
+  if (stagingStat.dev !== evolvableStat.dev) {
+    throw failure(
+      `Cannot prove ${paths.staging} and ${paths.evolvable} are on the same filesystem ` +
+      "volume; publishing a staged tree must be a single atomic rename.",
+      "PLATFORM_REFUSED");
+  }
   if (typeof fs.statfsSync !== "function") throw failure("This Node/filesystem cannot prove free-space reserve", "PLATFORM_REFUSED");
   const free = fs.statfsSync(paths.evolvable);
   const required = treeBytes(source) * 2 + 1024 * 1024;
   if (Number(free.bavail) * Number(free.bsize) < required) throw failure(`Insufficient free-space reserve: need at least ${required} bytes`, "DISK_RESERVE");
 }
 
-function stageTree(paths, packet, txid, currentPointer) {
+/* STAGING IS SPLIT IN TWO, AND THE SPLIT IS THE WHOLE POINT OF THIS FILE'S CHANGE.
+ *
+ * `stageUnlocked` does the expensive part -- a full recursive copy, a full-tree hash to
+ * build the manifest, and a second full-tree hash to verify it -- with NO lock held.
+ * `installStaged` does the cheap part, a single atomic rename, under the lock.
+ *
+ * Before the split, all of it ran inside the lock. The lock is only renewed at the durable
+ * writes inside `_commit`, so a holder doing long work that never touches the store renews
+ * nothing: on a large tree the hold outlasted the 30s lease and a second promoter could
+ * legally steal it. Both then reached `appendEntry` on the permanent adoption log before
+ * either touched the store and discovered it had been superseded. `expectedState` made that
+ * likely to end in HALT rather than silent divergence, but it detects a mismatch at its own
+ * read -- it does not serialize two writers between their reads.
+ *
+ * Raising the lease was considered and rejected: a bigger fixed deadline used as a stand-in
+ * for "this owner is still making progress" is the defect class this project keeps finding,
+ * not a fix for it. Renewing at checkpoints inside the copy was also rejected -- `fs.cpSync`
+ * is one synchronous call that nothing can interrupt, so checkpoints around it shrink the
+ * window without closing it, and any process can be descheduled past the lease regardless. */
+function claimToken() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+function stagingClaimPath(dir) {
+  return path.join(dir, ".claim.json");
+}
+
+/* Produce a fully built and verified tree in a transaction-private directory. No lock, no
+ * journal record, nothing promised to anyone. A crash here leaves only the directory, which
+ * `reclaimAbandonedStaging` collects by owner liveness. */
+function stageUnlocked(paths, packet, txid, currentPointer) {
   if (packet.source_tree) {
+    /* An already-committed tree, named by content. Nothing to stage: it is either present
+     * and verifiable or the packet is wrong. */
     const tree = canonicalRelative(packet.source_tree);
     if (!/^v-[0-9a-f]{8,64}$/.test(tree)) throw failure("packet.source_tree is not a versioned tree id", "INVALID_PACKET");
     const treeDir = path.join(paths.evolvable, tree);
     const manifestPath = path.join(treeDir, "tree.manifest.json");
     const verification = verifyTree(manifestPath, treeDir);
     if (!verification.ok) throw failure("source_tree failed closed-inventory verification", "VALIDATION_FAILED", verification);
-    const manifestSha = sha256(readFile(manifestPath));
-    return { tree, treeDir, manifestSha };
+    return { tree, treeDir, manifestSha: sha256(readFile(manifestPath)), staged: null };
   }
 
   const source = path.join(paths.evolvable, currentPointer.tree);
   rejectLinks(source);
+  fs.mkdirSync(paths.staging, { recursive: true });
   diskPreflight(paths, source);
-  const temporary = path.join(paths.evolvable, `.staging-${txid}`);
-  fs.rmSync(temporary, { recursive: true, force: true });
-  fs.cpSync(source, temporary, { recursive: true, errorOnExist: true, force: false });
-  fs.rmSync(path.join(temporary, "tree.manifest.json"), { force: true });
-  applyEdits(temporary, packet.edits);
-  rejectLinks(temporary);
-  const manifest = generate("tree", { rootDir: temporary });
-  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  fs.writeFileSync(path.join(temporary, "tree.manifest.json"), manifestBytes);
-  const manifestSha = sha256(manifestBytes);
-  const tree = `v-${manifestSha}`;
-  const treeDir = path.join(paths.evolvable, tree);
-  if (fs.existsSync(treeDir)) {
-    const verification = verifyTree(path.join(treeDir, "tree.manifest.json"), treeDir);
-    if (!verification.ok || sha256(readFile(path.join(treeDir, "tree.manifest.json"))) !== manifestSha) {
-      throw failure(`Existing immutable tree identity collision at ${tree}`, "HALT");
-    }
-    fs.rmSync(temporary, { recursive: true, force: true });
-  } else {
-    fs.renameSync(temporary, treeDir);
-    fsyncDirectory(paths.evolvable);
+
+  /* `txid` is `sha256(fingerprint + expected_active_sha)[:16]`, so two promoters of the
+   * SAME packet against the SAME ACTIVE derive the SAME txid -- which is deliberate (a
+   * re-run of a crashed transaction resumes it) but makes the txid alone unusable as a
+   * private directory name once staging is concurrent. The random claim makes the
+   * directory this ATTEMPT's, and `mkdirSync` without `recursive` is the atomic primitive
+   * that proves it: it fails rather than joining an existing directory. */
+  const claim = claimToken();
+  const temporary = path.join(paths.staging, `${txid}.${claim}`);
+  fs.mkdirSync(temporary);
+  fs.writeFileSync(stagingClaimPath(temporary), `${JSON.stringify({
+    schema_version: SCHEMA_VERSION, txid, claim, pid: process.pid,
+  })}\n`);
+
+  try {
+    const payload = path.join(temporary, "tree");
+    fs.cpSync(source, payload, { recursive: true, errorOnExist: true, force: false });
+    fs.rmSync(path.join(payload, "tree.manifest.json"), { force: true });
+    applyEdits(payload, packet.edits);
+    rejectLinks(payload);
+    const manifest = generate("tree", { rootDir: payload });
+    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    fs.writeFileSync(path.join(payload, "tree.manifest.json"), manifestBytes);
+    const manifestSha = sha256(manifestBytes);
+
+    /* The full closed-inventory verification happens HERE, unlocked, because it is the
+     * second full-tree hash pass and the second half of what used to blow the lease. */
+    const verification = verifyTree(path.join(payload, "tree.manifest.json"), payload);
+    if (!verification.ok) throw failure("Staged tree verification failed", "VALIDATION_FAILED", verification);
+
+    return {
+      tree: `v-${manifestSha}`,
+      treeDir: path.join(paths.evolvable, `v-${manifestSha}`),
+      manifestSha,
+      staged: { dir: temporary, payload, claim },
+    };
+  } catch (error) {
+    discardStaging(temporary);
+    throw error;
   }
-  return { tree, treeDir, manifestSha };
+}
+
+/* Publish a staged tree. Called with the lock held; must stay cheap. */
+function installStaged(paths, staged) {
+  if (!staged.staged) return;   // packet.source_tree: already committed, nothing to install
+  const { payload } = staged.staged;
+
+  /* Re-hash ONE small file rather than the whole tree. The tree is content-addressed --
+   * its directory name IS `v-<sha256 of this manifest>`, and the manifest is a closed
+   * inventory of every payload file's hash -- so a manifest that still hashes to the name
+   * is the identity claim. The full inventory pass already ran unlocked.
+   *
+   * Stated rather than glossed: this does not re-prove the payload against the manifest
+   * under the lock. It cannot be cheap and also do that. What it rules out is the staged
+   * tree having become a DIFFERENT tree between verification and install; the directory is
+   * private to this attempt, named with a random claim, and never advertised. */
+  const observed = sha256(readFile(path.join(payload, "tree.manifest.json")));
+  if (observed !== staged.manifestSha) {
+    discardStaging(staged.staged.dir);
+    throw failure(`Staged tree changed between verification and install: manifest now ${observed}, expected ${staged.manifestSha}`, "HALT");
+  }
+
+  if (fs.existsSync(staged.treeDir)) {
+    /* Content-addressed: an identical tree already exists. Prove it really is identical
+     * rather than trusting the name, then drop ours. */
+    const verification = verifyTree(path.join(staged.treeDir, "tree.manifest.json"), staged.treeDir);
+    if (!verification.ok || sha256(readFile(path.join(staged.treeDir, "tree.manifest.json"))) !== staged.manifestSha) {
+      throw failure(`Existing immutable tree identity collision at ${staged.tree}`, "HALT");
+    }
+    discardStaging(staged.staged.dir);
+    return;
+  }
+
+  try {
+    fs.renameSync(payload, staged.treeDir);
+  } catch (error) {
+    if (error.code === "EXDEV") {
+      /* Deliberately NOT falling back to a copy. A cross-device copy is not atomic, so a
+       * crash mid-copy would leave a half-built directory under a `v-` name that every
+       * reader treats as an immutable committed tree. Refusing is the honest outcome, and
+       * `diskPreflight` should have caught it before any work was done. */
+      throw failure(
+        `Cannot publish the staged tree: ${paths.staging} and ${paths.evolvable} are on ` +
+        "different filesystems, so the install cannot be a single atomic rename. Put " +
+        ".graphsmith/staging and .graphsmith/evolvable on one volume.",
+        "PLATFORM_REFUSED");
+    }
+    throw error;
+  }
+  fsyncDirectory(paths.evolvable);
+  discardStaging(staged.staged.dir);
+}
+
+function discardStaging(dir) {
+  /* maxRetries for Windows, where an antivirus or indexer holding a handle turns an
+   * ordinary cleanup into EBUSY/EPERM. */
+  try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+  catch (error) { /* best effort: an orphan here is reclaimed by owner liveness, not by this */ }
 }
 
 function buildEntry(paths, packet, txid, status, previous) {
@@ -524,6 +653,34 @@ function abortVisible(paths, packet, txid, committing, reason) {
   return { txid, state: "ABORTED" };
 }
 
+/* The cheap refusals, all of them reads.
+ *
+ * Called TWICE and that is deliberate. Once before staging, unlocked and advisory, and once
+ * under the lock where the answer is authoritative. The advisory call exists because moving
+ * staging out of the lock also moved it in front of these checks, and staging is not a
+ * read-only act -- `applyEdits` rewrites the copied tree. A second promotion of the same
+ * packet then failed with "Edit anchor must occur exactly once" from deep inside staging
+ * instead of WINDOW_EXISTS from the top, because the first promotion had already consumed
+ * the anchor. The caller was told the wrong thing about the wrong thing, and two suites
+ * caught it.
+ *
+ * The advisory call is never trusted: it can go stale between the read and the lock, which
+ * is exactly why the locked call still runs and still decides. It only stops the process
+ * spending a full tree copy and two hash passes to arrive at a refusal it could have made
+ * from a file read. */
+function refuseEarly(paths, store, packet, input, active, head) {
+  const unfinished = unfinishedTransactions(paths);
+  if (unfinished.length) throw failure(`Unfinished transaction ${unfinished[0]} requires recover() before a new promotion`, "RECOVERY_REQUIRED");
+  const projectManifest = readProjectManifest(paths);
+  if (projectManifest.adoption_log_head !== head) throw failure("Project manifest does not anchor the adoption-log tail", "CORRUPT_STATE");
+  if (input.expected_active_sha && input.expected_active_sha !== active.sha) throw failure("Stale proposal: expected ACTIVE hash mismatch", "STALE_PROPOSAL");
+  if (Object.prototype.hasOwnProperty.call(input, "expected_log_head") && input.expected_log_head !== head) throw failure("Stale proposal: expected adoption-log head mismatch", "STALE_PROPOSAL");
+  const window = readWindow(store);
+  if (!packet.rollback_of && !["NO_WINDOW", "CLOSED_PASS", "CLOSED_ROLLED_BACK", "CLOSED_FLAGGED"].includes(window.state)) {
+    throw failure(`Cannot promote while Gate-4 window is ${window.state}`, "WINDOW_EXISTS");
+  }
+}
+
 function promote(input) {
   const root = path.resolve(input && input.project_root ? input.project_root : process.cwd());
   const paths = locations(root);
@@ -531,36 +688,76 @@ function promote(input) {
   fs.mkdirSync(paths.state, { recursive: true });
   fs.mkdirSync(paths.evolvable, { recursive: true });
 
-  const { store, lock, sweptLeaseIds } = acquire(root);
+  /* ---- PHASE 1: build and verify the tree with NO LOCK HELD ----
+   *
+   * Everything here is advisory. The ACTIVE identity read now is what the txid is derived
+   * from and what the tree is copied from, and it can go stale before phase 2 acquires the
+   * lock -- so phase 2 re-reads it and aborts on drift. Nothing is journaled, nothing is
+   * published, and a crash leaves only a claimed staging directory that
+   * `reclaimAbandonedStaging` collects by owner liveness. */
+  const preActive = activeIdentity(paths);
+  const preHead = logHead(paths);
+  /* Refuse from a file read before spending a tree copy on it. Advisory only -- the same
+   * checks run again under the lock and it is that run that decides. */
+  refuseEarly(paths, createStore(root), packet, input, preActive, preHead);
+  const txidPlanned = sha256(packet.fingerprint + preActive.sha).slice(0, 16);
+  const prepared = stageUnlocked(paths, packet, txidPlanned, preActive.pointer);
+
+  let store; let lock; let sweptLeaseIds;
+  try {
+    ({ store, lock, sweptLeaseIds } = acquire(root));
+  } catch (error) {
+    /* Could not even take the lock: drop the staged work rather than leave it for the
+     * reclaimer, which would otherwise only notice once this process exits. */
+    if (prepared.staged) discardStaging(prepared.staged.dir);
+    throw error;
+  }
   let txid;
   let phase = "LEASED";
   let committing = null;
   try {
-    const unfinished = unfinishedTransactions(paths);
-    if (unfinished.length) throw failure(`Unfinished transaction ${unfinished[0]} requires recover() before a new promotion`, "RECOVERY_REQUIRED");
     const active = activeIdentity(paths);
     const head = logHead(paths);
-    const projectManifest = readProjectManifest(paths);
-    if (projectManifest.adoption_log_head !== head) throw failure("Project manifest does not anchor the adoption-log tail", "CORRUPT_STATE");
-    if (input.expected_active_sha && input.expected_active_sha !== active.sha) throw failure("Stale proposal: expected ACTIVE hash mismatch", "STALE_PROPOSAL");
-    if (Object.prototype.hasOwnProperty.call(input, "expected_log_head") && input.expected_log_head !== head) throw failure("Stale proposal: expected adoption-log head mismatch", "STALE_PROPOSAL");
-    const window = readWindow(store);
-    if (!packet.rollback_of && !["NO_WINDOW", "CLOSED_PASS", "CLOSED_ROLLED_BACK", "CLOSED_FLAGGED"].includes(window.state)) {
-      throw failure(`Cannot promote while Gate-4 window is ${window.state}`, "WINDOW_EXISTS");
-    }
+    /* The authoritative run. Same checks, under the lock, against state nothing else can be
+     * mutating -- this is the one that decides. */
+    refuseEarly(paths, store, packet, input, active, head);
     garbageCollect(paths, store, sweptLeaseIds);
+
+    /* ---- PHASE 2: the lock is held from here ----
+     *
+     * Phase 1 read ACTIVE and the log head without the lock, derived the txid from that
+     * ACTIVE, and copied that ACTIVE's tree. Any of it can have moved since. Abort rather
+     * than reconcile: the staged tree was built from a base that is no longer current, so
+     * publishing it would silently drop whatever landed in between. Nothing has been
+     * journaled yet, so an abort here costs only the staging work. */
+    if (active.sha !== preActive.sha || head !== preHead) {
+      throw failure(
+        "ACTIVE or the adoption-log head moved while this promotion was staging, so the " +
+        `staged tree was built from a base that is no longer current (staged against ` +
+        `active ${preActive.sha.slice(0, 12)} / head ${String(preHead).slice(0, 12)}, now ` +
+        `active ${active.sha.slice(0, 12)} / head ${String(head).slice(0, 12)}). Re-run the ` +
+        "promotion; nothing was written.",
+        "STALE_STAGING");
+    }
+
     txid = sha256(packet.fingerprint + active.sha).slice(0, 16);
     journalRecord(paths, txid, "TX_BEGIN", { expected_active_sha: active.sha, expected_log_head: head, packet });
     phase = "BEGUN";
 
-    const staged = stageTree(paths, packet, txid, active.pointer);
+    /* The expensive work already happened, unlocked. This is one atomic rename. */
+    const staged = prepared;
+    installStaged(paths, staged);
     const toPointer = { schema_version: SCHEMA_VERSION, txid, tree: staged.tree, tree_manifest_sha256: staged.manifestSha };
     journalRecord(paths, txid, "STAGE_DONE", {
       tree: staged.tree, tree_manifest_sha: staged.manifestSha, from_pointer: active.pointer, to_pointer: toPointer,
     });
     phase = "STAGED";
-    const verification = verifyTree(path.join(staged.treeDir, "tree.manifest.json"), staged.treeDir);
-    if (!verification.ok) throw failure("Staged tree verification failed", "VALIDATION_FAILED", verification);
+    /* Verification of the tree's full closed inventory happened in phase 1. What remains is
+     * the identity of what was actually PUBLISHED, which is one small file. */
+    const publishedManifest = sha256(readFile(path.join(staged.treeDir, "tree.manifest.json")));
+    if (publishedManifest !== staged.manifestSha) {
+      throw failure(`Published tree ${staged.tree} does not carry the verified manifest`, "HALT");
+    }
     expectedState(paths, active.sha, head, "validate");
     journalRecord(paths, txid, "VALIDATED");
     phase = "VALIDATED";
@@ -617,6 +814,13 @@ function promote(input) {
     }
     throw error;
   } finally {
+    /* Whatever happened, this attempt's staging directory must not outlive it. On the happy
+     * path `installStaged` already removed it; on every failure path -- including one that
+     * threw before `installStaged` ran, and including STALE_STAGING -- this is what stops a
+     * failed promotion leaving work for the reclaimer to find later. `discardStaging` is
+     * idempotent and swallows its own errors, so a double call is free and a locked file on
+     * Windows falls back to reclamation by owner liveness rather than failing the run. */
+    if (prepared.staged) discardStaging(prepared.staged.dir);
     release(store, lock);
   }
 }
@@ -647,15 +851,63 @@ function repairTornJournal(paths) {
 }
 
 function cleanupAbandonedStaging(paths) {
+  /* PRE-UPGRADE LEFTOVERS ONLY. Staging no longer happens under evolvable/; anything
+   * matching `.staging-*` here was written by a version that staged under the lock, so it
+   * is genuinely abandoned and a glob delete is still correct for it. New staging lives in
+   * paths.staging and is reclaimed by `reclaimAbandonedStaging`, which asks who owns it. */
   const fallbackTxid = activeIdentity(paths).pointer.txid;
   for (const entry of fs.readdirSync(paths.evolvable, { withFileTypes: true })) {
     if (!entry.isDirectory() || !entry.name.startsWith(".staging-")) continue;
-    fs.rmSync(path.join(paths.evolvable, entry.name), { recursive: true, force: true });
+    fs.rmSync(path.join(paths.evolvable, entry.name), { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     const candidate = entry.name.slice(".staging-".length);
     const txid = /^[0-9a-f]{16}$/.test(candidate) ? candidate : fallbackTxid;
     journalRecord(paths, txid, "RECOVERY_STEP", { action: `remove-abandoned-staging:${entry.name}` });
   }
   fsyncDirectory(paths.evolvable);
+}
+
+function ownerAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === "EPERM"; }   // EPERM: exists, not ours. Alive.
+}
+
+/* Reclaim staging directories whose owner is gone.
+ *
+ * This is the routine that made the whole restructure a protocol change rather than a
+ * patch. The old `cleanupAbandonedStaging` deleted EVERY `.staging-*` it saw, which was
+ * safe only because staging held the lock, so a concurrent `recover()` could not exist.
+ * Once staging runs unlocked, that same glob deletes a live promotion's work out from under
+ * it. So the question changed from "is this a staging directory" to "does anyone still own
+ * this staging directory", and it has to be answered from evidence.
+ *
+ * Ownership is the claim file's pid. NOT a wall-clock age: `Date.now()` minus a filesystem
+ * mtime is exactly the predicate that wedged the state store when a clock stepped backwards
+ * (see the skew gate in state-store.js), and reusing it here to decide whether to DELETE a
+ * directory would be strictly worse than wedging.
+ *
+ * A missing or unreadable claim means the directory was created but never claimed -- a
+ * crash in the window between `mkdirSync` and the claim write -- so nobody can be running
+ * against it and it is reclaimable. Fail-closed the other way, refusing forever, would
+ * grow the disk without bound with no command able to clear it. */
+function reclaimAbandonedStaging(paths) {
+  let entries;
+  try { entries = fs.readdirSync(paths.staging, { withFileTypes: true }); }
+  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+
+  const reclaimed = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(paths.staging, entry.name);
+    let claim = null;
+    try { claim = JSON.parse(fs.readFileSync(stagingClaimPath(dir), "utf8")); }
+    catch (error) { /* unclaimed or unreadable: see above */ }
+
+    if (claim && ownerAlive(claim.pid)) continue;   // someone is still staging into it
+    discardStaging(dir);
+    reclaimed.push({ dir: entry.name, txid: claim && claim.txid, pid: claim && claim.pid });
+  }
+  return reclaimed;
 }
 
 function recover(projectRoot = process.cwd()) {
@@ -774,6 +1026,15 @@ function recover(projectRoot = process.cwd()) {
       outcomes.push({ txid, state: "DONE" });
     }
     cleanupAbandonedStaging(paths);
+    /* Claim-based, and it runs under the lock only because recover() already holds it --
+     * NOT because the lock is what makes it safe. What makes it safe is that it asks each
+     * directory who owns it and skips the ones whose owner is still alive, so a promotion
+     * staging concurrently in another process keeps its work. */
+    const reclaimedStaging = reclaimAbandonedStaging(paths);
+    for (const r of reclaimedStaging) {
+      journalRecord(paths, r.txid || activeIdentity(paths).pointer.txid, "RECOVERY_STEP",
+        { action: `reclaim-abandoned-staging:${r.dir}`, owner_pid: r.pid === undefined ? null : r.pid });
+    }
     return { state: outcomes.length ? "RECOVERED" : "CLEAN", transactions: outcomes };
   } finally {
     release(store, lock);
@@ -964,6 +1225,11 @@ function selftest() {
 }
 
 module.exports = { promote, rollback, recover, SCHEMA_VERSION };
+/* Fixture builders the selftest already uses, exposed so tests/promote/lock-scope/ can
+ * build the same project without a second, divergent copy of the setup. Nothing here is
+ * product surface: `reclaimAbandonedStaging` is exported for a direct unit assertion, and
+ * the other two only construct temporary projects. */
+module.exports.__testing = { createFixture, testPacket, reclaimAbandonedStaging, stagingClaimPath };
 
 if (require.main === module) {
   const [command, argument] = process.argv.slice(2);
