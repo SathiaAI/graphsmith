@@ -648,27 +648,80 @@ function checkCrashInjectionActuallyCrashes() {
 
 function checkCandidateBaselineAreActuallyDifferentiable() {
   const name = "X1. paired replay: --candidate and --baseline are honored as distinct code trees, not just labels";
-  // replayPaired() calls materializeFixture(scenario, candDir) and materializeFixture(scenario, baseDir)
-  // using the SAME scenario.fixture for both, regardless of the --candidate/--baseline treeId values.
-  // There is no code path in scenario.js that reads a candidate- or baseline-specific tree/pipeline/worker
-  // set. This test proves it: two different --candidate values against the same corpus/seed produce
-  // byte-identical pair results (only the label in model_versions differs), which is expected if the
-  // tree ids are inert -- and is the observable symptom of the defect documented in FINDINGS.md.
-  const args1 = ["--replay", "--paired", "--candidate", "tree-AAA", "--baseline", "tree-BASE", "--corpus", REAL_CORPUS_DIR, "--seed", "0"];
-  const args2 = ["--replay", "--paired", "--candidate", "tree-ZZZ-totally-different", "--baseline", "tree-BASE", "--corpus", REAL_CORPUS_DIR, "--seed", "0"];
-  const r1 = runCLI(args1, { timeoutMs: 180000 });
-  const r2 = runCLI(args2, { timeoutMs: 180000 });
-  if (r1.status !== 0 || r2.status !== 0) { fail(name, "nonzero exit"); return; }
-  const b1 = parseJSONStdout(r1, name);
-  const b2 = parseJSONStdout(r2, name);
-  if (!b1 || !b2) return;
-  const pairs1 = JSON.stringify(b1.pairs);
-  const pairs2 = JSON.stringify(b2.pairs);
-  if (pairs1 === pairs2) {
-    fail(name, "DEFECT: changing --candidate treeId did not change a single pair result — materializeFixture() ignores candidateId/baselineId entirely and generates identical code for both sides from scenario.fixture alone. Gate 2's paired comparison can never produce a discordant pair through this path.");
-  } else {
-    pass(name, "candidate treeId change altered pair results as expected");
+
+  /* THIS CHECK USED TO ASSERT SOMETHING IT COULD NOT SEE, AND IT PASSED FOR THE WRONG REASON.
+   *
+   * The original form ran the whole corpus twice with two different --candidate ids and
+   * required `bundle.pairs` to differ. `pairs` carries only pass/cause_code, so the only way
+   * a tree id could move it was by flipping a VERDICT -- and the only scenarios whose verdict
+   * a tree id could flip were the `*-budget-fail` family, via issue #11: worker delay was
+   * scaled by one hash byte while the manager budget was shifted by an INDEPENDENT one, so
+   * whether the run exceeded its budget was a per-tree coin flip. Measured: the expectation
+   * was wrong for 37.2% of tree ids.
+   *
+   * So this check was resting on the defect. Measured directly on `pipeline-budget-fail`:
+   * tree-AAA drew 344ms of work against a 910ms budget (never exceeds -> verdict FAIL),
+   * tree-ZZZ drew 1297ms against 400ms (exceeds -> verdict PASS). Two different verdicts for
+   * two trees running IDENTICAL code. That discordance is what made this check green.
+   *
+   * It is the same defect class the check itself is meant to guard against: "the verdict
+   * changed" was used as a proxy for "the tree id was honored", and those are different
+   * claims. A correct evaluator SHOULD return the same verdict for two trees that both
+   * behave correctly -- demanding that the verdict differ is demanding that the evaluator
+   * be flaky.
+   *
+   * Rewritten to test the claim in its own name. Two REAL tree directories with genuinely
+   * different worker code, which is the `isTreeDir` path in materializeFixture() and the
+   * capability "distinct code trees" actually refers to. The discordance is then caused by
+   * the code, deterministically, with no timing involved -- and this now covers the tree-dir
+   * path, which nothing previously exercised. */
+
+  const dir = mkRoot("x1-trees");
+  const good = path.join(dir, "good");
+  const bad = path.join(dir, "bad");
+
+  /* Same pipeline on both sides; only the worker body differs. `pipeline-normal` expects
+   * `complete`, so the throwing tree must be discordant with the completing one. */
+  const pipeline = [
+    { step: "01-gather", worker: "gather.js" },
+    { step: "02-process", worker: "process.js" },
+    { step: "03-deliver", worker: "deliver.js" },
+  ];
+  const okWorker = 'module.exports.run = async (input, ctx) => ({ ...(input || {}), [ctx.step]: "done" });\n';
+  const brokenWorker = 'module.exports.run = async () => { throw new Error("candidate tree is broken on purpose"); };\n';
+
+  for (const [treeDir, processBody] of [[good, okWorker], [bad, brokenWorker]]) {
+    fs.mkdirSync(path.join(treeDir, "workers"), { recursive: true });
+    fs.writeFileSync(path.join(treeDir, "pipeline.json"), JSON.stringify(pipeline, null, 2));
+    fs.writeFileSync(path.join(treeDir, "workers", "gather.js"), okWorker);
+    fs.writeFileSync(path.join(treeDir, "workers", "process.js"), processBody);
+    fs.writeFileSync(path.join(treeDir, "workers", "deliver.js"), okWorker);
   }
+
+  const corpus = path.join(dir, "corpus");
+  fs.mkdirSync(corpus, { recursive: true });
+  fs.copyFileSync(path.join(REAL_CORPUS_DIR, "pipeline-normal.json"), path.join(corpus, "pipeline-normal.json"));
+
+  const r = runCLI(["--replay", "--paired", "--candidate", bad, "--baseline", good, "--corpus", corpus, "--seed", "0"],
+    { timeoutMs: 180000 });
+  if (r.status !== 0) { fail(name, `nonzero exit (${r.status}): ${(r.stderr || "").slice(0, 300)}`); return; }
+  const bundle = parseJSONStdout(r, name);
+  if (!bundle) return;
+  const pair = bundle.pairs && bundle.pairs[0];
+  if (!pair) { fail(name, "bundle carried no pairs"); return; }
+
+  if (pair.cand.pass === pair.base.pass) {
+    fail(name, "DEFECT: a candidate tree whose worker throws produced the same verdict as a " +
+      `baseline tree whose worker completes (cand.pass=${pair.cand.pass}, base.pass=${pair.base.pass}). ` +
+      "materializeFixture() is not reading the per-tree code, so Gate 2's paired comparison " +
+      "cannot produce a discordant pair from a real code difference.");
+    return;
+  }
+  if (pair.base.pass !== true) {
+    fail(name, `the intact baseline tree did not pass (cause=${pair.base.cause_code}); the discordance above cannot be attributed to the candidate`);
+    return;
+  }
+  pass(name, `distinct code trees produced a discordant pair from the code itself (cand.pass=${pair.cand.pass}, base.pass=${pair.base.pass}) — no timing dependence`);
 }
 
 // =====================================================================================
