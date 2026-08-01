@@ -1,0 +1,8 @@
+{
+  "id": "copilot",
+  "displayName": "GitHub Copilot",
+  "targetPath": ".github/copilot-instructions.md",
+  "placementMode": "reconciled",
+  "outputFormat": "markdown-plain",
+  "bodyTransform": "verbatim"
+}

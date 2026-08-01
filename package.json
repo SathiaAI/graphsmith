@@ -11,7 +11,9 @@
     "scripts/",
     "checks/",
     "references/",
-    "tests/"
+    "tests/",
+    "generators/",
+    "schemas/"
   ],
   "engines": {
     "node": ">=18"

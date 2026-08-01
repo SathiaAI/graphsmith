@@ -1,0 +1,8 @@
+{
+  "id": "agents-generic",
+  "displayName": "AGENTS.md (generic)",
+  "targetPath": "AGENTS.md",
+  "placementMode": "reconciled",
+  "outputFormat": "markdown-plain",
+  "bodyTransform": "verbatim"
+}

@@ -1,0 +1,24 @@
+{
+  "id": "cursor",
+  "displayName": "Cursor",
+  "targetPath": ".cursor/rules/graphsmith.mdc",
+  "placementMode": "standalone",
+  "outputFormat": "markdown-frontmatter",
+  "frontmatterFields": [
+    {
+      "name": "description",
+      "source": "static",
+      "required": true,
+      "maxLength": 300,
+      "staticValue": "Build and fix reliable multi-agent AI workflows: crash-safe steps, idempotent retries, deterministic routing. Use for agent, pipeline, orchestration, or automation work, or when an existing automation loses state, loops, duplicates work, or fabricates results."
+    },
+    {
+      "name": "alwaysApply",
+      "source": "static",
+      "required": true,
+      "staticValue": false
+    }
+  ],
+  "bodyTransform": "verbatim",
+  "generatedFileHeader": "<!-- GENERATED FILE -- do not hand-edit. Rendered from SKILL.md by scripts/generate.js (adapter: cursor). Any direct edit here is silently overwritten on the next generation run; edit root SKILL.md instead. -->"
+}
