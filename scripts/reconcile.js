@@ -348,7 +348,7 @@ function reconcile(targetPath, renderedBlock, options) {
 
   const rawWithBom = fs.readFileSync(targetPath, "utf8");
   const hasBom = rawWithBom.charCodeAt(0) === 0xfeff;
-  const bom = hasBom ? "﻿" : "";
+  const bom = hasBom ? String.fromCharCode(0xfeff) : "";
   const raw = hasBom ? rawWithBom.slice(1) : rawWithBom;
 
   const found = findBlock(raw, blockId);
