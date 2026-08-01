@@ -486,8 +486,52 @@ function aTamperedPayloadIsNotPublished() {
     "would give a v- tree an honest name over dishonest contents.");
 }
 
+/* ---------- the legacy namespace must not be deleted either ---------- */
+
+function legacyStagingIsReportedNotDeleted() {
+  /* `cleanupAbandonedStaging` used to rmSync every `.staging-*` under evolvable/. That was
+   * safe only while staging held the lock. Unlocked, during a MIXED-VERSION window -- an
+   * upgrade with an old-version promoter still mid-copy in the old location -- a new
+   * process taking the lock and running that glob deletes its work. Two reviewers named it;
+   * it is the same defect as the one that stopped this shipping, reachable through the old
+   * namespace instead of the new one.
+   *
+   * An old-format directory carries no ownership evidence anywhere -- no pid in the name,
+   * no claim file -- so "is anyone using this" cannot be answered from it. It is reported
+   * and left. */
+  const root = fixture("legacy");
+  const evolvable = path.join(root, ".graphsmith", "evolvable");
+  const legacy = path.join(evolvable, ".staging-0123456789abcdef");
+  fs.mkdirSync(legacy, { recursive: true });
+  fs.writeFileSync(path.join(legacy, "partial"), "an older version was copying into this");
+
+  promoteModule.recover(root);
+
+  check("recover-does-not-delete-a-legacy-staging-directory",
+    fs.existsSync(legacy) && fs.existsSync(path.join(legacy, "partial")),
+    "a pre-upgrade staging directory was deleted. During an upgrade an old-version promoter " +
+    "can still be copying into one, and nothing about it proves otherwise.");
+
+  const journal = path.join(root, ".graphsmith", "state", "journal.jsonl");
+  const raw = fs.existsSync(journal) ? fs.readFileSync(journal, "utf8") : "";
+  check("recover-reports-a-legacy-staging-directory-in-the-journal",
+    raw.includes("report-legacy-staging:.staging-0123456789abcdef"),
+    "a legacy staging directory was left in place but never named, so an operator has no " +
+    "way to know it is there -- silently leaving it is not better than silently deleting it");
+
+  /* And a normal promotion still works with one sitting there, so reporting instead of
+   * deleting does not wedge the project. */
+  let promoted = null;
+  try { promoted = promoteModule.promote(promoteModule.__testing.testPacket(root, "with-legacy")); }
+  catch (error) { promoted = { state: `THREW ${error.code}` }; }
+  check("a-promotion-succeeds-with-a-legacy-staging-directory-present",
+    promoted && promoted.state === "DONE",
+    `promotion returned ${JSON.stringify(promoted)} with a legacy staging directory present`);
+}
+
 function main() {
   lockIsFreeDuringStaging();
+  legacyStagingIsReportedNotDeleted();
   preconditionsRefuseBeforeStaging();
   recoverSparesARealStagerFrozenMidCopy();
   aTamperedPayloadIsNotPublished();

@@ -987,8 +987,25 @@ function tDiskReserve() {
   }
 }
 
+/* THIS CASE ASSERTED A BEHAVIOUR THAT HAS BEEN DELIBERATELY REVERSED.
+ *
+ * It required `recover()` to DELETE every `.staging-*` directory under evolvable/. That was
+ * safe only while staging held the state lock, because then no other promotion could be
+ * using one. Staging now runs unlocked, and during a mixed-version window -- an upgrade,
+ * with an old-version promoter still copying into the old location -- a new process taking
+ * the lock and running that glob destroys its work. Two independent reviewers called the
+ * retained glob a landmine for exactly this reason.
+ *
+ * An old-format staging directory carries no ownership evidence anywhere: no pid in the
+ * name, no claim file. So "is anyone still using this" cannot be answered from it, and
+ * `recover()` no longer acts as though the answer were no. It reports the directory in the
+ * journal and leaves it for an operator.
+ *
+ * The assertion is inverted rather than deleted, and the surrounding checks are kept: the
+ * transaction must still abort, and the leftover must still be NAMED, because silently
+ * leaving it would be no better than silently deleting it. */
 function tAbandonedStagingCleanup() {
-  const name = "14-abandoned-staging-cleaned-on-recover";
+  const name = "14-legacy-staging-reported-and-kept-on-recover";
   try {
     const root = mkRoot("staging");
     const fx = createFixture(root);
@@ -1012,10 +1029,18 @@ function tAbandonedStagingCleanup() {
     const aborted = jr.some((r) => r.record_type === "TX_ABORT");
     const errs = [];
     if (!aborted) errs.push("TX not aborted");
-    if (left.length > 0) errs.push(`.staging dirs remain: ${left.join(",")}`);
-    // Contract requires abandoned staging cleanup — if remains, FAIL (defect)
+    if (!left.includes(`.staging-${fakeTx}`)) {
+      errs.push(`the legacy staging dir was DELETED (left: ${JSON.stringify(left)}); during an ` +
+        "upgrade an old-version promoter can still be copying into one, and nothing about it " +
+        "proves otherwise");
+    }
+    if (!fs.existsSync(path.join(staging, "junk.txt"))) errs.push("its contents were destroyed");
+    const reported = journalRecords(fx.paths, fakeTx).some((r) =>
+      r.record_type === "RECOVERY_STEP" && typeof r.action === "string"
+      && r.action === `report-legacy-staging:.staging-${fakeTx}`);
+    if (!reported) errs.push("the leftover was kept but never named in the journal, so an operator cannot know it is there");
     if (errs.length) fail(name, errs.join("; "));
-    else pass(name, `rec=${rec.state}`);
+    else pass(name, `rec=${rec.state}, reported and kept`);
   } catch (e) { fail(name, e.stack || e.message); }
 }
 

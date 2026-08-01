@@ -885,20 +885,39 @@ function repairTornJournal(paths) {
   return { truncated_bytes: Buffer.byteLength(finalLine), truncated_prefix: finalLine };
 }
 
+/* Report pre-upgrade staging leftovers. Does NOT delete them, and that is the point.
+ *
+ * This used to `rmSync` every `.staging-*` directory under evolvable/. That was safe only
+ * while staging held the lock, because then no other promotion could be using one. Staging
+ * now runs unlocked, and during a MIXED-VERSION window -- an upgrade, with an old-version
+ * promoter still mid-copy in the old location -- a new process taking the lock and running
+ * this glob would delete that promoter's work. Exactly the defect that had to be fixed in
+ * the new staging root, reachable one more time through the old namespace.
+ *
+ * An old-format directory carries no ownership evidence anywhere: no pid in the name, no
+ * claim file, nothing. So the question "is anyone still using this" cannot be answered from
+ * it, and the honest response to a question you cannot answer is not to act as though the
+ * answer were no. It is named in the journal instead, so an operator can see it and remove
+ * it deliberately.
+ *
+ * That also makes the two namespaces consistent: neither path now deletes a directory whose
+ * ownership it cannot establish. A rule that holds everywhere is one fewer thing for the
+ * next change to get wrong. */
 function cleanupAbandonedStaging(paths) {
-  /* PRE-UPGRADE LEFTOVERS ONLY. Staging no longer happens under evolvable/; anything
-   * matching `.staging-*` here was written by a version that staged under the lock, so it
-   * is genuinely abandoned and a glob delete is still correct for it. New staging lives in
-   * paths.staging and is reclaimed by `reclaimAbandonedStaging`, which asks who owns it. */
   const fallbackTxid = activeIdentity(paths).pointer.txid;
+  const found = [];
   for (const entry of fs.readdirSync(paths.evolvable, { withFileTypes: true })) {
     if (!entry.isDirectory() || !entry.name.startsWith(".staging-")) continue;
-    fs.rmSync(path.join(paths.evolvable, entry.name), { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     const candidate = entry.name.slice(".staging-".length);
     const txid = /^[0-9a-f]{16}$/.test(candidate) ? candidate : fallbackTxid;
-    journalRecord(paths, txid, "RECOVERY_STEP", { action: `remove-abandoned-staging:${entry.name}` });
+    journalRecord(paths, txid, "RECOVERY_STEP", {
+      action: `report-legacy-staging:${entry.name}`,
+      detail: "left in place: a pre-upgrade staging directory carries no ownership evidence, " +
+        "so it cannot be shown to be abandoned. Remove it by hand once no promotion is running.",
+    });
+    found.push(entry.name);
   }
-  fsyncDirectory(paths.evolvable);
+  return found;
 }
 
 function ownerAlive(pid) {
@@ -1223,7 +1242,16 @@ function selftest() {
       packet: testPacket(stagingRoot, "abandoned-staging"),
     });
     recover(stagingRoot);
-    check("recover-removes-abandoned-staging", !fs.existsSync(stagingDir) && stagingFixture.tree === activeIdentity(stagingPaths).pointer.tree);
+    /* This case used to assert the directory was DELETED. It now asserts the opposite, and
+     * the change is deliberate: a pre-upgrade staging directory carries no ownership
+     * evidence, so deleting it during a mixed-version window could destroy the work of an
+     * old-version promoter still copying into it. It is reported in the journal and left. */
+    const legacyReported = parseJsonl(stagingPaths.journal).some((record) =>
+      record.record_type === "RECOVERY_STEP" && typeof record.action === "string"
+      && record.action.startsWith("report-legacy-staging:"));
+    check("recover-reports-and-keeps-legacy-staging",
+      fs.existsSync(stagingDir) && legacyReported
+      && stagingFixture.tree === activeIdentity(stagingPaths).pointer.tree);
 
     const gcRoot = path.join(base, "gc");
     const gcFixture = createFixture(gcRoot);
