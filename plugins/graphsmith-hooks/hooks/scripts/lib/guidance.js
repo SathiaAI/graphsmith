@@ -3,9 +3,12 @@
 /* GraphSmith plugin — hooks/scripts/lib/guidance.js
  *
  * Builds the guidance text injected into context by the SessionStart and
- * SubagentStart hooks. Reads the repo's own canonical SKILL.md (this
- * plugin's source is the repository root, so ${CLAUDE_PLUGIN_ROOT}/SKILL.md
- * IS the live, single-source-of-truth file — no duplicated/stale copy).
+ * SubagentStart hooks. Reads ${CLAUDE_PLUGIN_ROOT}/SKILL.md — a real
+ * committed copy of the repo root's canonical SKILL.md, deliberately NOT a
+ * symlink (a `120000` symlink blob checks out as a literal path-string file
+ * on Git for Windows without symlink support). The drift check in
+ * tests/plugin-hooks/run-tests.js fails loudly if this copy and the root
+ * file ever diverge.
  *
  * Deterministic, zero-dependency CommonJS, Node >= 18. No network calls,
  * no clocks, no randomness — matching this repo's house conventions (see

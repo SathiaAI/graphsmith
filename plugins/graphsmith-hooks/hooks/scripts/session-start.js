@@ -8,8 +8,11 @@
  *
  * Writes nothing to disk and touches nothing in the target repo — all it
  * does is read this plugin's own bundled SKILL.md
- * (${CLAUDE_PLUGIN_ROOT}/SKILL.md, which for this plugin IS the repo root's
- * canonical SKILL.md) and print a JSON hook response to stdout.
+ * (${CLAUDE_PLUGIN_ROOT}/SKILL.md, a real committed copy of the repo root's
+ * canonical SKILL.md — NOT a symlink, so it checks out correctly on every
+ * platform including Git for Windows without symlink support; kept in sync
+ * by the drift check in tests/plugin-hooks/run-tests.js) and print a JSON
+ * hook response to stdout.
  *
  * Never blocks on stdin: this hook doesn't need the SessionStart JSON
  * payload (session_id/cwd/source) to build its output, so the payload is

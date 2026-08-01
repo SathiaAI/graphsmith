@@ -41,6 +41,8 @@ const SESSION_START = path.join(HOOKS_DIR, "session-start.js");
 const SUBAGENT_START = path.join(HOOKS_DIR, "subagent-start.js");
 const UNINSTALL_CHECK = path.join(HOOKS_DIR, "uninstall-check.js");
 const OTHER_PLUGIN_FIXTURE = path.join(__dirname, "fixtures", "other-plugin-session-start.js");
+const ROOT_SKILL_MD = path.join(REPO, "SKILL.md");
+const PLUGIN_SKILL_MD = path.join(PLUGIN_ROOT, "SKILL.md");
 
 const results = [];
 function record(name, status, detail) {
@@ -140,6 +142,63 @@ async function test_missingSkillFileDoesNotCrash() {
     fail(name, e.message);
   } finally {
     fs.rmSync(emptyRoot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Checks plugins/graphsmith-hooks/SKILL.md is a real committed file (not a
+ * git symlink) with real markdown content byte-identical to root SKILL.md.
+ * A `120000` symlink blob checks out on Git for Windows (without Developer
+ * Mode / core.symlinks=true) as a literal small text file containing the
+ * link-target path string (e.g. "../../SKILL.md") — silently plausible,
+ * silently wrong. Shared by the real assertion and its own sabotage test
+ * below so both exercise identical logic.
+ */
+function checkPluginSkillMd() {
+  const problems = [];
+  const lst = fs.lstatSync(PLUGIN_SKILL_MD);
+  if (lst.isSymbolicLink()) problems.push("SKILL.md is a symlink (breaks on Windows without symlink support)");
+  const content = fs.readFileSync(PLUGIN_SKILL_MD, "utf8");
+  // A link-target path string is short and has no frontmatter; real
+  // GraphSmith markdown starts with a "---" frontmatter fence and runs to
+  // several KB. This bound catches the exact failure the bug produced
+  // ("../../SKILL.md", 15 bytes) without hardcoding that literal string.
+  if (content.length < 500) problems.push(`content suspiciously short (${content.length} chars) — looks like a path string, not markdown`);
+  if (!content.startsWith("---")) problems.push("content does not start with a YAML frontmatter fence");
+  const rootContent = fs.readFileSync(ROOT_SKILL_MD, "utf8");
+  if (content !== rootContent) problems.push("content has drifted from root SKILL.md (byte-for-byte mismatch)");
+  return problems;
+}
+
+function test_pluginSkillMdIsRealFileNotSymlink() {
+  const name = "plugin SKILL.md: real committed file (not a symlink), content byte-identical to root SKILL.md";
+  const problems = checkPluginSkillMd();
+  if (problems.length) return fail(name, problems.join("; "));
+  pass(name, "not a symlink; real markdown; byte-identical to root SKILL.md");
+}
+
+function test_pluginSkillMdSymlinkSabotageIsCaught() {
+  const name = "sabotage: reintroducing plugins/graphsmith-hooks/SKILL.md as a symlink is caught — proves the test has teeth";
+  const original = fs.readFileSync(PLUGIN_SKILL_MD);
+  try {
+    fs.rmSync(PLUGIN_SKILL_MD);
+    fs.symlinkSync(path.join("..", "..", "SKILL.md"), PLUGIN_SKILL_MD);
+    const problems = checkPluginSkillMd();
+    if (!problems.length) {
+      fail(name, "expected the symlink to be flagged, but checkPluginSkillMd() reported no problems");
+    } else {
+      pass(name, `reproduced: ${problems.join("; ")}`);
+    }
+  } finally {
+    fs.rmSync(PLUGIN_SKILL_MD, { force: true });
+    fs.writeFileSync(PLUGIN_SKILL_MD, original);
+    const restored = fs.readFileSync(PLUGIN_SKILL_MD);
+    const stillSymlink = fs.lstatSync(PLUGIN_SKILL_MD).isSymbolicLink();
+    if (stillSymlink || !restored.equals(original)) {
+      fail(name + " [restore]", "restored file is not a byte-identical regular file matching the original");
+    } else {
+      pass(name + " [restore]", "plugin SKILL.md restored byte-for-byte as a regular file");
+    }
   }
 }
 
@@ -398,9 +457,9 @@ async function test_uninstallRemovesOnlyOwnSegment() {
       ],
       ["statusLine untouched", JSON.stringify(after.statusLine) === JSON.stringify(fixture.statusLine)],
     ];
-    const failed = checks.filter(([, ok]) => !ok).map(([label]) => label);
-    if (failed.length) {
-      fail(name, `failed checks: ${failed.join(", ")}`);
+    const failedChecks = checks.filter(([, ok]) => !ok).map(([label]) => label);
+    if (failedChecks.length) {
+      fail(name, `failed checks: ${failedChecks.join(", ")}`);
     } else {
       pass(name, "sibling plugin entries, hook entries, and statusLine all byte-identical after removal");
     }
@@ -616,6 +675,8 @@ async function main() {
   await test_sessionStartBasicOutput();
   await test_subagentStartBasicOutput();
   await test_missingSkillFileDoesNotCrash();
+  test_pluginSkillMdIsRealFileNotSymlink();
+  test_pluginSkillMdSymlinkSabotageIsCaught();
   await test_stdinNeverClosesDoesNotHang();
   await test_stdinSafetySabotageIsCaught();
   await test_killMidExecutionDoesNotHangHarness();
