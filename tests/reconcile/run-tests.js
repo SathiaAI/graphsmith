@@ -39,6 +39,26 @@ const path = require("path");
 const os = require("os");
 const cp = require("child_process");
 
+// Deliberately NOT a global env override here. An earlier version of this
+// suite set GRAPHSMITH_RECONCILE_LOCK_STALE_MS process-wide, which broke
+// GROUP 9 (whose writer A legitimately holds its lock for 600ms -- a
+// too-small global staleness threshold made writer B mistake A's live
+// lock for an abandoned one and steal it out from under it). Each group
+// that needs a non-default staleness threshold (GROUP 3's post-kill
+// retry, GROUP 10's stale-reclaim proof) sets and restores
+// process.env.GRAPHSMITH_RECONCILE_LOCK_STALE_MS locally, scoped tightly
+// around just the call that needs it.
+function withLockStaleOverride(ms, fn) {
+  const prev = process.env.GRAPHSMITH_RECONCILE_LOCK_STALE_MS;
+  process.env.GRAPHSMITH_RECONCILE_LOCK_STALE_MS = String(ms);
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.GRAPHSMITH_RECONCILE_LOCK_STALE_MS;
+    else process.env.GRAPHSMITH_RECONCILE_LOCK_STALE_MS = prev;
+  }
+}
+
 const RECONCILE_PATH = path.resolve(__dirname, "..", "..", "scripts", "reconcile.js");
 const reconcileLib = require(RECONCILE_PATH);
 const { reconcile } = reconcileLib;
@@ -258,8 +278,12 @@ async function groupKillMidWrite() {
 
     // Sanity: a NORMAL (non-killed) run after the killed one still
     // completes and produces the expected spliced content -- proves the
-    // stall hook itself does not permanently break normal operation.
-    const r = reconcile(target, "NEW CONTENT AFTER NORMAL RUN", { blockId: "graphsmith" });
+    // stall hook itself does not permanently break normal operation. The
+    // killed child died holding the lock (SIGKILL skips the `finally`
+    // release, same as it skips any other JS cleanup), so this specific
+    // call needs a short staleness override to reclaim that abandoned
+    // lock promptly rather than wait out the production 30s window.
+    const r = withLockStaleOverride(50, () => reconcile(target, "NEW CONTENT AFTER NORMAL RUN", { blockId: "graphsmith" }));
     report("3.5 normal (non-killed) run after the killed one still succeeds", r.status === "spliced", JSON.stringify(r));
   } finally {
     cleanup(dir);
@@ -704,6 +728,222 @@ function groupInputValidation() {
 }
 
 // ===========================================================================
+// GROUP 9: real cross-process mutual exclusion (2026-08-04 fix)
+//
+// Confirmed by an independent, non-Anthropic three-model adversarial review
+// (Z.ai GLM-5.2, Google Gemini-3-Flash-Preview, DeepSeek-V4-Pro) plus a
+// standalone reproduction, and documented in
+// claude/graphsmith-v0.5.0-wave1-status-and-adversarial-findings-2026-08-01.md
+// ("NEW: Lane A/D concurrency fix is incomplete", 2026-08-04): the OCC-only
+// approach GROUP 5 above exercises (verifyUnchanged() then rename, no lock)
+// still had a real, reproducible data-loss race -- two concurrent writers
+// could both pass verifyUnchanged() before either installed. GROUP 5's own
+// 40-trial test relies on OS scheduling to even ATTEMPT to produce that
+// interleaving, which is exactly why it passed 66/66 while the bug was
+// still live: it never got unlucky enough to hit the few-syscall window.
+//
+// This group does not repeat that mistake. Using
+// GRAPHSMITH_RECONCILE_TEST_LOCK_HOLD_MS (a stall inserted immediately
+// AFTER the lock is acquired, before it is released), it FORCES the
+// worst-case interleaving deterministically, every single run, rather than
+// hoping for it -- and directly observes that a second writer cannot touch
+// the file while the first holds the lock, not just that the final result
+// happens to look fine.
+//
+// "Broke it on purpose" verification for this fix (matching this suite's
+// own documented convention, see file header): 9.1-9.2 below were run once
+// against the version of scripts/reconcile.js from immediately before this
+// fix (OCC-only, no lock) and confirmed to demonstrate NO blocking
+// whatsoever -- the second writer proceeded immediately, with no wait --
+// then re-run against the current, fixed file and confirmed below to show
+// real, measured blocking. Not encoded as a single self-demonstrating run
+// (same reasoning as the file header gives for the other such checks).
+// ===========================================================================
+
+function spawnReconcileChild(target, blockId, renderedBlock, envOverrides) {
+  const script = [
+    `const { reconcile } = require(${JSON.stringify(RECONCILE_PATH)});`,
+    `const r = reconcile(${JSON.stringify(target)}, ${JSON.stringify(renderedBlock)}, { blockId: ${JSON.stringify(blockId)} });`,
+    `process.stdout.write(JSON.stringify(r));`,
+  ].join("\n");
+  return cp.spawn(process.execPath, ["-e", script], {
+    env: Object.assign({}, process.env, envOverrides || {}),
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+}
+
+function waitForChild(child) {
+  return new Promise((resolve) => {
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.once("exit", (code) => resolve({ code, out }));
+  });
+}
+
+async function groupRealMutualExclusion() {
+  console.log("\n=== GROUP 9: real cross-process mutual exclusion (deterministic, not probabilistic) ===");
+  const dir = tmpDir("mutex");
+  try {
+    const target = path.join(dir, "AGENTS.md");
+
+    // --- 9.1/9.2: while writer A holds the lock, writer B must not be able
+    // to observe or produce a modified file until A releases it. ---
+    const HOLD_MS = 600;
+    const startedAt = Date.now();
+    const childA = spawnReconcileChild(target, "block-a", "BLOCK A CONTENT", {
+      GRAPHSMITH_RECONCILE_TEST_LOCK_HOLD_MS: String(HOLD_MS),
+    });
+    const doneA = waitForChild(childA);
+
+    // Give A a generous head start to have acquired the lock and be
+    // mid-stall (A's own read-decide-write after the stall is near-
+    // instant; the stall dominates its total runtime).
+    await delay(150);
+
+    // At this point A must still be holding the lock and the file must not
+    // yet contain block-a (A hasn't written yet -- it's still stalling).
+    const midStallExists = fs.existsSync(target);
+    report(
+      "9.1 while writer A holds the lock (mid-stall), the target has NOT been written yet",
+      !midStallExists,
+      midStallExists ? `target unexpectedly exists after only 150ms of a ${HOLD_MS}ms hold` : undefined
+    );
+
+    // Now start writer B. Under the OLD (pre-lock) code this would race
+    // straight through with no wait at all. Under the fix, B's
+    // acquireLock() must block/retry until A releases.
+    const bStartedAt = Date.now();
+    const childB = spawnReconcileChild(target, "block-b", "BLOCK B CONTENT", {});
+    const { code: codeB } = await waitForChild(childB);
+    const bElapsedMs = Date.now() - bStartedAt;
+    const { code: codeA } = await doneA;
+    const totalElapsedMs = Date.now() - startedAt;
+
+    report("9.2a writer A exited cleanly", codeA === 0, `exit code ${codeA}`);
+    report("9.2b writer B exited cleanly", codeB === 0, `exit code ${codeB}`);
+    // B started ~150ms into A's 600ms hold, so B must have waited at least
+    // ~roughly the remainder (allowing generous scheduling slack) before
+    // it could acquire the lock and complete -- proof B was genuinely
+    // blocked, not that it got lucky and raced through.
+    report(
+      "9.2c writer B measurably waited for the lock (did not race straight through)",
+      bElapsedMs >= HOLD_MS * 0.5,
+      `B took ${bElapsedMs}ms; A's hold was ${HOLD_MS}ms (started ${Date.now() - bStartedAt >= 0 ? "after" : "?"} A acquired)`
+    );
+    report(
+      "9.2d total wall-clock for both writers is at least A's hold duration (they did not overlap)",
+      totalElapsedMs >= HOLD_MS * 0.9,
+      `total ${totalElapsedMs}ms vs hold ${HOLD_MS}ms`
+    );
+
+    // The correctness payoff: BOTH blocks present, byte-identical to what
+    // each writer asked for, deterministically -- not "40/40 trials got
+    // lucky", every single run.
+    const finalContent = fs.readFileSync(target, "utf8");
+    const foundA = reconcileLib.findBlock(finalContent, "block-a");
+    const foundB = reconcileLib.findBlock(finalContent, "block-b");
+    report("9.3 block-a survived (not silently dropped)", !!foundA && foundA.body === "BLOCK A CONTENT\n", finalContent);
+    report("9.3b block-b survived (not silently dropped)", !!foundB && foundB.body === "BLOCK B CONTENT\n", finalContent);
+  } finally {
+    cleanup(dir);
+  }
+}
+
+async function groupLockStalenessReclaim() {
+  console.log("\n=== GROUP 10: lock staleness reclaim (crashed holder does not deadlock forever) ===");
+  const dir = tmpDir("lockstale");
+  try {
+    const target = path.join(dir, "AGENTS.md");
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Simulate a process that acquired the lock and then died (SIGKILL,
+    // power loss) without releasing it: create the lock file by hand and
+    // backdate its mtime past the (test-overridden, 100ms) staleness
+    // threshold, exactly like GROUP 3's killed child leaves behind.
+    const lockPath = reconcileLib.lockPathFor(target);
+    fs.writeFileSync(lockPath, "pid=99999999 acquired=0\n");
+    const oldTime = new Date(Date.now() - 5000); // 5s old, well past the 50ms override below
+    fs.utimesSync(lockPath, oldTime, oldTime);
+
+    const r = withLockStaleOverride(50, () => reconcile(target, "CONTENT AFTER STALE RECLAIM", { blockId: "graphsmith" }));
+    report("10.1 a stale (crashed-holder) lock is reclaimed, not waited out forever", r.status === "created", JSON.stringify(r));
+    report("10.2 the reclaimed lock file itself is cleaned up after release", !fs.existsSync(lockPath));
+
+    // Sanity: a LIVE (non-stale) lock is genuinely respected, not just
+    // ignored -- hold it open in-process (no release) and confirm a
+    // concurrent acquire attempt eventually throws LockAcquisitionError
+    // rather than silently proceeding unlocked.
+    const target2 = path.join(dir, "AGENTS2.md");
+    const liveLockPath = reconcileLib.acquireLock(target2); // acquired, held, never released here
+    let threwLockAcquisitionError = false;
+    try {
+      reconcile(target2, "SHOULD NOT ACQUIRE", { blockId: "graphsmith" });
+    } catch (e) {
+      threwLockAcquisitionError = e instanceof reconcileLib.LockAcquisitionError;
+    } finally {
+      reconcileLib.releaseLock(liveLockPath);
+    }
+    report("10.3 a live (non-stale) lock is genuinely respected -- concurrent caller cannot silently bypass it", threwLockAcquisitionError);
+  } finally {
+    cleanup(dir);
+  }
+}
+
+function groupConcurrentDeleteRobustness() {
+  console.log("\n=== GROUP 11: concurrent deletion between lstat and read is retried, not crashed (2026-08-04 fix) ===");
+  const dir = tmpDir("concdelete");
+  try {
+    const target = path.join(dir, "AGENTS.md");
+    fs.writeFileSync(target, '<!-- graphsmith:begin id="x" schema_version="1" -->\nold body\n<!-- graphsmith:end id="x" -->\n');
+
+    // Monkey-patch fs.readFileSync to simulate: the target existed at
+    // lstatSync time (proven -- lst is non-null) but was deleted by an
+    // actor outside this module's lock discipline before the subsequent
+    // readFileSync. Previously this threw an uncaught, non-retried ENOENT
+    // straight out of attemptReconcile(). Confirmed by this project's own
+    // reproduction (2026-08-04) against the real, unmodified module before
+    // this fix.
+    // The simulated deletion must be a REAL deletion, not just a faked
+    // error, or the subsequent create-path fs.linkSync (createOnly) would
+    // correctly refuse with a real EEXIST against the still-present file
+    // and this test would be exercising a self-contradictory world. Delete
+    // the file for real at the moment of interception, so everything
+    // downstream (the createOnly linkSync in the fallback path) sees a
+    // consistent, genuinely-absent target -- exactly what "an actor
+    // outside this module's lock discipline deleted it" means.
+    const origReadFileSync = fs.readFileSync;
+    let callCount = 0;
+    fs.readFileSync = function (p, ...args) {
+      if (p === target) {
+        callCount++;
+        if (callCount === 1) {
+          fs.unlinkSync(target);
+          const e = new Error("ENOENT: no such file or directory, open '" + p + "'");
+          e.code = "ENOENT";
+          throw e;
+        }
+      }
+      return origReadFileSync.call(fs, p, ...args);
+    };
+
+    let result, threw;
+    try {
+      result = reconcile(target, "new body", { blockId: "x" });
+      threw = false;
+    } catch (e) {
+      threw = true;
+    } finally {
+      fs.readFileSync = origReadFileSync;
+    }
+
+    report("11.1 concurrent deletion between lstat and read does not crash reconcile()", !threw, threw ? "threw an uncaught error" : undefined);
+    report("11.2 it falls through to the create path instead", !threw && result && result.status === "created", JSON.stringify(result));
+  } finally {
+    cleanup(dir);
+  }
+}
+
+// ===========================================================================
 // MAIN
 // ===========================================================================
 async function runAll() {
@@ -718,6 +958,9 @@ async function runAll() {
   groupLineEndingsAndBom();
   groupSchemaVersionCompat();
   groupInputValidation();
+  await groupRealMutualExclusion();
+  await groupLockStalenessReclaim();
+  groupConcurrentDeleteRobustness();
 
   console.log("\n--- SUMMARY ---");
   console.log(`PASS:  ${passed}`);

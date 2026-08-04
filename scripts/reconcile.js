@@ -112,20 +112,67 @@
  * each read the file once, each compute a COMPLETE new file content
  * unaware of the other, and a plain atomic rename is a pure last-write-wins:
  * whichever rename lands second silently discards the other call's block,
- * with no error. This module uses optimistic concurrency control, not a
- * lock file (a lock adds stale-lock-cleanup and deadlock surface area this
- * project's zero-dependency, minimum-code posture would reject for a
- * problem this narrow). atomicWriteFileSync() accepts an optional
- * `verifyUnchanged` callback that runs immediately before the rename
- * (after the new content is already fsynced) and re-checks that the
- * target's on-disk state still matches what this call read at the START of
- * its attempt. If it does not -- another process/thread's write landed
- * first -- the rename is skipped and a ConcurrentModificationError is
- * thrown instead of overwriting; reconcile() catches that, re-reads the
- * now-current file, recomputes the block placement against the fresh
- * content, and retries, up to MAX_CONCURRENT_ATTEMPTS times. Exhausting the
- * retry budget throws a loud, explicit error rather than ever guessing --
- * same "fail loud, never guess" posture as the future-schema-version
+ * with no error.
+ *
+ * REVISION HISTORY OF THIS FIX, stated honestly because the first attempt
+ * was wrong and it matters why: the original version of this module tried
+ * to solve this with optimistic concurrency control alone -- no lock, just
+ * a `verifyUnchanged` callback re-checking the target's on-disk state
+ * immediately before the install (rename/link), throwing
+ * ConcurrentModificationError on mismatch so reconcile()'s retry loop could
+ * re-read and retry. An independent, non-Anthropic three-model adversarial
+ * review (Z.ai GLM-5.2, Google Gemini-3-Flash-Preview, DeepSeek-V4-Pro; see
+ * claude/graphsmith-v0.5.0-wave1-status-and-adversarial-findings-2026-08-01.md,
+ * "NEW: Lane A/D concurrency fix is incomplete", 2026-08-04) found, and a
+ * standalone reproduction script confirmed, that this was still broken:
+ * `verifyUnchanged()` and the subsequent rename/link are two separate
+ * syscalls, not one atomic unit, so two concurrent writers can BOTH call
+ * `verifyUnchanged()` and BOTH get `true` (because neither has installed
+ * yet, so the file each of them reads is still the original), and then
+ * both install -- the second one silently discarding the first, with the
+ * first writer's `atomicWriteFileSync()` call returning a completely
+ * normal, no-error, successful byte count. The OCC approach reduced the
+ * probability of the original bug (a large window -> a few-syscalls-wide
+ * window) without eliminating it, and no "tighten the check further"
+ * variant of a check-then-act pattern can eliminate it -- that is a
+ * structural property of check-then-act, not a bug in one particular
+ * implementation of it.
+ *
+ * THE ACTUAL FIX: a real mutex. `reconcile()` acquires an exclusive,
+ * sibling lock file (targetPath + LOCK_SUFFIX) via the SAME atomic
+ * test-and-set primitive `atomicWriteFileSync`'s `createOnly` path already
+ * relies on elsewhere in this file (`fs.openSync(lockPath, "wx")`, which
+ * fails with EEXIST if another holder already has it) BEFORE doing
+ * anything else, and holds it for the ENTIRE read-decide-write critical
+ * section, releasing it in a `finally` no matter how that section exits.
+ * With the lock held, nothing else using this module can even read
+ * targetPath's state until the lock is released, so there is no window --
+ * of any width -- for two callers to both act on a stale read. The
+ * `verifyUnchanged` CAS check described below is retained as a defensive
+ * invariant assertion (it should now always pass, since only the lock
+ * holder can be touching targetPath), not as the primary safety mechanism.
+ *
+ * Two new failure modes come with a real lock, handled explicitly rather
+ * than ignored: (1) a process that dies while holding the lock would
+ * deadlock every future caller forever -- handled by lock staleness: a
+ * lock file older than LOCK_STALE_MS is assumed abandoned and forcibly
+ * reclaimed (see acquireLock() below for the exact, narrow race this
+ * itself has and why it is acceptable); (2) legitimate contention under
+ * load -- handled by a bounded retry-with-backoff acquire loop
+ * (LOCK_ACQUIRE_MAX_ATTEMPTS), throwing a loud, explicit
+ * LockAcquisitionError rather than hanging forever if it's exhausted.
+ *
+ * `atomicWriteFileSync()` accepts an optional `verifyUnchanged` callback
+ * that runs immediately before the install (after the new content is
+ * already fsynced) and re-checks that the target's on-disk state still
+ * matches what this call read at the START of its attempt. If it does not,
+ * the install is skipped and a ConcurrentModificationError is thrown
+ * instead of overwriting; reconcile()'s retry loop catches that, re-reads
+ * the now-current file, recomputes the block placement against the fresh
+ * content, and retries, up to MAX_CONCURRENT_ATTEMPTS times. With the lock
+ * now serializing every caller, this should never actually fire from
+ * another graphsmith-reconcile caller; it remains as a loud, "fail rather
+ * than guess" invariant check, same posture as the future-schema-version
  * refusal above.
  */
 
@@ -153,6 +200,43 @@ const DEFAULT_SCHEMA_VERSION = "1";
 // writing to targetPath continuously/pathologically fast; reconcile() fails
 // loud in that case rather than looping forever or guessing.
 const MAX_CONCURRENT_ATTEMPTS = 7;
+
+// Sibling lock file suffix (see CONCURRENCY note above). A dotfile with the
+// same "graphsmith-reconcile" prefix atomicWriteFileSync()'s scratch temp
+// files use, so a `.graphsmith-reconcile-lock.<basename>` next to a target
+// file is immediately recognizable as this module's own bookkeeping if a
+// developer ever spots one on disk.
+const LOCK_SUFFIX_PREFIX = ".graphsmith-reconcile-lock.";
+
+// A lock file older than this is assumed to belong to a process that died
+// (crashed, was SIGKILLed, or the machine lost power) while holding it,
+// rather than one that is still legitimately working -- this repo's own
+// CI jobs and local `reconcile()` calls complete in well under a second
+// even under heavy load, so 30s is a wide margin, not a tight guess.
+// Overridable via GRAPHSMITH_RECONCILE_LOCK_STALE_MS, same posture as
+// GRAPHSMITH_DEADLINE_SCALE (tests/_harness/deadline.js) and the two
+// TEST-ONLY stall hooks below: a test that deliberately SIGKILLs a
+// lock-holding child (a SIGKILL skips this module's `finally` release,
+// same as it skips any other JS cleanup) needs staleness to kick in on a
+// test-appropriate timescale, not production's 30s. Normal runs never set
+// this and get the safe default.
+const DEFAULT_LOCK_STALE_MS = 30000;
+function lockStaleMs() {
+  const raw = process.env.GRAPHSMITH_RECONCILE_LOCK_STALE_MS;
+  if (!raw) return DEFAULT_LOCK_STALE_MS;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms > 0 ? ms : DEFAULT_LOCK_STALE_MS;
+}
+
+// Bounded retry-with-backoff budget for ACQUIRING the lock (distinct from
+// MAX_CONCURRENT_ATTEMPTS, which bounds retries of the read-decide-write
+// body once the lock is already held). 40 attempts at a ~15ms base delay
+// covers real contention (this repo's own concurrent-caller tests run
+// several reconcile() calls back-to-back against the same file) well
+// within a second, while still failing loud instead of hanging forever if
+// something is holding the lock pathologically long.
+const LOCK_ACQUIRE_MAX_ATTEMPTS = 40;
+const LOCK_ACQUIRE_RETRY_MS = 15;
 
 const BLOCK_ID_RE = /^[a-z][a-z0-9-]*$/; // same shape as host-adapter.schema.json's `id`
 const SCHEMA_VERSION_RE = /^[0-9]+$/;
@@ -311,24 +395,152 @@ function findBlock(raw, blockId) {
 // backoff, not a novel mechanism introduced here.
 // ---------------------------------------------------------------------------
 function testStallBeforeRenameIfRequested() {
-  const raw = process.env.GRAPHSMITH_RECONCILE_TEST_STALL_MS;
+  syncSleepFromEnv("GRAPHSMITH_RECONCILE_TEST_STALL_MS");
+}
+
+// Same synchronous-sleep primitive, factored out so the new lock-hold test
+// hook (below) can reuse it without duplicating the SharedArrayBuffer +
+// Atomics.wait dance. Still the same mechanism scripts/write-report.js
+// already uses for its own EAGAIN backoff -- not novel.
+function syncSleep(ms) {
+  const ia = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+function syncSleepFromEnv(envVar) {
+  const raw = process.env[envVar];
   if (!raw) return;
   const ms = Number(raw);
   if (!Number.isFinite(ms) || ms <= 0) return;
-  const ia = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(ia, 0, 0, ms);
+  syncSleep(ms);
+}
+
+// ---------------------------------------------------------------------------
+// TEST-ONLY HOOK #2: an opt-in, env-var-gated synchronous stall inserted
+// immediately AFTER the lock is acquired and BEFORE it is released. Exists
+// so a test can deterministically prove the lock actually excludes a second
+// caller (start process A, let it acquire and stall while holding the
+// lock, start process B and confirm B blocks/retries until A's stall ends
+// and A releases) rather than relying on OS scheduling luck to even attempt
+// to produce contention. Inert unless
+// GRAPHSMITH_RECONCILE_TEST_LOCK_HOLD_MS is set to a positive number; same
+// posture as TEST-ONLY HOOK #1 above.
+// ---------------------------------------------------------------------------
+function testStallWhileHoldingLockIfRequested() {
+  syncSleepFromEnv("GRAPHSMITH_RECONCILE_TEST_LOCK_HOLD_MS");
 }
 
 /**
  * Thrown by atomicWriteFileSync() when its `verifyUnchanged` callback
  * reports that targetPath's on-disk state moved between this call's read
- * and its rename -- i.e. another process/thread won the race. Not a real
- * failure: reconcile()'s retry loop catches exactly this type and retries
- * against fresh content. A distinct class (rather than a plain Error) so
- * that catch site can't accidentally swallow an unrelated error from the
- * same try block.
+ * and its rename -- i.e. another process/thread won the race. With the
+ * lock (below) now serializing every caller, this is retained as a "fail
+ * loud rather than silently guess" invariant check, not the primary
+ * safety mechanism -- see the CONCURRENCY note in the module docstring for
+ * why OCC alone was not sufficient. A distinct class (rather than a plain
+ * Error) so that catch site can't accidentally swallow an unrelated error
+ * from the same try block.
  */
 class ConcurrentModificationError extends Error {}
+
+/**
+ * Thrown by acquireLock() when LOCK_ACQUIRE_MAX_ATTEMPTS is exhausted
+ * without acquiring targetPath's lock -- i.e. some other process has held
+ * it continuously, and not staled out, for the entire retry budget. A
+ * distinct class so callers can tell "I could not even start" apart from
+ * ConcurrentModificationError ("I started, then lost a race") and from
+ * reconcile()'s own retry-budget-exhausted Error.
+ */
+class LockAcquisitionError extends Error {}
+
+function lockPathFor(targetPath) {
+  const dir = path.dirname(targetPath);
+  return path.join(dir, `${LOCK_SUFFIX_PREFIX}${path.basename(targetPath)}`);
+}
+
+/**
+ * Acquire an exclusive, cross-process mutex on `targetPath` by atomically
+ * creating a sibling lock file -- `fs.openSync(lockPath, "wx")` fails with
+ * EEXIST if another holder already has it, the same OS-guaranteed
+ * test-and-set primitive `atomicWriteFileSync`'s `createOnly` path already
+ * relies on. Blocks (via bounded synchronous retry-with-backoff, not a
+ * busy-spin) until acquired, a stale lock is reclaimed, or
+ * LOCK_ACQUIRE_MAX_ATTEMPTS is exhausted.
+ *
+ * STALENESS RECLAIM RACE, stated honestly rather than glossed over: two
+ * callers can both observe the same lock file as stale (older than
+ * LOCK_STALE_MS) and both attempt to reclaim it. This is NOT re-introducing
+ * the original unbounded data-loss bug: reclaiming means "unlink the dead
+ * lock, then immediately retry the normal wx-create acquire" -- at most one
+ * of the two racing reclaimers' unlink+create actually wins the following
+ * wx-create (the other's create fails EEXIST against the winner's fresh
+ * lock and falls back into the ordinary retry loop). The narrow window is
+ * "two callers unlink the same already-gone file", which is harmless (the
+ * second unlink is a silent ENOENT no-op), not "two callers both believe
+ * they hold the lock" -- that property is never violated. A crashed
+ * holder's abandoned lock therefore costs at most one extra retry round for
+ * whichever caller loses the reclaim race, not a correctness gap.
+ *
+ * Returns the acquired lockPath (pass to releaseLock()).
+ */
+function acquireLock(targetPath) {
+  const lockPath = lockPathFor(targetPath);
+  const dir = path.dirname(targetPath);
+  let attemptedStaleReclaimThisRound = false;
+
+  for (let attempt = 1; attempt <= LOCK_ACQUIRE_MAX_ATTEMPTS; attempt++) {
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o644);
+      try {
+        fs.writeSync(fd, Buffer.from(`pid=${process.pid} acquired=${Date.now()}\n`, "utf8"));
+      } finally {
+        fs.closeSync(fd);
+      }
+      return lockPath; // acquired
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      // Someone else holds it (or held it and is gone). Check staleness.
+      let lockStat = null;
+      try {
+        lockStat = fs.statSync(lockPath);
+      } catch (_) {
+        // Lock vanished between our failed create and this stat (the
+        // holder just released it, or another reclaimer's unlink already
+        // ran) -- loop straight back around to retry the create, no sleep
+        // needed, this is the common fast-path case under contention.
+        continue;
+      }
+      const ageMs = Date.now() - lockStat.mtimeMs;
+      if (ageMs > lockStaleMs() && !attemptedStaleReclaimThisRound) {
+        attemptedStaleReclaimThisRound = true; // at most one reclaim attempt per stale sighting, not a tight loop
+        try {
+          fs.unlinkSync(lockPath);
+        } catch (_) {
+          /* already gone -- fine, see STALENESS RECLAIM RACE above */
+        }
+        continue; // retry the create immediately, no backoff sleep
+      }
+      syncSleep(LOCK_ACQUIRE_RETRY_MS);
+    }
+  }
+  throw new LockAcquisitionError(
+    `reconcile: could not acquire lock for ${targetPath} after ${LOCK_ACQUIRE_MAX_ATTEMPTS} attempts ` +
+      `(~${LOCK_ACQUIRE_MAX_ATTEMPTS * LOCK_ACQUIRE_RETRY_MS}ms) -- another process/thread has held ` +
+      `${lockPath} continuously and it never staled out (< ${lockStaleMs()}ms old on every check)`
+  );
+}
+
+/** Release a lock acquired by acquireLock(). Best-effort: if the lock file
+ * is already gone (e.g. force-removed by an operator during an incident),
+ * that is not this call's failure to report. */
+function releaseLock(lockPath) {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (_) {
+    /* best-effort, see doc above */
+  }
+}
 
 /**
  * Write `content` to `targetPath` atomically: full content to a scratch temp
@@ -442,11 +654,15 @@ function baseResult(status, targetPath, blockId, schemaVersion, extra) {
  * @returns {object} a result with at least {status, path, blockId,
  *   schemaVersion}; `status: "refused"` results also carry `reason` and
  *   never write anything.
- * @throws {Error} if MAX_CONCURRENT_ATTEMPTS is exhausted because another
- *   process/thread keeps winning the race on targetPath -- see the
- *   CONCURRENCY note in the module docstring. Nothing is left partially
- *   written in that case; the target is exactly as some attempt (this call's
- *   or a concurrent one's) left it.
+ * @throws {LockAcquisitionError} if the cross-process lock on targetPath
+ *   cannot be acquired within LOCK_ACQUIRE_MAX_ATTEMPTS -- see the
+ *   CONCURRENCY note in the module docstring. Nothing is read or written in
+ *   that case.
+ * @throws {Error} if MAX_CONCURRENT_ATTEMPTS is exhausted because the
+ *   verifyUnchanged invariant check keeps failing after the lock is already
+ *   held (should not happen in practice -- see CONCURRENCY note). Nothing
+ *   is left partially written in that case; the target is exactly as some
+ *   attempt left it.
  */
 function reconcile(targetPath, renderedBlock, options) {
   if (typeof targetPath !== "string" || targetPath.length === 0) {
@@ -459,20 +675,33 @@ function reconcile(targetPath, renderedBlock, options) {
   assertValidSchemaVersion(schemaVersion);
   const desiredBody = normalizeBody(renderedBlock); // validates renderedBlock is a string too
 
-  for (let attempt = 1; attempt <= MAX_CONCURRENT_ATTEMPTS; attempt++) {
-    try {
-      return attemptReconcile(targetPath, blockId, schemaVersion, desiredBody);
-    } catch (e) {
-      if (!(e instanceof ConcurrentModificationError)) throw e;
-      // Another process/thread's write landed between this attempt's read
-      // and its rename. Loop around: the next attemptReconcile() call reads
-      // targetPath fresh and recomputes the block placement against
-      // whatever is there now -- never guesses, never writes over it.
+  // Acquire the cross-process mutex BEFORE reading anything -- see the
+  // CONCURRENCY note in the module docstring for why the OCC-only approach
+  // this replaced was insufficient. Held for the entire read-decide-write
+  // critical section below, released in `finally` no matter how it exits.
+  const lockPath = acquireLock(targetPath);
+  try {
+    testStallWhileHoldingLockIfRequested();
+    for (let attempt = 1; attempt <= MAX_CONCURRENT_ATTEMPTS; attempt++) {
+      try {
+        return attemptReconcile(targetPath, blockId, schemaVersion, desiredBody);
+      } catch (e) {
+        if (!(e instanceof ConcurrentModificationError)) throw e;
+        // With the lock held, another graphsmith-reconcile caller cannot be
+        // mid-write here -- this invariant check firing would mean
+        // targetPath moved under an actor OUTSIDE this module's lock
+        // discipline. Loop around and recompute from fresh state anyway,
+        // rather than assume that can't happen.
+      }
     }
+    throw new Error(
+      `reconcile: exceeded ${MAX_CONCURRENT_ATTEMPTS} retries due to concurrent modification of ${targetPath} ` +
+        "even while holding the reconcile lock -- something outside this module's lock discipline is writing " +
+        "to this target"
+    );
+  } finally {
+    releaseLock(lockPath);
   }
-  throw new Error(
-    `reconcile: exceeded ${MAX_CONCURRENT_ATTEMPTS} retries due to concurrent modification of ${targetPath}`
-  );
 }
 
 /**
@@ -516,7 +745,28 @@ function attemptReconcile(targetPath, blockId, schemaVersion, desiredBody) {
     return baseResult("created", targetPath, blockId, schemaVersion, { bytesWritten });
   }
 
-  const rawWithBom = fs.readFileSync(targetPath, "utf8");
+  // Confirmed finding (2026-08-04 adversarial review, GLM-5.2 + Gemini-3-
+  // Flash-Preview independently, reproduced by this project directly): lst
+  // above proves the target existed at THAT instant, but an actor outside
+  // this module's lock discipline (a human `rm`, an unrelated tool) could
+  // still delete it in the gap before this read. Previously this threw an
+  // uncaught, non-retried ENOENT straight out of attemptReconcile(),
+  // crashing the whole reconcile() call instead of gracefully falling back
+  // to the same "absent -> create" path a fresh attempt would take. Now
+  // handled explicitly: caught, and re-dispatched to the exact same create
+  // logic used when lst was null from the start, rather than guessing at
+  // stale content or leaving the caller to deal with a raw fs error.
+  let rawWithBom;
+  try {
+    rawWithBom = fs.readFileSync(targetPath, "utf8");
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+    const dir = path.dirname(targetPath);
+    fs.mkdirSync(dir, { recursive: true });
+    const content = buildBlock(blockId, schemaVersion, desiredBody);
+    const bytesWritten = atomicWriteFileSync(targetPath, content, null, /* createOnly */ true);
+    return baseResult("created", targetPath, blockId, schemaVersion, { bytesWritten });
+  }
   const hasBom = rawWithBom.charCodeAt(0) === 0xfeff;
   const bom = hasBom ? String.fromCharCode(0xfeff) : "";
   const raw = hasBom ? rawWithBom.slice(1) : rawWithBom;
@@ -646,11 +896,17 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_SCHEMA_VERSION,
+  DEFAULT_LOCK_STALE_MS,
   reconcile,
+  ConcurrentModificationError,
+  LockAcquisitionError,
   // Exported for white-box testing, same convention as scripts/verify.js
   // exporting its own internal helpers (sha256Hex, verifyFileList, ...).
   findBlock,
   buildBlock,
   normalizeBody,
   atomicWriteFileSync,
+  lockPathFor,
+  acquireLock,
+  releaseLock,
 };
