@@ -611,42 +611,156 @@ function generateAll(options) {
     );
   }
 
+  // Validate every "reconciled" adapter's rendered body up front, before
+  // rendering or writing ANYTHING else -- same all-or-nothing posture as
+  // the three checks above. Found by the Lane A/D cross-lane integration
+  // review (2026-08-04, Finding 1): scripts/reconcile.js's own
+  // assertNoMarkerLookalike() (see that file, ~line 316) already refuses a
+  // renderedBlock that contains a marker-lookalike line, but it only runs
+  // INSIDE reconcile() -- i.e. partway through the write loop below, by
+  // which point earlier adapters in iteration order may already have
+  // written (standalone: directly and destructively; reconciled: via
+  // reconcile()). Demonstrated repro: a "standalone" adapter that sorts
+  // before a marker-lookalike "reconciled" adapter had its target
+  // wholesale-overwritten before the run ever threw. Running this same
+  // check for every reconciled adapter BEFORE the write loop starts closes
+  // that: a marker-lookalike body now aborts the whole run before any
+  // adapter, standalone or reconciled, writes anything.
+  //
+  // MARKER_LOOKALIKE_RE below is a deliberate, hand-kept-in-sync DUPLICATE
+  // of scripts/reconcile.js's own module-scope regex of the same name
+  // (~line 306 there) -- NOT imported, because reconcile.js is the
+  // data-loss-critical module this project deliberately avoids reopening
+  // for anything beyond its existing exported white-box-testing surface
+  // (see reconcile.js's own module.exports comment). GROUP 17's
+  // "regex stays in sync with reconcile.js" test (tests/generate/run-
+  // tests.js) reads reconcile.js's source text directly and asserts this
+  // literal pattern is still present verbatim -- if the two ever drift,
+  // that test fails loudly instead of this check silently going stale.
+  const MARKER_LOOKALIKE_RE = /^<!-- graphsmith:(?:begin|end)\b.*$/m;
+  const reconciledBodyCache = new Map(); // def -> rendered body, computed once here, reused (not re-rendered) in the write loop below
+  const markerLookalikeErrors = [];
+  for (const { def } of defs) {
+    if (def.placementMode !== "reconciled") continue;
+    const body = renderReconciledBody(skill, def);
+    reconciledBodyCache.set(def, body);
+    const m = MARKER_LOOKALIKE_RE.exec(body);
+    if (m) {
+      markerLookalikeErrors.push(
+        `adapter "${def.id}": rendered body contains a line that looks like a graphsmith marker (${JSON.stringify(m[0])}) and cannot be safely embedded as block body content`
+      );
+    }
+  }
+  if (markerLookalikeErrors.length > 0) {
+    throw new GenerationError(
+      `generateAll: ${markerLookalikeErrors.length} reconciled adapter(s) have a rendered body that looks like a graphsmith marker:\n\n  ${markerLookalikeErrors.join("\n  ")}`
+    );
+  }
+
   if (opts.adapterFilter) {
     const wanted = new Set(opts.adapterFilter);
     defs = defs.filter(({ def }) => wanted.has(def.id));
   }
 
+  // Process every "reconciled" adapter before any "standalone" adapter.
+  // Found by the Lane A/D cross-lane integration review (2026-08-04,
+  // Finding 1): the previous single flat pass over `defs` in file-load
+  // order meant a later reconciled failure could leave an EARLIER
+  // standalone adapter's destructive, no-history wholesale-overwrite
+  // already committed, with no way to undo it. Reconciled writes go
+  // through reconcile.js's lock+CAS-protected path and are the ones most
+  // likely to hit a real (non-marker-lookalike, now caught above)
+  // transient failure -- lock contention (LockAcquisitionError), a
+  // concurrent modification (ConcurrentModificationError / LockLostError).
+  // Running them all first means: if any of them fails, this function
+  // stops immediately (see the try/catch below) BEFORE a single
+  // standalone adapter has been touched.
+  //
+  // KNOWN, ACCEPTED LIMITATION: this does NOT make the run atomic -- a
+  // LATER reconciled adapter can still fail after an EARLIER reconciled
+  // adapter has already succeeded, and that earlier write is not rolled
+  // back (reconcile.js's CAS guarantee is per-file, not cross-file; real
+  // cross-file atomicity would need a transaction log this project does
+  // not have, which the review scoped out of this fix). What this DOES
+  // guarantee: a run that overall fails never leaves a standalone write on
+  // disk.
+  const orderedDefs = [
+    ...defs.filter(({ def }) => def.placementMode === "reconciled"),
+    ...defs.filter(({ def }) => def.placementMode !== "reconciled"),
+  ];
+
   const results = [];
   let driftCount = 0;
+  const succeededAdapterIds = [];
 
-  for (const { def } of defs) {
-    const targetPath = path.join(opts.root, def.targetPath);
+  try {
+    for (const { def } of orderedDefs) {
+      const targetPath = path.join(opts.root, def.targetPath);
 
-    if (def.placementMode === "standalone") {
-      const content = renderStandaloneContent(skill, def);
-      if (opts.check) {
-        const r = checkStandalone(targetPath, content);
-        if (r.drift) driftCount++;
-        results.push(Object.assign({ adapterId: def.id, mode: "standalone" }, r));
+      if (def.placementMode === "standalone") {
+        const content = renderStandaloneContent(skill, def);
+        if (opts.check) {
+          const r = checkStandalone(targetPath, content);
+          if (r.drift) driftCount++;
+          results.push(Object.assign({ adapterId: def.id, mode: "standalone" }, r));
+        } else {
+          const r = writeStandaloneAtomic(targetPath, content);
+          results.push(Object.assign({ adapterId: def.id, mode: "standalone" }, r));
+        }
+      } else if (def.placementMode === "reconciled") {
+        const body = reconciledBodyCache.get(def);
+        if (opts.check) {
+          const r = checkReconciled(targetPath, def.id, body);
+          if (r.drift) driftCount++;
+          results.push(Object.assign({ adapterId: def.id, mode: "reconciled" }, r));
+        } else {
+          // NEVER fs.writeFileSync a reconciled target directly -- reconcile()
+          // is the only permitted writer. See module header.
+          const r = reconcileLib.reconcile(targetPath, body, { blockId: def.id, schemaVersion: BLOCK_SCHEMA_VERSION });
+          results.push(Object.assign({ adapterId: def.id, mode: "reconciled" }, r));
+        }
       } else {
-        const r = writeStandaloneAtomic(targetPath, content);
-        results.push(Object.assign({ adapterId: def.id, mode: "standalone" }, r));
+        throw new GenerationError(`generateAll: adapter "${def.id}" has unknown placementMode "${def.placementMode}"`);
       }
-    } else if (def.placementMode === "reconciled") {
-      const body = renderReconciledBody(skill, def);
-      if (opts.check) {
-        const r = checkReconciled(targetPath, def.id, body);
-        if (r.drift) driftCount++;
-        results.push(Object.assign({ adapterId: def.id, mode: "reconciled" }, r));
-      } else {
-        // NEVER fs.writeFileSync a reconciled target directly -- reconcile()
-        // is the only permitted writer. See module header.
-        const r = reconcileLib.reconcile(targetPath, body, { blockId: def.id, schemaVersion: BLOCK_SCHEMA_VERSION });
-        results.push(Object.assign({ adapterId: def.id, mode: "reconciled" }, r));
-      }
-    } else {
-      throw new GenerationError(`generateAll: adapter "${def.id}" has unknown placementMode "${def.placementMode}"`);
+      succeededAdapterIds.push(def.id);
     }
+  } catch (e) {
+    // Honest, structured partial-state reporting -- Finding 1, option C.
+    // STOPS on the first failure rather than "continuing to process
+    // remaining adapters": continuing would let a LATER standalone adapter
+    // still be attempted (and possibly succeed) after an EARLIER
+    // reconciled adapter has already failed, which defeats the exact
+    // guarantee the reordering above exists to provide. This is a
+    // deliberate refinement made while implementing the originally-
+    // approved recommendation ("continue processing remaining adapters")
+    // -- continuing was found, on re-reading the write loop, to be
+    // incompatible with that guarantee; stop-on-first-failure is what
+    // actually delivers it. Flagged explicitly to Paul in this fix's
+    // report rather than implemented silently.
+    //
+    // Every error reaching here is wrapped uniformly, regardless of type
+    // (GenerationError, reconcile.js's LockAcquisitionError /
+    // ConcurrentModificationError / LockLostError, an fs error such as
+    // EACCES, or anything else) -- an unpredictable, never-seen-before
+    // failure mode is exactly the case where honest partial-state
+    // reporting matters most, so there is no type-based carve-out here.
+    // The original error is preserved as `.cause` and its message is
+    // folded into the new message, so no information is lost.
+    const failedIndex = succeededAdapterIds.length; // orderedDefs[failedIndex] is exactly the adapter mid-iteration when e was thrown
+    const failedId = orderedDefs[failedIndex] ? orderedDefs[failedIndex].def.id : "(unknown)";
+    const neverAttemptedIds = orderedDefs.slice(failedIndex + 1).map(({ def }) => def.id);
+    const partial = new GenerationError(
+      `generateAll: aborted after adapter "${failedId}" failed (${e.message}). ` +
+        `${succeededAdapterIds.length} adapter(s) already wrote successfully before this failure: ` +
+        `${succeededAdapterIds.length > 0 ? succeededAdapterIds.join(", ") : "(none)"}. ` +
+        `${neverAttemptedIds.length} adapter(s) were never attempted: ` +
+        `${neverAttemptedIds.length > 0 ? neverAttemptedIds.join(", ") : "(none)"}.`
+    );
+    partial.cause = e;
+    partial.succeededAdapterIds = succeededAdapterIds.slice();
+    partial.failedAdapterId = failedId;
+    partial.neverAttemptedAdapterIds = neverAttemptedIds;
+    throw partial;
   }
 
   return { results, driftCount };
