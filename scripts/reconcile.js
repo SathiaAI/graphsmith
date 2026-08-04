@@ -172,10 +172,20 @@
  * verify-after-acquire, verify-before-commit) in full; the property it
  * provides is deliberately weaker than "two callers can never simultaneously
  * believe they hold the lock" (nothing without a heartbeat can guarantee
- * that) and instead is the property that actually matters: at most one
- * caller's WRITE to targetPath, per acquisition, ever commits. A caller
- * whose lock is reclaimed always finds out before it writes (LockLostError),
- * never after.
+ * that). What the three-layer fix DOES guarantee is that a caller whose
+ * lock is reclaimed always finds out before it writes (LockLostError),
+ * never after -- that much is Layer 3's own check-before-write, alone. It
+ * is NOT, by itself, what makes "at most one caller's write per
+ * acquisition ever lands on disk" true: Layer 3's check and the write it
+ * gates are still two separate syscalls, with their own narrow
+ * check-then-act gap. That stronger property is the joint result of Layer
+ * 3 together with two OTHER, pre-existing mechanisms this module already
+ * had for unrelated reasons (the `verifyUnchanged` CAS check and
+ * `fs.linkSync`'s atomic EEXIST-on-conflict semantics) plus reconcile()'s
+ * retry loop re-validating against current on-disk state on any conflict --
+ * see acquireLock()'s own docstring below for the honest accounting of why
+ * Layer 3 alone is not sufficient and how that combination closes the gap
+ * it leaves open.
  *
  * `atomicWriteFileSync()` accepts an optional `verifyUnchanged` callback
  * that runs immediately before the install (after the new content is
@@ -571,11 +581,34 @@ function lockCurrentlyOwnedByToken(lockPath, token) {
  * a reclaimer legitimately, by this module's own staleness rules, taking
  * over LATER, mid-critical-section, if this call's hold genuinely outlives
  * the staleness threshold. Nothing without a heartbeat can PREVENT that
- * from happening. What Layer 3 guarantees instead is the property that
- * actually matters: the caller whose lock was reclaimed out from under it
- * always finds out BEFORE its write commits (throwing LockLostError), so
- * at most one caller's write per acquisition ever lands on disk. See
- * reconcile() and atomicWriteFileSync() below.
+ * from happening.
+ *
+ * WHAT LAYER 3 GUARANTEES ON ITS OWN, stated honestly because an earlier
+ * version of this comment overclaimed here too (found by the same
+ * three-model adversarial review that found NEW #2 above): the caller
+ * whose lock was reclaimed always finds out BEFORE its OWN write commits
+ * (throwing LockLostError instead of proceeding). It does NOT, by itself,
+ * guarantee that at most one caller's write per acquisition ever lands on
+ * disk -- verifyLockHeld() and the write it gates (fs.renameSync /
+ * fs.linkSync) are still two separate syscalls, so a reclaim can in
+ * principle land in the gap between the check returning true and that
+ * write actually committing, the same check-then-act shape this whole
+ * REVISION HISTORY exists to close. A standalone reproduction forcing that
+ * exact interleaving against this module's real, shipped code was built to
+ * test this directly, and did not produce a double-write, because the "at
+ * most one write" property is not Layer 3's alone to provide -- it is the
+ * joint result of Layer 3 together with two OTHER, pre-existing mechanisms
+ * this module already had for unrelated reasons: the `verifyUnchanged` CAS
+ * check on the append/splice paths, and `fs.linkSync`'s atomic
+ * EEXIST-on-conflict semantics on the create path (see
+ * atomicWriteFileSync's `createOnly` doc below) -- either of which
+ * independently catches a write that slipped past a Layer-3 gap, since the
+ * reclaimer's own subsequent activity changes targetPath's on-disk state
+ * (or occupies the path fs.linkSync targets) before the stale caller's
+ * write can land unnoticed -- plus reconcile()'s retry loop, which
+ * re-reads and recomputes against targetPath's CURRENT state on any
+ * conflict rather than trusting a stale snapshot. See reconcile() and
+ * atomicWriteFileSync() below.
  *
  * Returns `{ lockPath, token }`. Pass both to releaseLock(); pass `token`
  * through to the write path for Layer 3.
