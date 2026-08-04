@@ -199,6 +199,20 @@ function validateAdapterDef(def, schema) {
 // 1.1/1.2 spec's "indicator" set. Anything on this list forces quoting.
 const YAML_LEADING_INDICATOR_RE = /^[-?:,\[\]{}#&*!|>'"%@`]/;
 
+// Additional YAML 1.2 "core schema" scalars that a plain string can
+// accidentally collide with -- none of these start with a character
+// YAML_LEADING_INDICATOR_RE catches, and none are covered by the
+// true/false/null/decimal-number checks below. Confirmed via a real
+// parser (js-yaml) round-trip during the Lane D non-Anthropic adversarial
+// review (2026-08-04): unquoted, a real YAML reader silently resolves
+// each of these to null/a number/a float instead of the original string,
+// with zero error signal. See that review's findings for the exact
+// empirical evidence.
+const YAML_NULL_ALIAS_RE = /^~$/;
+const YAML_HEX_INT_RE = /^[-+]?0x[0-9a-fA-F]+$/;
+const YAML_OCTAL_INT_RE = /^[-+]?0o[0-7]+$/;
+const YAML_INF_NAN_RE = /^[-+]?\.(inf|Inf|INF|nan|NaN|NAN)$/;
+
 /**
  * Renders `value` as a YAML frontmatter scalar for one field. Prefers a
  * plain (unquoted) scalar when safe; falls back to a double-quoted, escaped
@@ -239,7 +253,11 @@ function toYamlScalar(fieldName, value) {
     value === "true" ||
     value === "false" ||
     value === "null" ||
-    /^-?\d+(\.\d+)?$/.test(value);
+    /^-?\d+(\.\d+)?$/.test(value) ||
+    YAML_NULL_ALIAS_RE.test(value) ||
+    YAML_HEX_INT_RE.test(value) ||
+    YAML_OCTAL_INT_RE.test(value) ||
+    YAML_INF_NAN_RE.test(value);
   if (!needsQuoting) return value;
   const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   return `"${escaped}"`;
@@ -455,6 +473,32 @@ function generateAll(options) {
   }
   if (validationErrors.length > 0) {
     throw new GenerationError(`generateAll: ${validationErrors.length} adapter definition(s) failed schema validation:\n\n${validationErrors.join("\n\n")}`);
+  }
+
+  // Validate EVERY adapter definition's targetPath resolves inside
+  // opts.root before rendering or writing ANYTHING -- same all-or-nothing
+  // posture as the schema-validation pass above (see GROUP 12's "invalid
+  // adapter aborts the whole run" guarantee, which this extends to a
+  // second class of bad input). A malformed or mistyped targetPath (e.g.
+  // containing "../") must never silently write outside the project
+  // root, and must never partially generate other, otherwise-valid
+  // adapters first. Found by the Lane D non-Anthropic adversarial review
+  // (2026-08-04): path.join(opts.root, def.targetPath) previously had no
+  // containment check at all.
+  const resolvedRoot = path.resolve(opts.root);
+  const containmentErrors = [];
+  for (const { def } of defs) {
+    const resolvedTarget = path.resolve(path.join(opts.root, def.targetPath));
+    if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(resolvedRoot + path.sep)) {
+      containmentErrors.push(
+        `adapter "${def.id}": targetPath ${JSON.stringify(def.targetPath)} resolves to "${resolvedTarget}", which is outside root "${resolvedRoot}"`
+      );
+    }
+  }
+  if (containmentErrors.length > 0) {
+    throw new GenerationError(
+      `generateAll: ${containmentErrors.length} adapter(s) have a targetPath that escapes opts.root:\n\n  ${containmentErrors.join("\n  ")}`
+    );
   }
 
   if (opts.adapterFilter) {

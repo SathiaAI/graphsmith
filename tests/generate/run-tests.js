@@ -684,6 +684,111 @@ function groupInvalidAdapterAbortsWholeRun() {
 }
 
 // ===========================================================================
+// GROUP 13: adapter targetPath must resolve inside opts.root (path
+// traversal containment -- found by the Lane D non-Anthropic adversarial
+// review, 2026-08-04: path.join(opts.root, def.targetPath) previously had
+// no containment check at all, confirmed via a direct repro that a
+// "../"-containing targetPath silently escaped the project root)
+// ===========================================================================
+function groupTargetPathContainment() {
+  console.log("\n=== GROUP 13: adapter targetPath containment ===");
+
+  // Positive control: a normal in-root targetPath still generates fine --
+  // the new containment check must not be overly restrictive.
+  {
+    const fixture = buildFixture("containment-ok");
+    let threw = false;
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = true;
+    }
+    report("13.1 a normal in-root targetPath does not throw", !threw);
+    report("13.2 the in-root file was actually written", fs.existsSync(path.join(fixture.dir, "AGENTS.md")));
+    cleanup(fixture.dir);
+  }
+
+  // A targetPath that resolves outside root (via "../") must be refused
+  // loudly, not silently written outside the project root. The escaping
+  // path is computed from the fixture's OWN actual directory via
+  // path.relative, not a hardcoded "../../.." guess, so this test is
+  // correct regardless of the OS temp directory's actual nesting depth.
+  {
+    const fixture = buildFixture("containment-escape");
+    const escapeDir = tmpDir("containment-escape-target");
+    const outsideFile = path.join(escapeDir, "OUTSIDE-ROOT-PWNED.txt");
+    const maliciousTargetPath = path.relative(fixture.dir, outsideFile);
+
+    fs.writeFileSync(
+      path.join(fixture.adaptersDir, "malicious-fixture.json"),
+      JSON.stringify(
+        {
+          id: "malicious-fixture",
+          displayName: "Malicious Fixture",
+          targetPath: maliciousTargetPath,
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    let threw = false;
+    let msg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = e instanceof generateLib.GenerationError;
+      msg = e.message;
+    }
+    report("13.3 a targetPath resolving outside opts.root throws GenerationError", threw && /outside root/.test(msg), msg);
+    report("13.4 the escaping file was NOT written outside root", !fs.existsSync(outsideFile));
+    report(
+      "13.5 all-or-nothing: nothing was written for the other, otherwise-valid adapters either",
+      !fs.existsSync(path.join(fixture.dir, "AGENTS.md")) && !fs.existsSync(path.join(fixture.dir, ".cursor")),
+      `AGENTS.md exists=${fs.existsSync(path.join(fixture.dir, "AGENTS.md"))}`
+    );
+
+    cleanup(fixture.dir);
+    cleanup(escapeDir);
+  }
+}
+
+// ===========================================================================
+// GROUP 14: toYamlScalar quotes YAML-core-schema-ambiguous values (found by
+// the Lane D non-Anthropic adversarial review, 2026-08-04: confirmed via a
+// real js-yaml round-trip test that "~", hex/octal integers, and
+// .inf/.nan previously round-tripped to null/a number instead of the
+// original string, with zero error signal)
+// ===========================================================================
+function groupYamlAmbiguousScalarQuoting() {
+  console.log("\n=== GROUP 14: toYamlScalar quotes YAML-ambiguous scalars ===");
+
+  // Each of these previously round-tripped to null/a number under a real
+  // YAML parser (js-yaml) instead of staying a string -- see the Lane D
+  // review's empirical evidence. All must now be quoted.
+  const ambiguousValues = ["~", "0x1F", "0o17", ".inf", ".nan", "0xAB", "0o7"];
+  for (const value of ambiguousValues) {
+    const rendered = generateLib.toYamlScalar("field", value);
+    const isQuoted = rendered.startsWith('"') && rendered.endsWith('"');
+    report(`14.${value} value ${JSON.stringify(value)} is now quoted (previously a bare, YAML-ambiguous scalar)`, isQuoted, rendered);
+  }
+
+  // Positive control: ordinary strings that merely CONTAIN one of these
+  // patterns as a substring -- not the entire value -- must NOT be
+  // over-quoted by the new checks, which are anchored with ^...$ and must
+  // not misfire on a partial match.
+  const nonAmbiguousValues = ["0x1Fish", "prefix .inf", "0o17 and more", "infinite"];
+  for (const value of nonAmbiguousValues) {
+    const rendered = generateLib.toYamlScalar("field", value);
+    report(`14.control ${JSON.stringify(value)} stays a plain (unquoted) scalar`, rendered === value, rendered);
+  }
+}
+
+// ===========================================================================
 // MAIN
 // ===========================================================================
 async function runAll() {
@@ -702,6 +807,8 @@ async function runAll() {
   groupNewAdapterZeroDiff();
   groupDeterminism();
   groupInvalidAdapterAbortsWholeRun();
+  groupTargetPathContainment();
+  groupYamlAmbiguousScalarQuoting();
 
   console.log("\n--- SUMMARY ---");
   console.log(`PASS:  ${passed}`);
