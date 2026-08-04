@@ -1319,6 +1319,61 @@ function groupFinding1WriteLoopHardening() {
 }
 
 // ===========================================================================
+// GROUP 18: Finding 4 (Lane A/D cross-lane integration review, 2026-08-04,
+// REFUTED as a live bug -- see that finding's writeup) AI-discoverability
+// doc note. Not a behavior test (Finding 4 has no code fix -- the fix IS
+// the doc note) -- confirms the same greppable marker phrase,
+// "FUTURE-EXTENSION HAZARD (bodyTransform)", is present at all 3 proposed
+// edit-entry points, so a future edit to any one of them (schema, the
+// render function, or the collision-check code) surfaces the other two via
+// a simple repo-wide search, per Paul's specific "how would an AI agent
+// doing vibe coding actually find this" question.
+// ===========================================================================
+function groupFinding4DocNoteDiscoverability() {
+  console.log("\n=== GROUP 18: Finding 4 doc-note AI-discoverability (schema + renderReconciledBody + collision-check) ===");
+
+  const MARKER = "FUTURE-EXTENSION HAZARD (bodyTransform)";
+  const schemaSrc = fs.readFileSync(REAL_SCHEMA_PATH, "utf8");
+  const generateSrc = fs.readFileSync(GENERATE_PATH, "utf8");
+
+  const inSchema = schemaSrc.includes(MARKER);
+  const occurrencesInGenerate = generateSrc.split(MARKER).length - 1;
+
+  report("18.1 marker phrase present in schemas/host-adapter.schema.json (bodyTransform field)", inSchema);
+  report(
+    "18.2 marker phrase present at least twice in scripts/generate.js (renderReconciledBody + the collision-check code)",
+    occurrencesInGenerate >= 2,
+    `found ${occurrencesInGenerate} occurrence(s)`
+  );
+
+  // The schema note itself must still be valid JSON (a doc-note change to a
+  // "description" string is the easiest kind of edit to accidentally break
+  // JSON syntax with -- e.g. an unescaped quote).
+  let schemaParsed = null;
+  let parseErr = null;
+  try {
+    schemaParsed = JSON.parse(schemaSrc);
+  } catch (e) {
+    parseErr = e;
+  }
+  report("18.3 schemas/host-adapter.schema.json is still valid JSON after the doc-note edit", schemaParsed !== null, parseErr && parseErr.message);
+  report(
+    "18.4 the bodyTransform field's description actually contains the marker (not just present elsewhere in the file)",
+    schemaParsed && schemaParsed.properties && schemaParsed.properties.bodyTransform && typeof schemaParsed.properties.bodyTransform.description === "string" && schemaParsed.properties.bodyTransform.description.includes(MARKER)
+  );
+
+  // Positive control: real adapter definitions (all bodyTransform:
+  // "verbatim") must still validate cleanly against the edited schema --
+  // confirms the doc-note-only change didn't accidentally alter validation
+  // behavior for any existing, real adapter.
+  for (const id of ["cursor", "copilot", "agents-generic"]) {
+    const def = loadRealAdapterDef(id);
+    const errors = schemaValidate.validate(def, REAL_SCHEMA, "$");
+    report(`18.control.${id} real "${id}" adapter definition still validates cleanly against the edited schema`, errors.length === 0, JSON.stringify(errors));
+  }
+}
+
+// ===========================================================================
 // MAIN
 // ===========================================================================
 async function runAll() {
@@ -1342,6 +1397,7 @@ async function runAll() {
   groupSymlinkedAncestorContainment();
   groupStandaloneCollisionRejected();
   groupFinding1WriteLoopHardening();
+  groupFinding4DocNoteDiscoverability();
 
   console.log("\n--- SUMMARY ---");
   console.log(`PASS:  ${passed}`);
