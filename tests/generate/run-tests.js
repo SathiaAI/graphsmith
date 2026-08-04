@@ -1052,6 +1052,273 @@ function groupStandaloneCollisionRejected() {
 }
 
 // ===========================================================================
+// GROUP 17: Finding 1 (Lane A/D cross-lane integration review, 2026-08-04) --
+// (a) a marker-lookalike reconciled body is caught up front, before ANY
+// adapter (standalone or reconciled) writes anything; (b) reconciled
+// adapters are processed before standalone adapters regardless of def load
+// (filename-sort) order, so a reconciled failure never leaves an
+// EARLIER-in-filename-order standalone write already committed; (c) a
+// failure anywhere in the write loop is reported with an honest, structured
+// account of which adapters already succeeded and which were never
+// attempted, rather than a bare exception; (d) the locally-duplicated
+// MARKER_LOOKALIKE_RE regex inside scripts/generate.js is asserted to stay
+// byte-identical to scripts/reconcile.js's own copy, so the two cannot
+// silently drift apart.
+// ===========================================================================
+function groupFinding1WriteLoopHardening() {
+  console.log("\n=== GROUP 17: marker-lookalike hoisted up front + reconciled-before-standalone + honest partial-state reporting ===");
+
+  const LOOKALIKE_SKILL =
+    "---\n" +
+    "name: testskill\n" +
+    "description: A plain test description with nothing fancy in it.\n" +
+    "---\n" +
+    "\n" +
+    "# Test Skill\n" +
+    "\n" +
+    "<!-- graphsmith:begin id=\"not-real\" schema_version=\"1\" -->\n" +
+    "This line at column 0 looks exactly like a real graphsmith marker.\n";
+
+  // 17.1 -- marker-lookalike body is caught BEFORE any write, even though
+  // the standalone adapter sorts first alphabetically (and would, under the
+  // old single-flat-pass loop, have already been written by the time the
+  // reconciled adapter's lookalike body was ever inspected inside
+  // reconcile()).
+  {
+    const fixture = buildFixture("finding1-lookalike-upfront", {
+      skill: LOOKALIKE_SKILL,
+      adapters: {
+        "aaa-standalone": {
+          id: "aaa-standalone",
+          displayName: "Standalone (sorts first)",
+          targetPath: "AAA-STANDALONE.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "zzz-reconciled": {
+          id: "zzz-reconciled",
+          displayName: "Reconciled (sorts last, lookalike body)",
+          targetPath: "ZZZ-RECONCILED.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    let threw = false;
+    let msg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = e instanceof generateLib.GenerationError;
+      msg = e.message;
+    }
+    report("17.1 marker-lookalike reconciled body throws GenerationError", threw && /marker/.test(msg), msg);
+    report(
+      "17.2 the alphabetically-earlier standalone adapter was NOT written (caught up front, before the write loop)",
+      !fs.existsSync(path.join(fixture.dir, "AAA-STANDALONE.md")),
+      `exists=${fs.existsSync(path.join(fixture.dir, "AAA-STANDALONE.md"))}`
+    );
+    report(
+      "17.3 the reconciled target was also not written",
+      !fs.existsSync(path.join(fixture.dir, "ZZZ-RECONCILED.md")),
+      `exists=${fs.existsSync(path.join(fixture.dir, "ZZZ-RECONCILED.md"))}`
+    );
+    cleanup(fixture.dir);
+  }
+
+  // 17.4 -- reordering + honest partial-state reporting, forced via a real
+  // (non-marker-lookalike) failure: pre-acquire reconcile.js's own
+  // cross-process lock on the reconciled adapter's target BEFORE calling
+  // generateAll, so reconcile()'s internal acquireLock() is guaranteed to
+  // exhaust LOCK_ACQUIRE_MAX_ATTEMPTS (40 attempts * LOCK_ACQUIRE_RETRY_MS
+  // 15ms = ~600ms, comfortably under DEFAULT_LOCK_STALE_MS's 30000ms so the
+  // held lock is never mistaken for stale and reclaimed mid-test) and throw
+  // a genuine LockAcquisitionError. The standalone adapter sorts FIRST
+  // alphabetically (would have run first, and succeeded, under the old
+  // single-flat-pass order) -- this test proves it is never even attempted.
+  {
+    const fixture = buildFixture("finding1-reorder-and-honest-report", {
+      adapters: {
+        "aaa-standalone": {
+          id: "aaa-standalone",
+          displayName: "Standalone (sorts first, must never run)",
+          targetPath: "AAA-STANDALONE.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "zzz-reconciled": {
+          id: "zzz-reconciled",
+          displayName: "Reconciled (sorts last, forced to fail)",
+          targetPath: "ZZZ-RECONCILED.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    const lockedTargetPath = path.join(fixture.dir, "ZZZ-RECONCILED.md");
+    const held = reconcileLib.acquireLock(lockedTargetPath);
+    let caught = null;
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      caught = e;
+    } finally {
+      reconcileLib.releaseLock(held.lockPath, held.token);
+    }
+    report("17.4 a real (non-marker-lookalike) reconciled failure still throws", caught !== null, caught && caught.message);
+    report(
+      "17.5 the underlying cause is reconcile.js's own LockAcquisitionError",
+      caught && caught.cause instanceof reconcileLib.LockAcquisitionError,
+      caught && caught.cause && caught.cause.constructor && caught.cause.constructor.name
+    );
+    report(
+      "17.6 the alphabetically-earlier standalone adapter was NEVER attempted (reordering worked)",
+      !fs.existsSync(path.join(fixture.dir, "AAA-STANDALONE.md")),
+      `exists=${fs.existsSync(path.join(fixture.dir, "AAA-STANDALONE.md"))}`
+    );
+    report(
+      "17.7 the error's neverAttemptedAdapterIds honestly lists the standalone adapter",
+      caught && Array.isArray(caught.neverAttemptedAdapterIds) && caught.neverAttemptedAdapterIds.includes("aaa-standalone"),
+      caught && JSON.stringify(caught.neverAttemptedAdapterIds)
+    );
+    report(
+      "17.8 the error's failedAdapterId names the reconciled adapter that actually failed",
+      caught && caught.failedAdapterId === "zzz-reconciled",
+      caught && caught.failedAdapterId
+    );
+    report(
+      "17.9 the error's succeededAdapterIds is empty (the reconciled adapter, now processed first, failed immediately)",
+      caught && Array.isArray(caught.succeededAdapterIds) && caught.succeededAdapterIds.length === 0,
+      caught && JSON.stringify(caught.succeededAdapterIds)
+    );
+    cleanup(fixture.dir);
+  }
+
+  // 17.10 -- succeededAdapterIds correctly lists an EARLIER reconciled
+  // adapter that genuinely succeeded before a LATER reconciled adapter's
+  // forced failure, and the standalone adapter (sorting after both
+  // reconciled adapters alphabetically here, so it is never reached
+  // regardless of ordering) is still confirmed never attempted.
+  {
+    const fixture = buildFixture("finding1-partial-success-then-fail", {
+      adapters: {
+        "rec-1-ok": {
+          id: "rec-1-ok",
+          displayName: "Reconciled (succeeds)",
+          targetPath: "REC-1.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "rec-2-fails": {
+          id: "rec-2-fails",
+          displayName: "Reconciled (forced to fail)",
+          targetPath: "REC-2.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "zzz-standalone": {
+          id: "zzz-standalone",
+          displayName: "Standalone (sorts last, must never run)",
+          targetPath: "ZZZ-STANDALONE.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    const lockedTargetPath = path.join(fixture.dir, "REC-2.md");
+    const held = reconcileLib.acquireLock(lockedTargetPath);
+    let caught = null;
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      caught = e;
+    } finally {
+      reconcileLib.releaseLock(held.lockPath, held.token);
+    }
+    report(
+      "17.11 succeededAdapterIds lists the earlier reconciled adapter that actually wrote",
+      caught && Array.isArray(caught.succeededAdapterIds) && caught.succeededAdapterIds.length === 1 && caught.succeededAdapterIds[0] === "rec-1-ok",
+      caught && JSON.stringify(caught.succeededAdapterIds)
+    );
+    report("17.12 REC-1.md (the succeeded adapter) really was written to disk", fs.existsSync(path.join(fixture.dir, "REC-1.md")));
+    report(
+      "17.13 the standalone adapter was still never attempted",
+      !fs.existsSync(path.join(fixture.dir, "ZZZ-STANDALONE.md")) &&
+        caught && Array.isArray(caught.neverAttemptedAdapterIds) && caught.neverAttemptedAdapterIds.includes("zzz-standalone"),
+      caught && JSON.stringify(caught.neverAttemptedAdapterIds)
+    );
+    cleanup(fixture.dir);
+  }
+
+  // 17.14 -- positive control: with no lookalike body and no forced
+  // failure, reordering is transparent to a normal successful run -- both
+  // adapters are written regardless of def-load order.
+  {
+    const fixture = buildFixture("finding1-control-normal-run", {
+      adapters: {
+        "aaa-standalone": {
+          id: "aaa-standalone",
+          displayName: "Standalone",
+          targetPath: "AAA-STANDALONE.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "zzz-reconciled": {
+          id: "zzz-reconciled",
+          displayName: "Reconciled",
+          targetPath: "ZZZ-RECONCILED.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    let threw = false;
+    let errMsg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = true;
+      errMsg = e.message;
+    }
+    report("17.14 a normal run with no failure does not throw", !threw, errMsg);
+    report(
+      "17.15 both adapters were written",
+      fs.existsSync(path.join(fixture.dir, "AAA-STANDALONE.md")) && fs.existsSync(path.join(fixture.dir, "ZZZ-RECONCILED.md"))
+    );
+    cleanup(fixture.dir);
+  }
+
+  // 17.16 -- drift guard: the MARKER_LOOKALIKE_RE pattern duplicated inside
+  // scripts/generate.js (deliberately NOT imported from reconcile.js -- see
+  // that check's comment in generate.js) must stay byte-identical to
+  // scripts/reconcile.js's own module-scope copy of the same regex. If a
+  // future edit changes one without the other, this test fails loudly
+  // instead of the up-front check silently going stale.
+  {
+    const DRIFT_CHECK_PATTERN = /^<!-- graphsmith:(?:begin|end)\b.*$/m;
+    const patternSource = DRIFT_CHECK_PATTERN.source;
+    const generateSrc = fs.readFileSync(GENERATE_PATH, "utf8");
+    const reconcileSrc = fs.readFileSync(RECONCILE_PATH, "utf8");
+    const inGenerate = generateSrc.includes(patternSource);
+    const inReconcile = reconcileSrc.includes(patternSource);
+    report(
+      "17.16 MARKER_LOOKALIKE_RE's pattern source is present, byte-identical, in both scripts/generate.js and scripts/reconcile.js",
+      inGenerate && inReconcile,
+      `in generate.js=${inGenerate}, in reconcile.js=${inReconcile}`
+    );
+  }
+}
+
+// ===========================================================================
 // MAIN
 // ===========================================================================
 async function runAll() {
@@ -1074,6 +1341,7 @@ async function runAll() {
   groupYamlAmbiguousScalarQuoting();
   groupSymlinkedAncestorContainment();
   groupStandaloneCollisionRejected();
+  groupFinding1WriteLoopHardening();
 
   console.log("\n--- SUMMARY ---");
   console.log(`PASS:  ${passed}`);
