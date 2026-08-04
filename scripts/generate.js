@@ -353,6 +353,25 @@ function renderStandaloneContent(skill, def) {
  * which a reconciler splicing a mid-file block cannot own) -- re-asserted
  * here defensively even though schema validation already rejects that
  * combination before rendering is ever reached.
+ *
+ * FUTURE-EXTENSION HAZARD (bodyTransform): this function currently ALWAYS
+ * returns `skill.body` verbatim, regardless of `def` -- there is only one
+ * bodyTransform value ("verbatim") and no other code path. That is WHY two
+ * "reconciled" adapters are currently allowed to safely share the same
+ * (targetPath, blockId) pair (see the Lane A/D cross-lane integration
+ * review, Finding 4, 2026-08-04, refuted as a live bug for exactly this
+ * reason -- both adapters always render identical content, so a "collision"
+ * is a genuine no-op). The moment this function is changed to return
+ * DIFFERENT content for different `def`s (e.g. a second bodyTransform enum
+ * value is added -- see schemas/host-adapter.schema.json's own matching
+ * warning on the `bodyTransform` field, same marker phrase), that
+ * assumption breaks: a same-(targetPath, blockId) collision would then
+ * silently splice one adapter's content over another's, with zero error
+ * signal, exactly like Finding 3's standalone/reconciled collision did
+ * before it was fixed. Add a same-(targetPath, blockId)-different-content
+ * collision check to generateAll() (see its standalone-collision check,
+ * same file, for the established pattern to extend) at the same time you
+ * make this change, not after.
  */
 function renderReconciledBody(skill, def) {
   if (def.outputFormat !== "markdown-plain") {
@@ -600,7 +619,15 @@ function generateAll(options) {
   const collisionErrors = [];
   for (const [resolvedTarget, owners] of targetPathOwners) {
     if (owners.length < 2) continue;
-    if (!owners.some((o) => o.placementMode === "standalone")) continue; // reconciled+reconciled is legitimate
+    // reconciled+reconciled is deliberately skipped here -- legitimate,
+    // documented behavior, TODAY safe only because renderReconciledBody()
+    // always renders identical content for every def (see its own doc
+    // comment). FUTURE-EXTENSION HAZARD (bodyTransform): if that ever
+    // changes, this skip becomes the same class of silent-data-loss gap
+    // Finding 3 (below, standalone-vs-reconciled) already closed for a
+    // different combination -- see renderReconciledBody()'s doc comment
+    // for what to add here.
+    if (!owners.some((o) => o.placementMode === "standalone")) continue;
     collisionErrors.push(
       `targetPath "${resolvedTarget}" is shared by adapter(s) ${owners.map((o) => `"${o.id}" (${o.placementMode})`).join(", ")} -- at least one is "standalone", which wholesale-overwrites its target file and would silently destroy whatever the other adapter (or a human) placed there`
     );
