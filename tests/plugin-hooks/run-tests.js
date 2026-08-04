@@ -516,6 +516,55 @@ async function test_uninstallSabotageIsCaught() {
   }
 }
 
+async function test_uninstallAtomicWriteSurvivesCrashBeforeRename() {
+  const name = "uninstall-check: a crash between temp-write and rename leaves settings.json completely untouched";
+  const dir = mkTemp("uninstall-atomic");
+  const settingsPath = path.join(dir, "settings.json");
+  const fixture = buildCombinedSettingsFixture();
+  const originalRaw = JSON.stringify(fixture, null, 2);
+  fs.writeFileSync(settingsPath, originalRaw);
+
+  try {
+    const exit = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [UNINSTALL_CHECK, "--settings", settingsPath, "--apply"], {
+        env: { ...process.env, GRAPHSMITH_UNINSTALL_TEST_CRASH_BEFORE_RENAME: "1" },
+      });
+      let err = "";
+      child.stderr.on("data", (c) => (err += c));
+      child.on("close", (code) => resolve({ code, err }));
+    });
+
+    if (exit.code === 0) {
+      fail(name, "expected a non-zero exit (simulated crash before rename should propagate as an uncaught error)");
+      return;
+    }
+
+    const afterRaw = fs.readFileSync(settingsPath, "utf8");
+    if (afterRaw !== originalRaw) {
+      fail(
+        name,
+        "settings.json was modified despite the crash happening before the atomic rename — atomicity is broken"
+      );
+      return;
+    }
+
+    const leftoverTmp = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith(".graphsmith-uninstall.") && f.endsWith(".tmp"));
+    if (leftoverTmp.length > 0) {
+      fail(name, `scratch temp file(s) not cleaned up after simulated crash: ${leftoverTmp.join(", ")}`);
+      return;
+    }
+
+    pass(
+      name,
+      `exit code ${exit.code} (as expected), settings.json byte-identical to before the run, no leftover temp file`
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 6. Real Claude Code CLI, fully isolated: install alongside a second   */
 /*    plugin, then uninstall, and check the CLI's OWN persisted state    */
@@ -684,6 +733,7 @@ async function main() {
   await test_twoPluginsClobberSabotageIsCaught();
   await test_uninstallRemovesOnlyOwnSegment();
   await test_uninstallSabotageIsCaught();
+  await test_uninstallAtomicWriteSurvivesCrashBeforeRename();
   await test_realCliMultiPluginAndUninstall();
 
   const fails = results.filter((r) => r.status === "FAIL");

@@ -27,11 +27,79 @@
  *   node hooks/scripts/uninstall-check.js --settings <path> [--apply]
  *
  * Without --apply, prints a dry-run summary of what would be removed and
- * makes no changes. With --apply, writes the pruned settings back to the
- * same path (after taking a `.bak` snapshot alongside it).
+ * makes no changes. With --apply, takes a `.bak` snapshot of the original
+ * content alongside the target path, then writes the pruned settings back
+ * to the same path via the same write-temp-then-rename atomic pattern this
+ * repo already uses for its higher-frequency writes (see
+ * atomicWriteFileSync() in scripts/reconcile.js at the repo root): the
+ * complete new content is written to a scratch temp file in the same
+ * directory, fsynced, then installed with a single fs.renameSync(). A
+ * same-filesystem rename is one atomic directory-entry update at the OS
+ * level, so a crash or kill at any point up to and including mid-write of
+ * the temp file leaves the real settings.json completely untouched; only
+ * a crash strictly AFTER the rename call itself has already been issued
+ * can be a concern, and by then the new content is already durably
+ * installed, not partial. This closes a gap an independent, non-Anthropic
+ * adversarial review found in the previous two-step
+ * ".bak-write-then-direct-overwrite" version (see claude/graphsmith-
+ * v0.5.0-wave1-status-and-adversarial-findings-2026-08-01.md, "LANE B
+ * ADVERSARIAL REVIEW", 2026-08-04): two independent fs.writeFileSync()
+ * calls are not one atomic unit, so a crash between them (or mid-write of
+ * the second one) could leave settings.json truncated or corrupted, with
+ * only a manual `.bak` restore as recovery.
+ *
+ * GRAPHSMITH_UNINSTALL_TEST_CRASH_BEFORE_RENAME: test-only. If set, throws
+ * immediately after the temp file is fully written and fsynced but before
+ * the rename that installs it — used by the test suite to prove the real
+ * settings.json is left byte-for-byte untouched by an interruption at
+ * exactly that point. Never set in production use.
  */
 
 const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+/**
+ * Write `content` to `targetPath` atomically: write to a scratch temp file
+ * in the same directory, fsync, then a single fs.renameSync() onto the
+ * real target. Mirrors atomicWriteFileSync() in scripts/reconcile.js at
+ * the repo root (same rationale, same pattern) — this file doesn't need
+ * that module's locking/CAS machinery (uninstall is a rare, manual,
+ * single-shot operation, not a concurrent hot path), only the atomicity
+ * half of it.
+ *
+ * @param {string} targetPath
+ * @param {string} content
+ */
+function atomicWriteFileSync(targetPath, content) {
+  const dir = path.dirname(targetPath);
+  const tmpPath = path.join(
+    dir,
+    `.graphsmith-uninstall.${path.basename(targetPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`
+  );
+  const buf = Buffer.from(content, "utf8");
+  const fd = fs.openSync(tmpPath, "wx", 0o644);
+  try {
+    let off = 0;
+    while (off < buf.length) off += fs.writeSync(fd, buf, off, buf.length - off);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    if (process.env.GRAPHSMITH_UNINSTALL_TEST_CRASH_BEFORE_RENAME) {
+      throw new Error("GRAPHSMITH_UNINSTALL_TEST_CRASH_BEFORE_RENAME: simulated crash before rename (test-only)");
+    }
+    fs.renameSync(tmpPath, targetPath);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch (_) {
+      /* best-effort cleanup; the original error is the one that matters */
+    }
+    throw e;
+  }
+}
 
 // Matches ONLY GraphSmith's own enabledPlugins key: "graphsmith@<marketplace>"
 // or the skills-directory form "graphsmith@skills-dir". Deliberately anchored
@@ -142,11 +210,11 @@ function main() {
   }
 
   fs.writeFileSync(settingsPath + ".bak", raw, "utf8");
-  fs.writeFileSync(settingsPath, JSON.stringify(pruned, null, 2) + "\n", "utf8");
+  atomicWriteFileSync(settingsPath, JSON.stringify(pruned, null, 2) + "\n");
   console.log(`\nApplied. Previous contents saved to ${settingsPath}.bak`);
 }
 
-module.exports = { removeGraphsmithSegment, isOurEnabledPluginKey, hookEntryReferencesUs };
+module.exports = { removeGraphsmithSegment, isOurEnabledPluginKey, hookEntryReferencesUs, atomicWriteFileSync };
 
 if (require.main === module) {
   main();
