@@ -789,6 +789,269 @@ function groupYamlAmbiguousScalarQuoting() {
 }
 
 // ===========================================================================
+// GROUP 15: targetPath containment survives a symlinked INTERMEDIATE
+// directory component, in both placementModes (found by the Lane A/D
+// cross-lane integration review, 2026-08-04, Finding 2: the purely lexical
+// containment check added for GROUP 13 never touches the filesystem, so a
+// symlinked ancestor directory -- not the leaf, and not a "../" segment --
+// defeated it; confirmed via direct repro in both modes)
+// ===========================================================================
+function groupSymlinkedAncestorContainment() {
+  console.log("\n=== GROUP 15: targetPath containment vs. symlinked intermediate directory ===");
+
+  // Reconciled mode: opts.root/.github is a symlink pointing OUTSIDE root.
+  // The lexical check (path.resolve(path.join(root, ".github/x.md"))) is
+  // still lexically under root and would pass; the real write is not.
+  {
+    const fixture = buildFixture("symlink-reconciled");
+    const outsideDir = tmpDir("symlink-reconciled-outside");
+    fs.symlinkSync(outsideDir, path.join(fixture.dir, ".github"), "dir");
+
+    let threw = false;
+    let msg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = e instanceof generateLib.GenerationError;
+      msg = e.message;
+    }
+    report("15.1 reconciled adapter behind a symlinked intermediate dir throws GenerationError", threw, msg);
+    report(
+      "15.2 nothing was written inside the symlink target (escaping root)",
+      !fs.existsSync(path.join(outsideDir, "copilot-instructions.md")),
+      `exists=${fs.existsSync(path.join(outsideDir, "copilot-instructions.md"))}`
+    );
+    report(
+      "15.3 all-or-nothing: the other, otherwise-valid adapters were not written either",
+      !fs.existsSync(path.join(fixture.dir, "AGENTS.md")) && !fs.existsSync(path.join(fixture.dir, ".cursor")),
+      `AGENTS.md exists=${fs.existsSync(path.join(fixture.dir, "AGENTS.md"))}`
+    );
+    cleanup(fixture.dir);
+    cleanup(outsideDir);
+  }
+
+  // Standalone mode: same shape, opts.root/.cursor is the symlink this time.
+  {
+    const fixture = buildFixture("symlink-standalone");
+    const outsideDir = tmpDir("symlink-standalone-outside");
+    fs.symlinkSync(outsideDir, path.join(fixture.dir, ".cursor"), "dir");
+
+    let threw = false;
+    let msg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = e instanceof generateLib.GenerationError;
+      msg = e.message;
+    }
+    report("15.4 standalone adapter behind a symlinked intermediate dir throws GenerationError", threw, msg);
+    report(
+      "15.5 nothing was written inside the symlink target (escaping root)",
+      !fs.existsSync(path.join(outsideDir, "rules", "graphsmith.mdc")),
+      `exists=${fs.existsSync(path.join(outsideDir, "rules", "graphsmith.mdc"))}`
+    );
+    cleanup(fixture.dir);
+    cleanup(outsideDir);
+  }
+
+  // Positive control: a deeper, NOT-symlinked, not-yet-existing nested
+  // target path (multiple non-existent intermediate directories) still
+  // generates fine -- the ancestor-walk loop must terminate correctly and
+  // not misfire just because intermediate directories don't exist yet on a
+  // first-ever run (the common case for every real adapter today).
+  {
+    const fixture = buildFixture("symlink-control-nested", {
+      adapters: {
+        nested: {
+          id: "nested",
+          displayName: "Nested",
+          targetPath: "a/b/c/d/nested.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    let threw = false;
+    let errMsg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = true;
+      errMsg = e.message;
+    }
+    report("15.6 a deep, non-symlinked, not-yet-existing nested targetPath does not throw", !threw, errMsg);
+    report("15.7 the nested file was actually written", fs.existsSync(path.join(fixture.dir, "a", "b", "c", "d", "nested.md")));
+    cleanup(fixture.dir);
+  }
+}
+
+// ===========================================================================
+// GROUP 16: a targetPath collision involving a "standalone" adapter is
+// refused up front (found by the Lane A/D cross-lane integration review,
+// 2026-08-04, Finding 3: confirmed via direct repro that a standalone
+// adapter sharing a targetPath with another adapter silently and
+// permanently destroys the other adapter's -- or a human's -- pre-existing
+// content on every run, with zero error signal)
+// ===========================================================================
+function groupStandaloneCollisionRejected() {
+  console.log("\n=== GROUP 16: standalone targetPath collision is refused up front ===");
+
+  // standalone + reconciled sharing a targetPath must be refused.
+  {
+    const fixture = buildFixture("collision-standalone-reconciled", {
+      adapters: {
+        "std-a": {
+          id: "std-a",
+          displayName: "Standalone A",
+          targetPath: "SHARED.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "rec-b": {
+          id: "rec-b",
+          displayName: "Reconciled B",
+          targetPath: "SHARED.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        other: {
+          id: "other",
+          displayName: "Other",
+          targetPath: "OTHER.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    let threw = false;
+    let msg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = e instanceof generateLib.GenerationError;
+      msg = e.message;
+    }
+    report("16.1 standalone+reconciled targetPath collision throws GenerationError", threw && /collision/.test(msg), msg);
+    report(
+      "16.2 all-or-nothing: nothing was written, not even the unrelated, otherwise-valid \"other\" adapter",
+      !fs.existsSync(path.join(fixture.dir, "SHARED.md")) && !fs.existsSync(path.join(fixture.dir, "OTHER.md")),
+      `SHARED.md exists=${fs.existsSync(path.join(fixture.dir, "SHARED.md"))}, OTHER.md exists=${fs.existsSync(path.join(fixture.dir, "OTHER.md"))}`
+    );
+    cleanup(fixture.dir);
+  }
+
+  // standalone + standalone sharing a targetPath must also be refused --
+  // equally pointless/silently-overwriting, just without a reconciled
+  // block to specifically destroy.
+  {
+    const fixture = buildFixture("collision-standalone-standalone", {
+      adapters: {
+        "std-a": {
+          id: "std-a",
+          displayName: "Standalone A",
+          targetPath: "SHARED.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "std-b": {
+          id: "std-b",
+          displayName: "Standalone B",
+          targetPath: "SHARED.md",
+          placementMode: "standalone",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    let threw = false;
+    let msg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = e instanceof generateLib.GenerationError;
+      msg = e.message;
+    }
+    report("16.3 standalone+standalone targetPath collision throws GenerationError", threw && /collision/.test(msg), msg);
+    cleanup(fixture.dir);
+  }
+
+  // Positive control: reconciled + reconciled sharing a targetPath with
+  // DIFFERENT blockIds is legitimate, documented behavior (reconcile.js
+  // explicitly supports multiple distinct blocks coexisting in one file)
+  // and must NOT be rejected by this check.
+  {
+    const fixture = buildFixture("collision-control-different-blockid", {
+      adapters: {
+        "rec-a": {
+          id: "rec-a",
+          displayName: "Reconciled A",
+          targetPath: "SHARED.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+        "rec-b": {
+          id: "rec-b",
+          displayName: "Reconciled B",
+          targetPath: "SHARED.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    let threw = false;
+    let errMsg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = true;
+      errMsg = e.message;
+    }
+    report("16.4 reconciled+reconciled targetPath collision with different blockIds does not throw", !threw, errMsg);
+    report("16.5 both blocks were actually written into the shared file", fs.existsSync(path.join(fixture.dir, "SHARED.md")));
+    cleanup(fixture.dir);
+  }
+
+  // Positive control: reconciled + reconciled sharing a targetPath with the
+  // SAME blockId is Finding 4 from the cross-lane review -- a genuine no-op
+  // today (empirically confirmed there), not something this check needs to
+  // (or should) reject.
+  {
+    const fixture = buildFixture("collision-control-same-blockid", {
+      adapters: {
+        "rec-a": {
+          id: "rec-a",
+          displayName: "Reconciled A",
+          targetPath: "SHARED.md",
+          placementMode: "reconciled",
+          outputFormat: "markdown-plain",
+          bodyTransform: "verbatim",
+        },
+      },
+    });
+    // Run generateAll twice with the SAME single adapter def against the
+    // same target -- same blockId, same targetPath, by construction.
+    let threw = false;
+    let errMsg = "";
+    try {
+      generateLib.generateAll(fixture.options);
+      generateLib.generateAll(fixture.options);
+    } catch (e) {
+      threw = true;
+      errMsg = e.message;
+    }
+    report("16.6 reconciled+reconciled same-blockId same-targetPath (re-run) does not throw", !threw, errMsg);
+    cleanup(fixture.dir);
+  }
+}
+
+// ===========================================================================
 // MAIN
 // ===========================================================================
 async function runAll() {
@@ -809,6 +1072,8 @@ async function runAll() {
   groupInvalidAdapterAbortsWholeRun();
   groupTargetPathContainment();
   groupYamlAmbiguousScalarQuoting();
+  groupSymlinkedAncestorContainment();
+  groupStandaloneCollisionRejected();
 
   console.log("\n--- SUMMARY ---");
   console.log(`PASS:  ${passed}`);

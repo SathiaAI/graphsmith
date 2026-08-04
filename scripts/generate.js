@@ -501,6 +501,116 @@ function generateAll(options) {
     );
   }
 
+  // Validate EVERY adapter's targetPath against a REALPATH-based containment
+  // check, in addition to the purely lexical one above, before rendering or
+  // writing ANYTHING. Found by the Lane A/D cross-lane integration review
+  // (2026-08-04, Finding 2): the lexical check above is a pure string
+  // operation that never touches the filesystem, so it is defeated by a
+  // symlinked INTERMEDIATE directory component (e.g. opts.root/.github
+  // itself being a symlink to somewhere outside opts.root) -- confirmed via
+  // direct repro in both placementModes. This check resolves opts.root once
+  // via fs.realpathSync, then for each adapter walks up from its target to
+  // the nearest EXISTING ancestor directory, realpath's that ancestor, and
+  // rejoins the (not-yet-existing) remaining path segments, so a symlinked
+  // ancestor is caught even though the leaf file doesn't exist yet on a
+  // first-ever generation run.
+  //
+  // KNOWN, ACCEPTED LIMITATION (not fixed by this check, documented
+  // instead per the review's own recommendation): this is still a
+  // check-then-act pair with a real, if narrow, TOCTOU window -- an
+  // intermediate symlink swapped in AFTER this check runs but BEFORE the
+  // actual write happens would not be caught. Closing that fully would
+  // require moving symlink-aware validation into the write primitives
+  // themselves (writeStandaloneAtomic / reconcile.js), which the review
+  // explicitly scoped as out-of-bounds for this check (reconcile.js is
+  // already hardened through 3 rounds of adversarial review; reopening it
+  // for a threat this project's actual trust model doesn't currently face
+  // -- generators/adapters/*.json is first-party, repo-committed content,
+  // not attacker input -- was judged not worth the added blast radius).
+  const realRoot = fs.realpathSync(resolvedRoot);
+  const realpathContainmentErrors = [];
+  for (const { def } of defs) {
+    const resolvedTarget = path.resolve(path.join(opts.root, def.targetPath));
+    const relativeFromRoot = path.relative(resolvedRoot, resolvedTarget);
+    // Already caught as a lexical escape above; skip re-deriving an ancestor
+    // walk for a path that isn't even lexically under root.
+    if (relativeFromRoot.startsWith("..") || path.isAbsolute(relativeFromRoot)) continue;
+
+    let current = resolvedTarget;
+    const remainingSegments = [];
+    let realAncestor = null;
+    while (true) {
+      if (fs.existsSync(current)) {
+        realAncestor = fs.realpathSync(current);
+        break;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        // Walked all the way to the filesystem root with nothing existing
+        // -- opts.root itself doesn't exist. Treat as a containment error
+        // rather than crashing with an unhandled ENOENT.
+        realpathContainmentErrors.push(
+          `adapter "${def.id}": no existing ancestor directory found while resolving targetPath ${JSON.stringify(def.targetPath)}`
+        );
+        realAncestor = null;
+        break;
+      }
+      remainingSegments.unshift(path.basename(current));
+      current = parent;
+    }
+    if (realAncestor === null) continue;
+
+    const realTarget = remainingSegments.length > 0 ? path.join(realAncestor, ...remainingSegments) : realAncestor;
+    if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+      realpathContainmentErrors.push(
+        `adapter "${def.id}": targetPath ${JSON.stringify(def.targetPath)} resolves (after following symlinked ancestors) to "${realTarget}", which is outside the real root "${realRoot}" -- likely a symlinked intermediate directory`
+      );
+    }
+  }
+  if (realpathContainmentErrors.length > 0) {
+    throw new GenerationError(
+      `generateAll: ${realpathContainmentErrors.length} adapter(s) have a targetPath that escapes opts.root once symlinked ancestors are resolved:\n\n  ${realpathContainmentErrors.join("\n  ")}`
+    );
+  }
+
+  // Validate EVERY adapter's targetPath is not shared with a "standalone"
+  // adapter before rendering or writing ANYTHING -- same all-or-nothing
+  // posture as the two checks above. Found by the Lane A/D cross-lane
+  // integration review (2026-08-04, Finding 3): a "standalone" adapter's
+  // write wholesale-replaces its target file, which is safe ONLY when it
+  // exclusively owns that file -- exactly the invariant "reconciled" mode
+  // exists to protect when a file is not exclusively GraphSmith's. A
+  // targetPath collision where at least one side is "standalone" (an
+  // adapter-JSON authoring mistake, e.g. a copy-paste error, not any kind
+  // of adversarial input) was confirmed via direct repro to silently and
+  // permanently destroy pre-existing file content -- including a
+  // legitimate reconciled block, or hand-written prose around it -- on
+  // every single run, with zero error signal. A collision between two
+  // "reconciled" adapters sharing a targetPath with DIFFERENT blockIds is
+  // legitimate, documented behavior (reconcile.js explicitly supports
+  // multiple distinct blocks coexisting in one file) and must NOT be
+  // rejected by this check -- only combinations involving "standalone"
+  // are inherently unsafe, so that is exactly what this checks for.
+  const targetPathOwners = new Map(); // resolved targetPath -> [{ id, placementMode }]
+  for (const { def } of defs) {
+    const resolvedTarget = path.resolve(path.join(opts.root, def.targetPath));
+    if (!targetPathOwners.has(resolvedTarget)) targetPathOwners.set(resolvedTarget, []);
+    targetPathOwners.get(resolvedTarget).push({ id: def.id, placementMode: def.placementMode });
+  }
+  const collisionErrors = [];
+  for (const [resolvedTarget, owners] of targetPathOwners) {
+    if (owners.length < 2) continue;
+    if (!owners.some((o) => o.placementMode === "standalone")) continue; // reconciled+reconciled is legitimate
+    collisionErrors.push(
+      `targetPath "${resolvedTarget}" is shared by adapter(s) ${owners.map((o) => `"${o.id}" (${o.placementMode})`).join(", ")} -- at least one is "standalone", which wholesale-overwrites its target file and would silently destroy whatever the other adapter (or a human) placed there`
+    );
+  }
+  if (collisionErrors.length > 0) {
+    throw new GenerationError(
+      `generateAll: ${collisionErrors.length} targetPath collision(s) involving a standalone adapter:\n\n  ${collisionErrors.join("\n  ")}`
+    );
+  }
+
   if (opts.adapterFilter) {
     const wanted = new Set(opts.adapterFilter);
     defs = defs.filter(({ def }) => wanted.has(def.id));
