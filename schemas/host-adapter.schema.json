@@ -2,10 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://graphsmith.ai/schemas/host-adapter.schema.json",
   "title": "GraphSmith Host Adapter",
-  "description": "Contract every Lane D (canonical-to-surfaces generator) adapter implements. An adapter takes GraphSmith's canonical skill definition (repo root SKILL.md) and renders it for one specific agent host. Frozen in v0.5.0 Wave 0 -- see .plans/v0.5.0/WAVE-0-CANONICAL-SOURCE.md for the decision this formalizes.",
+  "description": "Contract every Lane D (canonical-to-surfaces generator) adapter implements. An adapter takes GraphSmith's canonical skill definition (repo root SKILL.md) and renders it for one specific agent host. Frozen in v0.5.0 Wave 0 -- see .plans/v0.5.0/WAVE-0-CANONICAL-SOURCE.md for the decision this formalizes. Post-Wave-0 addendum (2026-08-01, extracted from an independent review of cosmtrek/mindwalk's adapter-schema testing discipline): added the schemaVersion field below so future extensions (e.g. the 'source' enum bump this doc's own field description already anticipates) have a machine-readable marker to key off, instead of relying on adapters and the generator staying implicitly in sync.",
   "type": "object",
-  "required": ["id", "displayName", "targetPath", "placementMode", "outputFormat", "bodyTransform"],
+  "required": ["schemaVersion", "id", "displayName", "targetPath", "placementMode", "outputFormat", "bodyTransform"],
   "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Version of this contract an adapter definition was authored against. Every adapter file must stamp this so Lane D's generator (and any future consumer) can detect drift explicitly instead of assuming -- bump this const, and every adapter's stamped value, together with any breaking change to the fields below."
+    },
     "id": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]*$",

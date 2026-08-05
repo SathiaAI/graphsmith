@@ -20,11 +20,15 @@
     "lock": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "pid", "proc_start_hint", "owner_token"],
+      "required": ["schema_version", "pid", "owner_token"],
       "properties": {
         "schema_version": { "$ref": "#/$defs/version" },
         "pid": { "type": "integer", "minimum": 1 },
-        "proc_start_hint": { "$ref": "#/$defs/nonEmpty" },
+        "proc_start_hint": {
+          "$ref": "#/$defs/nonEmpty",
+          "deprecated": true,
+          "description": "RETIRED. Never read by any product code; no longer written. Accepted ONLY so that a lock file left on disk by a prior version still validates -- this object is additionalProperties:false, so removing this property would make such a lock CORRUPT_STATE, a state the acquire path cannot recover from. It carries no meaning: do not read it, and do not infer a pid-reuse defence from its presence. See contract 01, amendment 2026-08-01."
+        },
         "owner_token": { "type": "string", "pattern": "^[a-f0-9]{32}$" }
       }
     },
