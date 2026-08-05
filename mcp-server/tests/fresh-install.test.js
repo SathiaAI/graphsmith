@@ -59,7 +59,23 @@ test(
       assert.ok(fs.existsSync(installedBin), "the installed package must expose its bin");
       assert.ok(fs.existsSync(path.join(installedPkgDir, "SKILL.md")), "SKILL.md must be bundled inside the installed package");
 
-      // 4. Confirm no leaked path back into the monorepo checkout anywhere
+      // 4. Resolve the real entrypoint to spawn in step 6 below.
+      // On Windows, npm's extensionless `.bin/graphsmith-mcp` file is a
+      // POSIX shell shim (see cmd-shim), not JavaScript -- spawning it as
+      // `node <that file>` below either throws a syntax error on startup
+      // or, worse, silently fails with nothing on stdout (stderr is
+      // intentionally discarded a few lines down as noise), which just
+      // hangs this test until the 15s timeout. Resolve the real JS
+      // entrypoint from the installed package's own package.json instead
+      // of trusting OS-specific bin-shim mechanics -- this is still a
+      // faithful test of "the installed package, in isolation, runs",
+      // since that's the exact file any shim ultimately execs.
+      const installedPkgJson = JSON.parse(fs.readFileSync(path.join(installedPkgDir, "package.json"), "utf8"));
+      const binRelPath = typeof installedPkgJson.bin === "string" ? installedPkgJson.bin : installedPkgJson.bin["graphsmith-mcp"];
+      const installedEntrypoint = path.join(installedPkgDir, binRelPath);
+      assert.ok(fs.existsSync(installedEntrypoint), "the installed package's bin entrypoint must exist on disk");
+
+      // 5. Confirm no leaked path back into the monorepo checkout anywhere
       // in the installed files (the ponytail createRequire failure mode).
       const installedFiles = fs.readdirSync(installedPkgDir, { recursive: true });
       for (const rel of installedFiles) {
@@ -74,12 +90,13 @@ test(
         }
       }
 
-      // 5. Actually run it: spawn the INSTALLED binary from the INSTALLED
+      // 6. Actually run it: spawn the INSTALLED binary from the INSTALLED
       // directory and do a real stdio JSON-RPC round trip.
-      const child = spawn(process.execPath, [installedBin], { cwd: installDir, stdio: ["pipe", "pipe", "pipe"] });
+      const child = spawn(process.execPath, [installedEntrypoint], { cwd: installDir, stdio: ["pipe", "pipe", "pipe"] });
+      let stderrBuf = "";
       const response = await new Promise((resolve, reject) => {
         let buf = "";
-        const timer = setTimeout(() => reject(new Error("isolated-install server did not respond in time")), 15000);
+        const timer = setTimeout(() => reject(new Error(`isolated-install server did not respond in time (stderr: ${stderrBuf.slice(0, 2000)})`)), 15000);
         child.stdout.on("data", (chunk) => {
           buf += chunk.toString("utf8");
           const nl = buf.indexOf("\n");
@@ -88,8 +105,19 @@ test(
             resolve(JSON.parse(buf.slice(0, nl)));
           }
         });
-        child.stderr.on("data", () => {});
+        // Keep stderr for the error message above instead of silently
+        // discarding it -- a crash on startup used to be indistinguishable
+        // from a slow response, both surfacing only as a bare timeout.
+        child.stderr.on("data", (chunk) => {
+          stderrBuf += chunk.toString("utf8");
+        });
+        child.on("exit", (code, signal) => {
+          reject(new Error(`isolated-install server exited early (code=${code}, signal=${signal}) before responding (stderr: ${stderrBuf.slice(0, 2000)})`));
+        });
+        child.on("error", reject);
         child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) + "\n");
+      }).finally(() => {
+        child.removeAllListeners("exit");
       });
       child.kill();
 
