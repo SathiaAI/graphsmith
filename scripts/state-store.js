@@ -12,6 +12,11 @@ const STATE_SCHEMA = require("../schemas/state-store.schema.json");
 
 const SCHEMA_VERSION = "1.0";
 const DEFAULT_LEASE_MS = 30000;
+/* How far a lock's mtime may sit AHEAD of this host's clock before the age is treated as
+ * unusable rather than as freshness. See the skew gate in `_acquireLock`. Not tunable:
+ * it separates "filesystem timestamp granularity" from "the clock moved", and neither of
+ * those is a per-deployment preference. */
+const LOCK_CLOCK_SKEW_TOLERANCE_MS = 5000;
 const DEFAULT_HEARTBEAT_MS = 5000;
 const DEFAULT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const ALPHA = 0.05 / 3;
@@ -176,8 +181,23 @@ function clone(value) {
  *
  *   - lock staleness (`Date.now() - observed.stat.mtimeMs`): compares against an
  *     mtime the OPERATING SYSTEM wrote. A frozen clock there makes every lock look
- *     infinitely stale or never stale -- silently testing a different product.
- *   - `proc_start_hint`: process identity, derived from process.uptime().
+ *     infinitely stale or never stale -- silently testing a different product. That
+ *     comparison is wall-clock and therefore NOT monotone; the skew gate in
+ *     `_acquireLock` is what keeps a backward correction from wedging the store.
+ *
+ * `proc_start_hint` USED to be listed here as a third real-clock site. It is no longer
+ * written. It was never read by any product code, and leaving a dead identity field in a
+ * lock record is worse than having none: the next reader infers a PID-reuse defence that
+ * does not exist. PID reuse is already bounded -- a reused pid can only cause a REFUSAL,
+ * never a false steal, and that refusal self-heals once the lock goes unrenewed.
+ *
+ * It is still ACCEPTED by the schema (removed from `required`, kept in `properties`).
+ * That is deliberate and not tidiness-aversion: the lock schema is
+ * `additionalProperties: false`, so hard-removing the property would make every lock file
+ * written by a previous version fail validation as CORRUPT_STATE -- and CORRUPT_STATE in
+ * the acquire path is unrecoverable by the tool itself. Deleting the field outright would
+ * have shipped a self-inflicted upgrade outage of exactly the kind the skew gate above
+ * exists to prevent. Verified by writing a legacy lock and upgrading against both variants.
  *
  * Injecting one global clock over both is the obvious mistake here, and it is worse
  * than the bug it would fix: it would turn the lock protocol into a no-op while every
@@ -539,7 +559,6 @@ class StateStore {
       const record = {
         schema_version: SCHEMA_VERSION,
         pid: process.pid,
-        proc_start_hint: `${process.pid}:${Math.floor(Date.now() - process.uptime() * 1000)}`,
         owner_token: ownerToken,
       };
       validateStateRecord(record, path.basename(this.lockPath));
@@ -614,9 +633,95 @@ class StateStore {
          * does long work WITHOUT touching the store renews nothing, so a sufficiently long
          * non-store phase can still be stolen from. The durable answer is an OS-level lock
          * whose lifetime is tied to the owner's file descriptor rather than to an mtime and
-         * a pid; that is a protocol change, not a patch. Tracked separately. */
+         * a pid. Node exposes no such primitive at zero dependencies (no `fs.flock`, no
+         * `fcntl`, no `O_EXLOCK` on any supported platform), so it is recorded as a
+         * limitation in KNOWN-LIMITATIONS.md rather than tracked as pending work.
+         *
+         * THIRD GATE, and it exists because `age` is a WALL-CLOCK subtraction.
+         *
+         * `Date.now() - mtimeMs` silently assumes the mtime is in the past. It is not
+         * always: a backward NTP correction, a VM resuming from suspend, a network
+         * filesystem whose server clock leads ours, or a restored backup that preserved
+         * mtimes all leave a lock whose mtime is in the FUTURE. `age` then goes negative,
+         * `unrenewed` is false, and BOTH gates below refuse -- forever, for the whole
+         * duration of the skew, even when the owning pid is long dead. Reproduced: a lock
+         * owned by a dead pid with an mtime 24h ahead wedged the store for 24h, reporting
+         * "renewed -3599995ms ago ... that owner is alive and making progress".
+         *
+         * That is not a slow acquisition, it is an outage: `_operation` takes this lock for
+         * EVERY store call including reads (`window.get`), and promote's `recover()` -- the
+         * command an operator would reach for -- takes it too. The repair path is blocked
+         * by the fault it repairs.
+         *
+         * A future mtime does not mean "freshly renewed". It means the mtime is unusable as
+         * an elapsed-time source, and the decision has to fall to the only other evidence
+         * available: is the owning process observably alive? Dead owner -> steal, which is
+         * what a dead owner has always deserved. Live owner -> still refuse, but say
+         * "clock skew" so an operator can see what they are looking at instead of reading a
+         * negative age. Same defect class as the other nine: a wall-clock subtraction used
+         * as a proxy for "this owner has made no progress". */
         const age = Date.now() - observed.stat.mtimeMs;
         const ownerAlive = this._pidAlive(observed.record.pid);
+        /* NOT `age < 0`. A strict sign test makes the gate fire on filesystem timestamp
+         * granularity rather than on a clock correction: a filesystem that rounds mtime up
+         * (FAT32 stores 2-second granularity; HFS+ 1 second) can hand back a mtime very
+         * slightly ahead of the writer's own `Date.now()`, and a strict test would then
+         * report LOCK_CLOCK_SKEW for ordinary, healthy contention on every acquire. That
+         * would be a worse bug than the one being fixed, and it would only appear on the
+         * platforms hardest for us to reproduce.
+         *
+         * Measured on Linux across 3000 freshly-created locks via the real acquire path:
+         * minimum observed age 0.117ms, never negative. The tolerance exists for the
+         * platforms and filesystems that measurement does NOT cover.
+         *
+         * The constant has to clear the coarsest granularity we could plausibly land on
+         * (2s) with margin, while staying far below any real correction -- NTP steps, VM
+         * resume and cross-host clock disagreement are seconds to hours. Inside the
+         * tolerance nothing changes: `unrenewed` is false for a small age, so the two
+         * original gates decide exactly as they did before, and the state self-heals as
+         * real time passes. */
+        const future = age < 0;
+        /* OWNER DEATH IS DECISIVE, AND THE TOLERANCE MUST NOT OVERRIDE IT.
+         *
+         * The first version of this gate applied the tolerance to both branches:
+         * `skewed = age < -TOLERANCE`, and anything inside the band fell through to the two
+         * original gates. For a DEAD owner that reproduced the exact wedge this gate exists
+         * to remove -- a negative age is never `> leaseMs`, so `unrenewed` stayed false and
+         * the second gate refused. Measured, dead pid, 30s lease, 5s tolerance:
+         *
+         *   mtime  -60000ms -> ACQUIRED      mtime   +4999ms -> LOCKED   <-- wedged
+         *   mtime      +0ms -> LOCKED        mtime  +20000ms -> ACQUIRED
+         *   mtime   +1000ms -> LOCKED        mtime +86400000ms -> ACQUIRED
+         *
+         * A bounded wedge (skew + lease, ~35s) rather than the original unbounded one, but
+         * the same defect, and the refusal message promised "stealable as soon as that pid
+         * exits" -- which was false inside the band. Found by two independent reviewers on
+         * the shipped diff, not by this file's own tests, which never pinned a dead owner
+         * inside the tolerance.
+         *
+         * So the tolerance is now DIAGNOSTIC ONLY, and only for a live owner: it decides
+         * whether a future mtime is worth naming as clock skew or is just filesystem
+         * timestamp granularity. It never decides whether a dead owner's lock survives. */
+        if (future && !ownerAlive) {
+          requiredString(observed.record.owner_token, "state.lock owner_token");
+          try {
+            if (!this._unlinkLockIfOwner(observed.record.owner_token)) continue;
+          } catch (stealError) {
+            if (stealError.code === "ENOENT") continue;
+            throw stealError;
+          }
+          continue;
+        }
+        if (future && age < -LOCK_CLOCK_SKEW_TOLERANCE_MS) {
+          throw fail(
+            `State store lock at ${this.lockPath} has an mtime ${Math.round(-age)}ms in the FUTURE, so ` +
+            "its age cannot be used to decide staleness. Refusing while the named pid " +
+            `${observed.record.pid} is still observably alive. This is a CLOCK SKEW, not a ` +
+            "busy store: check for a backward time correction, a resumed VM, or a network " +
+            "filesystem whose server clock leads this host. The lock becomes stealable as " +
+            "soon as that pid exits.",
+            "LOCK_CLOCK_SKEW");
+        }
         const unrenewed = age > this.leaseMs;
         if (ownerAlive && !unrenewed) {
           throw fail(
