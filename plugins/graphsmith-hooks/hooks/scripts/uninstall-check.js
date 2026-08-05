@@ -186,8 +186,22 @@ function main() {
     return;
   }
 
-  const raw = fs.readFileSync(settingsPath, "utf8");
-  const parsed = JSON.parse(raw);
+  let raw;
+  let parsed;
+  try {
+    raw = fs.readFileSync(settingsPath, "utf8");
+  } catch (err) {
+    console.error(`Could not read ${settingsPath}: ${err.code === "ENOENT" ? "file not found" : err.message}`);
+    process.exitCode = 2;
+    return;
+  }
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.error(`${settingsPath} is not valid JSON: ${err.message}`);
+    process.exitCode = 2;
+    return;
+  }
   const { settings: pruned, removed } = removeGraphsmithSegment(parsed);
 
   const nothingToDo =

@@ -84,7 +84,7 @@ function runScript(scriptPath, { env = {}, stdinMode = "close-empty", killAfterM
     if (stdinMode === "close-empty") {
       child.stdin.end();
     } else if (stdinMode === "never-close") {
-      // Deliberately never write and never end() — simulates the
+      // Deliberately never write and never end() -- simulates the
       // PowerShell stdin-swallowing class of bug: the child's stdin stays
       // open with no data and no EOF, indefinitely, unless the child
       // itself times out waiting on it.
@@ -233,7 +233,7 @@ async function test_stdinSafetySabotageIsCaught() {
   const original = fs.readFileSync(target, "utf8");
   const naive = [
     '"use strict";',
-    "// SABOTAGED FOR TEST: no timeout at all — waits forever for stdin 'end'.",
+    "// SABOTAGED FOR TEST: no timeout at all -- waits forever for stdin 'end'.",
     "function readStdinJSON() {",
     "  return new Promise((resolve) => {",
     "    let chunks = [];",
@@ -565,6 +565,68 @@ async function test_uninstallAtomicWriteSurvivesCrashBeforeRename() {
   }
 }
 
+async function test_uninstallMalformedJsonExitsCleanly() {
+  const name = "uninstall-check: a malformed-JSON settings file exits cleanly (code 2), not an uncaught crash";
+  const dir = mkTemp("uninstall-malformed");
+  const settingsPath = path.join(dir, "settings.json");
+  // Deliberately truncated/invalid JSON -- the kind of thing a half-written
+  // or hand-edited settings.json can end up containing.
+  fs.writeFileSync(settingsPath, '{ "enabledPlugins": { "graphsmith@graphsmith-marketplace": true ');
+
+  try {
+    const result = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [UNINSTALL_CHECK, "--settings", settingsPath, "--apply"]);
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (c) => (stdout += c));
+      child.stderr.on("data", (c) => (stderr += c));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+
+    const checks = [
+      ["exit code is 2 (usage/input-error convention this script already uses), not an uncaught-exception code", result.code === 2],
+      ["stderr does not contain a raw JS stack trace (\"at Object\", \"at Module\")", !/at (Object|Module)\b/.test(result.stderr)],
+      ["stderr mentions the settings path so the user can find the bad file", result.stderr.includes(settingsPath)],
+      ["settings.json itself was left completely untouched", fs.readFileSync(settingsPath, "utf8") === '{ "enabledPlugins": { "graphsmith@graphsmith-marketplace": true '],
+    ];
+    const failedChecks = checks.filter(([, ok]) => !ok).map(([label]) => label);
+    if (failedChecks.length) {
+      fail(name, `failed checks: ${failedChecks.join(", ")}; got exit=${result.code} stderr=${JSON.stringify(result.stderr)}`);
+    } else {
+      pass(name, `clean exit code 2 with a readable error message, no crash, no file modification`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function test_uninstallMissingSettingsFileExitsCleanly() {
+  const name = "uninstall-check: a nonexistent --settings path exits cleanly (code 2), not an uncaught ENOENT crash";
+  const dir = mkTemp("uninstall-missing");
+  const settingsPath = path.join(dir, "does-not-exist.json");
+
+  const result = await new Promise((resolve) => {
+    const child = spawn(process.execPath, [UNINSTALL_CHECK, "--settings", settingsPath, "--apply"]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += c));
+    child.stderr.on("data", (c) => (stderr += c));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+
+  const checks = [
+    ["exit code is 2, not an uncaught-exception code", result.code === 2],
+    ["stderr does not contain a raw JS stack trace (\"at Object\", \"at Module\")", !/at (Object|Module)\b/.test(result.stderr)],
+    ["stderr mentions the settings path", result.stderr.includes(settingsPath)],
+  ];
+  const failedChecks = checks.filter(([, ok]) => !ok).map(([label]) => label);
+  if (failedChecks.length) {
+    fail(name, `failed checks: ${failedChecks.join(", ")}; got exit=${result.code} stderr=${JSON.stringify(result.stderr)}`);
+  } else {
+    pass(name, `clean exit code 2 with a readable error message, no crash`);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 6. Real Claude Code CLI, fully isolated: install alongside a second   */
 /*    plugin, then uninstall, and check the CLI's OWN persisted state    */
@@ -734,6 +796,8 @@ async function main() {
   await test_uninstallRemovesOnlyOwnSegment();
   await test_uninstallSabotageIsCaught();
   await test_uninstallAtomicWriteSurvivesCrashBeforeRename();
+  await test_uninstallMalformedJsonExitsCleanly();
+  await test_uninstallMissingSettingsFileExitsCleanly();
   await test_realCliMultiPluginAndUninstall();
 
   const fails = results.filter((r) => r.status === "FAIL");
