@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "id": "copilot",
   "displayName": "GitHub Copilot",
   "targetPath": ".github/copilot-instructions.md",

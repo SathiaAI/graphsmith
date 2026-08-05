@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "id": "cursor",
   "displayName": "Cursor",
   "targetPath": ".cursor/rules/graphsmith.mdc",
