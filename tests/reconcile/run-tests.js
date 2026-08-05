@@ -1164,6 +1164,17 @@ function groupReadOnlyTargetAndDuplicatePairs() {
   {
     let canRunAsNobody = false;
     try {
+      // runuser/chown can only actually switch users when this process
+      // itself is root (uid 0) -- on GitHub Actions' hosted ubuntu-latest
+      // runner, for example, the `runuser` binary and `nobody` account
+      // both exist and `runuser --help` succeeds, but the process runs as
+      // the non-root `runner` user, so any real user-switch still fails
+      // with "runuser: may not be used by non-root users". Check uid 0
+      // directly rather than inferring root-ness from tool presence.
+      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+      if (!isRoot) {
+        throw new Error("not running as root");
+      }
       cp.execFileSync("id", ["nobody"], { stdio: "ignore" });
       cp.execFileSync("runuser", ["--help"], { stdio: "ignore" });
       canRunAsNobody = true;
@@ -1175,7 +1186,7 @@ function groupReadOnlyTargetAndDuplicatePairs() {
       report(
         "13.3 real chmod-444 target refused end-to-end as an unprivileged user",
         null,
-        "no `nobody` user / `runuser` available in this environment to drop privileges for a real permission-bit test"
+        "this process is not root (or `nobody` user / `runuser` is unavailable) -- cannot drop privileges for a real permission-bit test in this environment; 13.1/13.2 above already cover the refusal logic itself"
       );
     } else {
       const dir = tmpDir("readonly-real");
