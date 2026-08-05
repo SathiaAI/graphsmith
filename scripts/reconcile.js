@@ -496,6 +496,24 @@ class LockAcquisitionError extends Error {}
  */
 class LockLostError extends Error {}
 
+/**
+ * Thrown by atomicWriteFileSync() when targetPath already exists but is not
+ * writable (e.g. `chmod 444`). POSIX rename(2)/link(2) only require write
+ * permission on the *containing directory*, not on the target file's own
+ * mode bits -- so without this check, a deliberately read-only file would
+ * be silently replaced (content AND mode; the incoming file lands at the
+ * temp file's own mode, not the target's) with no error and no warning.
+ * This module's whole design posture is "fail loud, never guess" for every
+ * other ambiguous case (see ConcurrentModificationError, LockLostError
+ * above) -- an unwritable target is exactly that kind of case: a caller
+ * who chmod'd a file read-only is expressing an intent this module has no
+ * business overriding silently. Checked only on the plain-rename path;
+ * createOnly's fs.linkSync() already refuses outright (EEXIST) the moment
+ * targetPath exists at all, so a read-only *existing* target is already
+ * impossible to reach via that path.
+ */
+class TargetNotWritableError extends Error {}
+
 function lockPathFor(targetPath) {
   const dir = path.dirname(targetPath);
   return path.join(dir, `${LOCK_SUFFIX_PREFIX}${path.basename(targetPath)}`);
@@ -800,6 +818,24 @@ function atomicWriteFileSync(targetPath, content, verifyUnchanged, createOnly, v
         /* best-effort */
       }
     } else {
+      // See TargetNotWritableError's docstring: rename(2) doesn't consult
+      // the target's own mode bits, only the containing directory's, so a
+      // read-only target must be checked for explicitly or it gets
+      // silently replaced. ENOENT (target doesn't exist yet) is not an
+      // error here -- there is nothing to protect, fall through and create
+      // it normally.
+      try {
+        fs.accessSync(targetPath, fs.constants.W_OK);
+      } catch (accessErr) {
+        if (accessErr.code !== "ENOENT") {
+          throw new TargetNotWritableError(
+            `reconcile: refusing to overwrite ${targetPath} -- it exists but is not writable ` +
+              `(${accessErr.code}). If this was set read-only deliberately, that protection is ` +
+              "respected: this call will not silently strip it. Change the file's permissions " +
+              "yourself first if you do want reconcile() to update it."
+          );
+        }
+      }
       fs.renameSync(tmpPath, targetPath);
     }
   } catch (e) {
@@ -1003,6 +1039,25 @@ function attemptReconcile(targetPath, blockId, schemaVersion, desiredBody, lockP
     return baseResult("appended", targetPath, blockId, schemaVersion, { bytesWritten });
   }
 
+  // ---- REFUSAL: a second, independently-complete marker pair for this
+  // same blockId exists later in the file (e.g. a hand-edit, or a merge
+  // that kept both sides of a conflict). findBlock() only ever locates the
+  // FIRST complete pair, by design (see its own docstring) -- silently
+  // updating just that one and leaving a second, complete, stale pair
+  // untouched forever would be exactly the kind of guess this module
+  // otherwise refuses to make everywhere else (compare
+  // ConcurrentModificationError, the "future-schema-version" refusal
+  // below, and findBlock()'s own single-pair ambiguity check). Detected by
+  // re-running findBlock() against everything after the first pair's end;
+  // if that still finds a complete pair for the same blockId, the file is
+  // ambiguous and this call refuses rather than silently picking one.
+  const secondPair = findBlock(raw.slice(found.blockEnd), blockId);
+  if (secondPair) {
+    return baseResult("refused", targetPath, blockId, schemaVersion, {
+      reason: "duplicate-marker-pair",
+    });
+  }
+
   const foundVersionNum = Number(found.schemaVersion);
   const callVersionNum = Number(schemaVersion);
 
@@ -1103,6 +1158,7 @@ module.exports = {
   ConcurrentModificationError,
   LockAcquisitionError,
   LockLostError,
+  TargetNotWritableError,
   // Exported for white-box testing, same convention as scripts/verify.js
   // exporting its own internal helpers (sha256Hex, verifyFileList, ...).
   findBlock,
