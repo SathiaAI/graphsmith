@@ -25,7 +25,11 @@ const { execFileSync, spawn } = require("child_process");
 const PACKAGE_DIR = path.join(__dirname, "..");
 
 function sh(cmd, args, opts) {
-  return execFileSync(cmd, args, Object.assign({ encoding: "utf8" }, opts));
+  // On Windows, npm resolves to npm.cmd, and Node's execFileSync does not
+  // auto-resolve .cmd/.bat extensions unless shell: true is set -- without
+  // it this fails with ENOENT even though npm is genuinely on PATH.
+  const platformOpts = process.platform === "win32" ? { shell: true } : {};
+  return execFileSync(cmd, args, Object.assign({ encoding: "utf8" }, opts, platformOpts));
 }
 
 test(
