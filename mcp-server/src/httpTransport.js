@@ -73,21 +73,34 @@ function createHttpServer(options) {
       return;
     }
 
-    let body = "";
+    /* Accumulate as raw Buffer chunks and count actual bytes received --
+     * NOT `body += chunk`, which implicitly decodes each chunk as UTF-8
+     * and measures `.length` in UTF-16 code units. For multi-byte UTF-8
+     * content that under-counts MAX_BODY_BYTES (a 3-byte-per-char payload
+     * can be ~3x the real cap before the check trips), and it can also
+     * silently corrupt characters that straddle a chunk boundary -- a
+     * partial multi-byte sequence decodes to U+FFFD replacement
+     * character(s) with no error raised, and the resulting corrupted
+     * string can still pass JSON.parse(). Decoding once, from the fully
+     * reassembled bytes, avoids both problems. */
+    let chunks = [];
+    let bytesReceived = 0;
     let tooLarge = false;
     req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > MAX_BODY_BYTES) {
+      bytesReceived += chunk.length;
+      if (bytesReceived > MAX_BODY_BYTES) {
         tooLarge = true;
         req.destroy();
+        return;
       }
+      chunks.push(chunk);
     });
 
     req.on("end", () => {
       if (tooLarge) return; // connection already destroyed, nothing to respond with
       let msg;
       try {
-        msg = JSON.parse(body);
+        msg = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       } catch (err) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(
