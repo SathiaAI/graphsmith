@@ -84,7 +84,7 @@ function runScript(scriptPath, { env = {}, stdinMode = "close-empty", killAfterM
     if (stdinMode === "close-empty") {
       child.stdin.end();
     } else if (stdinMode === "never-close") {
-      // Deliberately never write and never end() -- simulates the
+      // Deliberately never write and never end() — simulates the
       // PowerShell stdin-swallowing class of bug: the child's stdin stays
       // open with no data and no EOF, indefinitely, unless the child
       // itself times out waiting on it.
@@ -233,7 +233,7 @@ async function test_stdinSafetySabotageIsCaught() {
   const original = fs.readFileSync(target, "utf8");
   const naive = [
     '"use strict";',
-    "// SABOTAGED FOR TEST: no timeout at all -- waits forever for stdin 'end'.",
+    "// SABOTAGED FOR TEST: no timeout at all — waits forever for stdin 'end'.",
     "function readStdinJSON() {",
     "  return new Promise((resolve) => {",
     "    let chunks = [];",
