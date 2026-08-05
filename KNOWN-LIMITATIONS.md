@@ -67,5 +67,27 @@ The pattern across all seven is one thing: **the check was about a different bou
 ## 7. Signer-trust limitations
 GSA verification shows a bundle **was signed by the claimed key and is unaltered**. Whether to **trust that key is the verifier's policy** — an allowlist, an org key, or a transparency log (GSA-SPEC §5.5). The default is a local keypair, which attests "signed by *a* key"; cross-organisation non-repudiation is weaker until keyless / transparency-log signing (opt-in, targeted for a later draft). A **privileged local attacker** who can already rewrite the producer, the verifier, and the signing keys on the same machine is **out of scope, stated as such** — local self-verification detects same-user drift and mistakes, not a root adversary; CI cross-checking from a trusted workflow covers shared repositories. *Control:* the verifier-supplied trusted-key set + out-of-band maintainer signature for air-gapped verification (register Lane D, v0.3.0).
 
+## 8. The state-store lock is not tied to a file descriptor
+Exclusive access to `.graphsmith/state` is held by a **lock file plus an mtime and a pid**, not by the operating system. The textbook alternative — a lock whose lifetime is bound to the owner's open file descriptor, so that the kernel releases it the instant the owner dies — **cannot be built here at zero runtime dependencies**, and this is recorded as a limitation rather than tracked as pending work because nothing about it is pending.
+
+Node exposes no file locking at all. On the exact runtime CI uses:
+
+```
+$ node -e "const fs=require('fs'); console.log(process.version, typeof fs.flock, fs.constants.O_EXLOCK)"
+v22.22.2 undefined undefined
+```
+
+There is no `fs.flock`, no `fcntl`, no `O_EXLOCK`, and no `LOCK_*` constant on any supported platform. The three ways out are each worse than the limitation: a **native addon** (`fs-ext` and equivalents) requires prebuilds or `node-gyp` across {ubuntu, macos, windows} x node {18, 22} and ends GraphSmith's zero-dependency property, which is itself a security claim for something installed into a developer toolchain; **shelling out to `flock(1)`** is not portable — it is absent from a standard Windows environment and its availability on macOS is package-dependent; and `open(..., "wx")` / `mkdir`, which is what is used today, is genuinely atomic but is not bound to the process.
+
+**What this costs, precisely.** Ownership has to be inferred from two observable facts instead of held by the kernel: is the owning pid observably alive, and has the lock been renewed recently. Both are approximations of the fact actually wanted, which is *"is the owner still making progress"*:
+
+- a holder doing long work **without touching the store** renews nothing, so a sufficiently long non-store phase is stealable — the lock is only refreshed at the durable writes inside `_commit`;
+- `pid` liveness is not owner identity. A crashed owner in a foreign pid namespace, or a recycled pid, can read as alive. This costs a bounded wait (at most one lease) and never a false steal, because a steal additionally requires the lock to have gone unrenewed;
+- the age is a **wall-clock subtraction** against a filesystem mtime and is therefore not monotone. That one used to be a wedge — a lock whose mtime sat in the future was read as freshly renewed and refused indefinitely, including to `recover()` — and is now gated explicitly (contract 01 clause (d), `tests/state-store/clock-skew/`). The gate makes the failure honest; it does not make the mtime a reliable clock.
+
+*Control:* both gates must agree before a lock is taken (`scripts/state-store.js`), renewal happens synchronously at every durable write rather than on a timer that could not fire, `_assertStillOwned` stops a superseded run **before** it writes rather than at release, and every reachable lock state is pinned by `tests/state-store/clock-skew/` with mutation controls.
+
+**What would be needed to do it properly:** a decision that a native dependency is acceptable, *and* a real deployment with concurrent writers to justify it. Neither holds today — single-writer use does not exercise the gap, and adding a compiled dependency to remove a hazard that use does not reach would be a net loss in the property that matters more.
+
 ---
 *This document is publication-hygiene clean. See also the worked offline-verifier transcript in [`docs/examples/offline-verify.md`](docs/examples/offline-verify.md).*
