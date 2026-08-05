@@ -65,6 +65,7 @@ stages:
     - node scripts/scenario.js --selftest
     - node scripts/promote.js --selftest
     - node scripts/gate.js --selftest
+    - node scripts/verify.js --selftest
     - node scripts/ci-check-pr-separation.js --selftest
     # The classification policy lives in ci-suite-manifest.json and the runner
     # is scripts/ci-run-suites.js -- the same script the GitHub Actions
