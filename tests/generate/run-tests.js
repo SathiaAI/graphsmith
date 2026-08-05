@@ -356,6 +356,7 @@ function groupHeaderPlacement() {
   // launch adapters are standalone + markdown-plain, but the placement
   // rule must hold generically): header must be the first line.
   const plainDef = {
+    schemaVersion: 1,
     id: "plain-standalone-fixture",
     displayName: "Plain Standalone Fixture",
     targetPath: "FIXTURE.md",
@@ -588,6 +589,7 @@ function groupNewAdapterZeroDiff() {
       // A brand-new, fully valid, unrelated standalone adapter targeting a
       // path with no overlap with the other three.
       "fixture-newhost": {
+        schemaVersion: 1,
         id: "fixture-newhost",
         displayName: "Fixture New Host",
         targetPath: ".fixture-newhost/rules.md",
@@ -723,6 +725,7 @@ function groupTargetPathContainment() {
       path.join(fixture.adaptersDir, "malicious-fixture.json"),
       JSON.stringify(
         {
+          schemaVersion: 1,
           id: "malicious-fixture",
           displayName: "Malicious Fixture",
           targetPath: maliciousTargetPath,
@@ -863,6 +866,7 @@ function groupSymlinkedAncestorContainment() {
     const fixture = buildFixture("symlink-control-nested", {
       adapters: {
         nested: {
+          schemaVersion: 1,
           id: "nested",
           displayName: "Nested",
           targetPath: "a/b/c/d/nested.md",
@@ -902,6 +906,7 @@ function groupStandaloneCollisionRejected() {
     const fixture = buildFixture("collision-standalone-reconciled", {
       adapters: {
         "std-a": {
+          schemaVersion: 1,
           id: "std-a",
           displayName: "Standalone A",
           targetPath: "SHARED.md",
@@ -910,6 +915,7 @@ function groupStandaloneCollisionRejected() {
           bodyTransform: "verbatim",
         },
         "rec-b": {
+          schemaVersion: 1,
           id: "rec-b",
           displayName: "Reconciled B",
           targetPath: "SHARED.md",
@@ -918,6 +924,7 @@ function groupStandaloneCollisionRejected() {
           bodyTransform: "verbatim",
         },
         other: {
+          schemaVersion: 1,
           id: "other",
           displayName: "Other",
           targetPath: "OTHER.md",
@@ -951,6 +958,7 @@ function groupStandaloneCollisionRejected() {
     const fixture = buildFixture("collision-standalone-standalone", {
       adapters: {
         "std-a": {
+          schemaVersion: 1,
           id: "std-a",
           displayName: "Standalone A",
           targetPath: "SHARED.md",
@@ -959,6 +967,7 @@ function groupStandaloneCollisionRejected() {
           bodyTransform: "verbatim",
         },
         "std-b": {
+          schemaVersion: 1,
           id: "std-b",
           displayName: "Standalone B",
           targetPath: "SHARED.md",
@@ -988,6 +997,7 @@ function groupStandaloneCollisionRejected() {
     const fixture = buildFixture("collision-control-different-blockid", {
       adapters: {
         "rec-a": {
+          schemaVersion: 1,
           id: "rec-a",
           displayName: "Reconciled A",
           targetPath: "SHARED.md",
@@ -996,6 +1006,7 @@ function groupStandaloneCollisionRejected() {
           bodyTransform: "verbatim",
         },
         "rec-b": {
+          schemaVersion: 1,
           id: "rec-b",
           displayName: "Reconciled B",
           targetPath: "SHARED.md",
@@ -1026,6 +1037,7 @@ function groupStandaloneCollisionRejected() {
     const fixture = buildFixture("collision-control-same-blockid", {
       adapters: {
         "rec-a": {
+          schemaVersion: 1,
           id: "rec-a",
           displayName: "Reconciled A",
           targetPath: "SHARED.md",
@@ -1089,6 +1101,7 @@ function groupFinding1WriteLoopHardening() {
       skill: LOOKALIKE_SKILL,
       adapters: {
         "aaa-standalone": {
+          schemaVersion: 1,
           id: "aaa-standalone",
           displayName: "Standalone (sorts first)",
           targetPath: "AAA-STANDALONE.md",
@@ -1097,6 +1110,7 @@ function groupFinding1WriteLoopHardening() {
           bodyTransform: "verbatim",
         },
         "zzz-reconciled": {
+          schemaVersion: 1,
           id: "zzz-reconciled",
           displayName: "Reconciled (sorts last, lookalike body)",
           targetPath: "ZZZ-RECONCILED.md",
@@ -1142,6 +1156,7 @@ function groupFinding1WriteLoopHardening() {
     const fixture = buildFixture("finding1-reorder-and-honest-report", {
       adapters: {
         "aaa-standalone": {
+          schemaVersion: 1,
           id: "aaa-standalone",
           displayName: "Standalone (sorts first, must never run)",
           targetPath: "AAA-STANDALONE.md",
@@ -1150,6 +1165,7 @@ function groupFinding1WriteLoopHardening() {
           bodyTransform: "verbatim",
         },
         "zzz-reconciled": {
+          schemaVersion: 1,
           id: "zzz-reconciled",
           displayName: "Reconciled (sorts last, forced to fail)",
           targetPath: "ZZZ-RECONCILED.md",
@@ -1207,6 +1223,7 @@ function groupFinding1WriteLoopHardening() {
     const fixture = buildFixture("finding1-partial-success-then-fail", {
       adapters: {
         "rec-1-ok": {
+          schemaVersion: 1,
           id: "rec-1-ok",
           displayName: "Reconciled (succeeds)",
           targetPath: "REC-1.md",
@@ -1215,6 +1232,7 @@ function groupFinding1WriteLoopHardening() {
           bodyTransform: "verbatim",
         },
         "rec-2-fails": {
+          schemaVersion: 1,
           id: "rec-2-fails",
           displayName: "Reconciled (forced to fail)",
           targetPath: "REC-2.md",
@@ -1223,6 +1241,7 @@ function groupFinding1WriteLoopHardening() {
           bodyTransform: "verbatim",
         },
         "zzz-standalone": {
+          schemaVersion: 1,
           id: "zzz-standalone",
           displayName: "Standalone (sorts last, must never run)",
           targetPath: "ZZZ-STANDALONE.md",
@@ -1264,6 +1283,7 @@ function groupFinding1WriteLoopHardening() {
     const fixture = buildFixture("finding1-control-normal-run", {
       adapters: {
         "aaa-standalone": {
+          schemaVersion: 1,
           id: "aaa-standalone",
           displayName: "Standalone",
           targetPath: "AAA-STANDALONE.md",
@@ -1272,6 +1292,7 @@ function groupFinding1WriteLoopHardening() {
           bodyTransform: "verbatim",
         },
         "zzz-reconciled": {
+          schemaVersion: 1,
           id: "zzz-reconciled",
           displayName: "Reconciled",
           targetPath: "ZZZ-RECONCILED.md",
