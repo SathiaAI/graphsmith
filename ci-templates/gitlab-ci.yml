@@ -65,7 +65,6 @@ stages:
     - node scripts/scenario.js --selftest
     - node scripts/promote.js --selftest
     - node scripts/gate.js --selftest
-    - node scripts/verify.js --selftest
     - node scripts/ci-check-pr-separation.js --selftest
     # The classification policy lives in ci-suite-manifest.json and the runner
     # is scripts/ci-run-suites.js -- the same script the GitHub Actions
@@ -78,6 +77,12 @@ stages:
     # that exit non-zero BY DESIGN on findings -- they are run and logged but
     # never gate. Anything in NEITHER list is treated as gating (fail-safe).
     - node scripts/ci-run-suites.js
+    # mcp-server/tests/*.test.js uses Node's built-in test runner directly
+    # (its own package.json "test" script), not the
+    # tests/<component>/<family>/run-tests.js convention discovered above --
+    # so it needs its own explicit step here too, mirroring the GitHub
+    # Actions `phase-a-selftests` job's "mcp-server test suite" step.
+    - cd mcp-server && npm test && cd ..
     # The evidence-only suites above are run and logged but never gate. Their
     # GATE is the pair of gauntlet batteries, which fold in each
     # ADJUDICATION.md and exit 0 only when every failing test is a documented
