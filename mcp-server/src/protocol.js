@@ -36,6 +36,10 @@ const ERROR_CODES = Object.freeze({
   INTERNAL_ERROR: -32603,
   UNSUPPORTED_PROTOCOL_VERSION: -32022,
   UNAUTHENTICATED: -32001,
+  // Streamable HTTP transport, "Request Metadata" / "Server Validation":
+  // a mirrored HTTP header (MCP-Protocol-Version, Mcp-Method, Mcp-Name) is
+  // missing or disagrees with the JSON-RPC body. HTTP status MUST be 400.
+  HEADER_MISMATCH: -32020,
 });
 
 const META_PROTOCOL_VERSION_KEY = "io.modelcontextprotocol/protocolVersion";

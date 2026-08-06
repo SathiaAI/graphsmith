@@ -17,8 +17,17 @@ const SERVER_INFO = Object.freeze({ name: pkg.name, version: pkg.version });
 const GUIDANCE_INSTRUCTIONS =
   `Call the "${TOOL_NAME}" tool (no arguments) to retrieve GraphSmith's current guidance (SKILL.md).`;
 
+/* Per the MCP schema's `Result` interface: "Servers implementing this
+ * protocol version MUST include this field [resultType]." This server
+ * never implements Multi Round-Trip Requests (no InputRequiredResult), so
+ * every result it ever returns is the "complete" variant -- injected
+ * uniformly here rather than threaded through every call site. */
 function okResponse(id, result) {
-  return { jsonrpc: "2.0", id: id === undefined ? null : id, result };
+  const body =
+    result && typeof result === "object" && !Array.isArray(result)
+      ? { ...result, resultType: "complete" }
+      : result;
+  return { jsonrpc: "2.0", id: id === undefined ? null : id, result: body };
 }
 
 function errorResponse(id, code, message, data) {
@@ -60,17 +69,23 @@ function validateMeta(params) {
     };
   }
 
+  /* Per the MCP schema's RequestMetaObject, clientInfo is OPTIONAL
+   * ("io.modelcontextprotocol/clientInfo"?: Implementation) -- "Clients
+   * SHOULD include this field on every request", not MUST. Only validate
+   * its shape when the client actually sent it; a well-formed but absent
+   * clientInfo is not an error. */
   const clientInfo = meta[META_CLIENT_INFO_KEY];
   if (
-    !clientInfo ||
-    typeof clientInfo !== "object" ||
-    Array.isArray(clientInfo) ||
-    typeof clientInfo.name !== "string" ||
-    typeof clientInfo.version !== "string"
+    clientInfo !== undefined &&
+    (!clientInfo ||
+      typeof clientInfo !== "object" ||
+      Array.isArray(clientInfo) ||
+      typeof clientInfo.name !== "string" ||
+      typeof clientInfo.version !== "string")
   ) {
     return {
       code: ERROR_CODES.INVALID_PARAMS,
-      message: `_meta["${META_CLIENT_INFO_KEY}"] is required and must be {name: string, version: string}.`,
+      message: `_meta["${META_CLIENT_INFO_KEY}"], when present, must be {name: string, version: string}.`,
     };
   }
 
@@ -96,11 +111,34 @@ function validateMeta(params) {
     return {
       code: ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION,
       message: `Unsupported protocol version "${protocolVersion}". This server speaks "${STATELESS_PROTOCOL_VERSION}" (stateless) and "${LEGACY_PROTOCOL_VERSION}" (legacy initialize handshake).`,
+      /* Per the MCP schema's UnsupportedProtocolVersionError.data shape:
+       * {supported: string[], requested: string} -- lets the client pick a
+       * mutually supported version from `supported` and retry, instead of
+       * getting a dead-end error with nothing to act on. */
+      data: {
+        supported: [STATELESS_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION],
+        requested: protocolVersion,
+      },
     };
   }
 
   return null;
 }
+
+/* This server's tool surface (one tool, no arguments, no per-caller
+ * variance) never changes within a running process, so server/discover
+ * and tools/list results are safe to mark cacheable per the MCP schema's
+ * CacheableResult shape (see ListToolsResult extends CacheableResult in
+ * schema.ts): `ttlMs` (milliseconds, analogous to HTTP Cache-Control
+ * max-age) and `cacheScope` ("public" | "private"). The schema defines
+ * the fields' semantics but not a mandated ttlMs value; 1 hour is this
+ * server's own reasonable, conservative choice, not a value copied from
+ * spec text. cacheScope is "public" because neither result depends on
+ * which caller is asking. `server/discover` itself isn't a method the
+ * real MCP spec defines -- it's this server's own stateless-native
+ * discovery probe -- but it's exactly as static as tools/list, so the
+ * same treatment applies by analogy. */
+const CACHEABLE_STATIC_RESULT_META = Object.freeze({ ttlMs: 3600000, cacheScope: "public" });
 
 function handleDiscover(id) {
   return okResponse(id, {
@@ -110,11 +148,12 @@ function handleDiscover(id) {
     },
     serverInfo: SERVER_INFO,
     instructions: GUIDANCE_INSTRUCTIONS,
+    ...CACHEABLE_STATIC_RESULT_META,
   });
 }
 
 function handleToolsList(id) {
-  return okResponse(id, { tools: [toolDescriptor()] });
+  return okResponse(id, { tools: [toolDescriptor()], ...CACHEABLE_STATIC_RESULT_META });
 }
 
 function handleToolsCall(id, params) {
@@ -206,8 +245,14 @@ function handleMessage(msg, ctx) {
   if (method === "initialize") {
     return handleLegacyInitialize(id, connectionState);
   }
-  if (method === "notifications/initialized") {
-    /* JSON-RPC notification: no "id", no response. */
+  if (method.startsWith("notifications/")) {
+    /* JSON-RPC/MCP notification, by naming convention -- e.g.
+     * "notifications/initialized", "notifications/cancelled": no response
+     * is ever sent, for any method under this prefix. Generalized from a
+     * single hardcoded method name so a new notification type doesn't
+     * silently regress into getting a real JSON-RPC error response
+     * (falling through to the `default:` case below) instead of being
+     * suppressed like every other notification. */
     return null;
   }
 
@@ -219,20 +264,20 @@ function handleMessage(msg, ctx) {
        * stateless-native discovery probe and must itself be
        * self-authenticating/self-describing. */
       const metaError = validateMeta(params);
-      if (metaError) return errorResponse(id, metaError.code, metaError.message);
+      if (metaError) return errorResponse(id, metaError.code, metaError.message, metaError.data);
       return handleDiscover(id);
     }
     case "tools/list": {
       if (!connectionState.legacyInitialized) {
         const metaError = validateMeta(params);
-        if (metaError) return errorResponse(id, metaError.code, metaError.message);
+        if (metaError) return errorResponse(id, metaError.code, metaError.message, metaError.data);
       }
       return handleToolsList(id);
     }
     case "tools/call": {
       if (!connectionState.legacyInitialized) {
         const metaError = validateMeta(params);
-        if (metaError) return errorResponse(id, metaError.code, metaError.message);
+        if (metaError) return errorResponse(id, metaError.code, metaError.message, metaError.data);
       }
       return handleToolsCall(id, params);
     }
