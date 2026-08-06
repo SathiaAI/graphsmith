@@ -13,17 +13,21 @@
  * sake (reading the input file, optionally writing --out); the adapters and
  * renderer themselves stay pure (text/object in, object/string out).
  *
- * Harness detection (--harness omitted): tries the Claude Code adapter
- * first, then Codex, and uses whichever adapter's own recognizer
- * (isClaudeLine / the codex line-type switch) reports the file as
- * recognized. JUDGMENT CALL, not specified by the design doc (which only
- * documents the `--harness claude-code|codex` flag, not what happens when
- * it is omitted): this two-adapter-race approach can misclassify a file
- * that happens to satisfy both recognizers' loose heuristics (unlikely in
- * practice -- the two vocabularies barely overlap -- but not proven
- * impossible). --harness is the reliable path; auto-detection is a
- * convenience with a documented failure mode (an explicit error naming both
- * attempts, never a silent guess presented as certain).
+ * Harness detection (--harness omitted): runs BOTH adapters (isClaudeLine /
+ * the codex line-type switch) over the input and looks at how many report
+ * the file as recognized. RESOLVED, 2026-08-06 (CodeRabbit review, PR #23)
+ * -- this used to be an open judgment call, disclosed as such right here:
+ * the original two-adapter-RACE approach returned on the FIRST adapter to
+ * report recognized, without ever checking whether the OTHER adapter would
+ * also recognize the same input, flagged at the time as "unlikely in
+ * practice... not proven impossible." The user asked for it hardened
+ * regardless of how unlikely, so it now is: if exactly one adapter
+ * recognizes the file, that one is used (the common case, unchanged
+ * behavior); if neither recognizes it, the existing "could not recognize"
+ * error is unchanged; if MORE THAN ONE adapter recognizes the same input,
+ * that is now an explicit, named error requiring --harness be passed
+ * rather than a silent pick of whichever adapter happened to run first.
+ * --harness remains the fully reliable path either way.
  */
 
 const fs = require("fs");
@@ -81,13 +85,28 @@ function buildPostmortem(sessionPath, opts) {
     return { trace, diagnostics, harness: opts.harness };
   }
 
+  // CodeRabbit review, PR #23, 2026-08-06 (ambiguous harness auto-
+  // detection): both adapters are now run UNCONDITIONALLY (not stopping at
+  // the first recognized result), so a file that happens to satisfy both
+  // recognizers' loose heuristics can be detected as ambiguous instead of
+  // silently resolved to whichever adapter's HARNESSES-array position came
+  // first. See the file header for the full history of this decision.
   const attempts = [];
   for (const harness of HARNESSES) {
     const result = parseWithHarness(harness, text, parseOpts);
     attempts.push({ harness, result });
-    if (result.diagnostics.recognized) {
-      return { trace: result.trace, diagnostics: result.diagnostics, harness };
-    }
+  }
+  const recognizedAttempts = attempts.filter((a) => a.result.diagnostics.recognized);
+  if (recognizedAttempts.length === 1) {
+    const only = recognizedAttempts[0];
+    return { trace: only.result.trace, diagnostics: only.result.diagnostics, harness: only.harness };
+  }
+  if (recognizedAttempts.length > 1) {
+    throw new Error(
+      `postmortem: '${sessionPath}' was ambiguously recognized by more than one harness adapter ` +
+        `(${recognizedAttempts.map((a) => a.harness).join(", ")}). Auto-detection cannot pick a single ` +
+        `answer safely -- pass --harness explicitly to say which one this session log actually is.`
+    );
   }
   throw new Error(
     `postmortem: could not recognize '${sessionPath}' as a Claude Code or Codex session log. ` +
