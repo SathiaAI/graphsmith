@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0.0",
+  "policy_id": "postmortem-command-classification-v1",
+  "description": "Declarative, versioned pattern list for graphsmith postmortem's shell-command classification (Lane F, .plans/gsa-followup/LANE-F-CODING-SESSION-POSTMORTEM-DESIGN.md Part 3b). Externalized into its own data file mirroring scripts/risk-policy.json's separation from scripts/capability-policy.js, per that design doc's explicit instruction. This is a CLASSIFICATION aid, not a proof of anything -- it can only recognize command shapes; it never inspects whether a command actually succeeded (see schemas/session-trace.schema.json stats.observability.verifyOutcome, always 'unavailable' in v1). scripts/postmortem-classify.js is the only reader of this file.",
+  "verify_command_patterns": {
+    "description": "Substrings (case-insensitive) that mark a shell command as verify-shaped (test/build runner). The first ten entries are the exact, source-confirmed mindwalk verifyCommand() list (internal/adapter/adapter.go), reproduced byte-for-byte: 'go test, go vet, npm test, npm run build, pnpm test, pnpm build, pytest, make test, cargo test, swift test' -- confirmed to NOT include jest/vitest/mvn test/dotnet test/tox/rspec. The design doc's Part 3b explicitly directs this list to be adapt-not-adopt and EXTENDED 'for GraphSmith's less Go/JS-narrow audience' (GraphSmith itself targets Claude Code, Codex, Gemini CLI, Cursor, Windsurf/Devin, Hermes, and Copilot users across many stacks, not mindwalk's own narrower Go-tooling test corpus). The extension below is a disclosed, deliberate GraphSmith-side addition -- flagged explicitly, not silently folded in as if mindwalk already had it.",
+    "mindwalk_confirmed": [
+      "go test", "go vet", "npm test", "npm run build", "pnpm test",
+      "pnpm build", "pytest", "make test", "cargo test", "swift test"
+    ],
+    "graphsmith_extension": [
+      "yarn test", "yarn build", "jest", "vitest", "mocha",
+      "mvn test", "gradle test", "gradlew test", "dotnet test",
+      "rspec", "tox", "go test ./...", "bundle exec rspec", "ctest"
+    ]
+  },
+  "search_programs": {
+    "description": "Program basenames (case-insensitive) that only inspect the tree the way Grep/Glob/LS would. Source-confirmed from mindwalk's searchPrograms map.",
+    "programs": ["grep", "rg", "ag", "find", "fd", "ls", "tree"]
+  },
+  "read_only_programs": {
+    "description": "Program basenames that never mutate anything and carry no path-target signal on their own (used as the 'harmless in a pipeline segment' allowlist for both search- and read-command classification). Source-confirmed from mindwalk's readOnlyPrograms map.",
+    "programs": [
+      "cd", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "awk",
+      "echo", "which", "file", "stat", "du", "pwd", "dirname", "basename", "true"
+    ]
+  },
+  "read_programs": {
+    "description": "Program basenames that page file contents the way Read would (cat/head/tail/nl, plus the sed -n '...p' file idiom handled specially in code). Source-confirmed from mindwalk's readPrograms map.",
+    "programs": ["cat", "head", "tail", "nl", "sed"]
+  },
+  "tool_action_map": {
+    "description": "Direct tool-name -> action mappings, borrowed as-is from mindwalk's actionFor() switch (both Claude Code and Codex tool names share one table since the taxonomy is harness-agnostic).",
+    "read": ["Read"],
+    "edit": ["Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"],
+    "search": ["Grep", "Glob", "LS", "view_image"],
+    "shell_like": ["Bash", "exec_command", "write_stdin", "js", "js_repl"]
+  }
+}
