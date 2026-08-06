@@ -402,25 +402,25 @@ function buildCombinedSettingsFixture() {
     hooks: {
       SessionStart: [
         {
+          // A single shared matcher group whose hooks[] holds BOTH
+          // GraphSmith's own hook and a sibling plugin's hook side by
+          // side -- this is what the inner-item-level removal fix (as
+          // opposed to dropping the whole entry) is checked against.
           matcher: "startup",
           hooks: [
             {
               type: "command",
               command: "node",
               args: [
-                "/home/user/.claude/plugins/cache/graphsmith@graphsmith-marketplace/hooks/scripts/session-start.js",
+                // Real documented plugin-cache path shape: cache/<marketplace>/<plugin>/<version>/...
+                "/home/user/.claude/plugins/cache/graphsmith-marketplace/graphsmith/0.5.0/hooks/scripts/session-start.js",
               ],
             },
-          ],
-        },
-        {
-          matcher: "startup",
-          hooks: [
             {
               type: "command",
               command: "node",
               args: [
-                "/home/user/.claude/plugins/cache/other-plugin@other-marketplace/hooks/scripts/session-start.js",
+                "/home/user/.claude/plugins/cache/other-marketplace/other-plugin/1.0.0/hooks/scripts/session-start.js",
               ],
             },
           ],
@@ -450,10 +450,18 @@ async function test_uninstallRemovesOnlyOwnSegment() {
     const checks = [
       ["graphsmith key removed", !("graphsmith@graphsmith-marketplace" in after.enabledPlugins)],
       ["sibling key intact", after.enabledPlugins["other-plugin@other-marketplace"] === true],
-      ["graphsmith hook entry removed", after.hooks.SessionStart.length === 1],
+      // The fixture's shared matcher-group entry holds BOTH plugins' hooks
+      // side by side (entry.hooks: [graphsmithHook, otherPluginHook]) --
+      // the whole entry must survive (only the inner graphsmith item goes).
+      ["shared matcher-group entry survives", after.hooks.SessionStart.length === 1],
+      ["only the sibling's inner hook remains", after.hooks.SessionStart[0].hooks.length === 1],
       [
-        "sibling hook entry intact",
-        after.hooks.SessionStart[0].hooks[0].args[0].includes("other-plugin@other-marketplace"),
+        "sibling's inner hook is byte-intact",
+        after.hooks.SessionStart[0].hooks[0].args[0].includes("cache/other-marketplace/other-plugin/"),
+      ],
+      [
+        "graphsmith's own inner hook is gone",
+        !after.hooks.SessionStart[0].hooks.some((h) => h.args[0].includes("cache/graphsmith-marketplace/graphsmith/")),
       ],
       ["statusLine untouched", JSON.stringify(after.statusLine) === JSON.stringify(fixture.statusLine)],
     ];
@@ -461,7 +469,7 @@ async function test_uninstallRemovesOnlyOwnSegment() {
     if (failedChecks.length) {
       fail(name, `failed checks: ${failedChecks.join(", ")}`);
     } else {
-      pass(name, "sibling plugin entries, hook entries, and statusLine all byte-identical after removal");
+      pass(name, "sibling plugin's inner hook and enabledPlugins entry, and statusLine, all byte-identical after removal");
     }
   } catch (e) {
     fail(name, e.message);
@@ -474,13 +482,14 @@ async function test_uninstallSabotageIsCaught() {
   const name = "sabotage: over-broad uninstall matcher strips the sibling plugin too — proves the test has teeth";
   const target = UNINSTALL_CHECK;
   const original = fs.readFileSync(target, "utf8");
-  // Broaden the enabledPlugins matcher from "exactly graphsmith@<marketplace>"
-  // to "any key containing the substring 'plugin'" — a realistic mistake
-  // (e.g. someone "simplifying" the regex) that would also delete every
-  // other plugin whose marketplace or name happens to contain that word.
+  // Broaden the enabledPlugins matcher from "exactly graphsmith@<the
+  // resolved marketplace>" to "any key containing the substring 'plugin'"
+  // — a realistic mistake (e.g. someone "simplifying" the regex) that
+  // would also delete every other plugin whose marketplace or name
+  // happens to contain that word.
   const sabotaged = original.replace(
-    "const ENABLED_PLUGIN_KEY_RE = /^graphsmith@[^@]+$/;",
-    "const ENABLED_PLUGIN_KEY_RE = /plugin/;"
+    "  return new RegExp(`^${escapeRegExp(PLUGIN_NAME)}@${escapeRegExp(marketplace)}$`);",
+    "  return /plugin/;"
   );
   if (sabotaged === original) {
     fail(name, "sabotage injection point not found in uninstall-check.js — refusing to run an untested patch");
@@ -560,6 +569,49 @@ async function test_uninstallAtomicWriteSurvivesCrashBeforeRename() {
       name,
       `exit code ${exit.code} (as expected), settings.json byte-identical to before the run, no leftover temp file`
     );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function test_uninstallPreservesFilePermissions() {
+  const name = "uninstall-check: a locked-down settings.json (0600) stays 0600 after --apply, not widened to 0644";
+  if (process.platform === "win32") {
+    // Windows doesn't have POSIX permission bits; fs.chmodSync there
+    // barely affects anything meaningful, so this check would be a no-op
+    // that appears to pass without actually proving anything.
+    return;
+  }
+  const dir = mkTemp("uninstall-perms");
+  const settingsPath = path.join(dir, "settings.json");
+  fs.writeFileSync(settingsPath, JSON.stringify(buildCombinedSettingsFixture(), null, 2));
+  fs.chmodSync(settingsPath, 0o600);
+
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [UNINSTALL_CHECK, "--settings", settingsPath, "--apply"]);
+      let err = "";
+      child.stderr.on("data", (c) => (err += c));
+      child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}: ${err}`))));
+    });
+
+    const settingsMode = fs.statSync(settingsPath).mode & 0o777;
+    const bakMode = fs.statSync(settingsPath + ".bak").mode & 0o777;
+    const checks = [
+      ["settings.json stays 0600", settingsMode === 0o600],
+      ["settings.json.bak stays 0600", bakMode === 0o600],
+    ];
+    const failedChecks = checks.filter(([, ok]) => !ok).map(([label]) => label);
+    if (failedChecks.length) {
+      fail(
+        name,
+        `failed checks: ${failedChecks.join(", ")} (settings.json mode=${settingsMode.toString(8)}, .bak mode=${bakMode.toString(8)})`
+      );
+    } else {
+      pass(name, "both settings.json and its .bak snapshot kept the original 0600 permissions");
+    }
+  } catch (e) {
+    fail(name, e.message);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -796,6 +848,7 @@ async function main() {
   await test_uninstallRemovesOnlyOwnSegment();
   await test_uninstallSabotageIsCaught();
   await test_uninstallAtomicWriteSurvivesCrashBeforeRename();
+  await test_uninstallPreservesFilePermissions();
   await test_uninstallMalformedJsonExitsCleanly();
   await test_uninstallMissingSettingsFileExitsCleanly();
   await test_realCliMultiPluginAndUninstall();
