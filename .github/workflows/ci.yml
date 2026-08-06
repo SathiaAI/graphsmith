@@ -126,6 +126,24 @@ jobs:
         # ~3300 lines deep, which repeatedly cost more time than the fixes did.
         run: node scripts/ci-run-suites.js
 
+      - name: mcp-server test suite (44 tests, node:test runner)
+        # mcp-server/tests/*.test.js uses Node's built-in test runner directly
+        # (mcp-server/package.json's own "test" script), not the
+        # tests/<component>/<family>/run-tests.js convention the step above
+        # discovers -- so ci-run-suites.js never sees these tests and they
+        # were not gated by CI at all until this step was added. Runs `npm
+        # test` (== bare `node --test`, no path argument -- this repo tried
+        # both `tests/*.test.js` and `tests/` first: the former needs the
+        # shell to expand the glob, which pwsh does NOT do for external
+        # commands on windows-latest and Node 18's test runner does not do
+        # internally either; the latter (a directory argument) works on
+        # Node 18.20.8 but throws MODULE_NOT_FOUND on Node 22.22.2. Bare
+        # `node --test`, relying on its default cwd-recursive discovery, is
+        # the only form verified to pass identically on Node 18 and 22) so
+        # this exercises the exact same command a contributor runs locally.
+        working-directory: mcp-server
+        run: npm test
+
       - name: Gauntlet regression batteries (v0.3.0 + v0.4.0 — adjudicated HOLD/BREAK gate)
         # The raw adversarial suites above are evidence-only (they exit non-zero on their
         # documented adjudicated false-positives). The gauntlets are the GATING regression:
