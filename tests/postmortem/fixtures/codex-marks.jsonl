@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-01T19:00:00Z","type":"session_meta","payload":{"id":"codex-marks-1","session_id":"codex-marks-1","timestamp":"2026-08-01T19:00:00Z","cwd":"/repo"}}
+{"timestamp":"2026-08-01T19:00:01Z","type":"response_item","payload":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"spawn_agent","arguments":"{}"}}
+{"timestamp":"2026-08-01T19:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"spawned"}}
+{"timestamp":"2026-08-01T19:00:03Z","type":"event_msg","payload":{"type":"context_compacted"}}

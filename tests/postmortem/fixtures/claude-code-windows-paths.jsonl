@@ -1,0 +1,8 @@
+{"type":"ai-title","aiTitle":"Windows paths test","sessionId":"cc-win-1"}
+{"type":"user","timestamp":"2026-08-01T16:00:00Z","cwd":"C:\\Users\\dev\\repo","sessionId":"cc-win-1","message":{"role":"user","content":"Fix the Windows build."}}
+{"type":"assistant","timestamp":"2026-08-01T16:00:01Z","sessionId":"cc-win-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"C:\\Users\\dev\\repo\\src\\main.js"}}]}}
+{"type":"user","timestamp":"2026-08-01T16:00:02Z","sessionId":"cc-win-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"main() {}\n","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-08-01T16:00:03Z","sessionId":"cc-win-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Edit","input":{"file_path":"C:\\Users\\dev\\repo\\src\\lib\\util.js","old_string":"a","new_string":"b"}}]}}
+{"type":"user","timestamp":"2026-08-01T16:00:04Z","sessionId":"cc-win-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"updated","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-08-01T16:00:05Z","sessionId":"cc-win-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_3","name":"Read","input":{"file_path":"D:\\secrets\\file.txt"}}]}}
+{"type":"user","timestamp":"2026-08-01T16:00:06Z","sessionId":"cc-win-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"top secret\n","is_error":false}]}}

@@ -1,0 +1,6 @@
+{"type":"user","timestamp":"2026-08-06T09:00:00Z","cwd":"/repo","sessionId":"cc-seq-1","message":{"role":"user","content":"Kick off two subagents while a third tool call is still pending."}}
+{"type":"assistant","timestamp":"2026-08-06T09:00:01Z","sessionId":"cc-seq-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_t1","name":"Task","input":{"description":"first subagent"}},{"type":"tool_use","id":"toolu_t2","name":"Bash","input":{"command":"npm test"}}]}}
+{"type":"assistant","timestamp":"2026-08-06T09:00:02Z","sessionId":"cc-seq-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_t3","name":"Agent","input":{"description":"second subagent, issued while t1/t2 are still unresolved"}}]}}
+{"type":"user","timestamp":"2026-08-06T09:00:03Z","sessionId":"cc-seq-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_t1","content":"t1 done","is_error":false}]}}
+{"type":"user","timestamp":"2026-08-06T09:00:04Z","sessionId":"cc-seq-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_t2","content":"t2 done","is_error":false}]}}
+{"type":"user","timestamp":"2026-08-06T09:00:05Z","sessionId":"cc-seq-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_t3","content":"t3 done","is_error":false}]}}

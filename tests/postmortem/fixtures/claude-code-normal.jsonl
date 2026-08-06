@@ -1,0 +1,9 @@
+{"type":"ai-title","aiTitle":"Fix off-by-one bug","sessionId":"cc-normal-1"}
+{"type":"user","timestamp":"2026-08-01T10:00:00Z","cwd":"/repo","sessionId":"cc-normal-1","gitBranch":"main","message":{"role":"user","content":"Please read src/util.js and fix the off-by-one bug, then run the tests."}}
+{"type":"assistant","timestamp":"2026-08-01T10:00:01Z","sessionId":"cc-normal-1","message":{"role":"assistant","model":"claude-test-model","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/repo/src/util.js"}}]}}
+{"type":"user","timestamp":"2026-08-01T10:00:02Z","sessionId":"cc-normal-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"1\tfunction sum(a,b){ return a+b+1 }\n","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-08-01T10:00:03Z","sessionId":"cc-normal-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Edit","input":{"file_path":"/repo/src/util.js","old_string":"a+b+1","new_string":"a+b"}}]}}
+{"type":"user","timestamp":"2026-08-01T10:00:04Z","sessionId":"cc-normal-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"updated","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-08-01T10:00:05Z","sessionId":"cc-normal-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"command":"npm test"}}]}}
+{"type":"user","timestamp":"2026-08-01T10:00:06Z","sessionId":"cc-normal-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"PASS  1 test\n","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-08-01T10:00:07Z","sessionId":"cc-normal-1","message":{"role":"assistant","content":[{"type":"text","text":"Fixed the off-by-one bug and confirmed the test suite passes."}]}}

@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2026-08-06T09:00:00Z","cwd":"/repo","sessionId":"cc-dup-1","message":{"role":"user","content":"Read a.txt, then read b.txt."}}
+{"type":"assistant","timestamp":"2026-08-06T09:00:01Z","sessionId":"cc-dup-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_dup","name":"Read","input":{"file_path":"/repo/a.txt"}}]}}
+{"type":"assistant","timestamp":"2026-08-06T09:00:02Z","sessionId":"cc-dup-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_dup","name":"Read","input":{"file_path":"/repo/b.txt"}}]}}
+{"type":"user","timestamp":"2026-08-06T09:00:03Z","sessionId":"cc-dup-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_dup","content":"contents-of-a","is_error":false}]}}
