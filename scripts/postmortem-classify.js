@@ -110,6 +110,24 @@ function truncateRunes(text, limit, ellipsis) {
   return runes.slice(0, keep).join("") + ellipsis;
 }
 
+/** CodeRabbit review, PR #23, 2026-08-06 (multiline summaries): collapses
+ * any run of \r/\n into a single space -- the same collapsing approach
+ * postmortem-render.js's escapeMarkNote() already uses for a mark's note
+ * at RENDER time, but a trace event's `summary` field is built here, at
+ * TRACE-BUILD time (summarizeTool/summarizeExecWrapper below), so it needs
+ * its own copy of the same collapse rather than depending on a render-time
+ * fix elsewhere. A multiline Bash command or multiline Task `description`
+ * copied into `summary` unchanged would produce a multiline value,
+ * violating the schema's "one-line, mechanically generated" summary
+ * contract (schemas/session-trace.schema.json) and potentially breaking a
+ * line-oriented consumer of the raw trace JSON (not just the Markdown
+ * report). Applied to source text BEFORE truncation, so the truncation
+ * budget is spent on the collapsed (shorter) text, not the original
+ * newline-bearing one. */
+function collapseNewlines(text) {
+  return String(text || "").replace(/[\r\n]+/g, " ");
+}
+
 const USER_MESSAGE_NOTE_LIMIT = 2000;
 
 /** Mirrors adapter.UserMessageNote. */
@@ -165,6 +183,25 @@ function normalizePath(cwd, base, rawPath) {
   if (!p || p.includes("\n")) return { ok: false };
   if (/^https?:\/\//i.test(p)) return { ok: false };
 
+  // CodeRabbit review, PR #23, 2026-08-06 (home-relative path
+  // misclassification): "~" is shell shorthand for the invoking user's home
+  // directory -- it is NOT an ordinary relative path segment. Falling
+  // through to the ordinary relative-path branch below (as this used to)
+  // resolved e.g. "~/.bashrc" AS IF it were a path inside the session's
+  // repo cwd, silently mis-locating it. Recognized here, BEFORE ordinary
+  // relative-path normalization runs, and routed straight to `outside`
+  // with scope "home" -- the schema's existing "home" enum value, not a
+  // new one. Deliberately does NOT expand "~" against the actual
+  // os.homedir() of whatever machine happens to be running `graphsmith
+  // postmortem`: doing so would make the reported outside PATH itself
+  // host-dependent, not just its scope LABEL (the one disclosed exception
+  // to this file's determinism rule -- see outsideScope()'s own comment).
+  // The path is kept exactly as written in the log; only the scope is
+  // set, directly from the "~" shape itself, never from a real lookup.
+  if (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) {
+    return { ok: true, outside: { scope: "home", path: toSlash(p) } };
+  }
+
   const cwdStyle = pathStyleOf(cwd) || (cwd && cwd.includes("\\") ? "win32" : "posix");
   const rawStyle = pathStyleOf(p);
   const baseStyle = pathStyleOf(base);
@@ -175,8 +212,35 @@ function normalizePath(cwd, base, rawPath) {
     const mod = styleModule(style);
     const clean = mod.normalize(p);
     const cleanSlash = toSlash(clean);
-    if (cleanSlash === "." || cleanSlash.startsWith("../") || cleanSlash === "..") {
-      return { ok: false };
+    if (cleanSlash === ".") return { ok: false };
+    if (cleanSlash === ".." || cleanSlash.startsWith("../")) {
+      // CodeRabbit review, PR #23, 2026-08-06 (silently-dropped parent-
+      // relative paths): a path like "../secret.txt" used to return
+      // { ok: false } here unconditionally, dropping it from BOTH targets
+      // AND outside -- worse than misclassifying, it vanished with no
+      // trace at all, directly conflicting with this file's own
+      // "never silently drop, never silently guess" ethos (see e.g. F3's
+      // comment on the weak-target keep-don't-drop fix above). A
+      // "../"-prefixed path is not unresolvable, it is merely resolvable to
+      // somewhere OUTSIDE the anchor directory -- exactly what the
+      // `outside` array exists to record. Resolve it against the same
+      // anchor an ordinary relative path would use (the explicit `base` if
+      // the caller supplied one, else the session's own `cwd`) and report
+      // it as an outside touch when it does escape; if the anchor is
+      // itself a subdirectory such that "../secret.txt" actually resolves
+      // BACK inside the repo root, it is a normal in-repo target instead
+      // (relSameStyle already tells these two cases apart). Only genuinely
+      // un-anchorable input (no base AND no cwd recorded for the session)
+      // falls back to ok:false -- there is no path string to compute
+      // ANY location, in or out of the repo, without an anchor.
+      const anchor = base || cwd;
+      if (!anchor) return { ok: false };
+      const abs = mod.normalize(mod.join(anchor, p));
+      if (cwd) {
+        const rel = relSameStyle(mod, cwd, abs, style);
+        if (rel !== null) return { ok: true, rel: toSlash(rel) };
+      }
+      return { ok: true, outside: { scope: outsideScope(abs), path: toSlash(abs) } };
     }
     if (base) {
       const abs = mod.normalize(mod.join(base, p));
@@ -267,6 +331,20 @@ function safeHomedir() {
  * ------------------------------------------------------------------------- */
 
 const pathLineRe = /(?:^|[\s"'([])([A-Za-z0-9_./@+-]*[A-Za-z0-9_/@+-]\.[A-Za-z0-9][A-Za-z0-9._-]*):([0-9]+)/g;
+// CodeRabbit review, PR #23, 2026-08-06 (Windows path extraction from tool
+// output): pathLineRe's path character class has no backslash and no colon
+// (colon is the literal separator before the line number), so a Windows
+// drive-letter absolute path in a Grep/Glob/LS hit line -- e.g.
+// "C:\repo\src\a.js:12:hit" -- never matched: the drive letter's own ":"
+// breaks the "path:LINE" shape the base regex expects, and "\repo\src"
+// contains characters outside the allowed set even before that. Such hits
+// were silently dropped from touched-file stats even though this file's
+// own path-normalization code (pathStyleOf/normalizePath, see the file
+// header) explicitly supports Windows paths elsewhere. A second,
+// Windows-specific regex handles the drive-letter shape (accepting either
+// "\" or "/" as the separator, since a Windows path recorded with forward
+// slashes is also valid); parsePathHits below runs both and merges results.
+const pathLineWinRe = /(?:^|[\s"'([])([A-Za-z]:[\\/][^\s"'()[\]:]*\.[A-Za-z0-9][A-Za-z0-9._-]*):([0-9]+)/g;
 const pathOnlyRe = /(?:^|[\s"'([])([./~A-Za-z0-9_@+-]*[/][A-Za-z0-9_./~@+-]*\.[A-Za-z0-9][A-Za-z0-9._-]*)(?:$|[\s"',)\]:;])/g;
 const commandPathRe = /(?:^|[\s"'=])([./~A-Za-z0-9_@+-]+\.[A-Za-z0-9][A-Za-z0-9._-]*)(?:$|[\s"',)\]:;])/g;
 const patchFileRe = /^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm;
@@ -316,6 +394,19 @@ function parsePathHits(text) {
   pathLineRe.lastIndex = 0;
   let m;
   while ((m = pathLineRe.exec(text))) {
+    const line = parseInt(m[2], 10);
+    if (line > 0) {
+      const cleaned = cleanExtractedPath(m[1], true);
+      if (cleaned.ok) {
+        if (!byPath.has(cleaned.path)) byPath.set(cleaned.path, []);
+        byPath.get(cleaned.path).push([line, line]);
+      }
+    }
+  }
+  // CodeRabbit review, PR #23, 2026-08-06 (Windows path extraction) -- see
+  // pathLineWinRe's own comment above for why this second pass exists.
+  pathLineWinRe.lastIndex = 0;
+  while ((m = pathLineWinRe.exec(text))) {
     const line = parseInt(m[2], 10);
     if (line > 0) {
       const cleaned = cleanExtractedPath(m[1], true);
@@ -392,21 +483,66 @@ function programOf(fields) {
  * segment separators count as a real token boundary here. */
 const SHELL_TOKEN_BOUNDARY_RE = /[\s|;&]/;
 
+/* CodeRabbit review, PR #23, 2026-08-06 (verify-pattern boundary regex): the
+ * single SHELL_TOKEN_BOUNDARY_RE above (whitespace/|/;/&) is the correct,
+ * strict boundary for the character AFTER a match -- see Finding 11's own
+ * comment for why that strictness matters (a trailing "." must NOT count as
+ * a boundary, or "jest.config.js" would misclassify as verify). But used as
+ * the BEFORE-match boundary too, it was too strict in the other direction:
+ * a verify pattern preceded by a path separator -- "./gradlew test" (before
+ * "gradlew" is "/"), or "node_modules/.bin/jest" (before "jest" is "/") --
+ * failed beforeOk and fell through to "exec" even though these are real,
+ * unambiguous verify-runner invocations, not a token embedded inside an
+ * unrelated filename the way "jest.config.js" is. A leading path separator
+ * is exactly the shape a real relative-executable or node_modules/.bin
+ * invocation takes; it is never how a token gets embedded INSIDE a
+ * filename (that would need to be a suffix, like "jest.config.js", which
+ * afterOk already refuses). This asymmetry is intentional: only the BEFORE
+ * check gains "/" and "\\" as additional valid boundary characters; the
+ * AFTER check keeps the original strict set unchanged. */
+const SHELL_TOKEN_LEADING_BOUNDARY_RE = /[\s|;&/\\]/;
+
+/* CodeRabbit review, PR #23, 2026-08-06 (verify-detection false positive
+ * via echo): verifyCommand used to scan the WHOLE lowercased command string
+ * for a pattern occurrence, with only character-boundary checks -- it never
+ * asked whether the matched text was actually being INVOKED as a program,
+ * versus merely appearing as literal argument text to some other command.
+ * `echo npm test` matched the "npm test" pattern (real, boundary-clean
+ * whitespace on both sides) even though `echo` never invokes anything; it
+ * just prints its arguments. Because actionFor() checks verify before other
+ * classifications, this became a false "verify" classification that could
+ * reset editsAfterLastVerify, producing a false "the session re-verified"
+ * signal. Fix: scan per SHELL SEGMENT (the same fieldsFuncSplit/programOf
+ * split searchCommand/readCommand already use), and skip any segment whose
+ * own invoked program is "echo" -- echo's arguments are text being printed,
+ * never a program name being run, so no pattern occurring only within an
+ * echo segment can be a real verify invocation. Segments whose program is
+ * anything else (including the verify runner itself, e.g. "npm"/"npx"/
+ * "gradlew") are scanned exactly as before -- this does not require the
+ * match to BE the segment's first token (that would break "npx jest --ci",
+ * where "npx" is the program and "jest" is its argument, a real invocation
+ * this file's own existing regression tests require to stay classified as
+ * verify). */
 function verifyCommand(command) {
   const patterns = loadPatterns().verifyPatterns;
   const c = String(command || "").toLowerCase();
-  return patterns.some((p) => {
-    let idx = c.indexOf(p);
-    while (idx !== -1) {
-      const before = idx === 0 ? "" : c[idx - 1];
-      const after = idx + p.length >= c.length ? "" : c[idx + p.length];
-      const beforeOk = before === "" || SHELL_TOKEN_BOUNDARY_RE.test(before);
-      const afterOk = after === "" || SHELL_TOKEN_BOUNDARY_RE.test(after);
-      if (beforeOk && afterOk) return true;
-      idx = c.indexOf(p, idx + 1);
+  for (const segment of fieldsFuncSplit(c)) {
+    const fields = segment.trim().split(/\s+/).filter(Boolean);
+    const { program } = programOf(fields);
+    if (program === "echo") continue;
+    for (const p of patterns) {
+      let idx = segment.indexOf(p);
+      while (idx !== -1) {
+        const before = idx === 0 ? "" : segment[idx - 1];
+        const after = idx + p.length >= segment.length ? "" : segment[idx + p.length];
+        const beforeOk = before === "" || SHELL_TOKEN_LEADING_BOUNDARY_RE.test(before);
+        const afterOk = after === "" || SHELL_TOKEN_BOUNDARY_RE.test(after);
+        if (beforeOk && afterOk) return true;
+        idx = segment.indexOf(p, idx + 1);
+      }
     }
-    return false;
-  });
+  }
+  return false;
 }
 
 /** Mirrors adapter.searchCommand. */
@@ -779,11 +915,31 @@ function touchRank(touch) {
 function targetsFor(cwd, tool, input, result) {
   const targets = [];
   const outside = [];
+  const seenOutside = new Set(); // CodeRabbit review, PR #23, 2026-08-06 -- see the dedup note just below
 
   const add = (rawPath, touch, weak, lines, base) => {
     const norm = normalizePath(cwd, base, rawPath);
     if (!norm.ok) return;
     if (norm.outside) {
+      // CodeRabbit review, PR #23, 2026-08-06 (duplicate outside-path
+      // entries per event): several tool cases below call `add()` more
+      // than once over the SAME command/result text via different
+      // extraction passes (e.g. Bash's commandReadPaths + extractCommandPaths
+      // + extractPaths all independently scan the same command string) --
+      // when the same outside path is found by more than one pass, each
+      // pass used to append its own identical {scope, path} entry here, so
+      // a single event's `outside` array (part of the public session-trace
+      // JSON, not just the rendered report -- postmortem-render.js's
+      // outsideTouches() already dedupes at the whole-REPORT level, a
+      // separate, unrelated dedup this does not replace) could contain
+      // exact duplicates. Dedupe within this one event's outside array the
+      // same way `targets` already dedupes just below (a `find()` by path),
+      // scoped per-event via this function-local `seenOutside` Set, keyed
+      // by scope+path the same way postmortem-render.js's own
+      // outsideTouches() key its report-level dedup.
+      const key = norm.outside.scope + "|" + norm.outside.path;
+      if (seenOutside.has(key)) return;
+      seenOutside.add(key);
       outside.push(norm.outside);
       return;
     }
@@ -803,6 +959,16 @@ function targetsFor(cwd, tool, input, result) {
     const existing = targets.find((t) => t.path === norm.rel);
     if (existing) {
       if (touchRank(touch) > touchRank(existing.touch)) existing.touch = touch;
+      // CodeRabbit review, PR #23, 2026-08-06 (weak flag not cleared on
+      // structured confirmation): a free-text-inferred target (weak: true)
+      // that is later confirmed by a structured, non-weak argument for the
+      // SAME path used to keep its weak flag forever -- add() upgraded
+      // `touch` above but never cleared `weak`, so a structurally-certain
+      // edit could still be reported as weak:true (an inferred guess) when
+      // it is actually confirmed.
+      // A structured (non-weak) argument confirms a path previously inferred
+      // from free text -- the target is no longer a guess.
+      if (!weak && existing.weak) delete existing.weak;
       if (lines) existing.lines = (existing.lines || []).concat(lines);
       return;
     }
@@ -901,16 +1067,16 @@ function summarizeExecWrapper(input) {
   if (additionalCalls === 1) suffix = " (+1 more tool call)";
   else if (additionalCalls > 1) suffix = ` (+${additionalCalls} more tool calls)`;
   const commandLimit = TOOL_SUMMARY_VERB_LIMIT - Array.from(suffix).length;
-  return truncateRunes(primary, commandLimit, "...") + suffix;
+  return truncateRunes(collapseNewlines(primary), commandLimit, "...") + suffix;
 }
 
 /** Mirrors adapter.SummarizeTool. */
 function summarizeTool(tool, input, targets, outside, isError) {
   let verb = tool;
-  if (typeof input.description === "string" && input.description) verb = input.description;
+  if (typeof input.description === "string" && input.description) verb = collapseNewlines(input.description);
   const command = firstString(input, "command", "cmd");
   if (command) {
-    verb = truncateRunes(command, TOOL_SUMMARY_VERB_LIMIT, "...");
+    verb = truncateRunes(collapseNewlines(command), TOOL_SUMMARY_VERB_LIMIT, "...");
   } else if (tool === "exec") {
     const summary = summarizeExecWrapper(input);
     if (summary) verb = summary;
@@ -919,7 +1085,22 @@ function summarizeTool(tool, input, targets, outside, isError) {
   return `${verb} -> ${targets.length} targets, ${outside.length} outside${status}`;
 }
 
-/** Mirrors adapter.BuildEvent -- builds one session-trace event object. */
+/** Mirrors adapter.BuildEvent -- builds one session-trace event object.
+ *
+ * CodeRabbit review, PR #23, 2026-08-06 (P1, unresolved calls treated as
+ * exact success): a call still pending at EOF (never confirmed successful
+ * by a real tool_result/function_call_output) used to be built with
+ * isError: false, structurally indistinguishable from a real confirmed
+ * success -- while the Claude Code adapter unconditionally claimed "exact"
+ * error observability for the whole trace. Callers now pass
+ * `result.unresolved: true` for a call that was still pending when the
+ * session log ended (see postmortem-claude-code.js's final pendingOrder
+ * walk); that flows through to `event.unresolved`, a distinguishable
+ * marker a report reader (or computeStats below) can use to NOT treat the
+ * call's isError:false as a confirmed non-error. Omitted (not written as
+ * `false`) for a normally-resolved event, matching this file's existing
+ * convention of only writing optional fields when they have something to
+ * say (see `ts`/`outside` just below). */
 function buildEvent(seq, cwd, call, result) {
   const action = actionFor(call.name, call.input || {}, result.content);
   const { targets, outside } = targetsFor(cwd, call.name, call.input || {}, result.content);
@@ -934,6 +1115,7 @@ function buildEvent(seq, cwd, call, result) {
   };
   if (call.timestamp) event.ts = call.timestamp;
   if (outside.length) event.outside = outside;
+  if (result.unresolved) event.unresolved = true;
   return event;
 }
 
@@ -967,6 +1149,7 @@ function computeStats(events, marks, filesInRepo, errorSignal) {
   let weakReads = 0;
   let errors = 0;
   let firstEdit = -1;
+  let anyUnresolved = false; // CodeRabbit review, PR #23, 2026-08-06 -- see the errorSignal downgrade below
 
   const stats = {
     filesInRepo: filesInRepo == null ? 0 : filesInRepo,
@@ -993,6 +1176,7 @@ function computeStats(events, marks, filesInRepo, errorSignal) {
 
   for (const event of events) {
     countAction(stats.actions, event.action);
+    if (event.unresolved) anyUnresolved = true;
     if (event.isError) {
       errors++;
       countAction(stats.errors, event.action);
@@ -1040,7 +1224,22 @@ function computeStats(events, marks, filesInRepo, errorSignal) {
   else if (weakReads === 0) stats.observability.reads = "exact";
   else stats.observability.reads = "estimated";
 
+  // CodeRabbit review, PR #23, 2026-08-06 (P1, unresolved calls treated as
+  // exact success): a call still pending at EOF is emitted with
+  // isError:false (see buildEvent's `unresolved` handling above) but that
+  // is NOT a confirmed non-error -- it's simply a call the session never
+  // got a result for before the log ended. Claiming stats.observability
+  // .errors === "exact" for a trace that contains even one such
+  // unconfirmed call would be dishonest: an unresolved call silently counts
+  // toward the error-rate denominator as if it were a verified success.
+  // Downgrade "exact" to "estimated" whenever any event is unresolved,
+  // regardless of what errorSignal the caller passed in (only "exact" needs
+  // downgrading -- "estimated" stays "estimated" either way, so this is a
+  // one-directional honesty check, never an upgrade).
   stats.observability.errors = errorSignal || "estimated";
+  if (anyUnresolved && stats.observability.errors === "exact") {
+    stats.observability.errors = "estimated";
+  }
 
   return stats;
 }
