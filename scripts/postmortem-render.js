@@ -79,10 +79,26 @@ function churnList(events) {
  * model, the startedAt/endedAt-derived range label) interpolated further
  * down in renderMarkdown -- same untrusted-text-into-Markdown concern,
  * same fix, name kept as-is to minimize diff.
+ *
+ * CodeRabbit review, PR #23, 2026-08-06 (Markdown escaping gap): this
+ * helper escaped backslash/backtick/double-quote/newlines but never `&`,
+ * `<`, `>` -- the HTML delimiters. A session mark (or, per the sourcePath/
+ * churn/outside fix below, a crafted path) containing raw `<script>...
+ * </script>` or similar rides straight through into the rendered Markdown
+ * document unescaped; many Markdown renderers (including GitHub's) pass
+ * inline HTML through verbatim, so this was a real injection surface, not
+ * just a cosmetic one. `&` is escaped FIRST, before `<`/`>`, so escaping
+ * `<` to `&lt;` doesn't get its own `&` re-escaped into `&amp;lt;` on a
+ * second pass -- there is only one pass here, but ordering it this way
+ * keeps the transform correct if a future edit ever loops over these
+ * replacements or composes escapeMarkNote with itself.
  */
 function escapeMarkNote(text) {
   return String(text || "")
     .replace(/\\/g, "\\\\")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
     .replace(/`/g, "\\`")
     .replace(/"/g, '\\"')
     .replace(/[\r\n]+/g, " ");
@@ -131,7 +147,15 @@ function renderMarkdown(trace, diagnostics) {
   if (diagnostics.unparseableLines) {
     sourceBits.push(`${diagnostics.unparseableLines} unparseable — skipped, not dropped silently`);
   }
-  lines.push(`Source: ${session.sourcePath || "(no source path recorded)"} (${sourceBits.join(", ")})`);
+  // CodeRabbit review, PR #23, 2026-08-06 (Markdown escaping gap):
+  // session.sourcePath used to be interpolated here completely unescaped --
+  // it is a CLI-invocation-controlled filesystem path (Finding 6's own
+  // comment above notes that distinction), but nothing stops a caller from
+  // invoking `graphsmith postmortem` against a path containing Markdown/HTML-
+  // sensitive characters (a session log copied into a maliciously-named
+  // directory, for instance), so it gets the same escapeMarkNote()
+  // treatment as every other log-content/path-content render site.
+  lines.push(`Source: ${session.sourcePath ? escapeMarkNote(session.sourcePath) : "(no source path recorded)"} (${sourceBits.join(", ")})`);
 
   // Finding 7 (adversarial review, fresh Grok pass, 2026-08-06, cosmetic):
   // the old one-liner (`repoBits.join(" (") + (session.gitBranch ? ")" : "")`)
@@ -161,8 +185,13 @@ function renderMarkdown(trace, diagnostics) {
   const actionBits = ACTION_ORDER.filter((k) => stats.actions[k] > 0).map((k) => `${stats.actions[k]} ${k}`);
   lines.push(`${total} tool call${total === 1 ? "" : "s"}: ${actionBits.length ? actionBits.join(", ") : "none"}`);
 
+  // CodeRabbit review, PR #23, 2026-08-06 (Markdown escaping gap): a churn
+  // file path comes from the trace's own targets[].path, which is
+  // ultimately derived from tool-call input (structured or free-text-
+  // extracted) -- untrusted log content, same as a mark's note. These used
+  // to be joined into the "churn: ..." suffix completely unescaped.
   const churn = churnList(events);
-  const churnSuffix = churn.length ? ` (churn: ${churn.join(", ")})` : "";
+  const churnSuffix = churn.length ? ` (churn: ${churn.map(escapeMarkNote).join(", ")})` : "";
   lines.push(`${stats.touched} file${stats.touched === 1 ? "" : "s"} touched, ${stats.edited} edited` +
     (stats.churnFiles ? ` (${stats.churnFiles} edited 3+ times${churnSuffix})` : ""));
 
@@ -186,8 +215,15 @@ function renderMarkdown(trace, diagnostics) {
     // example did; that claim is not something the data actually carries
     // for every case, and asserting it unconditionally would be exactly
     // the kind of unproven claim a mechanical/zero-LLM report must avoid.
+    // CodeRabbit review, PR #23, 2026-08-06 (Markdown escaping gap): both
+    // `o.path` and `o.scope` come from the trace's own outside[] entries --
+    // path is untrusted log content exactly like a churn path above; scope
+    // is schema-constrained to "home"|"tmp"|"other" so it can never actually
+    // carry anything dangerous, but it is escaped here too rather than
+    // hand-waving an exemption for one of two interpolated values in the
+    // same template literal.
     lines.push(`${outside.length} touch${outside.length === 1 ? "" : "es"} outside the repo: ` +
-      outside.map((o) => `${o.path} (scope: ${o.scope})`).join("; "));
+      outside.map((o) => `${escapeMarkNote(o.path)} (scope: ${escapeMarkNote(o.scope)})`).join("; "));
   }
   lines.push("");
 
