@@ -70,19 +70,29 @@ const crypto = require("crypto");
  *
  * @param {string} targetPath
  * @param {string} content
+ * @param {number} [mode] permission bits to install on the new file (e.g.
+ *   the original file's own mode, read via fs.statSync before this call).
+ *   Defaults to 0o644 when omitted -- only appropriate when there is no
+ *   original file to preserve the permissions of.
  */
-function atomicWriteFileSync(targetPath, content) {
+function atomicWriteFileSync(targetPath, content, mode) {
   const dir = path.dirname(targetPath);
   const tmpPath = path.join(
     dir,
     `.graphsmith-uninstall.${path.basename(targetPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`
   );
   const buf = Buffer.from(content, "utf8");
-  const fd = fs.openSync(tmpPath, "wx", 0o644);
+  const fd = fs.openSync(tmpPath, "wx", mode !== undefined ? mode : 0o644);
   try {
     let off = 0;
     while (off < buf.length) off += fs.writeSync(fd, buf, off, buf.length - off);
     fs.fsyncSync(fd);
+    // openSync's mode argument is masked by the process umask, so asking
+    // for a specific mode (e.g. preserving a locked-down 0600 original)
+    // can still land looser than requested. fchmodSync sets the exact bits
+    // regardless of umask, closing that gap -- a settings.json with
+    // embedded secrets that was 0600 before this run stays 0600 after.
+    if (mode !== undefined) fs.fchmodSync(fd, mode);
   } finally {
     fs.closeSync(fd);
   }
@@ -101,66 +111,148 @@ function atomicWriteFileSync(targetPath, content) {
   }
 }
 
-// Matches ONLY GraphSmith's own enabledPlugins key: "graphsmith@<marketplace>"
-// or the skills-directory form "graphsmith@skills-dir". Deliberately anchored
-// (^...$) so it can never match a differently-named plugin such as
-// "graphsmith-extra@marketplace" or "not-graphsmith@marketplace".
-const ENABLED_PLUGIN_KEY_RE = /^graphsmith@[^@]+$/;
+// This script ships as part of exactly one plugin (see plugin.json's own
+// "name"). It is never matched against "any plugin named graphsmith" --
+// every regex below is additionally scoped to one specific marketplace
+// name, resolved by resolveMarketplaceName() below.
+const PLUGIN_NAME = "graphsmith";
+
+// Fallback marketplace name (this plugin's own published marketplace, see
+// .claude-plugin/marketplace.json) used ONLY when neither an explicit
+// --marketplace flag nor ${CLAUDE_PLUGIN_ROOT} (set by Claude Code on a
+// real hook invocation) is available to resolve the actual installed
+// marketplace. Never widened to "match any marketplace": that would strip
+// a same-named GraphSmith install enabled from an unrelated marketplace
+// (e.g. an internal fork) -- the exact adversarial scenario this fix
+// closes.
+const DEFAULT_MARKETPLACE_NAME = "graphsmith-marketplace";
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Resolves which marketplace's GraphSmith install this run should act on.
+ * Precedence: explicit --marketplace flag > ${CLAUDE_PLUGIN_ROOT} (a real
+ * hook invocation sets this to the plugin's own cache path, shaped
+ * `.../cache/<marketplace>/<plugin>/<version>`, per
+ * https://code.claude.com/docs/en/plugin-marketplaces) > this plugin's
+ * own published default. Never resolves to "unknown" and falls through to
+ * matching everything -- that is exactly the over-broad behavior this fix
+ * removes.
+ *
+ * @param {string|null} explicitMarketplace
+ * @returns {string}
+ */
+function resolveMarketplaceName(explicitMarketplace) {
+  if (explicitMarketplace) return explicitMarketplace;
+  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  if (pluginRoot) {
+    const parts = pluginRoot.split(/[/\\]/).filter(Boolean);
+    const cacheIdx = parts.lastIndexOf("cache");
+    // cache/<marketplace>/<plugin>/<version> -- CLAUDE_PLUGIN_ROOT is the
+    // <version> directory itself, so marketplace is two segments before it.
+    if (cacheIdx !== -1 && parts.length >= cacheIdx + 4) {
+      return parts[cacheIdx + 1];
+    }
+  }
+  return DEFAULT_MARKETPLACE_NAME;
+}
+
+// Matches ONLY GraphSmith's own enabledPlugins key for the resolved
+// marketplace: "graphsmith@<that specific marketplace>" (the real
+// enabledPlugins key shape, confirmed against
+// https://code.claude.com/docs/en/plugin-marketplaces, e.g.
+// "code-formatter@company-tools": true). Deliberately anchored (^...$) AND
+// scoped to one marketplace name -- not "any graphsmith@*" -- so a
+// same-named GraphSmith install enabled from a different marketplace is
+// never touched.
+function buildEnabledPluginKeyRe(marketplace) {
+  return new RegExp(`^${escapeRegExp(PLUGIN_NAME)}@${escapeRegExp(marketplace)}$`);
+}
 
 // Matches a hook command/args entry that points at one of THIS plugin's own
-// hook scripts, inside a path segment that identifies it as the graphsmith
-// plugin's own installed copy (plugin-cache or skills-dir layout both put
-// the plugin identity directory directly above `hooks/scripts/`).
-const HOOK_SCRIPT_PATH_RE =
-  /(^|[/\\])graphsmith@[^/\\]+[/\\]hooks[/\\]scripts[/\\](session-start|subagent-start|uninstall-check)\.js$/;
-
-function isOurEnabledPluginKey(key) {
-  return ENABLED_PLUGIN_KEY_RE.test(key);
+// hook scripts, inside the real, documented Claude Code plugin-cache path
+// shape: <...>/cache/<marketplace>/<plugin>/<version>/hooks/scripts/<script>.js
+// (see https://code.claude.com/docs/en/plugin-marketplaces, "Pre-populate
+// plugins for containers": "cache/<marketplace>/<plugin>/<version>/...").
+// The version segment is unconstrained ([^/\\]+) since it tracks whatever
+// plugin.json currently declares. Scoped to the resolved marketplace name
+// for the same reason as buildEnabledPluginKeyRe above.
+function buildHookScriptPathRe(marketplace) {
+  return new RegExp(
+    `(^|[/\\\\])cache[/\\\\]${escapeRegExp(marketplace)}[/\\\\]${escapeRegExp(PLUGIN_NAME)}` +
+      `[/\\\\][^/\\\\]+[/\\\\]hooks[/\\\\]scripts[/\\\\](session-start|subagent-start|uninstall-check)\\.js$`
+  );
 }
 
-function stringReferencesOurHookScript(value) {
-  return typeof value === "string" && HOOK_SCRIPT_PATH_RE.test(value);
-}
-
-function hookEntryReferencesUs(hookGroupEntry) {
-  if (!hookGroupEntry || !Array.isArray(hookGroupEntry.hooks)) return false;
-  return hookGroupEntry.hooks.some((h) => {
-    if (!h || typeof h !== "object") return false;
-    if (stringReferencesOurHookScript(h.command)) return true;
-    if (Array.isArray(h.args) && h.args.some(stringReferencesOurHookScript)) return true;
-    return false;
-  });
+function stringReferencesOurHookScript(value, hookScriptPathRe) {
+  return typeof value === "string" && hookScriptPathRe.test(value);
 }
 
 /**
  * Pure function: takes a settings-shaped object, returns a NEW object with
- * only GraphSmith's own segment removed, plus a summary of what changed.
- * Never mutates the input.
+ * only GraphSmith's own segment (scoped to `marketplace`) removed, plus a
+ * summary of what changed. Never mutates the input.
+ *
+ * Hook removal happens at the INNER hooks[] item level, not by dropping an
+ * entire matcher-group entry: a shared entry shaped like
+ * `{matcher, hooks: [graphsmithHook, otherPluginHook]}` keeps
+ * `otherPluginHook` in place and only the entry as a whole is dropped once
+ * every one of its inner hooks belonged to GraphSmith.
  *
  * @param {object} settings
+ * @param {string} marketplace the specific marketplace this run should act on
  * @returns {{settings: object, removed: {enabledPluginKeys: string[], hookEventNames: Record<string, number>}}}
  */
-function removeGraphsmithSegment(settings) {
+function removeGraphsmithSegment(settings, marketplace) {
   const input = settings && typeof settings === "object" ? settings : {};
   const output = JSON.parse(JSON.stringify(input));
   const removed = { enabledPluginKeys: [], hookEventNames: {} };
 
+  const enabledPluginKeyRe = buildEnabledPluginKeyRe(marketplace);
+  const hookScriptPathRe = buildHookScriptPathRe(marketplace);
+
   if (output.enabledPlugins && typeof output.enabledPlugins === "object") {
     for (const key of Object.keys(output.enabledPlugins)) {
-      if (isOurEnabledPluginKey(key)) {
+      if (enabledPluginKeyRe.test(key)) {
         delete output.enabledPlugins[key];
         removed.enabledPluginKeys.push(key);
       }
     }
   }
 
+  function innerHookIsOurs(h) {
+    if (!h || typeof h !== "object") return false;
+    if (stringReferencesOurHookScript(h.command, hookScriptPathRe)) return true;
+    if (Array.isArray(h.args) && h.args.some((a) => stringReferencesOurHookScript(a, hookScriptPathRe))) return true;
+    return false;
+  }
+
   if (output.hooks && typeof output.hooks === "object") {
     for (const eventName of Object.keys(output.hooks)) {
       const group = output.hooks[eventName];
       if (!Array.isArray(group)) continue;
-      const before = group.length;
-      output.hooks[eventName] = group.filter((entry) => !hookEntryReferencesUs(entry));
-      const removedCount = before - output.hooks[eventName].length;
+      let removedCount = 0;
+      const nextGroup = [];
+      for (const entry of group) {
+        if (!entry || !Array.isArray(entry.hooks)) {
+          nextGroup.push(entry);
+          continue;
+        }
+        const keptInnerHooks = entry.hooks.filter((h) => {
+          const isOurs = innerHookIsOurs(h);
+          if (isOurs) removedCount++;
+          return !isOurs;
+        });
+        if (keptInnerHooks.length > 0) {
+          // Only rebuild the entry (a new object) when something inside it
+          // actually changed, so an untouched entry stays byte-identical.
+          nextGroup.push(keptInnerHooks.length === entry.hooks.length ? entry : { ...entry, hooks: keptInnerHooks });
+        }
+        // else: every inner hook in this entry was ours -- drop the whole entry.
+      }
+      output.hooks[eventName] = nextGroup;
       if (removedCount > 0) removed.hookEventNames[eventName] = removedCount;
       if (output.hooks[eventName].length === 0) delete output.hooks[eventName];
     }
@@ -170,26 +262,30 @@ function removeGraphsmithSegment(settings) {
 }
 
 function parseArgs(argv) {
-  const out = { settingsPath: null, apply: false };
+  const out = { settingsPath: null, apply: false, marketplace: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--settings") out.settingsPath = argv[++i];
     else if (argv[i] === "--apply") out.apply = true;
+    else if (argv[i] === "--marketplace") out.marketplace = argv[++i];
   }
   return out;
 }
 
 function main() {
-  const { settingsPath, apply } = parseArgs(process.argv.slice(2));
+  const { settingsPath, apply, marketplace: explicitMarketplace } = parseArgs(process.argv.slice(2));
   if (!settingsPath) {
-    console.error("Usage: node uninstall-check.js --settings <path> [--apply]");
+    console.error("Usage: node uninstall-check.js --settings <path> [--apply] [--marketplace <name>]");
     process.exitCode = 2;
     return;
   }
+  const marketplace = resolveMarketplaceName(explicitMarketplace);
 
   let raw;
   let parsed;
+  let originalMode;
   try {
     raw = fs.readFileSync(settingsPath, "utf8");
+    originalMode = fs.statSync(settingsPath).mode & 0o777;
   } catch (err) {
     console.error(`Could not read ${settingsPath}: ${err.code === "ENOENT" ? "file not found" : err.message}`);
     process.exitCode = 2;
@@ -202,17 +298,17 @@ function main() {
     process.exitCode = 2;
     return;
   }
-  const { settings: pruned, removed } = removeGraphsmithSegment(parsed);
+  const { settings: pruned, removed } = removeGraphsmithSegment(parsed, marketplace);
 
   const nothingToDo =
     removed.enabledPluginKeys.length === 0 && Object.keys(removed.hookEventNames).length === 0;
 
   if (nothingToDo) {
-    console.log("No GraphSmith segment found — nothing to remove.");
+    console.log(`No GraphSmith segment found for marketplace "${marketplace}" — nothing to remove.`);
     return;
   }
 
-  console.log("GraphSmith segment found:");
+  console.log(`GraphSmith segment found (marketplace "${marketplace}"):`);
   for (const k of removed.enabledPluginKeys) console.log(`  enabledPlugins["${k}"]`);
   for (const [event, count] of Object.entries(removed.hookEventNames)) {
     console.log(`  hooks.${event}: ${count} entr${count === 1 ? "y" : "ies"} referencing graphsmith`);
@@ -224,11 +320,25 @@ function main() {
   }
 
   fs.writeFileSync(settingsPath + ".bak", raw, "utf8");
-  atomicWriteFileSync(settingsPath, JSON.stringify(pruned, null, 2) + "\n");
+  if (originalMode !== undefined) {
+    try {
+      fs.chmodSync(settingsPath + ".bak", originalMode);
+    } catch (_err) {
+      /* best-effort; the .bak is a convenience copy, not the source of truth */
+    }
+  }
+  atomicWriteFileSync(settingsPath, JSON.stringify(pruned, null, 2) + "\n", originalMode);
   console.log(`\nApplied. Previous contents saved to ${settingsPath}.bak`);
 }
 
-module.exports = { removeGraphsmithSegment, isOurEnabledPluginKey, hookEntryReferencesUs, atomicWriteFileSync };
+module.exports = {
+  removeGraphsmithSegment,
+  buildEnabledPluginKeyRe,
+  buildHookScriptPathRe,
+  resolveMarketplaceName,
+  atomicWriteFileSync,
+  DEFAULT_MARKETPLACE_NAME,
+};
 
 if (require.main === module) {
   main();

@@ -81,7 +81,12 @@ function buildGuidance(pluginRoot, eventLabel) {
       "(discipline block not found in SKILL.md — see the file directly for the current rules.)"
   );
   parts.push(
-    "Full skill definition: SKILL.md at the project root (also auto-discovered as the `graphsmith` skill)."
+    "Full skill definition: this plugin's own bundled copy of SKILL.md " +
+      "(not independently auto-discovered as a Claude Code skill on its own -- " +
+      "per Claude Code's plugin marketplace docs, a plugin's skills load from " +
+      "a `skills/<name>/SKILL.md` layout under its source, which this plugin " +
+      "does not use. Install the `graphsmith-skill` npm package, or use its " +
+      "`graphsmith` CLI, to get the full skill)."
   );
 
   let context = parts.join("\n\n");
