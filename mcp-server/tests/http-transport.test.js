@@ -76,6 +76,18 @@ const validRpcBody = {
   },
 };
 
+/* Streamable HTTP transport, 2026-07-28 revision: MCP-Protocol-Version and
+ * Mcp-Method are required on every request; Mcp-Name is additionally
+ * required for tools/call. These mirror validRpcBody's own method/name/
+ * protocol version so a real success path (as opposed to the adversarial
+ * auth-rejection tests below, which never get far enough to reach header
+ * validation) has valid headers to succeed with. */
+const validRpcHeaders = {
+  "mcp-protocol-version": STATELESS_PROTOCOL_VERSION,
+  "mcp-method": "tools/call",
+  "mcp-name": TOOL_NAME,
+};
+
 test("createHttpServer() REFUSES TO CONSTRUCT without a token (fail closed at startup)", () => {
   assert.throws(() => createHttpServer({}), /token/i);
   assert.throws(() => createHttpServer({ token: "" }), /token/i);
@@ -122,7 +134,12 @@ test("a call WITH the correct bearer token succeeds and returns the guidance", a
   const server = await startServer(TEST_TOKEN);
   try {
     const { port } = server.address();
-    const res = await postJson(port, "/", validRpcBody, { authorization: `Bearer ${TEST_TOKEN}` });
+    const res = await postJson(
+      port,
+      "/",
+      validRpcBody,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, validRpcHeaders)
+    );
     assert.equal(res.statusCode, 200);
     assert.equal(res.body.error, undefined);
     assert.equal(res.body.result.isError, false);
@@ -136,7 +153,12 @@ test("every HTTP request is independently authenticated: a previously-successful
   const server = await startServer(TEST_TOKEN);
   try {
     const { port } = server.address();
-    const authed = await postJson(port, "/", validRpcBody, { authorization: `Bearer ${TEST_TOKEN}` });
+    const authed = await postJson(
+      port,
+      "/",
+      validRpcBody,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, validRpcHeaders)
+    );
     assert.equal(authed.statusCode, 200);
     // Immediately follow with an unauthenticated call on a fresh connection/request.
     const unauthed = await postJson(port, "/", validRpcBody);
@@ -307,6 +329,199 @@ test("a multi-byte UTF-8 character split across two TCP chunks round-trips intac
     // If the chunk-boundary split corrupted the character, this comes back
     // containing U+FFFD (or something else) instead of the original id.
     assert.equal(parsed.id, idWithMultiByteChar);
+  } finally {
+    server.close();
+  }
+});
+
+/* --- Mirrored HTTP header validation (Streamable HTTP transport,
+ * 2026-07-28 revision, "Request Metadata" / "Server Validation"): every
+ * POST must carry MCP-Protocol-Version and Mcp-Method matching the body,
+ * plus Mcp-Name for tools/call; a missing or disagreeing header is a 400
+ * with a HeaderMismatch (-32020) JSON-RPC error, checked after auth but
+ * before dispatch. --- */
+
+test("a request missing the MCP-Protocol-Version header is rejected 400 HeaderMismatch", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const res = await postJson(port, "/", validRpcBody, {
+      authorization: `Bearer ${TEST_TOKEN}`,
+      "mcp-method": "tools/call",
+      "mcp-name": TOOL_NAME,
+      // MCP-Protocol-Version deliberately omitted
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error.code, -32020);
+  } finally {
+    server.close();
+  }
+});
+
+test("a request missing the Mcp-Method header is rejected 400 HeaderMismatch", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const res = await postJson(port, "/", validRpcBody, {
+      authorization: `Bearer ${TEST_TOKEN}`,
+      "mcp-protocol-version": STATELESS_PROTOCOL_VERSION,
+      "mcp-name": TOOL_NAME,
+      // Mcp-Method deliberately omitted
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error.code, -32020);
+  } finally {
+    server.close();
+  }
+});
+
+test("a tools/call request missing the Mcp-Name header is rejected 400 HeaderMismatch", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const res = await postJson(port, "/", validRpcBody, {
+      authorization: `Bearer ${TEST_TOKEN}`,
+      "mcp-protocol-version": STATELESS_PROTOCOL_VERSION,
+      "mcp-method": "tools/call",
+      // Mcp-Name deliberately omitted
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error.code, -32020);
+  } finally {
+    server.close();
+  }
+});
+
+test("a Mcp-Method header that disagrees with the body's method is rejected 400 HeaderMismatch", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const res = await postJson(
+      port,
+      "/",
+      validRpcBody,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, validRpcHeaders, { "mcp-method": "tools/list" })
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error.code, -32020);
+  } finally {
+    server.close();
+  }
+});
+
+test("a Mcp-Name header that disagrees with the body's tool name is rejected 400 HeaderMismatch", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const res = await postJson(
+      port,
+      "/",
+      validRpcBody,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, validRpcHeaders, { "mcp-name": "not_the_real_tool" })
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error.code, -32020);
+  } finally {
+    server.close();
+  }
+});
+
+test("tools/list does not require an Mcp-Name header (only tools/call does)", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const body = {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/list",
+      params: { _meta: validRpcBody.params._meta },
+    };
+    const res = await postJson(
+      port,
+      "/",
+      body,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, { "mcp-protocol-version": STATELESS_PROTOCOL_VERSION, "mcp-method": "tools/list" })
+    );
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.result.tools[0].name, TOOL_NAME);
+  } finally {
+    server.close();
+  }
+});
+
+/* --- Real HTTP status codes reflecting JSON-RPC error vs success. --- */
+
+test("an unknown method returns HTTP 404 (spec: unimplemented method -> 404, not 200)", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const body = { jsonrpc: "2.0", id: 10, method: "resources/subscribe", params: {} };
+    const res = await postJson(
+      port,
+      "/",
+      body,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, { "mcp-protocol-version": STATELESS_PROTOCOL_VERSION, "mcp-method": "resources/subscribe" })
+    );
+    assert.equal(res.statusCode, 404);
+    assert.equal(res.body.error.code, -32601);
+  } finally {
+    server.close();
+  }
+});
+
+test("an unsupported protocol version returns HTTP 400 with a supported/requested data payload, not 200", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const body = {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "server/discover",
+      params: {
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": "1999-01-01",
+          "io.modelcontextprotocol/clientInfo": { name: "c", version: "1" },
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    };
+    const res = await postJson(
+      port,
+      "/",
+      body,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, { "mcp-protocol-version": "1999-01-01", "mcp-method": "server/discover" })
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error.code, -32022);
+    assert.deepEqual(res.body.error.data.supported.sort(), [STATELESS_PROTOCOL_VERSION, "2025-06-18"].sort());
+    assert.equal(res.body.error.data.requested, "1999-01-01");
+  } finally {
+    server.close();
+  }
+});
+
+test("a successful tools/call result carries resultType 'complete' and cacheable tools/list carries ttlMs/cacheScope", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    const { port } = server.address();
+    const callRes = await postJson(
+      port,
+      "/",
+      validRpcBody,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, validRpcHeaders)
+    );
+    assert.equal(callRes.body.result.resultType, "complete");
+
+    const listBody = { jsonrpc: "2.0", id: 12, method: "tools/list", params: { _meta: validRpcBody.params._meta } };
+    const listRes = await postJson(
+      port,
+      "/",
+      listBody,
+      Object.assign({ authorization: `Bearer ${TEST_TOKEN}` }, { "mcp-protocol-version": STATELESS_PROTOCOL_VERSION, "mcp-method": "tools/list" })
+    );
+    assert.equal(listRes.body.result.resultType, "complete");
+    assert.equal(typeof listRes.body.result.ttlMs, "number");
+    assert.equal(listRes.body.result.cacheScope, "public");
   } finally {
     server.close();
   }

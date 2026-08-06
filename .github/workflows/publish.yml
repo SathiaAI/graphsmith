@@ -38,6 +38,16 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - run: npm publish --access public --provenance
+      - name: Publish graphsmith-skill (repo root)
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # mcp-server/ ships as its own independently-installable package
+      # (graphsmith-mcp-server, per mcp-server/package.json) -- without this
+      # step, `npm install -g graphsmith-mcp-server` (the README's documented
+      # install path) 404s because the package was never published.
+      - name: Publish graphsmith-mcp-server (mcp-server/)
+        run: npm publish --access public --provenance
+        working-directory: mcp-server
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

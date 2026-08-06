@@ -36,10 +36,22 @@ test("tools/list with no _meta on a fresh connection is INVALID_PARAMS", () => {
   assert.equal(res.error.code, ERROR_CODES.INVALID_PARAMS);
 });
 
-test("missing clientInfo is INVALID_PARAMS", () => {
+test("missing clientInfo is valid -- per the MCP schema it's optional (clients SHOULD send it, but aren't required to)", () => {
   const params = {
     _meta: {
       "io.modelcontextprotocol/protocolVersion": STATELESS_PROTOCOL_VERSION,
+      "io.modelcontextprotocol/clientCapabilities": {},
+    },
+  };
+  const res = handleMessage({ jsonrpc: "2.0", id: 1, method: "server/discover", params }, freshCtx());
+  assert.equal(res.error, undefined);
+});
+
+test("clientInfo, when present but malformed, is still INVALID_PARAMS", () => {
+  const params = {
+    _meta: {
+      "io.modelcontextprotocol/protocolVersion": STATELESS_PROTOCOL_VERSION,
+      "io.modelcontextprotocol/clientInfo": { name: "missing-version-field" },
       "io.modelcontextprotocol/clientCapabilities": {},
     },
   };

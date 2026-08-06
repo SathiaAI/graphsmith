@@ -7,6 +7,116 @@ const { ERROR_CODES } = require("./protocol.js");
 
 const MAX_BODY_BYTES = 1024 * 1024; // 1 MiB -- this server's only real payload is a no-arg tool call.
 
+/* Maps a JSON-RPC error code to the HTTP status this transport reports it
+ * under, so HTTP-level tooling (proxies, health checks, monitoring, a
+ * generic `curl -f`) can tell success from failure without parsing the
+ * JSON-RPC body. METHOD_NOT_FOUND -> 404 and UNSUPPORTED_PROTOCOL_VERSION /
+ * HEADER_MISMATCH -> 400 are spec-mandated (modelcontextprotocol.io/
+ * specification/draft/basic/transports/streamable-http: "If the server
+ * does not implement the requested RPC method, it MUST respond with 404
+ * Not Found..."; UnsupportedProtocolVersionError and HeaderMismatchError
+ * both "MUST be 400 Bad Request"). The remaining mappings (PARSE_ERROR /
+ * INVALID_REQUEST / INVALID_PARAMS -> 400, INTERNAL_ERROR -> 500) follow
+ * standard JSON-RPC-over-HTTP convention; the spec doesn't mandate them
+ * for this server's remaining error codes. */
+function errorHttpStatus(code) {
+  switch (code) {
+    case ERROR_CODES.METHOD_NOT_FOUND:
+      return 404;
+    case ERROR_CODES.UNAUTHENTICATED:
+      return 401;
+    case ERROR_CODES.INTERNAL_ERROR:
+      return 500;
+    case ERROR_CODES.PARSE_ERROR:
+    case ERROR_CODES.INVALID_REQUEST:
+    case ERROR_CODES.INVALID_PARAMS:
+    case ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION:
+    case ERROR_CODES.HEADER_MISMATCH:
+      return 400;
+    default:
+      return 500;
+  }
+}
+
+function getHeader(headers, name) {
+  // Node lowercases incoming header names itself, but normalize defensively.
+  const v = headers[name.toLowerCase()];
+  return Array.isArray(v) ? v[0] : v;
+}
+
+/* Decodes the "=?base64?...?=" sentinel form the spec requires for header
+ * values that can't be safely represented as plain ASCII (e.g. a Mcp-Name
+ * containing non-ASCII characters). Returns the input unchanged if it
+ * doesn't match the sentinel pattern. */
+function decodeMcpHeaderValue(raw) {
+  if (typeof raw !== "string") return raw;
+  const m = /^=\?base64\?([A-Za-z0-9+/=]*)\?=$/.exec(raw);
+  if (!m) return raw;
+  try {
+    return Buffer.from(m[1], "base64").toString("utf8");
+  } catch (_err) {
+    return raw; // malformed encoding -- let the equality check below fail naturally
+  }
+}
+
+/* Validates the Streamable HTTP transport's mirrored request-metadata
+ * headers against the JSON-RPC body, per the 2026-07-28 revision's
+ * "Request Metadata" section (modelcontextprotocol.io/specification/
+ * draft/basic/transports/streamable-http#request-metadata):
+ *   - MCP-Protocol-Version is required on every request and MUST match
+ *     _meta["io.modelcontextprotocol/protocolVersion"] in the body.
+ *   - Mcp-Method is required on every request and MUST match the body's
+ *     "method".
+ *   - Mcp-Name is required specifically for "tools/call" (the only
+ *     name-bearing method this server implements) and MUST match
+ *     params.name, decoding the base64 sentinel form first if present.
+ * Per spec, header requirements are undefined for notification POSTs, so
+ * callers must not invoke this for a notification-shaped message.
+ * Returns a human-readable mismatch description on failure, or null if
+ * every required header is present and agrees with the body. */
+function validateMirroredHeaders(headers, msg) {
+  const method = msg && typeof msg === "object" && typeof msg.method === "string" ? msg.method : undefined;
+
+  const protocolVersionHeader = getHeader(headers, "mcp-protocol-version");
+  if (!protocolVersionHeader) {
+    return "Missing required header: MCP-Protocol-Version.";
+  }
+  const bodyProtocolVersion =
+    msg && msg.params && typeof msg.params === "object" && msg.params._meta && typeof msg.params._meta === "object"
+      ? msg.params._meta["io.modelcontextprotocol/protocolVersion"]
+      : undefined;
+  /* Only compared when the body actually carries a _meta block -- a
+   * missing/malformed _meta is INVALID_PARAMS territory that the JSON-RPC
+   * dispatcher (validateMeta in server.js) already reports on its own;
+   * this check's job is only to catch a header/body DISAGREEMENT, not to
+   * duplicate that separate validation. */
+  if (bodyProtocolVersion !== undefined && protocolVersionHeader !== bodyProtocolVersion) {
+    return `Header mismatch: MCP-Protocol-Version header value '${protocolVersionHeader}' does not match body value '${bodyProtocolVersion}'.`;
+  }
+
+  const methodHeader = getHeader(headers, "mcp-method");
+  if (!methodHeader) {
+    return "Missing required header: Mcp-Method.";
+  }
+  if (method !== undefined && methodHeader !== method) {
+    return `Header mismatch: Mcp-Method header value '${methodHeader}' does not match body value '${method}'.`;
+  }
+
+  if (method === "tools/call") {
+    const nameHeaderRaw = getHeader(headers, "mcp-name");
+    if (!nameHeaderRaw) {
+      return "Missing required header: Mcp-Name (required for tools/call).";
+    }
+    const nameHeader = decodeMcpHeaderValue(nameHeaderRaw);
+    const bodyName = msg.params && typeof msg.params === "object" ? msg.params.name : undefined;
+    if (bodyName !== undefined && nameHeader !== bodyName) {
+      return `Header mismatch: Mcp-Name header value '${nameHeader}' does not match body value '${bodyName}'.`;
+    }
+  }
+
+  return null;
+}
+
 /* Network (HTTP, "streamable-http"-style) transport.
  *
  * THIS IS THE TRANSPORT THE ADVERSARIAL AUTH TEST TARGETS. Per the frozen
@@ -113,6 +223,31 @@ function createHttpServer(options) {
         return;
       }
 
+      /* Notification-shaped messages (no meaningful response expected) are
+       * exempt from header/body mirroring requirements -- the spec's
+       * "Sending Messages" section notes header requirements for
+       * notification POSTs are not defined by this revision. Detected the
+       * same way server.js's own dispatcher detects them, so the two stay
+       * in agreement about what counts as a notification. */
+      const isNotification =
+        msg && typeof msg === "object" && !Array.isArray(msg) && typeof msg.method === "string" &&
+        msg.method.startsWith("notifications/");
+
+      if (!isNotification) {
+        const headerError = validateMirroredHeaders(req.headers, msg);
+        if (headerError) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg && typeof msg === "object" && !Array.isArray(msg) && msg.id !== undefined ? msg.id : null,
+              error: { code: ERROR_CODES.HEADER_MISMATCH, message: headerError },
+            })
+          );
+          return;
+        }
+      }
+
       /* Fresh, unshared connectionState per HTTP request -- no session ID,
        * no cross-request memory. This means the legacy initialize
        * handshake's "remembered" state never applies over this transport;
@@ -121,11 +256,14 @@ function createHttpServer(options) {
       const response = handleMessage(msg, { connectionState, authenticated: true });
 
       if (response === null) {
-        res.writeHead(204);
+        /* Notification accepted: spec requires 202 Accepted with no body
+         * (Streamable HTTP, "Sending Messages"), not an arbitrary 2xx. */
+        res.writeHead(202);
         res.end();
         return;
       }
-      res.writeHead(200, { "content-type": "application/json" });
+      const status = response.error ? errorHttpStatus(response.error.code) : 200;
+      res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(response));
     });
   });

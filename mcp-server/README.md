@@ -42,6 +42,11 @@ characters, and every request must carry a matching `Authorization: Bearer <toke
 header or it is refused with `401` -- before the request body is even parsed. There is
 no "network mode without auth" code path.
 
+Every request must also carry the MCP spec's mirrored request-metadata headers
+(`MCP-Protocol-Version`, `Mcp-Method`, and -- for `tools/call` -- `Mcp-Name`), each
+matching the corresponding value in the JSON-RPC body. A missing or disagreeing header
+is refused with `400` and a `HeaderMismatch` (`-32020`) JSON-RPC error.
+
 ## Tool surface
 
 One tool, `graphsmith_guidance`: read-only, takes no arguments (its input schema is
