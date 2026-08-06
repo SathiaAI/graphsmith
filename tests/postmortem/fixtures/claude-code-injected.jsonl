@@ -1,0 +1,6 @@
+{"type":"ai-title","aiTitle":"Injected msg test","sessionId":"cc-injected-1"}
+{"type":"user","timestamp":"2026-08-01T11:00:00Z","cwd":"/repo","sessionId":"cc-injected-1","message":{"role":"user","content":"<system-reminder>\nThis is harness-injected context, not something the user typed.\n</system-reminder>"}}
+{"type":"user","timestamp":"2026-08-01T11:00:01Z","sessionId":"cc-injected-1","message":{"role":"user","content":"Please add a README badge."}}
+{"type":"assistant","timestamp":"2026-08-01T11:00:02Z","sessionId":"cc-injected-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/repo/README.md"}}]}}
+{"type":"user","timestamp":"2026-08-01T11:00:03Z","sessionId":"cc-injected-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"# repo\n","is_error":false}]}}
+{"type":"user","timestamp":"2026-08-01T11:00:04Z","sessionId":"cc-injected-1","message":{"role":"user","content":"<local-command-caveat>\nOutput was truncated.\n</local-command-caveat>"}}

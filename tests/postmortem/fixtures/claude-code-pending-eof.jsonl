@@ -1,0 +1,5 @@
+{"type":"ai-title","aiTitle":"Pending at EOF","sessionId":"cc-pending-1"}
+{"type":"user","timestamp":"2026-08-01T12:00:00Z","cwd":"/repo","sessionId":"cc-pending-1","message":{"role":"user","content":"Look at the config file and update it."}}
+{"type":"assistant","timestamp":"2026-08-01T12:00:01Z","sessionId":"cc-pending-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/repo/config.json"}}]}}
+{"type":"user","timestamp":"2026-08-01T12:00:02Z","sessionId":"cc-pending-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"{}\n","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-08-01T12:00:03Z","sessionId":"cc-pending-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Edit","input":{"file_path":"/repo/config.json","old_string":"{}","new_string":"{\"debug\":false}"}}]}}

@@ -1,0 +1,6 @@
+{"type":"ai-title","aiTitle":"Subagent test","sessionId":"cc-side-1"}
+{"type":"user","timestamp":"2026-08-01T13:00:00Z","cwd":"/repo","sessionId":"cc-side-1","message":{"role":"user","content":"Investigate the auth module using a subagent."}}
+{"type":"assistant","timestamp":"2026-08-01T13:00:01Z","sessionId":"cc-side-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"description":"investigate auth"}}]}}
+{"type":"assistant","timestamp":"2026-08-01T13:00:02Z","isSidechain":true,"sessionId":"cc-side-1","agentId":"agent-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_sub_read","name":"Read","input":{"file_path":"/repo/src/auth.js"}}]}}
+{"type":"user","timestamp":"2026-08-01T13:00:03Z","isSidechain":true,"sessionId":"cc-side-1","agentId":"agent-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sub_read","content":"auth code","is_error":false}]}}
+{"type":"user","timestamp":"2026-08-01T13:00:04Z","sessionId":"cc-side-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_task","content":"Subagent found no issues.","is_error":false}]}}

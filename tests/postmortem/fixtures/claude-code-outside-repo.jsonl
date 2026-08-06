@@ -1,0 +1,4 @@
+{"type":"ai-title","aiTitle":"Outside repo touch","sessionId":"cc-outside-1"}
+{"type":"user","timestamp":"2026-08-01T14:00:00Z","cwd":"/repo","sessionId":"cc-outside-1","message":{"role":"user","content":"Check /etc/hosts for a stale entry."}}
+{"type":"assistant","timestamp":"2026-08-01T14:00:01Z","sessionId":"cc-outside-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/etc/hosts"}}]}}
+{"type":"user","timestamp":"2026-08-01T14:00:02Z","sessionId":"cc-outside-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"127.0.0.1 localhost\n","is_error":false}]}}

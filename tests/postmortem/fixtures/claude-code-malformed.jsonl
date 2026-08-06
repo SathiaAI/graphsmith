@@ -1,0 +1,8 @@
+{"type":"ai-title","aiTitle":"Malformed lines test","sessionId":"cc-malformed-1"}
+{this is not valid json at all}
+{"type":"user","timestamp":"2026-08-01T15:00:00Z","cwd":"/repo","sessionId":"cc-malformed-1","message":{"role":"user","content":"Read the manifest."}}
+
+[1,2,3]
+{"type":"assistant","timestamp":"2026-08-01T15:00:01Z","sessionId":"cc-malformed-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/repo/manifest.json"}}]}}
+{"type":"user","timestamp":"2026-08-01T15:00:02Z","sessionId":"cc-malformed-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"{}","is_error":false}]}}
+{"incomplete":
