@@ -12,8 +12,8 @@
  * verbatim from the log's own timestamps, never generated).
  *
  * ADAPTED from mindwalk's internal/adapter/claudecode/adapter.go (MIT,
- * cosmtrek/mindwalk) per the design doc's ADAPT decision (Part 2), not
- * vendored or shelled out to.
+ * cosmtrek/mindwalk) -- reimplemented natively per the design doc's ADAPT
+ * decision (Part 2), not vendored or shelled out to.
  *
  * Correlation: tool_use / tool_result content items are matched across
  * separate JSONL lines by id, via an in-order pending map (assistant lines
