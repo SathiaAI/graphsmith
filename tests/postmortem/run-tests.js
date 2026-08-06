@@ -363,8 +363,15 @@ function groupWindowsPaths() {
   report("8.6 normalizePath: win32 nested relative resolves to posix-slash form", r1.ok && r1.rel === "a/b.txt");
   const r2 = classify.normalizePath("/repo", "", "/repo/a/b.txt");
   report("8.7 normalizePath: posix nested relative still works (no regression from win32 support)", r2.ok && r2.rel === "a/b.txt");
+  // CodeRabbit review, PR #23, 2026-08-06 (CR-6, silently-dropped parent-
+  // relative paths): this used to assert ok:false -- the path was silently
+  // dropped from both targets and outside. That was itself the bug CR-6
+  // fixes (see GROUP 16's CR-6 cases for the primary regression coverage);
+  // updated here to assert the new, correct behavior: a cwd is available,
+  // so the path resolves against it and surfaces as an outside touch
+  // instead of vanishing with no trace, same as the POSIX case.
   const r3 = classify.normalizePath("C:\\Users\\dev\\repo", "", "..\\..\\Windows\\System32\\cmd.exe");
-  report("8.8 normalizePath: win32 relative path escaping upward with no base is refused (ok:false)", r3.ok === false);
+  report("8.8 normalizePath: win32 relative path escaping upward with a cwd resolves as an outside touch, not silently dropped", r3.ok === true && !!r3.outside && r3.outside.path === "C:/Users/Windows/System32/cmd.exe", JSON.stringify(r3));
 }
 
 /* ===========================================================================
@@ -417,7 +424,7 @@ function groupCli() {
   const ccPath = path.join(FIXTURES, "claude-code-normal.jsonl");
   const stdoutRun = runCli([ccPath]);
   report("11.3 stdout run: exit 0", stdoutRun.status === 0);
-  report("11.4 stdout run: Markdown report on stdout", /^# Session post-mortem — claude-code/.test(stdoutRun.stdout));
+  report("11.4 stdout run: Markdown report on stdout", /^# Session post-mortem \u2014 claude-code/.test(stdoutRun.stdout));
 
   const dir = tmpDir("cli-out");
   try {
@@ -440,7 +447,7 @@ function groupCli() {
 
     const codexPath = path.join(FIXTURES, "codex-normal.jsonl");
     const autoCodex = runCli([codexPath]);
-    report("11.10 auto-detect: codex fixture is recognized without --harness", autoCodex.status === 0 && /^# Session post-mortem — codex/.test(autoCodex.stdout));
+    report("11.10 auto-detect: codex fixture is recognized without --harness", autoCodex.status === 0 && /^# Session post-mortem \u2014 codex/.test(autoCodex.stdout));
 
     const missing = runCli([path.join(dir, "does-not-exist.jsonl")]);
     report("11.11 missing file: exits non-zero with a readable error, not a stack trace to the user", missing.status !== 0 && /cannot read/.test(missing.stderr) && !/at Object/.test(missing.stderr));
@@ -729,6 +736,461 @@ function groupFreshReviewRound2() {
   // node --check plus the full suite's continued pass with no regressions.
 }
 
+/* ===========================================================================
+ * GROUP 16: CodeRabbit review findings, PR #23, 2026-08-06 -- the 21-comment
+ * automated review left on the Lane F merge (PR #23) after merge, triaged
+ * and fixed in a follow-up branch. Each assertion below was individually
+ * verified via `git stash` isolation (source fix stashed, test still
+ * present) to FAIL against the pre-fix code and PASS against the fix,
+ * exactly like GROUP 14/15 above, before being folded into this permanent
+ * suite.
+ * ========================================================================= */
+function groupCodeRabbitFindings() {
+  console.log("\n=== GROUP 16: CodeRabbit review findings, PR #23, 2026-08-06 ===");
+
+  // CR-1 (P1): events used to be pushed to events[] in RESOLUTION order (when
+  // a tool_result arrived), not call-ISSUANCE order. A call issued first
+  // (toolu_a) that resolves SECOND must still appear before a call issued
+  // second (toolu_b) that resolves FIRST -- eventsBeforeFirstEdit and
+  // editsAfterLastVerify (postmortem-classify.js's computeStats) both trust
+  // events[] order via seq, so a resolution-order array can invert the "did
+  // you verify after your last edit" narrative.
+  {
+    const cc = parseClaudeCodeSession(readFixture("claude-code-out-of-order-results.jsonl"), { sourcePath: "/fixtures/claude-code-out-of-order-results.jsonl" });
+    report("16.1 CR-1: 2 events produced", cc.trace.events.length === 2, `got ${cc.trace.events.length}`);
+    report(
+      "16.2 CR-1: event 0 is the call ISSUED first (a.txt), even though its result arrived SECOND",
+      cc.trace.events[0] && cc.trace.events[0].targets.some((t) => t.path === "a.txt"),
+      cc.trace.events[0] && JSON.stringify(cc.trace.events[0].targets)
+    );
+    report(
+      "16.3 CR-1: event 1 is the call issued second (b.txt), even though its result arrived FIRST",
+      cc.trace.events[1] && cc.trace.events[1].targets.some((t) => t.path === "b.txt"),
+      cc.trace.events[1] && JSON.stringify(cc.trace.events[1].targets)
+    );
+  }
+
+  // CR-2 (P1): a call still pending at EOF (never confirmed successful) used
+  // to be emitted with isError: false, indistinguishable from a real
+  // confirmed success, while the Claude Code adapter unconditionally called
+  // computeStats(events, marks, null, "exact") -- claiming EXACT (not
+  // estimated) error observability. An unconfirmed call silently counting
+  // as a confirmed non-error under a claim of exactness is dishonest.
+  // Fixture: claude-code-pending-eof.jsonl has one call that resolves
+  // normally (Read, real success) and one call still pending at EOF (Edit).
+  {
+    const cc = parseClaudeCodeSession(readFixture("claude-code-pending-eof.jsonl"), { sourcePath: "/fixtures/claude-code-pending-eof.jsonl" });
+    const resolved = cc.trace.events[0];
+    const pending = cc.trace.events[1];
+    report("16.4 CR-2: the resolved (real success) event is NOT marked unresolved", resolved && resolved.unresolved !== true);
+    report("16.5 CR-2: the pending-at-EOF event IS marked unresolved -- distinguishable from a confirmed success", pending && pending.unresolved === true);
+    report(
+      "16.6 CR-2: with an unresolved event present, observability.errors is honestly downgraded to 'estimated', not left claiming 'exact'",
+      cc.trace.stats.observability.errors === "estimated",
+      cc.trace.stats.observability.errors
+    );
+  }
+
+  // CR-2b: a trace with NO unresolved events must still get to claim "exact"
+  // for Claude Code -- the downgrade must be conditional on an actual
+  // unresolved event being present, not an unconditional regression to
+  // "estimated" for every Claude Code trace.
+  {
+    const cc = parseClaudeCodeSession(readFixture("claude-code-normal.jsonl"), { sourcePath: "/fixtures/claude-code-normal.jsonl" });
+    report("16.7 CR-2b: a trace with no unresolved events still reports observability.errors 'exact' (no regression)", cc.trace.stats.observability.errors === "exact");
+  }
+
+  // CR-3: escapeMarkNote() didn't escape &, <, > (HTML delimiters -- a
+  // session mark, sourcePath, churn path, or outside path/scope could
+  // inject raw HTML into the rendered report), and session.sourcePath, each
+  // churn file path, and each outside path/scope were rendered WITHOUT
+  // going through escapeMarkNote() at all.
+  {
+    const trace = {
+      session: {
+        harness: "claude-code",
+        sourcePath: "/repo/<script>alert(1)</script>&session.jsonl",
+      },
+      events: [
+        // 3 edits to the same file -> churnList includes it (>= 3 threshold)
+        { seq: 0, tool: "Edit", action: "edit", targets: [{ path: "<img src=x onerror=alert(1)>&evil.js", touch: "edit" }], resultBytes: 0, isError: false, summary: "" },
+        { seq: 1, tool: "Edit", action: "edit", targets: [{ path: "<img src=x onerror=alert(1)>&evil.js", touch: "edit" }], resultBytes: 0, isError: false, summary: "" },
+        { seq: 2, tool: "Edit", action: "edit", targets: [{ path: "<img src=x onerror=alert(1)>&evil.js", touch: "edit" }], resultBytes: 0, isError: false, summary: "", outside: [{ scope: "other", path: "/etc/<script>&passwd" }] },
+      ],
+      marks: [],
+      stats: {
+        actions: { search: 0, read: 0, edit: 3, exec: 0, verify: 0, other: 0 },
+        errors: { search: 0, read: 0, edit: 0, exec: 0, verify: 0, other: 0 },
+        touched: 1, edited: 1, churnFiles: 1, eventsBeforeFirstEdit: 0, errorRate: 0, editsAfterLastVerify: 3,
+        observability: { repoSize: "unavailable" },
+      },
+    };
+    const md = renderMarkdown(trace, {});
+    report("16.8 CR-3: sourcePath's raw <script> tag does not survive unescaped in the document", !md.includes("<script>alert(1)</script>"));
+    report("16.9 CR-3: sourcePath's raw & does not survive unescaped in the document", !md.includes("</script>&session"));
+    report("16.10 CR-3: sourcePath's HTML is escaped (appears in the document as &lt;script&gt;)", md.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    report("16.11 CR-3: churn path's raw HTML does not survive unescaped", !md.includes("<img src=x onerror=alert(1)>"));
+    report("16.12 CR-3: churn path's HTML is escaped in the churn suffix", md.includes("&lt;img src=x onerror=alert(1)&gt;"));
+    report("16.13 CR-3: outside-touch path's raw HTML does not survive unescaped", !md.includes("/etc/<script>&passwd"));
+    report("16.14 CR-3: outside-touch path's HTML is escaped", md.includes("/etc/&lt;script&gt;&amp;passwd"));
+  }
+
+  // CR-4: verifyCommand's boundary regex only accepted whitespace/|/;/& as
+  // a valid character BEFORE a verify-pattern match, so a verify runner
+  // invoked via a leading path separator ("./gradlew test",
+  // "node_modules/.bin/jest") was misclassified as exec instead of verify.
+  // The AFTER-match boundary must stay strict (unchanged) so
+  // "jest.config.js" alone still does NOT match -- only the leading
+  // boundary gained "/" and "\\".
+  {
+    report("16.16 CR-4: './gradlew test' IS verify-shaped (leading '/' before a real verify invocation)", classify.verifyCommand("./gradlew test") === true);
+    report("16.17 CR-4: 'node_modules/.bin/jest' IS verify-shaped (leading '/' before a real verify invocation)", classify.verifyCommand("node_modules/.bin/jest") === true);
+    report("16.18 CR-4: 'jest.config.js' alone is still NOT verify-shaped (no regression -- AFTER boundary stays strict)", classify.verifyCommand("jest.config.js") === false);
+    report("16.19 CR-4: 'cat jest.config.js' is still NOT verify-shaped (Finding 11, no regression)", classify.verifyCommand("cat jest.config.js") === false);
+  }
+
+  // CR-5: a type-less Codex line with only a bare `id` (no `payload`) used
+  // to be enough on its own to recognize a file as Codex -- mirrors the
+  // already-fixed Claude Code Finding 12 gap (bare sessionId alone).
+  {
+    const bareId = parseCodexSession('{"id":"foreign-1"}\n', { sourcePath: "/fixtures/codex-bare-id.jsonl" });
+    report("16.20 CR-5: a bare {\"id\":\"foreign-1\"} line alone does NOT recognize the file as Codex", bareId.diagnostics.recognized === false);
+
+    // No regression: a type-less line that DOES carry a payload object
+    // alongside its id is still a legitimate recognition signal.
+    const withPayload = parseCodexSession('{"id":"real-codex-1","payload":{"cwd":"/repo"}}\n', { sourcePath: "/fixtures/codex-bare-id-payload.jsonl" });
+    report("16.21 CR-5: a type-less line WITH a payload object still recognizes the file as Codex (no regression)", withPayload.diagnostics.recognized === true);
+    report("16.22 CR-5: sessionId is still captured from a legitimately-recognized type-less line", withPayload.trace.session.id === "real-codex-1");
+  }
+
+  // CR-6: a parent-relative path ("../secret.txt") used to return
+  // { ok: false } unconditionally in normalizePath, dropping it from BOTH
+  // targets AND outside -- silently vanishing with no trace at all, worse
+  // than misclassifying. It must now resolve against the session cwd and
+  // surface as an outside touch.
+  {
+    const r = classify.normalizePath("/repo", "", "../secret.txt");
+    report("16.23 CR-6: '../secret.txt' resolves (ok:true), not silently dropped", r.ok === true, JSON.stringify(r));
+    report("16.24 CR-6: '../secret.txt' resolved against cwd surfaces as an outside touch", !!r.outside && r.outside.path === "/secret.txt", JSON.stringify(r));
+
+    // End-to-end: the same case via targetsFor/a real Bash call.
+    const { targets, outside } = classify.targetsFor("/repo", "Bash", { command: "cat ../secret.txt" }, "");
+    report("16.25 CR-6 end-to-end: '../secret.txt' referenced from a Bash command appears in outside, not silently vanished", outside.some((o) => o.path === "/secret.txt"));
+    report("16.26 CR-6 end-to-end: it does NOT also appear in targets (it is not an in-repo file)", !targets.some((t) => t.path.includes("secret.txt")));
+
+    // A "../"-prefixed path that resolves BACK inside the repo root (base is
+    // a subdirectory) must be treated as a normal in-repo target, not outside.
+    const r2 = classify.normalizePath("/repo", "/repo/sub", "../top.txt");
+    report("16.27 CR-6: '../top.txt' from a subdirectory base that resolves back inside the repo is an in-repo target, not outside", r2.ok === true && r2.rel === "top.txt" && !r2.outside, JSON.stringify(r2));
+  }
+
+  // CR-7: "~/.bashrc" (shell shorthand for the user's home directory) used
+  // to be treated as an ordinary relative path and normalized as if it
+  // were inside the repo. It must now be recognized BEFORE ordinary
+  // relative-path handling and routed to outside with scope "home".
+  {
+    const r = classify.normalizePath("/repo", "", "~/.bashrc");
+    report("16.28 CR-7: '~/.bashrc' is NOT resolved as an in-repo target", !r.rel);
+    report("16.29 CR-7: '~/.bashrc' is reported as an outside touch with scope 'home'", !!r.outside && r.outside.scope === "home", JSON.stringify(r));
+    report("16.30 CR-7: the outside path keeps the literal '~' form, not a host-dependent expansion", r.outside && r.outside.path === "~/.bashrc", JSON.stringify(r));
+
+    // End-to-end: a Bash command referencing ~/.bashrc.
+    const { targets, outside } = classify.targetsFor("/repo", "Bash", { command: "cat ~/.bashrc" }, "");
+    report("16.31 CR-7 end-to-end: 'cat ~/.bashrc' surfaces the home file in outside with scope 'home'", outside.some((o) => o.scope === "home" && o.path === "~/.bashrc"), JSON.stringify(outside));
+    report("16.32 CR-7 end-to-end: it does NOT also appear as an in-repo target", !targets.some((t) => t.path.includes(".bashrc")));
+
+    // Bare "~" alone (no trailing slash) is also home-shorthand, not a
+    // one-character relative path.
+    const rBare = classify.normalizePath("/repo", "", "~");
+    report("16.33 CR-7: bare '~' alone is also routed to outside scope 'home'", !!rBare.outside && rBare.outside.scope === "home", JSON.stringify(rBare));
+  }
+
+  // CR-8: a Windows drive-letter absolute path in a Grep/Glob/LS hit line
+  // ("C:\repo\src\a.js:12:hit") was silently dropped from touched-file
+  // stats -- the hit-line regex had no backslash/drive-colon support, even
+  // though this file's own path-normalization code explicitly supports
+  // Windows paths elsewhere.
+  {
+    const hits = classify.parsePathHits("C:\\repo\\src\\a.js:12:some match here\nno path on this line");
+    report("16.34 CR-8: a Windows backslash hit line is extracted by parsePathHits", hits.some((h) => h.path === "C:\\repo\\src\\a.js"), JSON.stringify(hits));
+    const hitLines = hits.find((h) => h.path === "C:\\repo\\src\\a.js");
+    report("16.35 CR-8: the extracted hit carries its line number", !!hitLines && hitLines.lines.some((l) => l[0] === 12 && l[1] === 12), JSON.stringify(hitLines));
+
+    // End-to-end: a Grep tool call whose result contains a Windows hit line,
+    // with a Windows-style session cwd so it resolves as an in-repo target.
+    const { targets } = classify.targetsFor(
+      "C:\\repo",
+      "Grep",
+      { pattern: "TODO" },
+      "C:\\repo\\src\\a.js:12:some match here"
+    );
+    report("16.36 CR-8 end-to-end: the Windows hit line resolves into targets, not silently dropped", targets.some((t) => t.path === "src/a.js"), JSON.stringify(targets));
+  }
+
+  // CR-9: the same outside path found by multiple extraction passes within
+  // a single event (commandReadPaths, extractCommandPaths, extractPaths all
+  // independently discover "/tmp/build.log" in "cat /tmp/build.log") used
+  // to append a duplicate {scope,path} entry to that event's `outside`
+  // array PER extraction pass that found it -- part of the public
+  // session-trace JSON, not just the rendered report (which already
+  // dedupes at the whole-report level via postmortem-render.js's
+  // outsideTouches(), a SEPARATE, unrelated dedup this fix does not touch).
+  {
+    const { outside } = classify.targetsFor("/repo", "Bash", { command: "cat /tmp/build.log" }, "");
+    report("16.37 CR-9: the same outside path found via multiple extraction routes appears exactly once in this event's outside array", outside.length === 1 && outside[0].path === "/tmp/build.log", JSON.stringify(outside));
+  }
+
+  // CR-10: a free-text-inferred target (weak: true) later confirmed by a
+  // structured, non-weak argument for the SAME path used to keep the weak
+  // flag forever -- add() upgraded `touch` but never cleared `weak`.
+  // CodeRabbit supplied this diff directly; applied verbatim. Exercised via
+  // the "exec" tool case, whose execCommands loop adds a free-text-inferred
+  // read target for src/a.js (weak) BEFORE the execPatchPaths pass adds a
+  // structured, non-weak edit target for the SAME path (a JS-wrapper
+  // snippet that both `cat`s and apply_patch-es the same file).
+  {
+    const src = [
+      'const patch = "*** Update File: src/a.js\\n@@\\n-old\\n+new\\n";',
+      'tools.exec_command({cmd: "cat src/a.js", workdir: "/repo"});',
+      "tools.apply_patch(patch);",
+    ].join("\n");
+    const { targets } = classify.targetsFor("/repo", "exec", { _raw: src }, "");
+    const target = targets.find((t) => t.path === "src/a.js");
+    report("16.38 CR-10: the path is upgraded to touch 'edit' (structured confirmation wins over the earlier weak read)", !!target && target.touch === "edit", JSON.stringify(target));
+    report("16.39 CR-10: the final target has NO weak flag -- the structured confirmation cleared it", !!target && !target.weak, JSON.stringify(target));
+  }
+
+  // CR-11: a multiline Bash command or multiline Task description copied
+  // into an event's `summary` unchanged produced a multiline value,
+  // violating the schema's "one-line" summary contract.
+  {
+    const multilineCommand = "echo one\necho two\r\necho three";
+    const summary1 = classify.summarizeTool("Bash", { command: multilineCommand }, [], [], false);
+    report("16.40 CR-11: a multiline Bash command's summary has no raw newline", !summary1.includes("\n") && !summary1.includes("\r"), JSON.stringify(summary1));
+    report("16.41 CR-11: the multiline command's lines are collapsed to spaces, not silently truncated away", summary1.includes("echo one echo two echo three"), summary1);
+
+    const multilineDescription = "First subagent step.\nSecond subagent step.";
+    const summary2 = classify.summarizeTool("Task", { description: multilineDescription }, [], [], false);
+    report("16.42 CR-11: a multiline Task description's summary has no raw newline", !summary2.includes("\n"), JSON.stringify(summary2));
+
+    // End-to-end: buildEvent's summary field for a real multiline command.
+    const event = classify.buildEvent(0, "/repo", { name: "Bash", input: { command: multilineCommand }, timestamp: "2026-08-06T00:00:00Z" }, { content: "", isError: false });
+    report("16.43 CR-11 end-to-end: buildEvent's summary field contains no raw newline", !event.summary.includes("\n") && !event.summary.includes("\r"), JSON.stringify(event.summary));
+  }
+
+  // CR-12: Finding 8's id-less-call synthetic key used to be a STRING
+  // ("__no-id-0", ...) -- a real harness-provided tool_use.id could
+  // theoretically literally equal that exact string, colliding with a
+  // synthetic key on the Map and wrongly triggering the "duplicate,
+  // still-pending" drop as if it were a reissue of the SAME call. A real
+  // call with id "__no-id-0", immediately followed by a real id-less call,
+  // must produce two distinct events, not a collision/drop.
+  {
+    const lines = [
+      { type: "user", timestamp: "2026-08-06T16:00:00Z", cwd: "/repo", sessionId: "cc-symbol-collision-1", message: { role: "user", content: "Read two files." } },
+      { type: "assistant", timestamp: "2026-08-06T16:00:01Z", sessionId: "cc-symbol-collision-1", message: { role: "assistant", content: [{ type: "tool_use", id: "__no-id-0", name: "Read", input: { file_path: "/repo/real-id-collision.txt" } }] } },
+      { type: "assistant", timestamp: "2026-08-06T16:00:02Z", sessionId: "cc-symbol-collision-1", message: { role: "assistant", content: [{ type: "tool_use", name: "Read", input: { file_path: "/repo/id-less-after.txt" } }] } },
+      { type: "user", timestamp: "2026-08-06T16:00:03Z", sessionId: "cc-symbol-collision-1", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "__no-id-0", content: "real-id contents", is_error: false }] } },
+    ].map((l) => JSON.stringify(l)).join("\n") + "\n";
+    const cc = parseClaudeCodeSession(lines, { sourcePath: "/fixtures/claude-code-symbol-collision.jsonl" });
+    report("16.44 CR-12: 2 distinct events produced, not a collision/drop", cc.trace.events.length === 2, `got ${cc.trace.events.length}`);
+    report(
+      "16.45 CR-12: the real id (\"__no-id-0\") call's target survives, resolved",
+      cc.trace.events.some((e) => e.targets.some((t) => t.path === "real-id-collision.txt") && e.unresolved !== true),
+      JSON.stringify(cc.trace.events)
+    );
+    report(
+      "16.46 CR-12: the id-less call issued right after it also survives as its own distinct event",
+      cc.trace.events.some((e) => e.targets.some((t) => t.path === "id-less-after.txt")),
+      JSON.stringify(cc.trace.events)
+    );
+  }
+
+  // CR-13: a tool_use item with a missing/non-string `name` used to be
+  // registered with `call.name` passed through as-is (undefined), so
+  // buildEvent emitted `tool: undefined` -- violating the schema's
+  // required-string events[].tool field, and JSON.stringify would silently
+  // DROP that object key entirely rather than showing null/a placeholder.
+  {
+    const lines = [
+      { type: "user", timestamp: "2026-08-06T17:00:00Z", cwd: "/repo", sessionId: "cc-no-name-1", message: { role: "user", content: "Do something." } },
+      { type: "assistant", timestamp: "2026-08-06T17:00:01Z", sessionId: "cc-no-name-1", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_no_name", input: { file_path: "/repo/no-name.txt" } }] } },
+    ].map((l) => JSON.stringify(l)).join("\n") + "\n";
+    const cc = parseClaudeCodeSession(lines, { sourcePath: "/fixtures/claude-code-no-name.jsonl" });
+    report("16.47 CR-13: the call still appears in the trace, not silently dropped", cc.trace.events.length === 1, `got ${cc.trace.events.length}`);
+    report("16.48 CR-13: event.tool is a valid non-empty string, not undefined", !!cc.trace.events[0] && typeof cc.trace.events[0].tool === "string" && cc.trace.events[0].tool.length > 0, cc.trace.events[0] && String(cc.trace.events[0].tool));
+    report("16.49 CR-13: JSON.stringify of the event still includes a 'tool' key (would silently vanish if left undefined)", cc.trace.events[0] && JSON.stringify(cc.trace.events[0]).includes('"tool"'));
+  }
+
+  // CR-14: session-level metadata (sessionId/cwd/gitBranch/timestamp for
+  // Claude Code; payload.id/session_id/cwd/git.branch/timestamp for Codex)
+  // used to be copied on a bare truthy guard only -- a malformed log line
+  // with e.g. a NUMERIC cwd would pass and reach session.cwd, then flow
+  // into the path classifier for every later event.
+  {
+    // Claude Code: a numeric cwd on the FIRST line must not poison
+    // session.cwd; the real (string) cwd on a later line must still win.
+    const ccLines = [
+      { type: "user", timestamp: "2026-08-06T18:00:00Z", cwd: 12345, sessionId: "cc-bad-cwd-1", message: { role: "user", content: "go" } },
+      { type: "assistant", timestamp: "2026-08-06T18:00:01Z", cwd: "/repo", sessionId: "cc-bad-cwd-1", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_badcwd", name: "Read", input: { file_path: "/repo/ok.txt" } }] } },
+    ].map((l) => JSON.stringify(l)).join("\n") + "\n";
+    const cc = parseClaudeCodeSession(ccLines, { sourcePath: "/fixtures/claude-code-bad-cwd.jsonl" });
+    report("16.50 CR-14 (Claude Code): a numeric cwd is ignored, not copied into session.cwd", cc.trace.session.cwd !== 12345, String(cc.trace.session.cwd));
+    report("16.51 CR-14 (Claude Code): the later real string cwd is captured instead", cc.trace.session.cwd === "/repo", String(cc.trace.session.cwd));
+    report("16.52 CR-14 (Claude Code): classification is not corrupted -- the Read target resolves in-repo", cc.trace.events[0] && cc.trace.events[0].targets.some((t) => t.path === "ok.txt"), JSON.stringify(cc.trace.events[0]));
+
+    // Codex: same shape, via session_meta's payload.cwd.
+    const cxLines = [
+      { timestamp: "2026-08-06T19:00:00Z", type: "session_meta", payload: { id: "codex-bad-cwd-1", session_id: "codex-bad-cwd-1", cwd: 999 } },
+      { timestamp: "2026-08-06T19:00:01Z", type: "turn_context", payload: { cwd: "/repo" } },
+      { timestamp: "2026-08-06T19:00:02Z", type: "response_item", payload: { type: "function_call", id: "fc-1", call_id: "call-1", name: "exec_command", arguments: JSON.stringify({ cmd: "cat ok.txt", workdir: "/repo" }) } },
+    ].map((l) => JSON.stringify(l)).join("\n") + "\n";
+    const cx = parseCodexSession(cxLines, { sourcePath: "/fixtures/codex-bad-cwd.jsonl" });
+    report("16.53 CR-14 (Codex): a numeric payload.cwd is ignored, not copied into session.cwd", cx.trace.session.cwd !== 999, String(cx.trace.session.cwd));
+    report("16.54 CR-14 (Codex): the later real string cwd (from turn_context) is captured instead", cx.trace.session.cwd === "/repo", String(cx.trace.session.cwd));
+  }
+
+  // CR-15: `echo npm test` matched the "npm test" verify pattern via plain
+  // substring/boundary matching even though echo never invokes a test
+  // runner -- it just prints text. actionFor checks verify before other
+  // classifications, so this became a false "verify" that could reset
+  // editsAfterLastVerify (a false "the session re-verified" signal).
+  {
+    report("16.55 CR-15: 'echo npm test' is NOT verify-shaped", classify.verifyCommand("echo npm test") === false);
+    report("16.56 CR-15: actionFor classifies 'echo npm test' as exec (echo is not itself a recognized verify/search/read program)", classify.actionFor("Bash", { command: "echo npm test" }, "") === "exec");
+
+    // No regression: a real verify invocation alongside an unrelated echo
+    // segment must still be detected.
+    report("16.57 CR-15: 'echo start && npm test' -- the REAL npm test segment still IS verify-shaped", classify.verifyCommand("echo start && npm test") === true);
+
+    // No regression on the existing Finding-11 boundary suite this fix sits
+    // directly next to.
+    report("16.58 CR-15: 'npx jest --ci' is still verify-shaped (no regression)", classify.verifyCommand("npx jest --ci") === true);
+    report("16.59 CR-15: 'tox -e py39' is still verify-shaped (no regression)", classify.verifyCommand("tox -e py39") === true);
+    report("16.60 CR-15: 'go test ./...' is still verify-shaped (no regression)", classify.verifyCommand("go test ./...") === true);
+  }
+
+  // CR-16: `positional` used to be computed by filtering out any token
+  // starting with "--", without excluding the VALUE token that follows
+  // --harness/--out -- so `--harness codex session.jsonl` set sessionPath
+  // to the literal string "codex". Separately, --harness/--out as the LAST
+  // argument (no value token following) silently fell back to
+  // auto-detection / stdout instead of erroring.
+  {
+    const ccPath = path.join(FIXTURES, "claude-code-normal.jsonl");
+    const codexPath = path.join(FIXTURES, "codex-normal.jsonl");
+
+    // --harness given a valid value, followed by the real positional path:
+    // sessionPath must be the real path, NOT the literal string "codex".
+    const harnessThenPath = runCli(["--harness", "codex", ccPath]);
+    report(
+      "16.61 CR-16: '--harness codex <ccPath>' does not mistake the option's own value for sessionPath",
+      !/cannot read 'codex'/.test(harnessThenPath.stderr),
+      JSON.stringify({ status: harnessThenPath.status, stderr: harnessThenPath.stderr })
+    );
+    // The Claude Code fixture forced through the Codex adapter should fail
+    // as an explicit harness-mismatch error (same shape as GROUP 11's
+    // 11.8), proving sessionPath really was resolved to ccPath, not "codex".
+    report(
+      "16.62 CR-16: sessionPath was correctly resolved to the real path (harness-mismatch error references the real file, not 'codex')",
+      harnessThenPath.status !== 0 && /not recognized as a codex session/.test(harnessThenPath.stderr),
+      harnessThenPath.stderr
+    );
+
+    // --harness as the LAST argument, no value following: usage error,
+    // exit 2, NOT a silent auto-detect fallback.
+    const harnessNoValue = runCli([ccPath, "--harness"]);
+    report(
+      "16.63 CR-16: '--harness' as the last arg with no value exits 2 with a usage error, not a silent auto-detect",
+      harnessNoValue.status === 2 && /--harness requires a value/.test(harnessNoValue.stderr),
+      JSON.stringify({ status: harnessNoValue.status, stderr: harnessNoValue.stderr })
+    );
+
+    // --out as the LAST argument, no value following: usage error, exit 2,
+    // NOT a silent stdout fallback.
+    const outNoValue = runCli([ccPath, "--out"]);
+    report(
+      "16.64 CR-16: '--out' as the last arg with no value exits 2 with a usage error, not a silent stdout fallback",
+      outNoValue.status === 2 && /--out requires a value/.test(outNoValue.stderr),
+      JSON.stringify({ status: outNoValue.status, stderr: outNoValue.stderr })
+    );
+    report("16.65 CR-16: '--out' with no value does NOT silently print the report to stdout", outNoValue.stdout === "");
+
+    // An unrecognized --xxx flag is also a usage error, not silently
+    // ignored / silently swept into positional.
+    const unknownFlag = runCli([ccPath, "--bogus-flag"]);
+    report(
+      "16.66 CR-16: an unknown '--xxx' flag exits 2 with a usage error",
+      unknownFlag.status === 2 && /unknown option '--bogus-flag'/.test(unknownFlag.stderr),
+      JSON.stringify({ status: unknownFlag.status, stderr: unknownFlag.stderr })
+    );
+
+    // No regression: valid --harness/--out usage (GROUP 11's own cases)
+    // must still work exactly as documented.
+    const dir = tmpDir("cli-out-cr16");
+    try {
+      const outPath = path.join(dir, "report.md");
+      const validOut = runCli([ccPath, "--out", outPath]);
+      report("16.67 CR-16: valid '--out <path>' usage still works (no regression)", validOut.status === 0 && fs.existsSync(outPath));
+      const validHarness = runCli([codexPath, "--harness", "codex"]);
+      report("16.68 CR-16: valid '--harness codex' usage on a real codex fixture still works (no regression)", validHarness.status === 0 && /^# Session post-mortem \u2014 codex/.test(validHarness.stdout));
+    } finally {
+      cleanup(dir);
+    }
+  }
+
+  // CR-17: harness auto-detection used to return on the FIRST adapter to
+  // report recognized, without ever checking whether the OTHER adapter
+  // would also recognize the same input. A line shaped `{"type":"message",
+  // "sessionId":"...","timestamp":"...", ...}` satisfies BOTH recognizers:
+  // Claude Code's isClaudeLine falls through to its default branch for an
+  // unlisted `type` and accepts a string sessionId backed by a timestamp;
+  // Codex's line-type switch's `case "message":` sets recognized=true
+  // unconditionally on type alone. buildPostmortem must now throw,
+  // requiring --harness, rather than silently picking Claude Code (first
+  // in HARNESSES) because it happened to run first.
+  {
+    const dualShapeLine = JSON.stringify({
+      type: "message",
+      sessionId: "dual-shape-1",
+      timestamp: "2026-08-06T20:00:00Z",
+      role: "user",
+      content: [{ type: "text", text: "hello" }],
+    }) + "\n";
+    // Sanity check the premise directly against both adapters before
+    // asserting on the orchestrator's behavior built on top of it.
+    const ccDirect = parseClaudeCodeSession(dualShapeLine, { sourcePath: "/fixtures/dual-shape.jsonl" });
+    const cxDirect = parseCodexSession(dualShapeLine, { sourcePath: "/fixtures/dual-shape.jsonl" });
+    report("16.69 CR-17 premise: the dual-shape line IS recognized by the Claude Code adapter", ccDirect.diagnostics.recognized === true);
+    report("16.70 CR-17 premise: the dual-shape line IS ALSO recognized by the Codex adapter", cxDirect.diagnostics.recognized === true);
+
+    const dir = tmpDir("cr17-ambiguous");
+    try {
+      const dualPath = path.join(dir, "dual-shape.jsonl");
+      fs.writeFileSync(dualPath, dualShapeLine);
+      let threw = null;
+      try {
+        buildPostmortem(dualPath);
+      } catch (e) {
+        threw = e;
+      }
+      report("16.71 CR-17: buildPostmortem throws for a dual-recognized file, rather than silently picking one", threw !== null);
+      report(
+        "16.72 CR-17: the error requires --harness and names both matched harnesses",
+        !!threw && /--harness/.test(threw.message) && /claude-code/.test(threw.message) && /codex/.test(threw.message),
+        threw && threw.message
+      );
+
+      // No regression: --harness explicitly still resolves the ambiguity
+      // (the reliable path remains fully functional).
+      const forced = buildPostmortem(dualPath, { harness: "codex" });
+      report("16.73 CR-17: '--harness codex' still resolves the ambiguous file explicitly (no regression)", forced.harness === "codex");
+    } finally {
+      cleanup(dir);
+    }
+  }
+}
+
 function main() {
   groupSyntax();
   groupNormalSessions();
@@ -745,6 +1207,7 @@ function main() {
   groupProgrammaticApi();
   groupAdversarialRegressions();
   groupFreshReviewRound2();
+  groupCodeRabbitFindings();
 
   console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped/unavailable`);
   process.exit(failed > 0 ? 1 : 0);
