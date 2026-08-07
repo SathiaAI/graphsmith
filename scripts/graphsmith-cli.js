@@ -149,7 +149,20 @@ function cmdPostmortem(args) {
   }
 
   if (outPath) {
-    fs.writeFileSync(outPath, result.markdown, "utf8");
+    /* Adversarial review (Grok-4.5 + Qwen3-Coder-Plus via OpenRouter,
+     * CR-18 follow-up, 2026-08-07): writeFileSync had no try/catch here,
+     * unlike runPostmortem's call above -- an --out that resolves to an
+     * existing directory (including --out "" , which path.resolve()s to
+     * the CLI's own cwd) threw an uncaught EISDIR with a raw Node stack
+     * trace instead of the clean, single-line error this command uses
+     * everywhere else. Reproduced directly before this fix landed. */
+    try {
+      fs.writeFileSync(outPath, result.markdown, "utf8");
+    } catch (e) {
+      console.error(e.message);
+      process.exit(1);
+      return;
+    }
     console.error(`graphsmith postmortem: wrote ${outPath} (${result.harness}, ${result.trace.events.length} events)`);
   } else {
     writeReport(result.markdown);

@@ -68,7 +68,19 @@ function groupCr18OutResolve() {
   console.log("\n=== GROUP 18: CR-18 --out path.resolve() hardening ===");
 
   const ccPath = path.join(FIXTURES, "claude-code-normal.jsonl");
-  const dir = tmpDir("cr18-out-resolve");
+  /* Adversarial review (Grok-4.5 via OpenRouter, CR-18 follow-up,
+   * 2026-08-07): os.tmpdir() can be a symlink (e.g. macOS's /tmp ->
+   * /private/tmp, and this repo's CI matrix does run macos-latest).
+   * The CLI resolves --out via path.resolve()/process.cwd() inside the
+   * spawned child, which on some platforms returns the *real* (symlink-
+   * resolved) cwd -- so building expectedPath from the mkdtemp-returned
+   * logical path and then string/regex-matching it against the CLI's
+   * printed absolute path (assertion 18.2) can spuriously fail even
+   * though the write succeeded at the right location. realpathSync here
+   * makes both sides of that comparison use the same resolved path.
+   * (18.1/18.3 use fs.existsSync, which follows the symlink transparently
+   * and isn't affected -- this fix is for 18.2's exact-string match.) */
+  const dir = fs.realpathSync(tmpDir("cr18-out-resolve"));
   try {
     const relOut = cp.spawnSync(process.execPath, [CLI, "postmortem", ccPath, "--out", "report.md"], { encoding: "utf8", cwd: dir });
     const expectedPath = path.join(dir, "report.md");
