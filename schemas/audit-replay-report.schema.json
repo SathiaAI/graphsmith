@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/audit-replay-report.schema.json",
+  "title": "GraphSmith audit replay report",
+  "description": "Output of `graphsmith audit replay <bundle.json>`. A narrative report over an already-produced GSA attestation bundle. Recomputes nothing itself -- pure consumer of scripts/gsa-verify.js#verifyBundle() and scripts/gsa-plan.js#replayBundle()/#planDrift(). A report whose verification_provenance is 'external', or whose verify_result.status is not PASS, MUST render every dimension unavailable -- it must never narrate an unverified, forged, or tampered bundle as trustworthy.",
+  "type": "object",
+  "required": ["schema_version", "tool", "bundle_id", "generated", "mode", "asserted_profiles", "verification_provenance", "verify_result", "replay_result", "dimensions", "marks", "skills_lens", "narrative", "evidence_index"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "0.2" },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "const": "graphsmith-audit-replay" },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "bundle_id": { "type": "string", "pattern": "^gsa-[0-9a-f]{16}$" },
+    "generated": {
+      "description": "UTC timestamp the report was produced, or 'unavailable' -- no clock read in the decision path. [Fixed per adversarial review -- HIGH: the first draft used `oneOf` here, which is broken under draft 2020-12's default (non-format-asserting) semantics -- confirmed by running the schema through Python's jsonschema.Draft202012Validator, which correctly rejects 'unavailable' as matching BOTH oneOf branches simultaneously, since `format` is annotation-only unless a validator opts into format-assertion. Fixed by switching to `anyOf`, which only requires at least one branch to match and has no exclusivity requirement.",
+      "anyOf": [
+        { "type": "string", "const": "unavailable" },
+        { "type": "string", "format": "date-time" }
+      ]
+    },
+    "mode": { "enum": ["standard", "deterministic", "regulator"] },
+    "asserted_profiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["R", "E", "B", "T", "G", "Q", "A", "X"] }
+    },
+    "verification_provenance": {
+      "enum": ["live", "external"],
+      "description": "[Fixed per adversarial review -- HIGH] 'live': verify_result came from a real verifyBundle() run performed by this invocation. 'external': verify_result was supplied by the caller (e.g. via --no-verify + stdin) and is NOT independently confirmed. When this is 'external', every entry in `dimensions` MUST have status 'unavailable' regardless of what verify_result claims -- this is the structural fix that closes the forgery path a reviewer found in the first draft (a hand-written fake PASS could otherwise produce a fully 'verified'-labeled report)."
+    },
+    "verify_result": {
+      "description": "Verbatim output of gsa-verify.js#verifyBundle() when verification_provenance is 'live'; the caller-supplied value when 'external'. Never re-derived by this tool either way.",
+      "type": "object",
+      "required": ["status", "steps", "confirmed_profiles", "downgraded_profiles", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["PASS", "FAIL"] },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["step", "status"],
+            "additionalProperties": false,
+            "properties": {
+              "step": { "type": "string" },
+              "status": { "enum": ["PASS", "FAIL", "UNAVAILABLE"] },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "confirmed_profiles": { "type": "array", "items": { "type": "string" } },
+        "downgraded_profiles": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
+    },
+    "replay_result": {
+      "description": "Verbatim output of gsa-plan.js#replayBundle(). [Fixed per adversarial review -- MEDIUM: this was optional in the first draft's schema despite being described in prose as an always-run, standing section -- now required, matching the prose in Section 1.2.]",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reproducible": { "type": "boolean" },
+        "deterministic_confirmed": { "type": "boolean" },
+        "mismatches": { "type": "array", "items": { "type": "string" } },
+        "non_replayable": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["reproducible", "deterministic_confirmed", "mismatches", "non_replayable"]
+    },
+    "drift": {
+      "description": "Present only when a prior bundle was supplied via --diff. Verbatim output of gsa-plan.js#planDrift(prev, curr).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "added": { "type": "array", "items": { "type": "string" } },
+        "removed": { "type": "array", "items": { "type": "string" } },
+        "changed": { "type": "array", "items": { "type": "string" } },
+        "destructive": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": { "enum": ["artifact-removed", "output-changed", "mode-downgrade", "profile-dropped", "error"] },
+              "key": { "type": "string" },
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "profile": { "type": "string" },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "safe": { "type": "boolean" }
+      },
+      "required": ["added", "removed", "changed", "destructive", "safe"]
+    },
+    "dimensions": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/dimension" }
+    },
+    "marks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/mark" }
+    },
+    "skills_lens": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/skillLensEntry" }
+    },
+    "narrative": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Plain-English summary, template-composed from dimensions/verify_result/replay_result/marks. Never LLM-generated; must not assert anything not traceable to evidence_index."
+    },
+    "evidence_index": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidencePointer" }
+    }
+  },
+  "$defs": {
+    "dimension": {
+      "type": "object",
+      "required": ["id", "title", "status", "evidence", "assumptions"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "enum": ["provenance_signing", "capability_posture", "determinism_repair", "adversarial_coverage", "extended_controls_v040"] },
+        "title": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["verified", "failed", "unavailable"] },
+        "evidence": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/evidencePointer" } },
+        "assumptions": { "type": "array", "items": { "type": "string" } },
+        "reason": { "type": "string", "description": "Required in practice when status != verified; enforced by the report generator, not the schema, since JSON Schema can't express a cross-field conditional this cleanly without duplicating the whole dimension shape per status." }
+      }
+    },
+    "mark": {
+      "type": "object",
+      "required": ["marker", "list", "pointer", "offset"],
+      "additionalProperties": false,
+      "properties": {
+        "marker": { "type": "string", "minLength": 1 },
+        "list": { "enum": ["nondeterministic", "repair", "model-dependent"] },
+        "pointer": { "type": "string", "description": "JSON Pointer to the artifact (always execution_trace today)." },
+        "offset": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "skillLensEntry": {
+      "type": "object",
+      "required": ["skill_id", "version", "approval_status", "source", "trace_mentions"],
+      "additionalProperties": false,
+      "properties": {
+        "skill_id": { "type": "string" },
+        "version": { "type": "string" },
+        "approval_status": { "enum": ["approved", "quarantined", "generated", "revoked"] },
+        "source": { "enum": ["local", "generated", "remote"] },
+        "signer": { "type": "string" },
+        "trace_mentions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of literal skill_id string occurrences found in execution_trace by plain string search. NOT a structural call count -- evidence of co-occurrence only, never presented as an invocation count."
+        }
+      }
+    },
+    "evidencePointer": {
+      "type": "object",
+      "required": ["pointer", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer into the bundle's manifest (prefix /manifest/...) or contents (prefix /contents/<path>)." },
+        "description": { "type": "string", "minLength": 1 },
+        "excerpt": { "type": "string", "description": "A short literal value or truncated excerpt. Never fabricated; omitted rather than approximated when large or when redaction status is unknown." }
+      }
+    }
+  }
+}
