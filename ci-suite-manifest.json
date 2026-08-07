@@ -50,6 +50,7 @@
   ],
   "gating_suites": [
     "tests/manifest/",
+    "tests/audit-replay/",
     "tests/report-integrity/",
     "tests/harness-honesty/",
     "tests/state-store/",
