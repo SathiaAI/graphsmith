@@ -318,4 +318,308 @@ function groupMalformed() {
   report("7.2 malformed: sourceLines counts all 7 non-blank raw lines", cc.trace.session.sourceLines === 7);
   report("7.3 malformed: exactly 3 unparseable lines counted (invalid JSON x2 + non-object JSON)", cc.diagnostics.unparseableLines === 3);
   report("7.4 malformed: the 1 valid tool call still produced an event", cc.trace.events.length === 1 && cc.trace.events[0].tool === "Read");
-  report("7.5 malformed: the 1 valid user message still produced a mark", cc.trace.marks.filt
+  report("7.5 malformed: the 1 valid user message still produced a mark", cc.trace.marks.filter((m) => m.type === "user-message").length === 1);
+  report("7.6 malformed: still recognized as a Claude Code session overall", cc.diagnostics.recognized === true);
+
+  // Codex adapter must not crash on malformed lines either (inline text,
+  // not a committed fixture -- see file header).
+  const codexRaw = [
+    '{"timestamp":"2026-08-01T21:00:00Z","type":"session_meta","payload":{"id":"codex-malformed-1","session_id":"codex-malformed-1","cwd":"/repo"}}',
+    "not json at all {{{",
+    '{"timestamp":"2026-08-01T21:00:01Z","type":"response_item","payload":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"exec_command","arguments":"{\\"cmd\\":\\"npm test\\",\\"workdir\\":\\"/repo\\"}"}}',
+    "42",
+    '{"timestamp":"2026-08-01T21:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Process exited with code 0"}}',
+  ].join("\n") + "\n";
+  let cxThrew = false;
+  let cx;
+  try {
+    cx = parseCodexSession(codexRaw, { sourcePath: "/fixtures/codex-malformed.jsonl" });
+  } catch (_) {
+    cxThrew = true;
+  }
+  report("7.7 Codex malformed: parser did not throw", cxThrew === false);
+  report("7.8 Codex malformed: 2 unparseable lines counted (invalid JSON + bare number)", !!cx && cx.diagnostics.unparseableLines === 2);
+  report("7.9 Codex malformed: the 1 valid tool call still produced an event", !!cx && cx.trace.events.length === 1 && cx.trace.events[0].action === "verify");
+}
+
+/* ===========================================================================
+ * GROUP 8: Windows-style paths.
+ * ========================================================================= */
+function groupWindowsPaths() {
+  console.log("\n=== GROUP 8: Windows-style paths ===");
+
+  const cc = parseClaudeCodeSession(readFixture("claude-code-windows-paths.jsonl"), { sourcePath: "/fixtures/claude-code-windows-paths.jsonl" });
+  report("8.1 windows: 3 events", cc.trace.events.length === 3);
+  report("8.2 windows: nested file resolves to posix-slash relative path (src/main.js)", cc.trace.events[0].targets.some((t) => t.path === "src/main.js"));
+  report("8.3 windows: deeper nested file resolves correctly (src/lib/util.js)", cc.trace.events[1].targets.some((t) => t.path === "src/lib/util.js"));
+  report("8.4 windows: cross-drive path is an outside touch, not silently dropped or mis-resolved", cc.trace.events[2].targets.length === 0 && Array.isArray(cc.trace.events[2].outside) && cc.trace.events[2].outside.length === 1);
+  report("8.5 windows: outside path is forward-slash normalized for display", cc.trace.events[2].outside[0].path === "D:/secrets/file.txt");
+
+  // Direct path.win32-vs-path.posix unit checks, host-OS independent (this
+  // suite may run on a Linux CI runner, but these assertions must hold
+  // regardless of the HOST platform, which is the whole point of this
+  // Windows-path handling -- see postmortem-classify.js's file header).
+  const r1 = classify.normalizePath("C:\\Users\\dev\\repo", "", "C:\\Users\\dev\\repo\\a\\b.txt");
+  report("8.6 normalizePath: win32 nested relative resolves to posix-slash form", r1.ok && r1.rel === "a/b.txt");
+  const r2 = classify.normalizePath("/repo", "", "/repo/a/b.txt");
+  report("8.7 normalizePath: posix nested relative still works (no regression from win32 support)", r2.ok && r2.rel === "a/b.txt");
+  // CodeRabbit review, PR #23, 2026-08-06 (CR-6, silently-dropped parent-
+  // relative paths): this used to assert ok:false -- the path was silently
+  // dropped from both targets and outside. That was itself the bug CR-6
+  // fixes (see GROUP 16's CR-6 cases for the primary regression coverage);
+  // updated here to assert the new, correct behavior: a cwd is available,
+  // so the path resolves against it and surfaces as an outside touch
+  // instead of vanishing with no trace, same as the POSIX case.
+  const r3 = classify.normalizePath("C:\\Users\\dev\\repo", "", "..\\..\\Windows\\System32\\cmd.exe");
+  report("8.8 normalizePath: win32 relative path escaping upward with a cwd resolves as an outside touch, not silently dropped", r3.ok === true && !!r3.outside && r3.outside.path === "C:/Users/Windows/System32/cmd.exe", JSON.stringify(r3));
+}
+
+/* ===========================================================================
+ * GROUP 9: Codex marks (compaction, subagent) -- bonus harness-specific
+ * coverage beyond the minimum list, since Codex's mark vocabulary is
+ * exercised differently than Claude Code's (event_msg vs tool_use).
+ * ========================================================================= */
+function groupCodexMarks() {
+  console.log("\n=== GROUP 9: Codex compaction + subagent marks ===");
+  const cx = parseCodexSession(readFixture("codex-marks.jsonl"), { sourcePath: "/fixtures/codex-marks.jsonl" });
+  report("9.1 codex marks: subagent mark for spawn_agent", cx.trace.marks.some((m) => m.type === "subagent" && m.note === "spawn_agent"));
+  report("9.2 codex marks: compaction mark for context_compacted", cx.trace.marks.some((m) => m.type === "compaction"));
+  report("9.3 codex marks: stats.compactions === 1, stats.subagents === 1", cx.trace.stats.compactions === 1 && cx.trace.stats.subagents === 1);
+}
+
+/* ===========================================================================
+ * GROUP 10: shell-command classification unit tests (exec-unless-provable
+ * discipline).
+ * ========================================================================= */
+function groupClassification() {
+  console.log("\n=== GROUP 10: shell-command classification ===");
+  report("10.1 verifyCommand: 'npm test' -> true", classify.verifyCommand("npm test") === true);
+  report("10.2 verifyCommand: 'go test ./...' -> true", classify.verifyCommand("go test ./...") === true);
+  report("10.3 verifyCommand: extension list includes jest (disclosed GraphSmith addition)", classify.verifyCommand("jest --ci") === true);
+  report("10.4 verifyCommand: unrelated command -> false", classify.verifyCommand("echo hello") === false);
+  report("10.5 searchCommand: 'grep -rn foo .' -> true", classify.searchCommand("grep -rn foo .") === true);
+  report("10.6 searchCommand: 'find . -name x -delete' -> false (mutating find)", classify.searchCommand("find . -name x -delete") === false);
+  report("10.7 searchCommand: unrecognized program -> false (conservative default)", classify.searchCommand("some-random-tool --scan") === false);
+  report("10.8 readCommand: 'cat foo.txt' -> true", classify.readCommand("cat foo.txt") === true);
+  report("10.9 readCommand: redirect present -> false", classify.readCommand("cat foo.txt > bar.txt") === false);
+  report("10.10 readCommand: 'sed -i' (mutating) -> false", classify.readCommand("sed -i s/a/b/ foo.txt") === false);
+  report("10.11 exec-unless-provable: rm/unknown program -> exec, not search/read/verify", classify.actionFor("Bash", { command: "rm -rf build" }, "") === "exec");
+  report("10.12 exec-unless-provable: mixed pipeline (grep | rm) -> exec, not search", classify.actionFor("Bash", { command: "grep foo file.txt | rm" }, "") === "exec");
+}
+
+/* ===========================================================================
+ * GROUP 11: CLI subcommand (scripts/graphsmith-cli.js postmortem).
+ * ========================================================================= */
+function runCli(args) {
+  return cp.spawnSync(process.execPath, [CLI, "postmortem", ...args], { encoding: "utf8" });
+}
+
+function groupCli() {
+  console.log("\n=== GROUP 11: `graphsmith postmortem` CLI subcommand ===");
+
+  const noArgs = runCli([]);
+  report("11.1 no args: usage printed, exit 2", noArgs.status === 2 && /usage: graphsmith postmortem/.test(noArgs.stderr));
+  report("11.2 no args: usage explicitly distinguishes from `audit replay`", /audit replay/.test(noArgs.stderr));
+
+  const ccPath = path.join(FIXTURES, "claude-code-normal.jsonl");
+  const stdoutRun = runCli([ccPath]);
+  report("11.3 stdout run: exit 0", stdoutRun.status === 0);
+  report("11.4 stdout run: Markdown report on stdout", /^# Session post-mortem — claude-code/.test(stdoutRun.stdout));
+
+  const dir = tmpDir("cli-out");
+  try {
+    const outPath = path.join(dir, "report.md");
+    const outRun = runCli([ccPath, "--out", outPath]);
+    report("11.5 --out run: exit 0", outRun.status === 0);
+    report("11.6 --out run: file written", fs.existsSync(outPath));
+    if (fs.existsSync(outPath)) {
+      const content = fs.readFileSync(outPath, "utf8");
+      report("11.7 --out file content matches stdout rendering", content === stdoutRun.stdout);
+    } else {
+      report("11.7 --out file content matches stdout rendering", null, "file was not written");
+    }
+
+    const forcedCodex = runCli([ccPath, "--harness", "codex"]);
+    report("11.8 --harness mismatch: exits non-zero with a clear error, not a silent wrong guess", forcedCodex.status !== 0 && /not recognized as a codex session/.test(forcedCodex.stderr));
+
+    const badHarness = runCli([ccPath, "--harness", "gemini-cli"]);
+    report("11.9 --harness invalid value: exits non-zero with a clear error", badHarness.status !== 0 && /--harness must be one of/.test(badHarness.stderr));
+
+    const codexPath = path.join(FIXTURES, "codex-normal.jsonl");
+    const autoCodex = runCli([codexPath]);
+    report("11.10 auto-detect: codex fixture is recognized without --harness", autoCodex.status === 0 && /^# Session post-mortem — codex/.test(autoCodex.stdout));
+
+    const missing = runCli([path.join(dir, "does-not-exist.jsonl")]);
+    report("11.11 missing file: exits non-zero with a readable error, not a stack trace to the user", missing.status !== 0 && /cannot read/.test(missing.stderr) && !/at Object/.test(missing.stderr));
+  } finally {
+    cleanup(dir);
+  }
+}
+
+/* ===========================================================================
+ * GROUP 12: determinism -- same input, byte-identical output, twice.
+ * ========================================================================= */
+function groupDeterminism() {
+  console.log("\n=== GROUP 12: determinism ===");
+  const text = readFixture("claude-code-normal.jsonl");
+  const a = parseClaudeCodeSession(text, { sourcePath: "/fixtures/x.jsonl" });
+  const b = parseClaudeCodeSession(text, { sourcePath: "/fixtures/x.jsonl" });
+  report("12.1 CC adapter: identical input -> byte-identical trace JSON", JSON.stringify(a.trace) === JSON.stringify(b.trace));
+  const mdA = renderMarkdown(a.trace, a.diagnostics);
+  const mdB = renderMarkdown(b.trace, b.diagnostics);
+  report("12.2 renderer: identical trace -> byte-identical Markdown", mdA === mdB);
+
+  const cxText = readFixture("codex-normal.jsonl");
+  const cxA = parseCodexSession(cxText, { sourcePath: "/fixtures/y.jsonl" });
+  const cxB = parseCodexSession(cxText, { sourcePath: "/fixtures/y.jsonl" });
+  report("12.3 Codex adapter: identical input -> byte-identical trace JSON", JSON.stringify(cxA.trace) === JSON.stringify(cxB.trace));
+}
+
+/* ===========================================================================
+ * GROUP 13: buildPostmortem/runPostmortem programmatic API sanity.
+ * ========================================================================= */
+function groupProgrammaticApi() {
+  console.log("\n=== GROUP 13: programmatic API (postmortem.js) ===");
+  const ccPath = path.join(FIXTURES, "claude-code-normal.jsonl");
+  const { trace, harness } = buildPostmortem(ccPath);
+  report("13.1 buildPostmortem: auto-detects claude-code", harness === "claude-code");
+  report("13.2 buildPostmortem: sourcePath is absolute", path.isAbsolute(trace.session.sourcePath));
+
+  const { markdown } = runPostmortem(ccPath, { harness: "claude-code" });
+  report("13.3 runPostmortem: forced harness matches auto-detected result", typeof markdown === "string" && markdown.length > 0);
+
+  let threw = false;
+  try {
+    buildPostmortem(path.join(FIXTURES, "does-not-exist.jsonl"));
+  } catch (e) {
+    threw = /cannot read/.test(e.message);
+  }
+  report("13.4 buildPostmortem: missing file throws a readable error", threw === true);
+}
+
+/* ===========================================================================
+ * GROUP 14: adversarial-review regressions (2026-08-06) -- F1 (duplicate
+ * tool_use id), F2 (mark seq stream-position semantics), F8 (Markdown
+ * escaping of mark notes).
+ * ========================================================================= */
+function groupAdversarialRegressions() {
+  console.log("\n=== GROUP 14: adversarial-review regressions (F1, F2, F8) ===");
+
+  // F1: a second tool_use reusing an id still pending (no tool_result yet)
+  // used to overwrite the pending-map entry, silently losing the FIRST
+  // call forever -- the eventual tool_result would resolve against the
+  // SECOND call's data instead. Fixture issues toolu_dup for a.txt, then
+  // again (duplicate id) for b.txt, before any result arrives; the single
+  // tool_result should pair with the first (a.txt) call.
+  {
+    const cc = parseClaudeCodeSession(readFixture("claude-code-duplicate-id.jsonl"), { sourcePath: "/fixtures/claude-code-duplicate-id.jsonl" });
+    report("14.1 F1: exactly 1 event produced for the duplicated id (not 0, not 2)", cc.trace.events.length === 1, `got ${cc.trace.events.length}`);
+    report(
+      "14.2 F1: the surviving event is the FIRST call (a.txt), not the duplicate second call (b.txt) that overwrote it pre-fix",
+      cc.trace.events.length === 1 && cc.trace.events[0].targets.some((t) => t.path === "a.txt"),
+      cc.trace.events[0] && JSON.stringify(cc.trace.events[0].targets)
+    );
+  }
+
+  // F2: a subagent mark issued while earlier tool_use calls are still
+  // unresolved must report how many calls have been ISSUED so far (stream
+  // position), not how many have already RESOLVED -- otherwise a mark that
+  // truly happened after 2 calls were issued looks like it happened after
+  // 0. Fixture: t1 (Task) + t2 (Bash) issued together, then t3 (Agent)
+  // issued alone while t1/t2 are still pending, then all three resolve.
+  {
+    const cc = parseClaudeCodeSession(readFixture("claude-code-mark-seq.jsonl"), { sourcePath: "/fixtures/claude-code-mark-seq.jsonl" });
+    const subagentMarks = cc.trace.marks.filter((m) => m.type === "subagent");
+    report("14.3 F2: two subagent marks recorded (t1 and t3)", subagentMarks.length === 2, JSON.stringify(subagentMarks));
+    report("14.4 F2: first subagent mark (t1, nothing yet issued before it) has seq 0", subagentMarks[0] && subagentMarks[0].seq === 0);
+    report(
+      "14.5 F2: second subagent mark (t3, issued after t1+t2 were already issued but before either resolved) has seq 2 -- stream position, not the 0 a completed-count semantic would have given pre-fix",
+      subagentMarks[1] && subagentMarks[1].seq === 2,
+      subagentMarks[1] && String(subagentMarks[1].seq)
+    );
+  }
+
+  // F8: a mark note is untrusted text and gets embedded into a Markdown
+  // `"..."` span (see postmortem-render.js's escapeMarkNote). A note
+  // containing a literal quote, an embedded newline, and a triple-backtick
+  // fence must not leak through unescaped -- the quote would visually break
+  // out of the span, the newline would inject a spurious extra line into a
+  // single-bullet timeline, and the triple-backtick could open a fenced
+  // code block that swallows the rest of the rendered document.
+  {
+    const trace = {
+      session: { harness: "claude-code" },
+      events: [],
+      marks: [{ seq: 0, type: "user-message", note: 'say "hi"\nthen ```break the doc```' }],
+      stats: {
+        actions: { search: 0, read: 0, edit: 0, exec: 0, verify: 0, other: 0 },
+        errors: { search: 0, read: 0, edit: 0, exec: 0, verify: 0, other: 0 },
+        touched: 0,
+        edited: 0,
+        churnFiles: 0,
+        eventsBeforeFirstEdit: 0,
+        errorRate: 0,
+        editsAfterLastVerify: 0,
+        observability: { repoSize: "unavailable" },
+      },
+    };
+    const md = renderMarkdown(trace, {});
+    const markLine = md.split("\n").find((l) => l.includes("user turn"));
+    report("14.6 F8: rendered mark line has no raw newline injected from the note (still one line)", !!markLine && !markLine.includes("\nthen"));
+    report("14.7 F8: embedded double-quote is escaped, not left raw breaking out of the span", !!markLine && markLine.includes('\\"hi\\"') && !markLine.includes('"hi"'));
+    report("14.8 F8: triple-backtick fence is escaped, not left as a live code-fence opener", !!markLine && !markLine.includes("```"));
+    // The fenced block, if left unescaped, would swallow everything after it
+    // in the document -- confirm the trailing "Note:" lines the renderer
+    // always appends still show up as literal text in the output.
+    report("14.9 F8: content after the note is not swallowed by an unclosed code fence", md.includes('Note: "verify" means'));
+  }
+}
+
+/* ===========================================================================
+ * GROUP 15: fresh Grok review round 2 regressions (2026-08-06) -- Findings
+ * 1-12 from the independent post-fix re-review of Lane F. Each assertion
+ * below was individually verified via `git stash` isolation (source fix
+ * stashed, test still present) to FAIL against the pre-fix code and PASS
+ * against the fix, before being folded into this permanent suite.
+ * ========================================================================= */
+function groupFreshReviewRound2() {
+  console.log("\n=== GROUP 15: fresh Grok review round 2 regressions (Findings 1-12) ===");
+
+  // Finding 1 (CRITICAL): a real tool_use id reused AFTER its first
+  // occurrence already resolved, with the second occurrence still pending
+  // at EOF, used to be double-emitted (pendingOrder held the id twice, the
+  // EOF loop never removed a resolved-from-`pending` key after emitting).
+  {
+    const cc = parseClaudeCodeSession(readFixture("claude-code-eof-reuse.jsonl"), { sourcePath: "/fixtures/claude-code-eof-reuse.jsonl" });
+    report("15.1 F1: exactly 2 events (Bash resolved + Read pending-at-EOF), not 3", cc.trace.events.length === 2, `got ${cc.trace.events.length}`);
+    report("15.2 F1: the pending-at-EOF Read event appears exactly once", cc.trace.events.filter((e) => e.tool === "Read").length === 1);
+  }
+
+  // Finding 3 (HIGH): session-level cwd used to be captured from an
+  // isSidechain:true line BEFORE the sidechain skip check ran, letting a
+  // subagent's own cwd poison the root session's cwd for every later event.
+  {
+    const cc = parseClaudeCodeSession(readFixture("claude-code-sidechain-cwd-poison.jsonl"), { sourcePath: "/fixtures/claude-code-sidechain-cwd-poison.jsonl" });
+    report("15.3 F3: root session cwd is the ROOT line's cwd (/repo), not the sidechain line's", cc.trace.session.cwd === "/repo", cc.trace.session.cwd);
+    const rootEvent = cc.trace.events.find((e) => e.tool === "Read" && e.ts === "2026-08-06T11:00:03Z");
+    report("15.4 F3: the root Read resolves in-repo (main.js), not misclassified outside due to a poisoned cwd", !!rootEvent && rootEvent.targets.some((t) => t.path === "main.js"), rootEvent && JSON.stringify(rootEvent));
+  }
+
+  // Finding 11 (HIGH, elevated from Grok's own LOW): verifyCommand's plain
+  // substring matching against short tokens ("jest", "tox") matched inside
+  // ordinary filenames.
+  {
+    report("15.5 F11: 'cat jest.config.js' is NOT verify-shaped (was a false positive)", classify.verifyCommand("cat jest.config.js") === false);
+  report("15.6 F11: 'cat tox.ini' is NOT verify-shaped (was a false positive)", classify.verifyCommand("cat tox.ini") === false);
+  report("15.7 F11: 'npx jest --ci' IS still verify-shaped (real invocation, no regression)", classify.verifyCommand("npx jest --ci") === true);
+  report("15.8 F11: 'tox -e py39' IS still verify-shaped (real invocation, no regression)", classify.verifyCommand("tox -e py39") === true);
+  }
+
+  // Finding 2 (HIGH): a Codex call_id reused after its first occurrence
+  // resolved used to be silently dropped forever (`if (calls.has(id)) break;`).
+  {
+    const codexLines = [
+      { timestamp: "2026-08-06T12:00:00Z", type: "session_meta", payload: { id: "codex-dup-1", session_id: "codex-dup-1", cwd: "/repo" } },
+      { timestamp: "2026-08-06T12:00:01Z", type: "response_item", payload: { type: "function_call", id: "fc-1", call_id: "call-dup", name: "exec_command", arguments: JSON.stringify({ cmd: "echo hi", workdir: "/repo" }) } },
+      { timestamp: "2026-08-06T12:00:02Z", type: "response_item", payload: { type: "function_call_output", call_id: "call-dup", output: "hi" } },
+      { timestamp: "2026-08-06T12:00:03Z", type: "
