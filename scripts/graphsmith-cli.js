@@ -4,6 +4,16 @@
  * bundle and exits non-zero on any violation — a fail-closed trust tool for CI / enterprise verifiers.
  * A PASS asserts only that the bundle is a complete, hash-valid, signature-valid, UNALTERED record —
  * NOT that the workflow is safe/correct/compliant. Zero-dep CJS, Node >= 18.
+ *
+ * Merge note (2026-08-07): this file reconciles two branches that both touched it independently
+ * after diverging from the same base (v0.5.0 Wave 1 / Lane B, commit 42579ad) --
+ * `gsa-followup/lane-f-coderabbit-fixes` (merged to main as #23/#24, added `postmortem`) and
+ * `gsa-followup/lane-e-audit-replay` (this branch, adds `audit replay`). Rebased Lane E onto
+ * current main (f3fb973) and combined both subcommands here; neither command's own logic changed
+ * in this merge -- cmdPostmortem is byte-for-byte main's version (including the CR-18 EISDIR
+ * try/catch), cmdAuditReplay/cmdAudit/auditReplayUsage/renderAuditReplayHuman are byte-for-byte
+ * Lane E's version. Only shared scaffolding (requires, main()'s dispatch table, the top-level
+ * usage string) was hand-merged to carry both.
  */
 "use strict";
 const fs = require("fs");
@@ -11,6 +21,7 @@ const path = require("path");
 const { verifyBundle } = require("./gsa-verify.js");
 const { runPostmortem } = require("./postmortem.js");
 const { writeReport } = require("./write-report.js");
+const { composeReport, validateVerifyResultShape } = require("./gsa-audit-replay.js");
 
 function readJson(p, label) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); }
@@ -170,12 +181,128 @@ function cmdPostmortem(args) {
   process.exit(0);
 }
 
+/* `graphsmith audit replay <bundle.json> [options]` — Lane E (GSA follow-up track).
+ * A NARRATION layer over verifyBundle() (gsa-verify.js) and replayBundle()/planDrift()
+ * (gsa-plan.js) — see scripts/gsa-audit-replay.js for the report composer and
+ * .plans/gsa-followup/LANE-E-AUDIT-REPLAY-DESIGN.md for the frozen design. This
+ * subcommand and gsa-audit-replay.js never import Node's built-in crypto module and never re-derive
+ * any of verifyBundle's §9 comparison logic (enforced by tests/audit-replay/run-tests.js
+ * GROUP 0, a real executable lint check, not just this comment).
+ */
+function auditReplayUsage() {
+  console.error(
+    "usage: graphsmith audit replay <bundle.json> [options]\n" +
+    "  --keys <trusted-keys.json>   Same shape as `verify`. Without it, provenance_signing\n" +
+    "                                renders unavailable for authenticity, same as `verify` does.\n" +
+    "  --revoked <hashes.json>      Same shape as `verify`.\n" +
+    "  --diff <prior-bundle.json>   Enables the drift section (planDrift). Optional.\n" +
+    "  --lens <skill_id>            Filter skills_lens to one skill_id. Optional.\n" +
+    "  --json                       Emit the full machine-readable report\n" +
+    "                                (schemas/audit-replay-report.schema.json). Default is a\n" +
+    "                                human-readable rendering in the existing §9.x step/status/note house style.\n" +
+    "  --no-verify                  Accept a precomputed verify_result as JSON on stdin instead of\n" +
+    "                                running verifyBundle() live. Sets verification_provenance to\n" +
+    "                                \"external\" — every dimension renders unavailable regardless of\n" +
+    "                                the supplied result's content. For CI pipelines that already ran\n" +
+    "                                `verify` and don't want to pay for it twice; NOT a way to get a\n" +
+    "                                \"verified\" report without a real verify."
+  );
+}
+
+function renderAuditReplayHuman(report) {
+  console.log("graphsmith audit replay — " + report.bundle_id);
+  console.log("mode=" + report.mode + "  asserted-profiles=[" + report.asserted_profiles.join(",") + "]  tool=" + report.tool.name + "@" + report.tool.version);
+  console.log("verification_provenance=" + report.verification_provenance + "  verify_result.status=" + report.verify_result.status);
+  console.log("");
+  for (const s of report.verify_result.steps) console.log("  [" + s.status + "] " + s.step + (s.detail ? " — " + s.detail : ""));
+  console.log("");
+  console.log("  replay: reproducible=" + report.replay_result.reproducible + " deterministic_confirmed=" + report.replay_result.deterministic_confirmed +
+    " mismatches=" + report.replay_result.mismatches.length + " non_replayable=" + report.replay_result.non_replayable.length);
+  console.log("");
+  console.log("  dimension                     status        reason");
+  console.log("  --------------------------------------------------------------------------");
+  for (const d of report.dimensions) console.log("  " + d.id.padEnd(28) + " [" + d.status + "]" + (d.reason ? " — " + d.reason : ""));
+  console.log("  --------------------------------------------------------------------------");
+  console.log("");
+  console.log("  marks: " + report.marks.length + " occurrence(s)   skills_lens: " + report.skills_lens.length + " skill(s)");
+  if (report.drift) {
+    console.log("  drift: " + (report.drift.safe ? "no destructive changes" : report.drift.destructive.length + " destructive change(s)") +
+      " (added=" + report.drift.added.length + " removed=" + report.drift.removed.length + " changed=" + report.drift.changed.length + ")");
+  }
+  console.log("");
+  console.log(report.narrative);
+}
+
+function cmdAuditReplay(args) {
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const bundlePath = positional[0];
+  if (!bundlePath) { auditReplayUsage(); process.exit(2); }
+  const bundle = readJson(bundlePath, "bundle");
+
+  const opts = {};
+  const keysAt = args.indexOf("--keys");
+  if (keysAt !== -1) opts.trustedKeys = readJson(args[keysAt + 1], "keys");
+  const revAt = args.indexOf("--revoked");
+  if (revAt !== -1) { const r = readJson(args[revAt + 1], "revoked"); opts.revoked = new Set(Array.isArray(r) ? r : []); }
+  const diffAt = args.indexOf("--diff");
+  const prevBundle = diffAt !== -1 ? readJson(args[diffAt + 1], "prior bundle") : undefined;
+  const lensAt = args.indexOf("--lens");
+  const lens = lensAt !== -1 ? args[lensAt + 1] : undefined;
+  const noVerify = args.includes("--no-verify");
+
+  let verificationProvenance, verifyResult;
+  if (noVerify) {
+    verificationProvenance = "external";
+    let raw;
+    try { raw = fs.readFileSync(0, "utf8"); }
+    catch (e) { console.error("graphsmith: --no-verify requires a verify_result JSON document on stdin: " + e.message); process.exit(2); }
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) { console.error("graphsmith: --no-verify stdin is not valid JSON: " + e.message); process.exit(2); }
+    const shapeErr = validateVerifyResultShape(parsed);
+    if (shapeErr) { console.error("graphsmith: malformed verify_result on stdin: " + shapeErr); process.exit(2); }
+    verifyResult = parsed;
+  } else {
+    verificationProvenance = "live";
+    verifyResult = verifyBundle(bundle, opts);
+  }
+
+  let report;
+  try {
+    report = composeReport({
+      bundle,
+      verificationProvenance,
+      verifyResult,
+      prevBundle,
+      lens,
+      generated: "unavailable", // no clock read in the decision path; the CLI has no data-supplied timestamp flag
+      toolVersion: require("../package.json").version,
+    });
+  } catch (e) {
+    console.error("graphsmith: audit replay failed — " + (e && e.message ? e.message : String(e)));
+    process.exit(2);
+  }
+
+  if (args.includes("--json")) console.log(JSON.stringify(report, null, 2));
+  else renderAuditReplayHuman(report);
+
+  process.exit(verificationProvenance === "live" && verifyResult.status === "PASS" ? 0 : 1);
+}
+
+function cmdAudit(args) {
+  const [sub, ...rest] = args;
+  if (sub === "replay") return cmdAuditReplay(rest);
+  console.error("usage: graphsmith audit replay <bundle.json> [options]");
+  process.exit(sub ? 1 : 2);
+}
+
 function main(argv) {
   const [cmd, ...rest] = argv;
   if (cmd === "verify") return cmdVerify(rest);
   if (cmd === "postmortem") return cmdPostmortem(rest);
+  if (cmd === "audit") return cmdAudit(rest);
   if (cmd === "--version" || cmd === "-v") { console.log(require("../package.json").version); return process.exit(0); }
-  console.error("graphsmith <command>\n\n  verify <bundle.json>             verify a GSA attestation bundle (fail-closed)\n  postmortem <session.jsonl>       mechanical plain-English post-mortem of a raw\n                                    Claude Code / Codex coding-session log\n  --version                        print the package version\n");
+  console.error("graphsmith <command>\n\n  verify <bundle.json>             verify a GSA attestation bundle (fail-closed)\n  postmortem <session.jsonl>       mechanical plain-English post-mortem of a raw\n                                    Claude Code / Codex coding-session log\n  audit replay <bundle.json>       narrate an already-produced GSA bundle (verify +\n                                    replay + drift), never re-derives trust\n  --version                        print the package version\n");
   process.exit(cmd ? 1 : 1);
 }
 
