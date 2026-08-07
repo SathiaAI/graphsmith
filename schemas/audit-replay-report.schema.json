@@ -19,7 +19,7 @@
     },
     "bundle_id": { "type": "string", "pattern": "^gsa-[0-9a-f]{16}$" },
     "generated": {
-      "description": "UTC timestamp the report was produced, or 'unavailable' -- no clock read in the decision path. [Fixed per adversarial review -- HIGH: the first draft used `oneOf` here, which is broken under draft 2020-12's default (non-format-asserting) semantics -- confirmed by running the schema through Python's jsonschema.Draft202012Validator, which correctly rejects 'unavailable' as matching BOTH oneOf branches simultaneously, since `format` is annotation-only unless a validator opts into format-assertion. Fixed by switching to `anyOf`, which only requires at least one branch to match and has no exclusivity requirement.",
+      "description": "UTC timestamp the report was produced, or 'unavailable' -- no clock read in the decision path. [Fixed per adversarial review -- HIGH: the first draft used `oneOf` here, which is broken under draft 2020-12's default (non-format-asserting) semantics -- confirmed by running the schema through Python's jsonschema.Draft202012Validator, which correctly rejects 'unavailable' as matching BOTH oneOf branches simultaneously, since `format` is annotation-only unless a validator opts into format-assertion. Fixed by switching to `anyOf`, which only requires at least one branch to match and has no exclusivity requirement.]",
       "anyOf": [
         { "type": "string", "const": "unavailable" },
         { "type": "string", "format": "date-time" }
