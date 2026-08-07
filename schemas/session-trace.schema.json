@@ -52,6 +52,7 @@
           },
           "resultBytes": { "type": "integer", "minimum": 0 },
           "isError": { "type": "boolean" },
+          "unresolved": { "type": "boolean", "description": "true when this call never received a matching result before the session log ended -- its isError:false is NOT a confirmed non-error, just the absence of any result. Omitted (not written as false) for a normally-resolved event. When any event in a trace has this set, stats.observability.errors is downgraded to 'estimated' even for a harness that otherwise reports a structural error flag." },
           "summary": { "type": "string", "description": "One-line, mechanically generated description of the call -- never free prose." }
         }
       }

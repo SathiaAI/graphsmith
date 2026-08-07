@@ -210,8 +210,15 @@ function parseCodexSession(text, opts) {
   const patchResults = new Map();
   let dupCallCounter = 0; // Finding 2 -- see the response_item/decodeCall branch below
 
+  // CodeRabbit review, PR #23, 2026-08-06 (session metadata copied without
+  // type checks): `ts` used to be accepted on a bare truthy check --
+  // a malformed/adversarial log line with e.g. a NUMERIC `timestamp` would
+  // pass and get copied verbatim into session.startedAt/endedAt (both
+  // schema'd as string date-time fields). Requiring typeof === "string"
+  // here mirrors the same guard added to every other session-metadata
+  // capture site in this file and in postmortem-claude-code.js.
   const applyLineTime = (ts) => {
-    if (!ts) return;
+    if (typeof ts !== "string" || !ts) return;
     if (!startedAt) startedAt = ts;
     endedAt = ts;
   };
@@ -244,21 +251,40 @@ function parseCodexSession(text, opts) {
         if (payload && typeof payload === "object") {
           const firstSessionMeta = !sawSessionMeta;
           sawSessionMeta = true;
+          // CodeRabbit review, PR #23, 2026-08-06 (session metadata copied
+          // without type checks): every field below used to be copied on a
+          // bare truthy guard -- a malformed/adversarial log with e.g. a
+          // NUMERIC or OBJECT payload.cwd would pass and reach session.cwd,
+          // then flow into buildEvent/the path classifier for every later
+          // event (normalizePath assumes a string), potentially
+          // misclassifying every target in the session. Every capture here
+          // now also requires typeof === "string". sessionId was already
+          // first-wins here (gated on firstSessionMeta); that direction is
+          // unchanged, just now type-checked -- see
+          // postmortem-claude-code.js's matching metadata-capture block for
+          // the same fix applied to the Claude Code adapter, including
+          // that file's own sessionId direction note.
           if (firstSessionMeta) {
-            sessionId = payload.id || payload.session_id || sessionId;
+            const idCandidate =
+              (typeof payload.id === "string" && payload.id) ||
+              (typeof payload.session_id === "string" && payload.session_id) ||
+              "";
+            if (idCandidate) sessionId = idCandidate;
           }
-          if (payload.cwd && !cwd) cwd = payload.cwd;
-          if (payload.git && payload.git.commit_hash && !commit) commit = payload.git.commit_hash;
-          if (payload.git && payload.git.branch && !gitBranch) gitBranch = payload.git.branch;
-          if (payload.timestamp && !startedAt) startedAt = payload.timestamp;
+          if (typeof payload.cwd === "string" && payload.cwd && !cwd) cwd = payload.cwd;
+          if (payload.git && typeof payload.git.commit_hash === "string" && payload.git.commit_hash && !commit) commit = payload.git.commit_hash;
+          if (payload.git && typeof payload.git.branch === "string" && payload.git.branch && !gitBranch) gitBranch = payload.git.branch;
+          if (typeof payload.timestamp === "string" && payload.timestamp && !startedAt) startedAt = payload.timestamp;
         }
         break;
       }
       case "turn_context": {
         recognized = true;
         if (payload && typeof payload === "object") {
-          if (payload.cwd && !cwd) cwd = payload.cwd;
-          if (payload.model && !model) model = payload.model;
+          // CodeRabbit review, PR #23, 2026-08-06 -- same type-check fix as
+          // session_meta above.
+          if (typeof payload.cwd === "string" && payload.cwd && !cwd) cwd = payload.cwd;
+          if (typeof payload.model === "string" && payload.model && !model) model = payload.model;
         }
         break;
       }
@@ -339,7 +365,25 @@ function parseCodexSession(text, opts) {
       }
       case "":
       case undefined: {
-        if (line.id) {
+        // CodeRabbit review, PR #23, 2026-08-06 (Codex bare-id over-
+        // recognition): mirrors an already-fixed Claude Code issue
+        // (Finding 12 in postmortem-claude-code.js's isClaudeLine: a bare
+        // sessionId alone was too weak a signal on its own). A type-less
+        // line with only `{"id": "foreign-1"}` used to set recognized =
+        // true with ZERO other validation -- any unrelated JSONL file that
+        // happens to have a top-level `id` string field on some line (many
+        // do) risked being auto-detected as a Codex session log. Since
+        // postmortem.js's harness auto-detection races both adapters and
+        // returns on the FIRST one to report recognized, a false positive
+        // here means a non-Codex file gets silently parsed by the wrong
+        // adapter instead of surfacing a clear "could not recognize" error.
+        // Require the line to ALSO carry a `payload` object -- every real
+        // Codex line type this adapter understands (session_meta,
+        // turn_context, response_item, event_msg) nests its actual content
+        // under `payload`, so requiring one here is a real structural
+        // signal, not an arbitrary extra hurdle. `sessionId` is still
+        // captured from a type-less line that otherwise looks legitimate.
+        if (typeof line.id === "string" && line.id && line.payload && typeof line.payload === "object" && !Array.isArray(line.payload)) {
           recognized = true;
           sessionId = line.id;
         }

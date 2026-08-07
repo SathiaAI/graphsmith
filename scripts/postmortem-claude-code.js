@@ -145,9 +145,48 @@ function parseClaudeCodeSession(text, opts) {
   let startedAt = "";
   let endedAt = "";
 
-  const pending = new Map(); // id -> {id, name, input, timestamp}
-  const pendingOrder = [];
-  let noIdCounter = 0; // Finding 8 -- see the tool_use branch below
+  // CodeRabbit review, PR #23, 2026-08-06 (P1, event ordering): `pending`
+  // now maps a call key to the OCCURRENCE object for that call (not the bare
+  // call data) and `pendingOrder` holds those occurrence objects themselves,
+  // in call-ISSUANCE order -- not just their keys. Before this fix, a
+  // resolved call was pushed straight into `events[]` the instant its
+  // tool_result arrived, so the final events[] order reflected RESOLUTION
+  // order, not issuance order: a call issued first (A) that happened to
+  // resolve after a call issued second (B) that resolved sooner ended up
+  // positioned AFTER B in events[]. Since eventsBeforeFirstEdit and
+  // editsAfterLastVerify (postmortem-classify.js's computeStats) both trust
+  // events[] order via each event's own seq, this could invert the report's
+  // core "did you verify after your last edit" narrative. Fix: never push
+  // to events[] at resolution time; instead record the result onto the
+  // occurrence object, and build events[] in one pass over `pendingOrder`
+  // (issuance order) after the main parse loop, mirroring how
+  // postmortem-codex.js's parseCodexSession already builds its own events[]
+  // from callOrder/calls/results. Each occurrence object is a distinct
+  // reference even when a real id is legitimately reused after its first
+  // occurrence resolved (a NEW occurrence object is pushed for the reuse,
+  // per the tool_use branch below) -- so this also structurally subsumes
+  // the old by-key EOF-flush loop (formerly "Finding 1", adversarial
+  // review, fresh Grok pass, 2026-08-06) that had to guard against a
+  // reused key appearing twice in pendingOrder: that guard is no longer
+  // needed because pendingOrder no longer holds bare keys that could repeat
+  // and require de-duplication, it holds unique occurrence objects.
+  const pending = new Map(); // key -> occurrence {key, call, result}, only while unresolved
+  const pendingOrder = []; // occurrence objects, in call-issuance order
+  // CodeRabbit review, PR #23, 2026-08-06 (id-less-call key collision
+  // risk): Finding 8's fix (below, in the tool_use branch) gave each
+  // id-less call its own synthetic STRING key (`__no-id-${noIdCounter++}`)
+  // so id-less calls wouldn't collide with each other. But a real
+  // harness-provided tool_use.id could theoretically BE that literal
+  // string ("__no-id-0", etc.) -- an adversarial or coincidentally-shaped
+  // log could then collide a real id with a synthetic one on the Map key,
+  // wrongly treating the real call as a "duplicate" of an unrelated
+  // id-less call. `pending`/`openByKey` here is a Map, which supports
+  // non-string keys natively, so id-less calls now key off a fresh
+  // Symbol() per call instead (see the tool_use branch below) -- a Symbol
+  // is guaranteed unique and a real string id can provably never equal
+  // one, closing the collision class entirely rather than just narrowing
+  // it. noIdCounter is no longer needed (Symbol() is unique on its own,
+  // no counter required to make it so).
 
   const rawLines = String(text).split("\n");
   for (let rawIdx = 0; rawIdx < rawLines.length; rawIdx++) {
@@ -186,10 +225,30 @@ function parseClaudeCodeSession(text, opts) {
     // session state" principle already applied to marks/events below.
     if (line.isSidechain === true) continue; // see file header note
 
-    if (line.sessionId) sessionId = line.sessionId;
-    if (line.cwd && !cwd) cwd = line.cwd;
-    if (line.gitBranch && !gitBranch) gitBranch = line.gitBranch;
-    if (line.timestamp) {
+    // CodeRabbit review, PR #23, 2026-08-06 (session metadata copied
+    // without type checks): these four fields used to be copied on a bare
+    // truthy guard only (`if (line.cwd && !cwd) cwd = line.cwd;`) -- a
+    // malformed/adversarial log line with e.g. a NUMERIC or OBJECT `cwd`
+    // would pass the truthy check and reach session.cwd, then flow into
+    // buildEvent/the path classifier for every later event, potentially
+    // misclassifying every target in the session (normalizePath assumes a
+    // string). Every capture below now also requires typeof === "string".
+    //
+    // sessionId specifically also changes from LAST-value-wins to
+    // FIRST-value-wins here: `if (line.sessionId) sessionId = line.sessionId;`
+    // (no `!sessionId` guard) meant every later line with a truthy
+    // sessionId overwrote the one before it. A session's true id should
+    // not change mid-log -- Codex's session_meta handling already treats
+    // its own id fields as first-wins (see postmortem-codex.js's
+    // `firstSessionMeta` gate) -- so this now matches that: first
+    // valid-string sessionId seen wins, later ones are ignored. No fixture
+    // in this repo actually varies sessionId within one file, so this is a
+    // pure correctness fix, not a behavior change any existing case relied
+    // on the old direction for.
+    if (typeof line.sessionId === "string" && line.sessionId && !sessionId) sessionId = line.sessionId;
+    if (typeof line.cwd === "string" && line.cwd && !cwd) cwd = line.cwd;
+    if (typeof line.gitBranch === "string" && line.gitBranch && !gitBranch) gitBranch = line.gitBranch;
+    if (typeof line.timestamp === "string" && line.timestamp) {
       if (!startedAt) startedAt = line.timestamp;
       endedAt = line.timestamp;
     }
@@ -248,11 +307,42 @@ function parseClaudeCodeSession(text, opts) {
         // tool_use_id to match against a real key), so it will surface in
         // the report unresolved (flushed at EOF) rather than silently
         // disappearing OR being guess-matched to an unrelated result.
-        const callKey = item.id || `__no-id-${noIdCounter++}`;
+        //
+        // CodeRabbit review, PR #23, 2026-08-06 (id-less-call key collision
+        // risk): Finding 8's synthetic key used to be a STRING
+        // (`__no-id-${noIdCounter++}`) -- a real harness-provided
+        // tool_use.id could theoretically literally equal that format
+        // ("__no-id-0"), colliding with a synthetic key on the Map and
+        // wrongly triggering the dedup check above as if it were a
+        // duplicate of an unrelated call. A Symbol() is a value no string
+        // (however adversarially chosen) can ever equal, so it closes this
+        // collision class entirely rather than just making it unlikely.
+        // Only `pending`/`pendingOrder`/the occurrence's own `.key` field
+        // ever see this key -- it is never concatenated into a string or
+        // JSON.stringify-ed itself (only the call OBJECT is, via
+        // buildEvent), so a non-string Map key is safe here.
+        const callKey = item.id || Symbol("no-id");
         if (pending.has(callKey)) continue;
+        // CodeRabbit review, PR #23, 2026-08-06 (missing/non-string
+        // tool_use name): if `item.name` were passed through as-is when
+        // missing or non-string, buildEvent would end up emitting
+        // `tool: undefined` -- violating the schema's required-string
+        // events[].tool field, and, worse, JSON.stringify silently DROPS
+        // an object property whose value is undefined, so a JSON consumer
+        // of the trace would see an event object missing its `tool` key
+        // entirely rather than an explicit null/placeholder. Skipping or
+        // dropping the call outright would reintroduce the exact "vanishes
+        // with no trace" failure mode this file explicitly avoids
+        // elsewhere (F1/Finding 1/Finding 8 above) -- a malformed name is
+        // not a reason to hide that a tool call happened at all. A fixed
+        // placeholder string keeps the call visible in the report (still
+        // resolvable/pairable by id, still counted in stats) while making
+        // it obvious in the rendered output that the harness didn't supply
+        // a usable name, which is more consistent with this file's
+        // "surface it, don't hide it" philosophy than silent omission.
         const call = {
           id: item.id,
-          name: item.name,
+          name: typeof item.name === "string" && item.name ? item.name : "unknown",
           input: item.input && typeof item.input === "object" ? item.input : {},
           timestamp: line.timestamp,
         };
@@ -270,11 +360,20 @@ function parseClaudeCodeSession(text, opts) {
           // Codex's callOrder.length is read at.
           marks.push({ seq: pendingOrder.length, type: "subagent", note: call.name });
         }
-        pendingOrder.push(callKey);
-        pending.set(callKey, call);
+        // CodeRabbit review, PR #23, 2026-08-06 (P1, event ordering): push
+        // an OCCURRENCE object (key + call + a result slot, initially
+        // unresolved), not the bare call -- see the `pending`/`pendingOrder`
+        // declaration comment above for why. `pending` still only holds
+        // occurrences that are CURRENTLY unresolved (same dedup-while-
+        // pending semantics as before: `pending.has(callKey)` above still
+        // only blocks a reissue of a real id while the previous occurrence
+        // of that id has no result yet).
+        const occ = { key: callKey, call, result: null };
+        pendingOrder.push(occ);
+        pending.set(callKey, occ);
       } else if (item.type === "tool_result") {
-        const call = pending.get(item.tool_use_id);
-        if (!call) continue;
+        const occ = pending.get(item.tool_use_id);
+        if (!occ) continue;
         pending.delete(item.tool_use_id);
         // Finding 9 (adversarial review, fresh Grok pass, 2026-08-06): loose
         // truthy coercion (`!!item.is_error`) turns the STRING "false" into
@@ -285,38 +384,35 @@ function parseClaudeCodeSession(text, opts) {
         // claim); only a real `true` should count as an error, so any other
         // value (a stray string, a number, undefined, null) is treated as
         // not-an-error rather than guessed at via coercion.
-        const result = { content: contentToString(item.content), isError: item.is_error === true };
-        events.push(buildEvent(events.length, cwd, call, result));
+        //
+        // CodeRabbit review, PR #23, 2026-08-06 (P1, event ordering): this
+        // used to be `events.push(buildEvent(...))` right here -- i.e. the
+        // instant a result arrived, not when its call was originally
+        // issued. Record the result onto the occurrence object instead;
+        // events[] is built in one pass over `pendingOrder` (issuance
+        // order) after the main loop, below.
+        occ.result = { content: contentToString(item.content), isError: item.is_error === true };
       }
     }
   }
 
-  // Anything still pending at EOF is still emitted -- a session ending
-  // mid-tool-call must not silently lose the last action.
-  //
-  // Finding 1 (adversarial review, fresh Grok pass, 2026-08-06, CRITICAL): a
-  // key can appear in pendingOrder more than once -- specifically, a real
-  // tool_use id reused AFTER its first occurrence already resolved (which
-  // is legitimate; the dedup check in the tool_use branch above only blocks
-  // reuse WHILE pending, by design) pushes that same id into pendingOrder a
-  // second time. `pending` (a Map) only ever holds the latest call for a
-  // given key, but this loop used to iterate pendingOrder without removing
-  // resolved/emitted entries from `pending`, so if that second occurrence
-  // was itself still pending at EOF, `pending.has(id)` was true on BOTH
-  // pendingOrder occurrences of that id and the SAME call object got pushed
-  // to `events` twice. Reproduced: 2 real calls (one resolved, one pending-
-  // at-EOF reusing the resolved one's id) produced 3 events instead of 2.
-  // Fix: delete from `pending` immediately after emitting, so a repeated
-  // key's second occurrence in pendingOrder finds nothing left to emit.
-  for (const id of pendingOrder) {
-    if (pending.has(id)) {
-      const call = pending.get(id);
-      pending.delete(id);
-      events.push(buildEvent(events.length, cwd, call, { content: "", isError: false }));
-    }
+  // CodeRabbit review, PR #23, 2026-08-06 (P1, event ordering): build
+  // events[] by walking `pendingOrder` -- call-ISSUANCE order -- exactly
+  // once, pairing each occurrence with whatever result it collected (or an
+  // empty/pending result if the session ended before one arrived; see
+  // buildEvent's `unresolved` handling below, added for the "unresolved
+  // calls counted as exact success" CodeRabbit finding). A session ending
+  // mid-tool-call must not silently lose the last action, so a still-
+  // pending occurrence (occ.result === null) is still emitted here, same as
+  // the old by-key EOF-flush loop this replaces (formerly "Finding 1",
+  // adversarial review, fresh Grok pass, 2026-08-06) -- but since
+  // `pendingOrder` now holds unique occurrence objects rather than
+  // (possibly repeated) keys, there is no double-emission risk to guard
+  // against here: every occurrence is visited exactly once, by construction.
+  for (const occ of pendingOrder) {
+    const result = occ.result || { content: "", isError: false, unresolved: true };
+    events.push(buildEvent(events.length, cwd, occ.call, result));
   }
-
-  for (let i = 0; i < events.length; i++) events[i].seq = i;
 
   session.id = sessionId || undefined;
   session.model = model || undefined;
