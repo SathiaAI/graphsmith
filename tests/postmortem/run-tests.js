@@ -47,7 +47,7 @@ const classify = require(path.join(REPO, "scripts", "postmortem-classify.js"));
 const { parseClaudeCodeSession } = require(path.join(REPO, "scripts", "postmortem-claude-code.js"));
 const { parseCodexSession } = require(path.join(REPO, "scripts", "postmortem-codex.js"));
 const { renderMarkdown } = require(path.join(REPO, "scripts", "postmortem-render.js"));
-const { buildPostmortem, runPostmortem } = require(path.join(REPO, "scripts", "postmortem.js"));
+const { buildPostmortem, runPostmortem, MAX_SESSION_FILE_BYTES } = require(path.join(REPO, "scripts", "postmortem.js"));
 
 let passed = 0;
 let failed = 0;
@@ -424,7 +424,7 @@ function groupCli() {
   const ccPath = path.join(FIXTURES, "claude-code-normal.jsonl");
   const stdoutRun = runCli([ccPath]);
   report("11.3 stdout run: exit 0", stdoutRun.status === 0);
-  report("11.4 stdout run: Markdown report on stdout", /^# Session post-mortem — claude-code/.test(stdoutRun.stdout));
+  report("11.4 stdout run: Markdown report on stdout", /^# Session post-mortem \u2014 claude-code/.test(stdoutRun.stdout));
 
   const dir = tmpDir("cli-out");
   try {
@@ -447,7 +447,7 @@ function groupCli() {
 
     const codexPath = path.join(FIXTURES, "codex-normal.jsonl");
     const autoCodex = runCli([codexPath]);
-    report("11.10 auto-detect: codex fixture is recognized without --harness", autoCodex.status === 0 && /^# Session post-mortem — codex/.test(autoCodex.stdout));
+    report("11.10 auto-detect: codex fixture is recognized without --harness", autoCodex.status === 0 && /^# Session post-mortem \u2014 codex/.test(autoCodex.stdout));
 
     const missing = runCli([path.join(dir, "does-not-exist.jsonl")]);
     report("11.11 missing file: exits non-zero with a readable error, not a stack trace to the user", missing.status !== 0 && /cannot read/.test(missing.stderr) && !/at Object/.test(missing.stderr));
@@ -1133,7 +1133,7 @@ function groupCodeRabbitFindings() {
       const validOut = runCli([ccPath, "--out", outPath]);
       report("16.67 CR-16: valid '--out <path>' usage still works (no regression)", validOut.status === 0 && fs.existsSync(outPath));
       const validHarness = runCli([codexPath, "--harness", "codex"]);
-      report("16.68 CR-16: valid '--harness codex' usage on a real codex fixture still works (no regression)", validHarness.status === 0 && /^# Session post-mortem — codex/.test(validHarness.stdout));
+      report("16.68 CR-16: valid '--harness codex' usage on a real codex fixture still works (no regression)", validHarness.status === 0 && /^# Session post-mortem \u2014 codex/.test(validHarness.stdout));
     } finally {
       cleanup(dir);
     }
@@ -1191,6 +1191,56 @@ function groupCodeRabbitFindings() {
   }
 }
 
+/* ===========================================================================
+ * GROUP 17: reliability-2 regression (adversarial review run-20260807-222752)
+ * -- an oversized session-log input must be rejected by a fast, clear,
+ * fail-closed size check BEFORE the file is ever read into memory, not
+ * attempted via fs.readFileSync (which used to have no size guard at all).
+ * Uses a sparse file (ftruncateSync to the target byte length, no actual
+ * data written) so the test doesn't need to allocate real disk/memory for
+ * a 200+ MiB fixture.
+ * ========================================================================= */
+function groupSizeGuard() {
+  console.log("\n=== GROUP 17: reliability-2 regression -- session-log size guard ===");
+
+  const dir = tmpDir("size-guard");
+  try {
+    const oversizedPath = path.join(dir, "oversized.jsonl");
+    const oversizedFd = fs.openSync(oversizedPath, "w");
+    fs.ftruncateSync(oversizedFd, MAX_SESSION_FILE_BYTES + 1);
+    fs.closeSync(oversizedFd);
+
+    let threw = null;
+    try {
+      buildPostmortem(oversizedPath);
+    } catch (e) {
+      threw = e;
+    }
+    report("17.1 an oversized session log is rejected, not read into memory", !!threw);
+    report(
+      "17.2 the rejection error names the actual file size and the configured limit, not a generic/stack-trace error",
+      !!threw && new RegExp(`${MAX_SESSION_FILE_BYTES + 1}`).test(threw.message) && new RegExp(`${MAX_SESSION_FILE_BYTES}`).test(threw.message)
+    );
+
+    const cliResult = runCli([oversizedPath]);
+    report("17.3 CLI: an oversized session log exits non-zero with a readable error, not a stack trace", cliResult.status !== 0 && /exceeds the/.test(cliResult.stderr) && !/at Object/.test(cliResult.stderr));
+
+    // No regression: a small, legitimately-sized session log is unaffected
+    // by the new size check.
+    const smallPath = path.join(dir, "small.jsonl");
+    fs.writeFileSync(smallPath, readFixture("claude-code-normal.jsonl"));
+    let smallThrew = null;
+    try {
+      buildPostmortem(smallPath);
+    } catch (e) {
+      smallThrew = e;
+    }
+    report("17.4 a normally-sized session log is unaffected by the size guard (no regression)", smallThrew === null, smallThrew && smallThrew.message);
+  } finally {
+    cleanup(dir);
+  }
+}
+
 function main() {
   groupSyntax();
   groupNormalSessions();
@@ -1208,6 +1258,7 @@ function main() {
   groupAdversarialRegressions();
   groupFreshReviewRound2();
   groupCodeRabbitFindings();
+  groupSizeGuard();
 
   console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped/unavailable`);
   process.exit(failed > 0 ? 1 : 0);
