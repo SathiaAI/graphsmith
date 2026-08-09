@@ -23,3 +23,14 @@ tests/**/last-run.json
 tmp-e/
 tmp-proj/
 .adversarial-review/
+
+# Stryker mutation-testing scratch dir (per-worker sandboxed copies) and
+# generated reports (regenerate via `npx stryker run stryker.<scope>.config.json`)
+.stryker-tmp/
+mutation-reports/
+
+# Auto-generated lockfile for the one devDependency (@stryker-mutator/core,
+# introduced 2026-08-08 for mutation-testing gate coverage). Not committed:
+# purely mechanical/regenerable via `npm install` from package.json, and this
+# repo otherwise stays dependency-lockfile-free by convention.
+package-lock.json
