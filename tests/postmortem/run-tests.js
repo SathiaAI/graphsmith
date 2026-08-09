@@ -424,7 +424,7 @@ function groupCli() {
   const ccPath = path.join(FIXTURES, "claude-code-normal.jsonl");
   const stdoutRun = runCli([ccPath]);
   report("11.3 stdout run: exit 0", stdoutRun.status === 0);
-  report("11.4 stdout run: Markdown report on stdout", /^# Session post-mortem \u2014 claude-code/.test(stdoutRun.stdout));
+  report("11.4 stdout run: Markdown report on stdout", /^# Session post-mortem — claude-code/.test(stdoutRun.stdout));
 
   const dir = tmpDir("cli-out");
   try {
@@ -447,7 +447,7 @@ function groupCli() {
 
     const codexPath = path.join(FIXTURES, "codex-normal.jsonl");
     const autoCodex = runCli([codexPath]);
-    report("11.10 auto-detect: codex fixture is recognized without --harness", autoCodex.status === 0 && /^# Session post-mortem \u2014 codex/.test(autoCodex.stdout));
+    report("11.10 auto-detect: codex fixture is recognized without --harness", autoCodex.status === 0 && /^# Session post-mortem — codex/.test(autoCodex.stdout));
 
     const missing = runCli([path.join(dir, "does-not-exist.jsonl")]);
     report("11.11 missing file: exits non-zero with a readable error, not a stack trace to the user", missing.status !== 0 && /cannot read/.test(missing.stderr) && !/at Object/.test(missing.stderr));
@@ -1133,7 +1133,7 @@ function groupCodeRabbitFindings() {
       const validOut = runCli([ccPath, "--out", outPath]);
       report("16.67 CR-16: valid '--out <path>' usage still works (no regression)", validOut.status === 0 && fs.existsSync(outPath));
       const validHarness = runCli([codexPath, "--harness", "codex"]);
-      report("16.68 CR-16: valid '--harness codex' usage on a real codex fixture still works (no regression)", validHarness.status === 0 && /^# Session post-mortem \u2014 codex/.test(validHarness.stdout));
+      report("16.68 CR-16: valid '--harness codex' usage on a real codex fixture still works (no regression)", validHarness.status === 0 && /^# Session post-mortem — codex/.test(validHarness.stdout));
     } finally {
       cleanup(dir);
     }
