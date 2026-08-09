@@ -38,6 +38,19 @@ const { renderMarkdown } = require("./postmortem-render.js");
 
 const HARNESSES = ["claude-code", "codex"];
 
+/* reliability-2 (adversarial review run-20260807-222752): buildPostmortem
+ * used to call fs.readFileSync on an arbitrary session-log path with no
+ * size check at all, and the raw text is then further multiplied in memory
+ * (split into a line array, then a parsed-event array) before rendering.
+ * An independent rebuttal reproduction reported a 512 MiB input pushing
+ * process RSS past 2.2 GiB and OOM-killing a 4 GiB CI runner. 200 MiB is
+ * generous for a legitimate single session transcript (JSONL text; even a
+ * multi-day continuous session is normally well under this) while keeping
+ * peak memory for the read+split+parse chain bounded to a level that fits
+ * inside a constrained CI runner rather than an unbounded multiple of
+ * whatever the file happens to be. */
+const MAX_SESSION_FILE_BYTES = 200 * 1024 * 1024; // 200 MiB
+
 function parseWithHarness(harness, text, opts) {
   if (harness === "claude-code") return parseClaudeCodeSession(text, opts);
   if (harness === "codex") return parseCodexSession(text, opts);
@@ -62,6 +75,26 @@ function buildPostmortem(sessionPath, opts) {
   // internally without needing an explicit path.resolve() at this layer,
   // so sourcePath now records exactly the string the caller passed in --
   // deterministic with respect to the input, not the invocation directory.
+  let stat;
+  try {
+    stat = fs.statSync(sessionPath);
+  } catch (e) {
+    throw new Error(`postmortem: cannot read '${sessionPath}': ${e.message}`);
+  }
+  // FAIL-CLOSED: reject oversized input before it is ever read into memory
+  // (see MAX_SESSION_FILE_BYTES above) rather than attempting the read and
+  // relying on the process to survive it.
+  if (stat.size > MAX_SESSION_FILE_BYTES) {
+    throw new Error(
+      `postmortem: '${sessionPath}' is ${stat.size} bytes, which exceeds the ` +
+        `${MAX_SESSION_FILE_BYTES}-byte (${Math.round(MAX_SESSION_FILE_BYTES / (1024 * 1024))} MiB) limit on ` +
+        `session-log input. This limit exists to avoid an out-of-memory crash on large ` +
+        `files (readFileSync + line-split + event-parse each hold a further copy in memory). ` +
+        `If this is a legitimate session that has genuinely grown this large, split it before ` +
+        `running postmortem on it.`
+    );
+  }
+
   let text;
   try {
     text = fs.readFileSync(sessionPath, "utf8");
@@ -126,4 +159,4 @@ function runPostmortem(sessionPath, opts) {
   return { markdown, trace, diagnostics, harness };
 }
 
-module.exports = { buildPostmortem, runPostmortem, HARNESSES };
+module.exports = { buildPostmortem, runPostmortem, HARNESSES, MAX_SESSION_FILE_BYTES };

@@ -34,5 +34,8 @@
     "cursor",
     "knosky"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@stryker-mutator/core": "^9.6.1"
+  }
 }
