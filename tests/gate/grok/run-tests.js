@@ -15,6 +15,13 @@ const ROOT = path.resolve(__dirname, "../../..");
 const GATE_PATH = path.join(ROOT, "scripts", "gate.js");
 const STATE_STORE_PATH = path.join(ROOT, "scripts", "state-store.js");
 
+/* Stryker always runs the command test runner from a copied .stryker-tmp/sandbox-*
+   working directory, even during its pre-mutation dry run. Static source-text
+   checks below read GATE_PATH back and pattern-match exact unmutated snippets;
+   Stryker's instrumentation rewrites that literal text (mutant-switch scaffolding),
+   so those checks cannot pass under instrumentation regardless of correctness. */
+const UNDER_STRYKER = ROOT.includes(".stryker-tmp") || __dirname.includes(".stryker-tmp");
+
 const gate = require(GATE_PATH);
 const { createStore } = require(STATE_STORE_PATH);
 
@@ -656,29 +663,37 @@ function attackAlphaLedger() {
 
   /* confirmation data must not be "read" (governance) before reserve —
      structural source order attack */
-  try {
-    const src = fs.readFileSync(GATE_PATH, "utf8");
-    const confResolveIdx = src.indexOf("const confirmation = confirmationPairs.map");
-    const reserveIdx = src.indexOf("alphaLedger.reserve");
-    const winsIdx = src.indexOf("const wins = discordant.filter");
-    assert(confResolveIdx > 0 && reserveIdx > 0 && winsIdx > 0, "markers missing");
-    /* Contract 03: Before ANY confirmation data is accessed, RESERVED is fsync'd.
-       If wins are computed before reserve → DEFECT */
-    if (winsIdx < reserveIdx) {
-      report(
-        "03e-reserve-before-confirmation-access",
-        "FAIL",
-        "DEFECT: confirmation wins/n_d computed before alphaLedger.reserve (contract 03 order)"
-      );
-    } else {
-      report(
-        "03e-reserve-before-confirmation-access",
-        "PASS",
-        "reserve precedes confirmation outcome use"
-      );
+  if (UNDER_STRYKER) {
+    report(
+      "03e-reserve-before-confirmation-access",
+      "SKIPPED",
+      "static source-order check cannot run under Stryker instrumentation (source text is rewritten); this test has no runtime-behavior component, so no mutation-kill coverage is lost -- see contract 03"
+    );
+  } else {
+    try {
+      const src = fs.readFileSync(GATE_PATH, "utf8");
+      const confResolveIdx = src.indexOf("const confirmation = confirmationPairs.map");
+      const reserveIdx = src.indexOf("alphaLedger.reserve");
+      const winsIdx = src.indexOf("const wins = discordant.filter");
+      assert(confResolveIdx > 0 && reserveIdx > 0 && winsIdx > 0, "markers missing");
+      /* Contract 03: Before ANY confirmation data is accessed, RESERVED is fsync'd.
+         If wins are computed before reserve → DEFECT */
+      if (winsIdx < reserveIdx) {
+        report(
+          "03e-reserve-before-confirmation-access",
+          "FAIL",
+          "DEFECT: confirmation wins/n_d computed before alphaLedger.reserve (contract 03 order)"
+        );
+      } else {
+        report(
+          "03e-reserve-before-confirmation-access",
+          "PASS",
+          "reserve precedes confirmation outcome use"
+        );
+      }
+    } catch (e) {
+      report("03e-reserve-before-confirmation-access", "FAIL", e.message);
     }
-  } catch (e) {
-    report("03e-reserve-before-confirmation-access", "FAIL", e.message);
   }
 }
 
