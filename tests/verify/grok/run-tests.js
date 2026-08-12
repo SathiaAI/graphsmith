@@ -13,6 +13,8 @@ const { spawnSync } = require("child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const VERIFY_PATH = path.join(REPO_ROOT, "scripts", "verify.js");
+// Observed via `node scripts/verify.js --selftest` (stderr summary line) on 2026-08-11: 85 passed, 0 failed.
+const SELFTEST_TOTAL_FLOOR = 85;
 const verify = require(VERIFY_PATH);
 const manifestLib = require(path.join(REPO_ROOT, "scripts", "manifest.js"));
 const loadersLib = require(path.join(REPO_ROOT, "scripts", "loaders.js"));
@@ -701,6 +703,43 @@ function attack_falseNegatives() {
       );
     }
   }
+
+  // 4h valid JSON but wrong shape (kind !== "release") — must be rejected the
+  // same as unparseable JSON, not silently accepted because it parses fine.
+  {
+    const fx = buildFixture("fn-shape-rel-kind");
+    fs.writeFileSync(
+      fx.releaseManifestPath,
+      JSON.stringify({ schema_version: manifestLib.SCHEMA_VERSION, kind: "project", files: [] }, null, 2)
+    );
+    const report = verify.runIntegrity(fx.root, {});
+    if (report.release_verified === "no" && report.checks.release.corrupt === true) {
+      pass("FN/release-manifest-wrong-kind-rejected", `fd=${report.failure_domain}`);
+    } else {
+      fail(
+        "FN/release-manifest-wrong-kind-rejected",
+        `rv=${report.release_verified} corrupt=${report.checks.release.corrupt} fd=${report.failure_domain}`
+      );
+    }
+  }
+
+  // 4i valid JSON, correct kind, but files is not an array — same rejection path.
+  {
+    const fx = buildFixture("fn-shape-rel-files");
+    fs.writeFileSync(
+      fx.releaseManifestPath,
+      JSON.stringify({ schema_version: manifestLib.SCHEMA_VERSION, kind: "release", files: "not-an-array" }, null, 2)
+    );
+    const report = verify.runIntegrity(fx.root, {});
+    if (report.release_verified === "no" && report.checks.release.corrupt === true) {
+      pass("FN/release-manifest-files-not-array-rejected", `fd=${report.failure_domain}`);
+    } else {
+      fail(
+        "FN/release-manifest-files-not-array-rejected",
+        `rv=${report.release_verified} corrupt=${report.checks.release.corrupt} fd=${report.failure_domain}`
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +931,37 @@ function attack_extra() {
     }
   }
 
+  // project manifest is valid JSON but wrong shape (kind !== "project") ->
+  // self-consistent no, reason malformed -- not silently accepted.
+  {
+    const fx = buildFixture("xtra-shape-proj-kind");
+    fs.writeFileSync(
+      fx.projPath,
+      JSON.stringify({ schema_version: manifestLib.SCHEMA_VERSION, kind: "release", files: [] }, null, 2)
+    );
+    const r = verify.runIntegrity(fx.root, {});
+    if (r.self_consistent === "no" && r.checks.project.reason === "malformed") {
+      pass("XTRA/project-manifest-wrong-kind-rejected", r.failure_domain);
+    } else {
+      fail("XTRA/project-manifest-wrong-kind-rejected", JSON.stringify(r.checks.project));
+    }
+  }
+
+  // project manifest: correct kind, but files is not an array -> same rejection.
+  {
+    const fx = buildFixture("xtra-shape-proj-files");
+    fs.writeFileSync(
+      fx.projPath,
+      JSON.stringify({ schema_version: manifestLib.SCHEMA_VERSION, kind: "project", files: { not: "an array" } }, null, 2)
+    );
+    const r = verify.runIntegrity(fx.root, {});
+    if (r.self_consistent === "no" && r.checks.project.reason === "malformed") {
+      pass("XTRA/project-manifest-files-not-array-rejected", r.failure_domain);
+    } else {
+      fail("XTRA/project-manifest-files-not-array-rejected", JSON.stringify(r.checks.project));
+    }
+  }
+
   // seq gap in adoption log
   {
     const fx = buildFixture("seq-gap");
@@ -954,13 +1024,31 @@ function attack_extra() {
     }
   }
 
-  // verify --selftest exits 0 (builder's corpus)
+  // verify --selftest exits 0 (builder's corpus) AND actually ran at least
+  // SELFTEST_TOTAL_FLOOR internal checks -- a deleted self-check probe lowers
+  // `total` without raising `failed`, so exit-code-only would miss it.
   {
     const cli = runCli(["--selftest"]);
-    if (cli.status === 0) {
-      pass("XTRA/verify-selftest-pass", (cli.stderr || "").trim().slice(0, 80));
-    } else {
+    if (cli.status !== 0) {
       fail("XTRA/verify-selftest-pass", `exit=${cli.status} ${(cli.stderr || "").slice(0, 200)}`);
+    } else {
+      let report;
+      try {
+        report = JSON.parse(cli.stdout);
+      } catch (e) {
+        fail("XTRA/verify-selftest-pass", `a self-test probe may have been removed: --selftest stdout is not valid JSON (${e.message})`);
+        report = null;
+      }
+      if (report) {
+        if (typeof report.total !== "number" || report.total < SELFTEST_TOTAL_FLOOR) {
+          fail(
+            "XTRA/verify-selftest-pass",
+            `a self-test probe may have been removed: total=${report.total} below floor=${SELFTEST_TOTAL_FLOOR}`
+          );
+        } else {
+          pass("XTRA/verify-selftest-pass", `total=${report.total} failed=${report.failed} ${(cli.stderr || "").trim().slice(0, 60)}`);
+        }
+      }
     }
   }
 
