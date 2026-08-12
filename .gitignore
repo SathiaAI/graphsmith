@@ -28,6 +28,7 @@ tmp-proj/
 # generated reports (regenerate via `npx stryker run stryker.<scope>.config.json`)
 .stryker-tmp/
 mutation-reports/
+reports/
 
 # Auto-generated lockfile for the one devDependency (@stryker-mutator/core,
 # introduced 2026-08-08 for mutation-testing gate coverage). Not committed:

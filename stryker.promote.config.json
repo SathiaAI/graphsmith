@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation-testing scope: scripts/promote.js (v0.5.0 mutation-testing gate follow-up, scoped run on 5 files with dedicated fast oracles). Scoped to this module (not the full backlog) because it has its own fast, comprehensive, dedicated test suite.",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "node tests/promote/grok/run-tests.js && node tests/promote/lock-scope/run-tests.js && node tests/promote/deepseek/run-tests.js"
+  },
+  "mutate": [
+    "scripts/promote.js"
+  ],
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": {
+    "fileName": "reports/mutation-promote/mutation.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation-promote/mutation.json"
+  },
+  "concurrency": 16,
+  "timeoutMS": 30000,
+  "timeoutFactor": 3,
+  "coverageAnalysis": "off"
+}
