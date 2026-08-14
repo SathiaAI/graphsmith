@@ -23,6 +23,7 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
    around it still fully exercise the code under test. */
 const UNDER_STRYKER = REPO_ROOT.includes(".stryker-tmp") || __dirname.includes(".stryker-tmp");
 
+const PROMOTE_PATH = path.join(REPO_ROOT, "scripts", "promote.js");
 const promoteMod = require(path.join(REPO_ROOT, "scripts", "promote.js"));
 const { generate, verifyTree } = require(path.join(REPO_ROOT, "scripts", "manifest.js"));
 const { createStore } = require(path.join(REPO_ROOT, "scripts", "state-store.js"));
@@ -1354,6 +1355,41 @@ function tSpawnSigkillIfUnix() {
   } catch (e) { fail(name, e.stack || e.message); }
 }
 
+/* promote.js has its own internal --selftest mode (10 named checks: happy path,
+   crash-and-recover matrix, torn-tail rollforward, abandoned-staging handling,
+   GC, abort, rollback) that no external suite previously invoked at all -- a
+   deleted/hollowed internal check would silently drop `tests.length` with no
+   external test noticing (promote.js's `check()` throws on a genuine failure,
+   but a REMOVED check call never throws -- it just quietly stops running). */
+function tSelftestCliFloor() {
+  const name = "13-cli-selftest-exit0-and-count";
+  try {
+    const r = spawnSync(process.execPath, [PROMOTE_PATH, "--selftest"], {
+      encoding: "utf8",
+    });
+    const errs = [];
+    if (r.status !== 0) errs.push(`exit want 0 got ${r.status}`);
+    let result;
+    try {
+      result = JSON.parse(r.stdout);
+    } catch (e) {
+      errs.push(`stdout not JSON: ${e.message}`);
+    }
+    if (result) {
+      if (result.status !== "pass") errs.push(`status=${result.status}`);
+      if (!Array.isArray(result.tests)) errs.push("tests must be an array");
+      else if (result.tests.length < 10) {
+        /* Baseline observed on release/v0.5.0-candidate: 10 checks. Floor, not
+           exact match, so legitimately adding new checks later doesn't break
+           this -- only a check silently disappearing does. */
+        errs.push(`selftest tests.length regressed: got ${result.tests.length}, want >= 10`);
+      }
+    }
+    if (errs.length) fail(name, errs.join("; "));
+    else pass(name, `exit=${r.status} status=${result.status} tests=${result.tests.length}`);
+  } catch (e) { fail(name, e.stack || e.message); }
+}
+
 /* ============================================================================
  * Run all
  * ============================================================================ */
@@ -1380,6 +1416,7 @@ function main() {
   tProjectManifestDoesNotRecordTree();
   tChainBreakHalt();
   tSpawnSigkillIfUnix();
+  tSelftestCliFloor();
 
   const counts = { PASS: 0, FAIL: 0, SKIPPED: 0 };
   for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1;
