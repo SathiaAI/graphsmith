@@ -4,7 +4,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node tests/gate/grok/run-tests.js && node tests/gate/gpt-sol-pro/run-tests.js"
+    "command": "node tests/gate/grok/run-tests.js && node tests/gate/gpt-sol-pro/run-tests.js && node tests/gate/triage/run-tests.js"
   },
   "mutate": [
     "scripts/gate.js"

@@ -124,7 +124,7 @@ function estimateTokens(text) {
 /* ------------------------------------------------------------------ */
 function gate1Static(candidate, ctx = {}) {
   const findings = [];
-  const evidence = { candidateId: candidate.id || candidate.fingerprint, checks: {} };
+  const evidence = { candidateId: candidate && (candidate.id || candidate.fingerprint), checks: {} };
   let pass = true;
 
   if (!candidate || typeof candidate !== "object") {
