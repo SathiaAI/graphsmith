@@ -4,7 +4,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node tests/promote/grok/run-tests.js && node tests/promote/lock-scope/run-tests.js && node tests/promote/deepseek/run-tests.js"
+    "command": "node tests/promote/grok/run-tests.js && node tests/promote/lock-scope/run-tests.js && node tests/promote/deepseek/run-tests.js && node tests/promote/triage/run-tests.js"
   },
   "mutate": [
     "scripts/promote.js"
