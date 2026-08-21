@@ -4,7 +4,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node tests/verify/grok/run-tests.js && node tests/verify/deepseek/run-tests.js"
+    "command": "node tests/verify/grok/run-tests.js && node tests/verify/deepseek/run-tests.js && node tests/verify/triage/run-tests.js"
   },
   "mutate": [
     "scripts/verify.js"
