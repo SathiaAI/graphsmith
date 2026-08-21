@@ -11,7 +11,8 @@
     { "$ref": "#/$defs/anchor" },
     { "$ref": "#/$defs/alpha" },
     { "$ref": "#/$defs/rejected" },
-    { "$ref": "#/$defs/rollback" }
+    { "$ref": "#/$defs/rollback" },
+    { "$ref": "#/$defs/writerClaim" }
   ],
   "$defs": {
     "version": { "const": "1.0" },
@@ -176,6 +177,28 @@
         "family": { "type": "string" },
         "evidence": {},
         "acknowledgement": {}
+      }
+    },
+    "writerClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "host_id", "instance_id", "claimed_at", "renewed_at", "claim_token"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/version" },
+        "host_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier for the host/node (hostname or platform-equivalent). Cross-host distinguishing signal that a bare PID cannot provide (FR-3)."
+        },
+        "instance_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{32}$",
+          "description": "Random per-process identifier, generated at startup. Distinguishes this process from a prior process on the same host, and is the identity named in the FR-1 refusal message."
+        },
+        "pid": { "type": "integer", "minimum": 1, "description": "Local liveness hint only, same caveat as the existing lock's pid field -- meaningless across hosts, which is exactly why host_id/instance_id exist." },
+        "claimed_at": { "type": "integer", "minimum": 0, "description": "Epoch ms when this claim was first acquired." },
+        "renewed_at": { "type": "integer", "minimum": 0, "description": "Epoch ms of the most recent heartbeat renewal (FR-2)." },
+        "claim_token": { "type": "string", "pattern": "^[a-f0-9]{32}$", "description": "Same role as the existing lock's owner_token: proves the renewing/releasing process is the one that acquired the claim." }
       }
     }
   }

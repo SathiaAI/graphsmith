@@ -114,6 +114,19 @@ function validateStateRecord(record, context) {
   return record;
 }
 
+/* Validates against ONE named $def directly, rather than the top-level `oneOf` dispatch
+ * `validateStateRecord` uses. Written for writer-claim.js (a record type that never
+ * shares a file with the others `validateStateRecord` disambiguates between), so a
+ * caller who already knows which record shape to expect gets a precise error instead
+ * of a `oneOf` "matched 0/2/etc schemas" message. */
+function validateNamedRecord(record, defName, context) {
+  const schema = STATE_SCHEMA.$defs && STATE_SCHEMA.$defs[defName];
+  if (!schema) throw fail(`Unknown state schema definition: ${defName}`, "INVALID_ARGUMENT");
+  const errors = schemaErrors(record, schema);
+  if (errors.length) throw fail(`Invalid ${defName} record in ${context}: ${errors[0]}`, "CORRUPT_STATE");
+  return record;
+}
+
 function parseStateJson(raw, context) {
   let record;
   try { record = JSON.parse(raw); }
@@ -165,6 +178,96 @@ function validateStateContent(file, content) {
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+/* Shared atomic-file primitives. `_createLockFile`/`_atomicReplace` below use these for
+ * the per-mutation state.lock; writer-claim.js's standing, process-lifetime claim (a
+ * SEPARATE mechanism from state.lock -- see FR-1..FR-4 in
+ * .plans/v0.5.0/GATEWAY-MULTI-INSTANCE-HANDOFF.md) reuses the same two functions rather
+ * than inventing new ones, per that plan's NFR-2 (no new atomic-write primitive). */
+
+// The file must never be OBSERVABLE in a half-formed state. The historical
+// `openSync(target, "wx")` + `writeSync` pair made the file exist before its content
+// did, so a competing reader that hit EEXIST and read it saw "" (or a truncated
+// record). Writing to a temp file and hard-LINKING it into place keeps the
+// exclusive-create contract -- link() fails EEXIST when the target already exists,
+// exactly as "wx" did -- while making the record atomically visible, fully formed.
+// Filesystems without hard links fall back to the old two-step create; the caller's
+// bounded retry loop covers that residual window.
+function atomicCreateExclusive(targetPath, payload) {
+  const temporary = `${targetPath}.new-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+  const writeTo = (target, flag) => {
+    const fd = fs.openSync(target, flag);
+    try { fs.writeSync(fd, payload); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  };
+  writeTo(temporary, "wx");
+  try {
+    fs.linkSync(temporary, targetPath);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch (cleanupError) { /* best effort */ }
+    if (["EPERM", "ENOSYS", "EXDEV", "EOPNOTSUPP", "ENOTSUP"].includes(error.code)) {
+      writeTo(targetPath, "wx");   // no hard links here; EEXIST still propagates
+      return;
+    }
+    throw error;                    // EEXIST -> the caller's contention path
+  }
+  try { fs.unlinkSync(temporary); } catch (error) { /* the target keeps the inode */ }
+}
+
+// Unconditional atomic overwrite (temp file + fsync + rename + best-effort directory
+// fsync) for a caller that already holds verified exclusive ownership of `targetPath`
+// and needs to update the record's content in place.
+function atomicOverwriteFile(targetPath, content, dirPath) {
+  const temporary = `${targetPath}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+  const fd = fs.openSync(temporary, "wx");
+  try {
+    fs.writeSync(fd, content);
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+  try {
+    fs.renameSync(temporary, targetPath);
+    try {
+      const dirFd = fs.openSync(dirPath, "r");
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    } catch (error) {
+      if (process.platform !== "win32" && !["EINVAL", "EISDIR", "EPERM"].includes(error.code)) throw error;
+    }
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch {}
+    throw error;
+  }
+}
+
+/* Liveness for a locally-owned pid. Two corrections, both found by adversarial review
+ * with working reproductions:
+ *
+ *   EPERM means ALIVE, not dead. A bare `catch { return false }` conflated "no such
+ *   process" with "cannot determine". A lock held by another USER was therefore
+ *   reported as ownerless and stolen -- demonstrated cross-uid on a lock 107ms old
+ *   against a 30s lease, i.e. the freshness of the lock could not save it.
+ *
+ *   A ZOMBIE is DEAD for this purpose. kill(pid, 0) succeeds on a process that has
+ *   exited but not been reaped, so an unreaped owner looked alive. Only /proc can tell
+ *   us, so this is a Linux-only refinement; elsewhere the caller's own freshness check
+ *   covers it.
+ *
+ * ESRCH from a DIFFERENT PID NAMESPACE is indistinguishable from a genuinely absent
+ * process and this cannot fix that. It is why callers keep a second, independent gate
+ * (freshness) rather than treating this as the sole authority. */
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error.code === "EPERM") return true;   // exists, we may not signal it
+    return false;                               // ESRCH, or a platform that cannot say
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close !== -1 && stat.slice(close + 2).split(" ")[0] === "Z") return false;
+  } catch (error) { /* no /proc: signal 0 is the best answer available */ }
+  return true;
 }
 
 /* LEASE TIME vs OPERATIONAL TIME -- the distinction this seam exists to preserve.
@@ -443,25 +546,7 @@ class StateStore {
 
   _atomicReplace(file, content) {
     validateStateContent(file, content);
-    const target = this._path(file);
-    const temporary = `${target}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
-    const fd = fs.openSync(temporary, "wx");
-    try {
-      fs.writeSync(fd, content);
-      fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
-    try {
-      fs.renameSync(temporary, target);
-      try {
-        const dirFd = fs.openSync(this.stateDir, "r");
-        try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
-      } catch (error) {
-        if (process.platform !== "win32" && !["EINVAL", "EISDIR", "EPERM"].includes(error.code)) throw error;
-      }
-    } catch (error) {
-      try { fs.unlinkSync(temporary); } catch {}
-      throw error;
-    }
+    atomicOverwriteFile(this._path(file), content, this.stateDir);
   }
 
   // The lock must never be OBSERVABLE in a half-formed state. The historical
@@ -474,24 +559,7 @@ class StateStore {
   // visible, fully formed. Filesystems without hard links fall back to the old
   // two-step create; _acquireLock's retry below covers that residual window.
   _createLockFile(record) {
-    const payload = JSON.stringify(record);
-    const temporary = `${this.lockPath}.new-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
-    const writeTo = (target, flag) => {
-      const fd = fs.openSync(target, flag);
-      try { fs.writeSync(fd, payload); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    };
-    writeTo(temporary, "wx");
-    try {
-      fs.linkSync(temporary, this.lockPath);
-    } catch (error) {
-      try { fs.unlinkSync(temporary); } catch (cleanupError) { /* best effort */ }
-      if (["EPERM", "ENOSYS", "EXDEV", "EOPNOTSUPP", "ENOTSUP"].includes(error.code)) {
-        writeTo(this.lockPath, "wx");   // no hard links here; EEXIST still propagates
-        return;
-      }
-      throw error;                      // EEXIST -> the caller's contention path
-    }
-    try { fs.unlinkSync(temporary); } catch (error) { /* the lock keeps the inode */ }
+    atomicCreateExclusive(this.lockPath, JSON.stringify(record));
   }
 
   _readLock() {
@@ -524,19 +592,7 @@ class StateStore {
    * process and this cannot fix that. It is why the lease remains a second gate rather
    * than this being the sole authority. */
   _pidAlive(pid) {
-    if (!Number.isSafeInteger(pid) || pid < 1) return false;
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if (error.code === "EPERM") return true;   // exists, we may not signal it
-      return false;                               // ESRCH, or a platform that cannot say
-    }
-    try {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-      const close = stat.lastIndexOf(")");
-      if (close !== -1 && stat.slice(close + 2).split(" ")[0] === "Z") return false;
-    } catch (error) { /* no /proc: signal 0 is the best answer available */ }
-    return true;
+    return pidAlive(pid);
   }
 
   _unlinkLockIfOwner(ownerToken) {
@@ -1493,6 +1549,14 @@ const api = {
 /* Exported so tests use the SAME real clock the product uses, rather than a second
  * near-identical copy that differs only in a metadata tag. */
 api.systemLeaseClock = systemLeaseClock;
+
+/* Exported so writer-claim.js (a separate, standing process-lifetime claim mechanism --
+ * see .plans/v0.5.0/GATEWAY-MULTI-INSTANCE-HANDOFF.md FR-1..FR-4) reuses these SAME
+ * primitives rather than a second near-identical copy, per that plan's NFR-2. */
+api.atomicCreateExclusive = atomicCreateExclusive;
+api.atomicOverwriteFile = atomicOverwriteFile;
+api.pidAlive = pidAlive;
+api.validateNamedRecord = validateNamedRecord;
 
 module.exports = api;
 
