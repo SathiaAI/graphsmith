@@ -89,5 +89,17 @@ There is no `fs.flock`, no `fcntl`, no `O_EXLOCK`, and no `LOCK_*` constant on a
 
 **What would be needed to do it properly:** a decision that a native dependency is acceptable, *and* a real deployment with concurrent writers to justify it. Neither holds today — single-writer use does not exercise the gap, and adding a compiled dependency to remove a hazard that use does not reach would be a net loss in the property that matters more.
 
+## 9. The MCP shim seals a session it is handed — it does not capture live traffic
+
+`scripts/gsa-mcp-shim.js` (`sealBoundaryBundle`) takes an already-assembled `session` object — `initialize`, the granted `tools[]`, and the `calls[]` already made — and maps it into a signed boundary-tier (profile A) attestation bundle. That is the whole of what exists: hashing, tracing, and sealing data that is passed in. **Nothing produces that `session` object from a live MCP connection.**
+
+The design doc ([`.plans/v0.3.0/graphsmith-v0.3.0-mcp-attestation-shim-design.md`](.plans/v0.3.0/graphsmith-v0.3.0-mcp-attestation-shim-design.md), §4) describes four deployment modes for capturing real traffic: a local proxy sitting between an MCP client and its servers, a client-side plugin hooking an agent's MCP middleware, server-side middleware wrapping a tool server, and a gateway integration for enterprise MCP gateways. **None of the four exist in code.** There is no JSON-RPC interceptor, no stdio wrapper, no HTTP reverse proxy, and no gateway-attachment point anywhere in the tree — confirmed by grepping the current source for `gateway`/`proxy`/`interceptor`: the only hits are an unrelated word-count comment and a JS `Proxy`-trap comment, neither part of MCP capture.
+
+**What this costs, precisely.** A caller who wants a real boundary attestation for a live MCP session must build the capture themselves — record `initialize`, `tools/list`, and every `tools/call` into the `session` shape the shim expects — before `sealBoundaryBundle` can do anything. The shim's own selftest (`--selftest` in the same file) demonstrates this: it hand-constructs a `session` literal in the test rather than deriving one from a running MCP exchange, because there is no code path that would derive one.
+
+*Control:* the shim's contract is narrow and honestly scoped — it never claims to observe anything beyond the `session` object it is given (the file's own header comment states the boundary-only, profile-A-never-full-profiles limit), and the produced bundle's `decision_record.md` states plainly that the agent's plan was not observed. There is no false "captured live" claim anywhere in the emitted bundle.
+
+**What would be needed to do it properly:** implement one of the four deployment modes in §4 of the design doc — most naturally the local proxy, since it needs no changes to the agent or to any MCP server. That is unbuilt work, not a documentation gap.
+
 ---
 *This document is publication-hygiene clean. See also the worked offline-verifier transcript in [`docs/examples/offline-verify.md`](docs/examples/offline-verify.md).*
