@@ -31,8 +31,9 @@ const os = require("os");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "../../..");
-const { WriterClaim, decideOnExisting, claimPath } = require(path.join(ROOT, "scripts", "writer-claim.js"));
+const { WriterClaim, decideOnExisting, claimPath, readStatus } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 const { systemLeaseClock } = require(path.join(ROOT, "scripts", "state-store.js"));
+const { createManualClock } = require("../../_harness/clock.js");
 const WORKER = path.join(__dirname, "_worker.js");
 
 const DEAD_PID = 999999; // above default pid_max everywhere in the CI matrix
@@ -206,14 +207,22 @@ async function realProcessRaceOverSharedDirectory() {
         `loser must report a specific writer-claim code, got ${losses[0].parsed.code}`);
     }
 
-    // Never-corrupted: the file on disk parses, validates, and names the actual winner.
-    let onDisk = null;
-    let readError = null;
-    try { onDisk = JSON.parse(fs.readFileSync(claimPath(root), "utf8")); } catch (error) { readError = error; }
-    check(`ac2-race-${trial}-final-claim-parses`, Boolean(onDisk) && !readError, `claim file did not parse after the race: ${readError && readError.message}`);
-    if (onDisk && wins.length === 1) {
-      check(`ac2-race-${trial}-final-claim-matches-winner`, onDisk.instance_id === wins[0].parsed.instanceId,
-        `on-disk claim instance_id ${onDisk.instance_id} did not match the reported winner ${wins[0].parsed.instanceId}`);
+    // Never-corrupted: the file on disk parses, SCHEMA-VALIDATES, and names the actual
+    // winner. CodeRabbit review (PR #27): the previous check only parsed JSON and
+    // compared instance_id -- a record with only instance_id set (missing every other
+    // required field) would pass this check while being a genuinely corrupt/incomplete
+    // claim. Go through readStatus(root), the same validated path production code uses,
+    // and require claimed===true with no validation error before trusting instance_id.
+    // A manual clock is deliberate and sufficient here (unlike the real-clock sites
+    // elsewhere in this suite, this check only validates the on-disk record's SHAPE and
+    // winner identity -- it never reads age_ms/renewed_at skew -- so it does not need to
+    // observe real elapsed time and should not grow the declared-real-clock-site list).
+    const status = readStatus(root, { clock: createManualClock() });
+    check(`ac2-race-${trial}-final-claim-parses`, status.claimed === true && !status.error,
+      `claim file did not validate after the race: ${status.error ? status.error.message : JSON.stringify(status)}`);
+    if (status.claimed && !status.error && wins.length === 1) {
+      check(`ac2-race-${trial}-final-claim-matches-winner`, status.instance_id === wins[0].parsed.instanceId,
+        `on-disk claim instance_id ${status.instance_id} did not match the reported winner ${wins[0].parsed.instanceId}`);
     }
     check(`ac2-race-${trial}-no-stray-temp-files`, strayTempFiles(root).length === 0,
       `stray temp file(s) left behind after the race: ${strayTempFiles(root).join(", ")}`);
