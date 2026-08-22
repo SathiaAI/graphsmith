@@ -117,6 +117,46 @@ function foreignHostNeverStealableUnderAnySkew() {
     `expected refuse/WRITER_CLAIM_FOREIGN_HOST, got ${JSON.stringify(liveForeign)}`);
 }
 
+/* CodeRabbit review (PR #27, follow-up round): instance_id is caller-supplied, so it
+ * can coincide across two hosts sharing a state directory -- by accident, or because a
+ * caller (possibly malicious) explicitly set it. Before the fix, decideOnExisting()
+ * checked instance_id before host_id: a foreign claim whose instance_id happened to
+ * match ours, combined with a pid this host cannot see as alive (true of essentially
+ * any foreign host's pid number), fell into the "own" branch instead of ever reaching
+ * the host_id gate -- silently adopting the foreign claim_token and producing exactly
+ * the two-attesting-writer condition AC-2 exists to prevent. This pins that the
+ * host_id gate now runs first and is unconditional, regardless of what instance_id or
+ * pid the foreign record carries. */
+function foreignHostRefusesEvenWithMatchingInstanceId() {
+  const now = 1_700_000_600_000;
+  const sharedInstanceId = "same-explicit-instance-id".padEnd(32, "0");
+
+  // The attacker-controlled/coincidental case: foreign host, matching instance_id, and
+  // a pid that is not alive from this host's point of view (DEAD_PID is chosen to be
+  // above any real pid_max, so stateStore.pidAlive() reads false here regardless of
+  // what is actually running on the real foreign host). Pre-fix, this combination
+  // returned "own".
+  const matchingInstanceDeadPid = decideOnExisting(
+    { host_id: "host-B-shared-volume", instance_id: sharedInstanceId, pid: DEAD_PID, claimed_at: now - 60_000, renewed_at: now },
+    { localHostId: "host-A-this-instance", localInstanceId: sharedInstanceId, localPid: process.pid, now, staleAfterMs: 3000, skewToleranceMs: 5000 },
+  );
+  check("ac2-foreign-host-refuses-matching-instance-id-dead-pid",
+    matchingInstanceDeadPid.outcome === "refuse" && matchingInstanceDeadPid.code === "WRITER_CLAIM_FOREIGN_HOST",
+    `expected refuse/WRITER_CLAIM_FOREIGN_HOST, got ${JSON.stringify(matchingInstanceDeadPid)}`);
+
+  // Same matching instance_id, but the foreign record's pid happens to equal this
+  // process's own local pid (a plausible coincidence -- pid numbers are reused and
+  // are not globally unique across hosts). Pre-fix this also returned "own" via
+  // `record.pid !== ctx.localPid` being false.
+  const matchingInstanceSamePidNumber = decideOnExisting(
+    { host_id: "host-B-shared-volume", instance_id: sharedInstanceId, pid: process.pid, claimed_at: now - 60_000, renewed_at: now },
+    { localHostId: "host-A-this-instance", localInstanceId: sharedInstanceId, localPid: process.pid, now, staleAfterMs: 3000, skewToleranceMs: 5000 },
+  );
+  check("ac2-foreign-host-refuses-matching-instance-id-colliding-pid-number",
+    matchingInstanceSamePidNumber.outcome === "refuse" && matchingInstanceSamePidNumber.code === "WRITER_CLAIM_FOREIGN_HOST",
+    `expected refuse/WRITER_CLAIM_FOREIGN_HOST, got ${JSON.stringify(matchingInstanceSamePidNumber)}`);
+}
+
 /* -----------------------------------------------------------------------------------
  * End-to-end (real fs, real WriterClaim.acquire()) on a single shared directory: plant
  * a claim as if written by a genuinely different host under large injected clock
@@ -231,6 +271,7 @@ async function realProcessRaceOverSharedDirectory() {
 
 async function main() {
   foreignHostNeverStealableUnderAnySkew();
+  foreignHostRefusesEvenWithMatchingInstanceId();
   endToEndSharedVolumeNeverSilentlyProceeds();
   await realProcessRaceOverSharedDirectory();
 
