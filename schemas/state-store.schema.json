@@ -182,7 +182,7 @@
     "writerClaim": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "host_id", "instance_id", "claimed_at", "renewed_at", "claim_token"],
+      "required": ["schema_version", "host_id", "instance_id", "pid", "claimed_at", "renewed_at", "claim_token"],
       "properties": {
         "schema_version": { "$ref": "#/$defs/version" },
         "host_id": {

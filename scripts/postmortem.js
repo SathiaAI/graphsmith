@@ -75,31 +75,59 @@ function buildPostmortem(sessionPath, opts) {
   // internally without needing an explicit path.resolve() at this layer,
   // so sourcePath now records exactly the string the caller passed in --
   // deterministic with respect to the input, not the invocation directory.
-  let stat;
+  // CodeRabbit/Codex review (PR #27): the previous version called fs.statSync(sessionPath)
+  // and fs.readFileSync(sessionPath, "utf8") as two SEPARATE operations, each re-resolving
+  // the path. Another process could replace sessionPath between them, or sessionPath could
+  // be a FIFO/device whose reported size does not bound what a subsequent read actually
+  // consumes -- either way the size check above could pass while the read below still
+  // pulls in an unbounded stream, defeating the MAX_SESSION_FILE_BYTES guard entirely.
+  // Fixed: open the path ONCE, fstatSync the resulting descriptor (not the path), reject
+  // anything that is not a regular file, and read exactly the checked byte count from
+  // that same descriptor -- closed on every exit path via finally.
+  let fd;
   try {
-    stat = fs.statSync(sessionPath);
+    fd = fs.openSync(sessionPath, "r");
   } catch (e) {
     throw new Error(`postmortem: cannot read '${sessionPath}': ${e.message}`);
   }
-  // FAIL-CLOSED: reject oversized input before it is ever read into memory
-  // (see MAX_SESSION_FILE_BYTES above) rather than attempting the read and
-  // relying on the process to survive it.
-  if (stat.size > MAX_SESSION_FILE_BYTES) {
-    throw new Error(
-      `postmortem: '${sessionPath}' is ${stat.size} bytes, which exceeds the ` +
-        `${MAX_SESSION_FILE_BYTES}-byte (${Math.round(MAX_SESSION_FILE_BYTES / (1024 * 1024))} MiB) limit on ` +
-        `session-log input. This limit exists to avoid an out-of-memory crash on large ` +
-        `files (readFileSync + line-split + event-parse each hold a further copy in memory). ` +
-        `If this is a legitimate session that has genuinely grown this large, split it before ` +
-        `running postmortem on it.`
-    );
-  }
-
   let text;
   try {
-    text = fs.readFileSync(sessionPath, "utf8");
-  } catch (e) {
-    throw new Error(`postmortem: cannot read '${sessionPath}': ${e.message}`);
+    let stat;
+    try {
+      stat = fs.fstatSync(fd);
+    } catch (e) {
+      throw new Error(`postmortem: cannot read '${sessionPath}': ${e.message}`);
+    }
+    if (!stat.isFile()) {
+      throw new Error(
+        `postmortem: '${sessionPath}' is not a regular file. Refusing to read a FIFO, ` +
+          `device, or other special file, whose reported size cannot be trusted to bound ` +
+          `how much a read actually consumes.`
+      );
+    }
+    // FAIL-CLOSED: reject oversized input before it is ever read into memory
+    // (see MAX_SESSION_FILE_BYTES above) rather than attempting the read and
+    // relying on the process to survive it.
+    if (stat.size > MAX_SESSION_FILE_BYTES) {
+      throw new Error(
+        `postmortem: '${sessionPath}' is ${stat.size} bytes, which exceeds the ` +
+          `${MAX_SESSION_FILE_BYTES}-byte (${Math.round(MAX_SESSION_FILE_BYTES / (1024 * 1024))} MiB) limit on ` +
+          `session-log input. This limit exists to avoid an out-of-memory crash on large ` +
+          `files (readFileSync + line-split + event-parse each hold a further copy in memory). ` +
+          `If this is a legitimate session that has genuinely grown this large, split it before ` +
+          `running postmortem on it.`
+      );
+    }
+    const buffer = Buffer.alloc(stat.size);
+    let readTotal = 0;
+    while (readTotal < stat.size) {
+      const bytesRead = fs.readSync(fd, buffer, readTotal, stat.size - readTotal, readTotal);
+      if (bytesRead === 0) break;   // fewer bytes available than fstatSync reported; stop, don't spin
+      readTotal += bytesRead;
+    }
+    text = buffer.toString("utf8", 0, readTotal);
+  } finally {
+    fs.closeSync(fd);
   }
 
   const parseOpts = { sourcePath: sessionPath };
