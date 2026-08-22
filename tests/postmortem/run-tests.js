@@ -1207,8 +1207,14 @@ function groupSizeGuard() {
   try {
     const oversizedPath = path.join(dir, "oversized.jsonl");
     const oversizedFd = fs.openSync(oversizedPath, "w");
-    fs.ftruncateSync(oversizedFd, MAX_SESSION_FILE_BYTES + 1);
-    fs.closeSync(oversizedFd);
+    // CodeRabbit review (PR #27): close the descriptor in a finally block -- if
+    // ftruncateSync throws, the previous version never reached fs.closeSync, leaking
+    // the descriptor (and, on Windows, keeping the file open and blocking cleanup(dir)).
+    try {
+      fs.ftruncateSync(oversizedFd, MAX_SESSION_FILE_BYTES + 1);
+    } finally {
+      fs.closeSync(oversizedFd);
+    }
 
     let threw = null;
     try {
