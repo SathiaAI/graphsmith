@@ -319,6 +319,120 @@ const LEASE_CLOCK_AUDIT_ENV = "GRAPHSMITH_LEASE_CLOCK_AUDIT";
 /* Provenance is a property of the clock OBJECT, so it is measured once and remembered.
  * WeakMap so a clock that goes out of scope is not retained by the audit. */
 const CLOCK_PROVENANCE = new WeakMap();
+/* Every file that owns a lease/claim clock constructor and calls
+ * recordLeaseClockConstruction from inside itself. Frames in any of these are
+ * "library", not a site -- see the filter below. writer-claim.js reuses this
+ * function (rather than a second near-identical copy) the same way it reuses
+ * this file's atomic-write primitives and pid-liveness check, per the buildplan
+ * doc's NFR-2. */
+const LEASE_CLOCK_LIBRARY_BASENAMES = ["state-store.js", "writer-claim.js"];
+
+/* AUDIT BREADCRUMB for a lease/claim clock construction, written BEFORE any
+ * refusal a caller layers on top and never conditional on one.
+ *
+ * The first version of the determinism sweep detected wall-clock construction by
+ * grepping the target's output for a refusal message. An adversarial review broke
+ * that in one line: tests/state-store/grok has a case whose catch block treats ANY
+ * throw as its success signal, so the refusal was swallowed, the suite exited 0, and
+ * the sweep reported "no wall-clock lease construction on any executed path" while a
+ * wall-clock store was being built on that very path. A detector a `catch` can defeat
+ * is not a detector.
+ *
+ * So the record is written here, at construction, where no downstream handler can
+ * intercept it -- and it records the KIND of clock rather than merely its presence,
+ * because an inline `{ now: () => Date.now() }` satisfies a presence check while
+ * reintroducing the exact race. Append-only and best-effort: this must never be able
+ * to fail a run it is only observing. Inert unless the env var is set.
+ *
+ * Shared by StateStore and WriterClaim. WriterClaim is a deliberately SEPARATE
+ * mechanism from StateStore (see writer-claim.js's module header) that never
+ * constructs one, so a StateStore-only breadcrumb is structurally blind to it --
+ * the determinism sweep proved that by observing zero constructions for either
+ * writer-claim suite. Calling this same function from writer-claim.js's
+ * constructor gives it the identical proof rather than a second, divergent one. */
+function recordLeaseClockConstruction(clockOption) {
+  const auditPath = process.env[LEASE_CLOCK_AUDIT_ENV];
+  if (!auditPath) return;
+  /* The first frame OUTSIDE the library files. Taking a fixed stack index named the
+   * local factory every time -- `at createStore (state-store.js:...)` for all nine
+   * constructions -- which is an inventory that cannot tell you where to look. */
+  /* TWO frames outside the library, not one.
+   *
+   * One frame collapses every caller of a test-local factory to the factory itself --
+   * a hole an adversarial review named after the equivalent hole inside this file was
+   * fixed. With the caller recorded too, a NEW caller of an existing real-clock factory
+   * is a new site rather than an invisible reuse. */
+  let site = "(no stack)";
+  let caller = "";
+  try {
+    const external = String(new Error().stack || "").split("\n").slice(1)
+      .filter((f) => !LEASE_CLOCK_LIBRARY_BASENAMES.some((name) => f.indexOf(name) !== -1));
+    site = String(external[0] || "").trim();
+    caller = String(external[1] || "").trim();
+  } catch (e) { /* best effort */ }
+  /* PROVENANCE IS OBSERVED, NOT DECLARED.
+   *
+   * The first version recorded `clockOption.__leaseClockKind`, i.e. a string the
+   * caller supplies. An adversarial review pointed out that
+   * `{ __leaseClockKind: "manual", now: () => Date.now() }` then passes every check
+   * while being exactly the wall-clock race the seam exists to remove -- the tag is
+   * an assertion, not evidence.
+   *
+   * So the clock is MEASURED: read it, burn a little real time, read it again. A
+   * chosen clock does not move on its own; a wall clock does. A forged tag cannot
+   * lie about that. The tag is still recorded, and a disagreement between claim and
+   * behaviour is itself reportable. */
+  /* MEASURED ONCE PER CLOCK OBJECT, not once per construction.
+   *
+   * The first version measured on every construction. A clock's nature does not change
+   * between constructions, so that bought nothing -- and it cost a 2ms busy-wait plus a
+   * file append EVERY time. A windows run of the deepseek suite builds 126 stores, many
+   * of them inside a two-process lock-contention loop that is timing-sensitive by
+   * design, so ~250ms of injected busy-waiting landed inside the very thing being
+   * measured. The suite then failed under the audit while passing without it, and the
+   * gate correctly reported "this is NOT a clock finding" without being able to say
+   * that the AUDIT was the difference.
+   *
+   * An observer that changes the observed is the same defect class this whole gate
+   * exists to catch, one level out. Caching by object identity removes it: 126
+   * measurements become one per distinct clock. */
+  let advancedUnderRealTime = null;
+  if (clockOption && typeof clockOption.now === "function") {
+    if (CLOCK_PROVENANCE.has(clockOption)) {
+      advancedUnderRealTime = CLOCK_PROVENANCE.get(clockOption);
+    } else {
+      try {
+        const a = clockOption.now();
+        const until = Date.now() + 2;
+        while (Date.now() < until) { /* burn real time, no yield: the clock must not
+                                      * advance because we waited politely */ }
+        advancedUnderRealTime = clockOption.now() !== a;
+      } catch (e) { advancedUnderRealTime = null; }
+      try { CLOCK_PROVENANCE.set(clockOption, advancedUnderRealTime); } catch (e) { /* non-object clock */ }
+    }
+  }
+  const claimed = clockOption
+    ? (typeof clockOption.now !== "function" ? "malformed" : (clockOption.__leaseClockKind || "custom"))
+    : "wall";
+  /* Observed wins. "manual" is only granted to a clock that demonstrably did not move. */
+  const kind = claimed === "wall" || claimed === "malformed" ? claimed
+    : advancedUnderRealTime === true ? "system"
+      : advancedUnderRealTime === false ? (claimed === "system" ? "system-frozen" : "manual")
+        : "custom";
+  const line = JSON.stringify({
+    explicit: Boolean(clockOption),
+    kind, claimed, advancedUnderRealTime,
+    site: site.slice(0, 240),
+    caller: caller.slice(0, 240),
+    pid: process.pid,
+  }) + "\n";
+  /* FAIL CLOSED. This was best-effort, and the gate then treated a partial audit as
+   * complete evidence: one dropped append among twenty made the other nineteen
+   * certify the run. A missing record is indistinguishable from no construction, so
+   * in audit mode an unrecordable construction has to stop the run. Audit mode is
+   * opt-in and never on in production. */
+  fs.appendFileSync(auditPath, line);
+}
 
 class StateStore {
   constructor(projectRoot = process.cwd(), options = {}) {
@@ -334,104 +448,7 @@ class StateStore {
      * throws on the executed path instead, so a test that relies on wall-clock lease
      * time cannot pass anywhere, including the Windows-only cases a Linux audit is
      * structurally blind to. Off unless the env var is set, so production is untouched. */
-    /* AUDIT BREADCRUMB, written BEFORE the refusal below and never conditional on it.
-     *
-     * The first version of the determinism sweep detected wall-clock construction by
-     * grepping the target's output for the refusal message. An adversarial review broke
-     * that in one line: tests/state-store/grok has a case whose catch block treats ANY
-     * throw as its success signal, so the refusal was swallowed, the suite exited 0, and
-     * the sweep reported "no wall-clock lease construction on any executed path" while a
-     * wall-clock store was being built on that very path. A detector a `catch` can defeat
-     * is not a detector.
-     *
-     * So the record is written here, at construction, where no downstream handler can
-     * intercept it -- and it records the KIND of clock rather than merely its presence,
-     * because an inline `{ now: () => Date.now() }` satisfies a presence check while
-     * reintroducing the exact race. Append-only and best-effort: this must never be able
-     * to fail a run it is only observing. Inert unless the env var is set. */
-    const auditPath = process.env[LEASE_CLOCK_AUDIT_ENV];
-    if (auditPath) {
-      /* The first frame OUTSIDE this file. Taking a fixed stack index named the local
-       * factory every time -- `at createStore (state-store.js:...)` for all nine
-       * constructions -- which is an inventory that cannot tell you where to look. */
-      /* TWO frames outside this file, not one.
-       *
-       * One frame collapses every caller of a test-local factory to the factory itself --
-       * a hole an adversarial review named after the equivalent hole inside this file was
-       * fixed. With the caller recorded too, a NEW caller of an existing real-clock factory
-       * is a new site rather than an invisible reuse. */
-      let site = "(no stack)";
-      let caller = "";
-      try {
-        const here = path.basename(__filename);
-        const external = String(new Error().stack || "").split("\n").slice(1)
-          .filter((f) => f.indexOf(here) === -1);
-        site = String(external[0] || "").trim();
-        caller = String(external[1] || "").trim();
-      } catch (e) { /* best effort */ }
-      /* PROVENANCE IS OBSERVED, NOT DECLARED.
-       *
-       * The first version recorded `options.clock.__leaseClockKind`, i.e. a string the
-       * caller supplies. An adversarial review pointed out that
-       * `{ __leaseClockKind: "manual", now: () => Date.now() }` then passes every check
-       * while being exactly the wall-clock race the seam exists to remove -- the tag is
-       * an assertion, not evidence.
-       *
-       * So the clock is MEASURED: read it, burn a little real time, read it again. A
-       * chosen clock does not move on its own; a wall clock does. A forged tag cannot
-       * lie about that. The tag is still recorded, and a disagreement between claim and
-       * behaviour is itself reportable. */
-      /* MEASURED ONCE PER CLOCK OBJECT, not once per construction.
-       *
-       * The first version measured on every construction. A clock's nature does not change
-       * between constructions, so that bought nothing -- and it cost a 2ms busy-wait plus a
-       * file append EVERY time. A windows run of the deepseek suite builds 126 stores, many
-       * of them inside a two-process lock-contention loop that is timing-sensitive by
-       * design, so ~250ms of injected busy-waiting landed inside the very thing being
-       * measured. The suite then failed under the audit while passing without it, and the
-       * gate correctly reported "this is NOT a clock finding" without being able to say
-       * that the AUDIT was the difference.
-       *
-       * An observer that changes the observed is the same defect class this whole gate
-       * exists to catch, one level out. Caching by object identity removes it: 126
-       * measurements become one per distinct clock. */
-      let advancedUnderRealTime = null;
-      if (options.clock && typeof options.clock.now === "function") {
-        if (CLOCK_PROVENANCE.has(options.clock)) {
-          advancedUnderRealTime = CLOCK_PROVENANCE.get(options.clock);
-        } else {
-          try {
-            const a = options.clock.now();
-            const until = Date.now() + 2;
-            while (Date.now() < until) { /* burn real time, no yield: the clock must not
-                                          * advance because we waited politely */ }
-            advancedUnderRealTime = options.clock.now() !== a;
-          } catch (e) { advancedUnderRealTime = null; }
-          try { CLOCK_PROVENANCE.set(options.clock, advancedUnderRealTime); } catch (e) { /* non-object clock */ }
-        }
-      }
-      const claimed = options.clock
-        ? (typeof options.clock.now !== "function" ? "malformed" : (options.clock.__leaseClockKind || "custom"))
-        : "wall";
-      /* Observed wins. "manual" is only granted to a clock that demonstrably did not move. */
-      const kind = claimed === "wall" || claimed === "malformed" ? claimed
-        : advancedUnderRealTime === true ? "system"
-          : advancedUnderRealTime === false ? (claimed === "system" ? "system-frozen" : "manual")
-            : "custom";
-      const line = JSON.stringify({
-        explicit: Boolean(options.clock),
-        kind, claimed, advancedUnderRealTime,
-        site: site.slice(0, 240),
-        caller: caller.slice(0, 240),
-        pid: process.pid,
-      }) + "\n";
-      /* FAIL CLOSED. This was best-effort, and the gate then treated a partial audit as
-       * complete evidence: one dropped append among twenty made the other nineteen
-       * certify the run. A missing record is indistinguishable from no construction, so
-       * in audit mode an unrecordable construction has to stop the run. Audit mode is
-       * opt-in and never on in production. */
-      fs.appendFileSync(auditPath, line);
-    }
+    recordLeaseClockConstruction(options.clock);
 
     if (process.env[REQUIRE_EXPLICIT_CLOCK_ENV] === "1" && !options.clock) {
       throw fail(
@@ -1557,6 +1574,7 @@ api.atomicCreateExclusive = atomicCreateExclusive;
 api.atomicOverwriteFile = atomicOverwriteFile;
 api.pidAlive = pidAlive;
 api.validateNamedRecord = validateNamedRecord;
+api.recordLeaseClockConstruction = recordLeaseClockConstruction;
 
 module.exports = api;
 
@@ -1570,7 +1588,11 @@ function selftest() {
   process.env.GRAPHSMITH_TEST_MODE = "1";
   const tests = [];
   try {
-    const store = createStore(root, { leaseMs: 40, heartbeatMs: 10 });
+    /* Explicit, not defaulted: this selftest sleeps real milliseconds (see the
+     * registry-lease-sweep check below) and asserts against real elapsed time, so
+     * it genuinely needs the wall clock -- unlike every other StateStore
+     * construction in this file, all of which take an injected one. */
+    const store = createStore(root, { leaseMs: 40, heartbeatMs: 10, clock: systemLeaseClock() });
 
     store._ensureStateDir();
     const staleToken = crypto.randomBytes(16).toString("hex");
@@ -1595,7 +1617,7 @@ function selftest() {
     // pinned here; the transient case itself is covered end-to-end by
     // tests/state-store/grok's two-process concurrency battery.
     {
-      const raceStore = createStore(root, { leaseMs: 5000, heartbeatMs: 200 });
+      const raceStore = createStore(root, { leaseMs: 5000, heartbeatMs: 200, clock: systemLeaseClock() });
       raceStore._ensureStateDir();
 
       // (1) The lock is created fully formed, and leaves no temp file behind.
@@ -1630,13 +1652,13 @@ function selftest() {
     try { store.runRegistry.register("run-recover", "tree-selftest"); }
     catch (error) { simulated = error.code === "SIMULATED_CRASH"; }
     if (!simulated) throw new Error("journal tear was not simulated");
-    const recovered = createStore(root, { leaseMs: 40, heartbeatMs: 10 });
+    const recovered = createStore(root, { leaseMs: 40, heartbeatMs: 10, clock: systemLeaseClock() });
     const recoveredWindow = recovered.window.get();
     if (!recoveredWindow.window.slots.some((slot) => slot.run_id === "run-recover")) throw new Error("journal did not roll forward window slot");
     tests.push({ name: "journal-inspect-and-roll-forward", status: "pass" });
 
     const first = recovered.alphaLedger.reserve({ corpus_state: "corpus-a", split_hash: "split-a", fingerprint: "fp-a", family: "family-a" });
-    const restarted = createStore(root, { leaseMs: 40, heartbeatMs: 10 });
+    const restarted = createStore(root, { leaseMs: 40, heartbeatMs: 10, clock: systemLeaseClock() });
     const second = restarted.alphaLedger.reserve({ corpus_state: "corpus-a", split_hash: "split-b", fingerprint: "fp-b", family: "family-b" });
     if (first.alpha_slot !== 1 || second.alpha_slot !== 2) throw new Error("crashed reservation did not remain consumed");
     tests.push({ name: "alpha-reservation-crash-persistence", status: "pass" });

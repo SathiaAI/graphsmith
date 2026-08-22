@@ -223,6 +223,7 @@ const DECLARED_REAL_CLOCK_SITES = {
       "hammer.js#anon",
       "tests/state-store/grok/run-tests.js#createRealClockStore <- tests/state-store/grok/run-tests.js#anon",
       "tests/state-store/grok/run-tests.js#createRealClockStore <- tests/state-store/grok/run-tests.js#mk",
+      "(unknown)",
     ],
     why:
       "crash.journal-roll-forward-monotonic-no-tear and concurrency.two-process-register-" +
@@ -231,7 +232,15 @@ const DECLARED_REAL_CLOCK_SITES = {
       "sweep saw every parent-written lease as expired by decades and fired a crash hook " +
       "on the recovery sweep instead of the operation under test. Both assert journal " +
       "INVARIANTS, never lease liveness, at a 10-minute lease. The two non-repo sites are " +
-      "generated worker scripts, which is the case a source scan cannot reach at all.",
+      "generated worker scripts, which is the case a source scan cannot reach at all. " +
+      "'(unknown)' is state-store.js's own --selftest CLI mode, which this suite's " +
+      "XTRA/state-store-selftest-cli-floor case spawns as `node scripts/state-store.js " +
+      "--selftest`: selftest() sleeps real milliseconds and asserts against real elapsed " +
+      "time (registry-lease-sweep), so it genuinely needs systemLeaseClock(). Every frame " +
+      "from the constructor up through the CLI dispatch lives inside state-store.js itself, " +
+      "so the breadcrumb's cross-file caller filter -- built for tests calling INTO the " +
+      "store, not the store calling itself -- has nothing external to name past the node " +
+      "module loader; that is the honest limit of a heuristic normalising on file+function.",
   },
   "tests/state-store/deepseek/run-tests.js": {
     sites: [
@@ -247,6 +256,21 @@ const DECLARED_REAL_CLOCK_SITES = {
       "neither. test 2's busy-owner check is real-clock on purpose: it asserts that a lock " +
       "being RENEWED is not stolen, and lock renewal writes an mtime the OS stamps -- there " +
       "is nothing to inject. All three assert invariants, never lease liveness.",
+  },
+  "tests/state-store/writer-claim-shared-storage/run-tests.js": {
+    sites: [
+      "tests/state-store/writer-claim-shared-storage/_worker.js#anon",
+      "tests/state-store/writer-claim-shared-storage/run-tests.js#endToEndSharedVolumeNeverSilentlyProceeds <- tests/state-store/writer-claim-shared-storage/run-tests.js#main",
+    ],
+    why:
+      "AC-2's whole point is a SECOND host racing the same shared directory, so both " +
+      "sites stand in for that second host's own clock and have to be real to reproduce " +
+      "the cross-host skew under test. endToEndSharedVolumeNeverSilentlyProceeds reads a " +
+      "planted claim record whose renewed_at was stamped from real Date.now() +/- a large " +
+      "skew; a frozen clock could not reproduce that skew relationship. _worker.js is a " +
+      "spawned second process racing acquire() against the first (realProcessRaceOverShared" +
+      "Directory) -- a clock thunk does not survive a spawn, same as grok's cross-process " +
+      "sites above. Neither asserts lease liveness; both assert single-writer refusal.",
   },
 };
 

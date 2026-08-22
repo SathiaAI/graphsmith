@@ -10,12 +10,16 @@
 
 const path = require("path");
 const { WriterClaim } = require(path.join(__dirname, "..", "..", "..", "scripts", "writer-claim.js"));
+const { systemLeaseClock } = require(path.join(__dirname, "..", "..", "..", "scripts", "state-store.js"));
 const { writeReport } = require(path.join(__dirname, "..", "..", "..", "scripts", "write-report.js"));
 
 const [, , stateDir, hostId, instanceId] = process.argv;
 
 try {
-  const claim = new WriterClaim(stateDir, { hostId, instanceId });
+  // Real clock, explicitly: this process stands in for a genuine second host racing
+  // over the shared directory (see run-tests.js), so it has to read the same real
+  // clock a genuine second host would.
+  const claim = new WriterClaim(stateDir, { hostId, instanceId, clock: systemLeaseClock() });
   claim.acquire();
   writeReport(JSON.stringify({ ok: true, instanceId, hostId }) + "\n");
   process.exitCode = 0;

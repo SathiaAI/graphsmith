@@ -32,6 +32,7 @@ const path = require("path");
 
 const ROOT = path.resolve(__dirname, "../../..");
 const { WriterClaim, decideOnExisting, claimPath } = require(path.join(ROOT, "scripts", "writer-claim.js"));
+const { systemLeaseClock } = require(path.join(ROOT, "scripts", "state-store.js"));
 const WORKER = path.join(__dirname, "_worker.js");
 
 const DEAD_PID = 999999; // above default pid_max everywhere in the CI matrix
@@ -133,7 +134,11 @@ function endToEndSharedVolumeNeverSilentlyProceeds() {
     const planted = planClaim(root, { host_id: "host-remote-nfs-writer", renewed_at: Date.now() + skewMs });
     const rawBefore = fs.readFileSync(claimPath(root), "utf8");
 
-    const local = new WriterClaim(root, { hostId: "host-this-machine", instanceId: "2".repeat(32) });
+    // Real clock, explicitly: this "host" is standing in for a genuine remote host in
+    // the scenario under test (AC-2), and the planted claim's renewed_at above is
+    // stamped from real Date.now() +/- skewMs, so the local instance has to read
+    // against the same real clock to reproduce the skew it is meant to observe.
+    const local = new WriterClaim(root, { hostId: "host-this-machine", instanceId: "2".repeat(32), clock: systemLeaseClock() });
     let thrown = null;
     try { local.acquire(); } catch (error) { thrown = error; }
 

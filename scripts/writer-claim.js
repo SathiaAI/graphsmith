@@ -177,6 +177,14 @@ class WriterClaim {
     this.hostId = typeof options.hostId === "string" && options.hostId.length > 0 ? options.hostId : defaultHostId();
     this.instanceId = options.instanceId || randomToken();
     if (!/^[a-f0-9]{32}$/.test(this.instanceId)) throw fail("instanceId must be a 32-hex-char token", "INVALID_ARGUMENT");
+    /* Same breadcrumb StateStore writes at construction, and for the same reason: a
+     * source scan for `new WriterClaim(` cannot see through the worker script this
+     * mechanism's own shared-storage suite spawns. See state-store.js's
+     * recordLeaseClockConstruction -- this is a SEPARATE mechanism from StateStore (see
+     * the module header above) that never constructs one, so StateStore's breadcrumb is
+     * structurally blind to this class; reusing the function gives this class the
+     * identical proof rather than a second, divergent one. */
+    stateStore.recordLeaseClockConstruction(options.clock);
     this.clock = options.clock && typeof options.clock.now === "function" ? options.clock : { now: () => Date.now() };
     this.heartbeatMs = positiveInteger(options.heartbeatMs, DEFAULT_HEARTBEAT_MS);
     this.staleAfterMs = positiveInteger(options.staleAfterMs, this.heartbeatMs * DEFAULT_MISSED_HEARTBEATS_STALE);
