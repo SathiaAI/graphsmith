@@ -393,7 +393,27 @@ class WriterClaim {
    * and write, this fd still refers to the OLD, now-orphaned inode -- the write lands
    * there, invisible to anyone reading the live path, instead of clobbering the new
    * owner's claim; a later status() call on this instance then correctly reports the
-   * claim as lost rather than silently believing the stale renewal "worked". */
+   * claim as lost rather than silently believing the stale renewal "worked".
+   *
+   * KNOWN, DISCLOSED LIMITATION (CodeRabbit review, PR #27, follow-up round): the
+   * ftruncateSync/writeSync/fsyncSync sequence below is not itself crash-atomic. A
+   * process killed (SIGKILL, power loss) in the narrow window after ftruncateSync but
+   * before the write completes leaves the claim file on disk at 0 bytes. The NEXT
+   * acquire() attempt -- by this or any instance -- then reads that as invalid JSON,
+   * classifies it CORRUPT_CLAIM, and (fail-closed, NFR-1) refuses unconditionally as
+   * WRITER_CLAIM_AMBIGUOUS rather than treating it as reclaimable, exactly like any
+   * other corrupt claim file. Recovery is the same as for any WRITER_CLAIM_AMBIGUOUS
+   * refusal (see that error's own message): after confirming no writer process is
+   * actually using this state directory, remove the claim file by hand and retry.
+   * This trades a rare, manual-recovery availability edge case for keeping the
+   * TOCTOU-safety fix above (a single fd held across the whole check-then-write,
+   * never rebinding the path via rename mid-renewal) -- switching back to a
+   * rename-based atomic write here would reopen exactly the TOCTOU race that fix
+   * closes. Not engineered further here because Phase 0 does not yet wire
+   * WriterClaim into any production entry point (see the startHeartbeat() doc
+   * comment above and KNOWN-LIMITATIONS.md); a guarded auto-recovery path is real
+   * follow-up work once there is an actual caller and operational surface to design
+   * it against, not something to build speculatively ahead of that. */
   renew() {
     if (!this._claimToken) throw fail("No writer-claim held by this instance", "WRITER_CLAIM_NOT_HELD");
     const now = this._now();
