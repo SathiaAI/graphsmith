@@ -130,6 +130,25 @@ function readClaimFile(stateDir) {
  * function so it can be pinned by tests without spinning up real processes or files.
  * Returns { outcome: "own" | "steal" | "refuse", code?, detail? }. */
 function decideOnExisting(record, ctx) {
+  if (record.host_id !== ctx.localHostId) {
+    /* CodeRabbit review (PR #27, follow-up round): this cross-host gate (AC-2) must run
+     * BEFORE the instance_id branch below, not after it. instance_id is caller-supplied
+     * (options.instanceId), so it can coincide across two hosts sharing a state
+     * directory (NFS, a shared volume) -- by accident or by a malicious/misconfigured
+     * caller. record.pid is also meaningless across hosts (see module header): a
+     * foreign host's pid number is essentially never a live local process, so
+     * stateStore.pidAlive(record.pid) reliably reads as "not alive" for a foreign
+     * claim. With the instance_id branch checked first, that combination -- matching
+     * instance_id + a foreign pid this host can't see as alive -- fell through to
+     * "own", silently adopting the foreign host's claim_token and producing exactly
+     * the two-attesting-writer condition this module exists to prevent, defeating the
+     * AC-2 unconditional-refusal guarantee entirely. Checking host_id first makes that
+     * unreachable: no combination of instance_id or pid can ever bypass this refusal.
+     * No staleness arithmetic is attempted for a foreign host either -- see the module
+     * header for why. */
+    return { outcome: "refuse", code: "WRITER_CLAIM_FOREIGN_HOST" };
+  }
+
   if (record.instance_id === ctx.localInstanceId) {
     /* CodeRabbit review (PR #27): instanceId is caller-supplied (options.instanceId),
      * so two DIFFERENT live processes started with the same explicit instanceId both
@@ -137,17 +156,13 @@ function decideOnExisting(record, ctx) {
      * lets the second process adopt the first's claim_token and act as attesting
      * writer too -- the exact two-writer condition this module exists to prevent. The
      * record's pid distinguishes them: a foreign, live pid under a matching
-     * instance_id is a real conflict, not a re-acquire. */
+     * instance_id is a real conflict, not a re-acquire. Both records are already known
+     * same-host here (the host_id gate above ran first), so pid-liveness is a
+     * meaningful signal at this point. */
     if (record.pid !== ctx.localPid && stateStore.pidAlive(record.pid)) {
       return { outcome: "refuse", code: "WRITER_CLAIM_HELD" };
     }
     return { outcome: "own" };
-  }
-
-  if (record.host_id !== ctx.localHostId) {
-    // Cross-host signal (AC-2): refuse unconditionally, regardless of apparent age.
-    // No staleness arithmetic is attempted -- see the module header for why.
-    return { outcome: "refuse", code: "WRITER_CLAIM_FOREIGN_HOST" };
   }
 
   const age = ctx.now - record.renewed_at;   // > 0 => renewed_at is in the past (normal)
