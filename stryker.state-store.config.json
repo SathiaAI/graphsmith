@@ -4,7 +4,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node tests/state-store/grok/run-tests.js && node tests/state-store/clock-skew/run-tests.js && node tests/state-store/deepseek/run-tests.js"
+    "command": "node tests/state-store/grok/run-tests.js && node tests/state-store/clock-skew/run-tests.js && node tests/state-store/deepseek/run-tests.js && node tests/state-store/writer-claim/run-tests.js && node tests/state-store/writer-claim-shared-storage/run-tests.js && node tests/state-store/atomic-primitives/run-tests.js"
   },
   "mutate": [
     "scripts/state-store.js"
