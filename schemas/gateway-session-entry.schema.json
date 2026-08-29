@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/gateway-session-entry.schema.json",
+  "title": "GraphSmith gateway-session chain entry (Track 1.2, SG-FR-5/SG-FR-7)",
+  "description": "One record in the append-only, hash-chained gateway-session log -- modeled on schemas/retention-entry.schema.json's chain shape (see checks/register-retention.js), but a separate chain: gateway sessions are not adoption/retention records (Standalone Gateway TRD SS0's grounding finding). entry_sha256 is SELF-REFERENTIAL (computed from this entry's own other fields, see scripts/gateway/chain.js#computeEntrySha256), unlike retention-entry's packet_sha256 (an externally-supplied hash of a packet this entry merely retains) -- this is what lets SG-FR-7's verifier detect a mutated entry by recomputing its hash from its own content, not only by checking the next entry's prev_entry_sha256 link.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "seq", "bundle_id", "prev_entry_sha256", "entry_sha256"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "seq": { "type": "integer", "minimum": 1, "description": "Monotonic position in the chain, contiguous (append-only)." },
+    "bundle_id": { "type": "string", "minLength": 1, "description": "References the sealed bundle file this entry chains -- <state_dir>/gateway-sessions/<bundle_id>.json, unaffected by this schema." },
+    "prev_entry_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "null only for seq==1 (chain root); otherwise the prior entry's entry_sha256."
+    },
+    "entry_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA-256 hex of this entry's own (schema_version, seq, bundle_id, prev_entry_sha256) tuple -- see scripts/gateway/chain.js#computeEntrySha256 for the exact canonical form."
+    }
+  }
+}
