@@ -4,7 +4,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node tests/state-store/grok/run-tests.js && node tests/state-store/clock-skew/run-tests.js && node tests/state-store/deepseek/run-tests.js && node tests/state-store/writer-claim/run-tests.js && node tests/state-store/writer-claim-shared-storage/run-tests.js && node tests/state-store/atomic-primitives/run-tests.js && node tests/state-store/pidalive-zombie/run-tests.js"
+    "command": "node tests/state-store/grok/run-tests.js && node tests/state-store/clock-skew/run-tests.js && node tests/state-store/deepseek/run-tests.js && node tests/state-store/writer-claim/run-tests.js && node tests/state-store/writer-claim-shared-storage/run-tests.js && node tests/state-store/atomic-primitives/run-tests.js && node tests/state-store/pidalive-zombie/run-tests.js && node tests/state-store/pidalive-crossplatform/run-tests.js && node tests/state-store/schema-validator/run-tests.js && node tests/state-store/deep-triage/run-tests.js && node tests/state-store/lease-clock-audit/run-tests.js && node tests/state-store/argument-aliases/run-tests.js && node tests/state-store/idempotent-replays/run-tests.js && node tests/state-store/numeric-edge-cases/run-tests.js && node tests/state-store/journal-and-status/run-tests.js && node tests/state-store/lock-lost-and-guards/run-tests.js"
   },
   "mutate": [
     "scripts/state-store.js"

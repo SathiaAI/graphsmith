@@ -1349,6 +1349,29 @@ function attackSelftestCliFloor() {
            exact match, so legitimately adding new checks later doesn't break
            this -- only a check silently disappearing does. */
         errs.push(`selftest tests.length regressed: got ${result.tests.length}, want >= 6`);
+      } else {
+        /* Round 9 (2026-08-29): the floor above only ever checked the ARRAY LENGTH, so a
+         * `tests.push({})` (dropping name/status entirely) or a `status: ""` mutant inside
+         * any individual selftest() check still passed this test -- the array got longer or
+         * stayed the same length either way. Pin each entry's shape and name/status content
+         * directly: every check selftest() KNOWS it ran must say so by name, not just add to
+         * a count. Presence-only (`.every(name => ...)`), not exact-set, so a later selftest()
+         * addition still doesn't break this -- only one of these six going missing, or
+         * reporting anything other than "pass", does. */
+        const EXPECTED_NAMES = [
+          "expired-lock-steal-and-token-refusal",
+          "lock-created-atomically-unreadable-lock-retried-then-condemned",
+          "journal-inspect-and-roll-forward",
+          "alpha-reservation-crash-persistence",
+          "registry-lease-sweep",
+          "schema-rejects-hostile-keys-on-read",
+        ];
+        const byName = new Map(result.tests.map((t) => [t && t.name, t]));
+        for (const expected of EXPECTED_NAMES) {
+          const entry = byName.get(expected);
+          if (!entry) errs.push(`selftest is missing the "${expected}" check entirely`);
+          else if (entry.status !== "pass") errs.push(`selftest check "${expected}" reported status=${JSON.stringify(entry.status)}, want "pass"`);
+        }
       }
     }
     if (errs.length) throw new Error(errs.join("; "));
