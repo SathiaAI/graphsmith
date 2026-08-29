@@ -4,7 +4,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node tests/manifest/gemini/run-tests.js && node tests/manifest/gpt-sol-pro/run-tests.js"
+    "command": "node tests/manifest/gemini/run-tests.js && node tests/manifest/gpt-sol-pro/run-tests.js && node tests/manifest/triage/run-tests.js"
   },
   "mutate": [
     "scripts/manifest.js"

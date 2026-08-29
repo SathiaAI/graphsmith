@@ -163,15 +163,14 @@ function verifyTree(manifestPath, rootDir) {
     }
   }
 
-  const seenPaths = new Set();
-  for (const entry of manifest.files) {
-    const cp = canonicalPath(entry.path);
-    if (seenPaths.has(cp)) {
-      throw new Error(`Duplicate path in manifest: "${cp}" — refused (contract 01)`);
-    }
-    seenPaths.add(cp);
-  }
-
+  /* Type/format validation MUST run before duplicate-path detection: the
+   * dedup loop below calls canonicalPath(entry.path), which assumes a string
+   * (round 10 mutation triage, 2026-08-29 — a manifest with a non-string
+   * `path` used to reach canonicalPath() first and crash with a raw
+   * "p.split is not a function" TypeError instead of the documented
+   * graceful "path must be a string" error; that TypeError also didn't match
+   * the CLI's isSchemaError classification, so `verify` exited 1 instead of
+   * the documented 2 for a malformed manifest). */
   for (const entry of manifest.files) {
     if (typeof entry.path !== "string") {
       throw new Error("Invalid manifest entry: path must be a string");
@@ -182,6 +181,15 @@ function verifyTree(manifestPath, rootDir) {
     if (typeof entry.bytes !== "number" || !Number.isInteger(entry.bytes) || entry.bytes < 0) {
       throw new Error("Invalid manifest entry: bytes must be a non-negative integer");
     }
+  }
+
+  const seenPaths = new Set();
+  for (const entry of manifest.files) {
+    const cp = canonicalPath(entry.path);
+    if (seenPaths.has(cp)) {
+      throw new Error(`Duplicate path in manifest: "${cp}" — refused (contract 01)`);
+    }
+    seenPaths.add(cp);
   }
 
   const manifestAbs = path.resolve(manifestPath);
