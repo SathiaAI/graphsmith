@@ -96,7 +96,8 @@
     "tests/generate/",
     "tests/plugin-hooks/",
     "tests/postmortem/",
-    "tests/reconcile/"
+    "tests/reconcile/",
+    "tests/mode-selection/"
   ],
   "evidence_only": [
     "tests/attacks/deepseek/",
