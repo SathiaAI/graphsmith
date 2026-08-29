@@ -119,14 +119,16 @@ function foreignHostNeverStealableUnderAnySkew() {
 
 /* CodeRabbit review (PR #27, follow-up round): instance_id is caller-supplied, so it
  * can coincide across two hosts sharing a state directory -- by accident, or because a
- * caller (possibly malicious) explicitly set it. Before the fix, decideOnExisting()
- * checked instance_id before host_id: a foreign claim whose instance_id happened to
- * match ours, combined with a pid this host cannot see as alive (true of essentially
- * any foreign host's pid number), fell into the "own" branch instead of ever reaching
- * the host_id gate -- silently adopting the foreign claim_token and producing exactly
- * the two-attesting-writer condition AC-2 exists to prevent. This pins that the
- * host_id gate now runs first and is unconditional, regardless of what instance_id or
- * pid the foreign record carries. */
+ * caller (possibly malicious) explicitly set it. [inferring] Before the fix,
+ * decideOnExisting() checked instance_id before host_id -- this describes prior code no
+ * longer present in the live file, not something re-verifiable here. A foreign claim
+ * whose instance_id happened to match ours, combined with a pid this host cannot see as
+ * alive (true of essentially any foreign host's pid number), fell into the "own" branch
+ * instead of ever reaching the host_id gate -- silently adopting the foreign
+ * claim_token and producing exactly the two-attesting-writer condition AC-2 exists to
+ * prevent. This pins the CURRENT, verifiable state: the host_id gate now runs first and
+ * is unconditional, regardless of what instance_id or pid the foreign record carries
+ * (scripts/writer-claim.js:132-148, decideOnExisting). */
 function foreignHostRefusesEvenWithMatchingInstanceId() {
   const now = 1_700_000_600_000;
   const sharedInstanceId = "same-explicit-instance-id".padEnd(32, "0");

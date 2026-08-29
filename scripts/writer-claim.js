@@ -137,15 +137,16 @@ function decideOnExisting(record, ctx) {
      * directory (NFS, a shared volume) -- by accident or by a malicious/misconfigured
      * caller. record.pid is also meaningless across hosts (see module header): a
      * foreign host's pid number is essentially never a live local process, so
-     * stateStore.pidAlive(record.pid) reliably reads as "not alive" for a foreign
-     * claim. With the instance_id branch checked first, that combination -- matching
-     * instance_id + a foreign pid this host can't see as alive -- fell through to
-     * "own", silently adopting the foreign host's claim_token and producing exactly
-     * the two-attesting-writer condition this module exists to prevent, defeating the
-     * AC-2 unconditional-refusal guarantee entirely. Checking host_id first makes that
-     * unreachable: no combination of instance_id or pid can ever bypass this refusal.
-     * No staleness arithmetic is attempted for a foreign host either -- see the module
-     * header for why. */
+     * stateStore.pidAlive(record.pid) (scripts/state-store.js:257) reliably reads as
+     * "not alive" for a foreign claim. With the instance_id branch checked first, that
+     * combination -- matching instance_id + a foreign pid this host can't see as alive
+     * -- fell through to "own", silently adopting the foreign host's claim_token and
+     * producing exactly the two-attesting-writer condition this module exists to
+     * prevent, defeating the AC-2 unconditional-refusal guarantee entirely. Checking
+     * host_id first (this function, above) makes that unreachable: no combination of
+     * instance_id or pid can ever bypass this refusal. No staleness arithmetic is
+     * attempted for a foreign host either -- see the module header (lines 18-36) for
+     * why. */
     return { outcome: "refuse", code: "WRITER_CLAIM_FOREIGN_HOST" };
   }
 
