@@ -1,10 +1,10 @@
 {
   "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
-  "_comment": "Mutation-testing scope: scripts/writer-claim.js (v0.5.0 mutation-testing gate follow-up, Decision G Option 1 first baseline round). Scoped to this module because it has its own fast, comprehensive, dedicated test suite.",
+  "_comment": "Mutation-testing scope: scripts/writer-claim.js (v0.5.0 mutation-testing gate follow-up, Decision G Option 1 first baseline round; Decision G Option 2 round added tests/state-store/writer-claim/triage/run-tests.js, a coverage-gap triage suite following the same method as gate.js round 6 / promote.js round 7). Scoped to this module because it has its own fast, comprehensive, dedicated test suite.",
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node tests/state-store/writer-claim/run-tests.js && node tests/state-store/writer-claim-shared-storage/run-tests.js"
+    "command": "node tests/state-store/writer-claim/run-tests.js && node tests/state-store/writer-claim-shared-storage/run-tests.js && node tests/state-store/writer-claim/triage/run-tests.js"
   },
   "mutate": [
     "scripts/writer-claim.js"
