@@ -35,3 +35,11 @@ reports/
 # purely mechanical/regenerable via `npm install` from package.json, and this
 # repo otherwise stays dependency-lockfile-free by convention.
 package-lock.json
+
+# Track 1.1 mode-selection contract: the per-deployment HMAC secret and any
+# pre-authorization artifacts derived from it never belong in source control
+# (TRD "GraphSmith Gateway Mode-Selection Contract", S4: "gitignored, file-
+# permission-restricted"). .graphsmith/gateway-mode.json itself (the
+# confirmed mode record) is deployment state, not a secret, but lives
+# alongside these and is equally not meant to be committed.
+.graphsmith/

@@ -97,7 +97,8 @@
     "tests/plugin-hooks/",
     "tests/postmortem/",
     "tests/reconcile/",
-    "tests/gsa-attach-shim/"
+    "tests/gsa-attach-shim/",
+    "tests/mode-selection/"
   ],
   "evidence_only": [
     "tests/attacks/deepseek/",
