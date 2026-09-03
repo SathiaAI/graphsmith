@@ -608,9 +608,11 @@ function crCodex_renewToctouDoesNotClobberContender() {
    * confirmed on a real Windows host from this environment (no native Windows execution
    * available, only Linux) -- this conclusion rests on CI log evidence and code reading,
    * not a local repro. crCodex_unlinkIfTokenDoesNotClobberSwappedFile below uses the same
-   * technique via a different code path (_unlinkIfToken's read-only fd) and has passed on
-   * windows-latest in every CI run checked, so it is left as-is rather than also skipped
-   * on unverified suspicion. */
+   * technique via a different code path (_unlinkIfToken's read-only fd). An earlier version
+   * of this comment said it had passed on windows-latest in every CI run checked and left it
+   * unskipped -- that was based on a single historical sample and turned out to be wrong: it
+   * failed the same way on the very next CI run after this fix landed. It is now skipped
+   * below for the same reason and with the same evidentiary caveat. */
   if (process.platform === "win32") {
     skip("cr-renew-toctou-swap-actually-happened",
       "unverified on this platform: unlinking owner.path while renew()'s own fd is open " +
@@ -669,6 +671,24 @@ function crCodex_renewToctouDoesNotClobberContender() {
 }
 
 function crCodex_unlinkIfTokenDoesNotClobberSwappedFile() {
+  /* [inferring] SKIPPED on win32 -- see the comment on crCodex_renewToctouDoesNotClobberContender
+   * above for the full reasoning (same unlink-under-open-fd technique, same inferred Windows
+   * file-sharing cause, same "no native Windows execution available to confirm directly"
+   * caveat). This function's own fd comes from _unlinkIfToken's fs.openSync(this.path, "r")
+   * (read-only) rather than renew()'s "r+", so it is a distinct code path -- but the CI
+   * failure signature (contender swap never completes, then EPERM) is identical, confirming
+   * this is the same platform limitation, not a coincidence. */
+  if (process.platform === "win32") {
+    skip("cr-unlink-toctou-swap-actually-happened",
+      "unverified on this platform: unlinking owner.path while _unlinkIfToken's own fd is " +
+      "open does not appear to permit the immediate same-path recreate this simulation " +
+      "needs on Windows (see comment above crCodex_renewToctouDoesNotClobberContender)");
+    skip("cr-unlink-toctou-release-does-not-throw", "see prior skip");
+    skip("cr-unlink-toctou-release-reports-false", "see prior skip");
+    skip("cr-unlink-toctou-contenders-claim-not-deleted", "see prior skip");
+    return;
+  }
+
   const root = freshRoot("cr-unlink-toctou");
   const clock = createManualClock();
   const owner = newClaim(root, { instanceId: "5".repeat(32), clock });
