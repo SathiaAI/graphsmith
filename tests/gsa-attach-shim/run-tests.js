@@ -171,10 +171,26 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function waitForExit(child) {
+/* A sentinel distinct from any real exit code (including the `null` Node reports for a
+ * signal-killed process) -- so a caller can tell "the child hit our deadline and we had
+ * to kill it" apart from "the child genuinely exited". */
+const EXIT_DEADLINE_EXCEEDED = Symbol("exit-deadline-exceeded");
+
+/* CodeRabbit review: if a caller's contention assumption regresses (e.g. a second
+ * worker against the same directory unexpectedly starts instead of being refused),
+ * the worker never exits on its own and this promise hung forever, wedging the whole
+ * suite instead of reporting a failed test. `timeoutMs` bounds the wait; on expiry the
+ * child is force-killed and the promise resolves to EXIT_DEADLINE_EXCEEDED so the
+ * caller can fail the check explicitly rather than mistake a forced kill for a real
+ * exit code. */
+function waitForExit(child, timeoutMs = 5000) {
   return new Promise((resolve) => {
     if (child.exitCode !== null) { resolve(child.exitCode); return; }
-    child.on("close", (code) => resolve(code));
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(EXIT_DEADLINE_EXCEEDED);
+    }, timeoutMs);
+    child.on("close", (code) => { clearTimeout(timer); resolve(code); });
   });
 }
 
@@ -251,7 +267,10 @@ async function secondInstanceAgainstSameDirectoryRefused() {
 
   const second = spawnWorker(root);
   const secondCode = await waitForExit(second.child);
-  check("second-instance-exits-nonzero", secondCode !== 0, `expected a non-zero exit code, got ${secondCode}`);
+  check("second-instance-exits-nonzero", secondCode !== 0 && secondCode !== EXIT_DEADLINE_EXCEEDED,
+    secondCode === EXIT_DEADLINE_EXCEEDED
+      ? "second worker did not exit within the deadline -- contention regression: it kept running instead of being refused"
+      : `expected a non-zero exit code, got ${secondCode}`);
 
   const secondFailure = await waitForLine(second.getStdout, (o) => o.phase === "start" && o.ok === false);
   check("second-instance-reports-writer-claim-refusal-code",
