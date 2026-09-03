@@ -30,6 +30,7 @@ const AUDIT_ENV = "GRAPHSMITH_LEASE_CLOCK_AUDIT";
 
 let failures = 0;
 const results = [];
+const tempDirs = [];
 
 function report(name, status, reason) {
   const line = status === "PASS" ? `PASS ${name}` : `FAIL ${name}+${reason || "unknown"}`;
@@ -44,6 +45,7 @@ function check(name, cond, reason) {
 
 function freshAuditPath() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-lease-clock-audit-"));
+  tempDirs.push(dir);
   return path.join(dir, "audit.jsonl");
 }
 
@@ -67,6 +69,7 @@ function recordAndRead(clockOption, auditPath) {
 /* ---- the early return: no audit env var set -> writes nothing at all ---- */
 function noAuditEnvWritesNothing() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-lease-clock-audit-none-"));
+  tempDirs.push(dir);
   const target = path.join(dir, "never-created.jsonl");
   const prev = process.env[AUDIT_ENV];
   delete process.env[AUDIT_ENV];
@@ -198,18 +201,28 @@ function recordCarriesProcessPid() {
 }
 
 function main() {
-  noAuditEnvWritesNothing();
-  undefinedClockOptionIsWall();
-  nonFunctionNowIsMalformed();
-  realAdvancingSystemTagIsSystem();
-  untaggedButGenuinelyAdvancingClockIsClassifiedSystem();
-  frozenTaggedManualClockIsManual();
-  frozenUntaggedClockIsAlsoManual();
-  taggedSystemButFrozenIsSystemFrozen();
-  throwingNowFunctionIsCustom();
-  sameClockObjectIsMeasuredOnlyOnce();
-  siteAndCallerNameThisTestFile();
-  recordCarriesProcessPid();
+  try {
+    noAuditEnvWritesNothing();
+    undefinedClockOptionIsWall();
+    nonFunctionNowIsMalformed();
+    realAdvancingSystemTagIsSystem();
+    untaggedButGenuinelyAdvancingClockIsClassifiedSystem();
+    frozenTaggedManualClockIsManual();
+    frozenUntaggedClockIsAlsoManual();
+    taggedSystemButFrozenIsSystemFrozen();
+    throwingNowFunctionIsCustom();
+    sameClockObjectIsMeasuredOnlyOnce();
+    siteAndCallerNameThisTestFile();
+    recordCarriesProcessPid();
+  } finally {
+    for (const dir of tempDirs) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch (_err) {
+        /* best-effort cleanup; never let it mask the real test result */
+      }
+    }
+  }
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
