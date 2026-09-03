@@ -56,6 +56,27 @@ function entryShapeOk(e) {
   return true;
 }
 
+const HEAD_KEYS = ["schema_version", "seq", "bundle_id", "entry_sha256"];
+
+/** Same strict, fail-closed shape discipline as entryShapeOk (and scripts/gateway/
+ * chain.js's own headShapeOk, which this deliberately mirrors -- this module stays
+ * dependency-free, per its own header, so it hand-rolls rather than requires it). Without
+ * this, a HEAD.json with a missing/wrong schema_version, extra fields, or an otherwise
+ * malformed shape could still slip through the tail comparison below and receive a clean
+ * "verified" verdict as long as its seq/bundle_id/entry_sha256 happened to match. */
+function headShapeOk(h) {
+  if (!h || typeof h !== "object") return false;
+  for (const k of HEAD_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(h, k)) return false;
+  }
+  for (const k of Object.keys(h)) if (HEAD_KEYS.indexOf(k) === -1) return false;
+  if (h.schema_version !== "1.0") return false;
+  if (typeof h.seq !== "number" || !Number.isInteger(h.seq) || h.seq < 1) return false;
+  if (typeof h.bundle_id !== "string" || h.bundle_id.length === 0) return false;
+  if (typeof h.entry_sha256 !== "string" || !HEX64.test(h.entry_sha256)) return false;
+  return true;
+}
+
 /* ctx = {
  *   chain: [gateway-session-entry],   // ordered append-only log, as read from chain.jsonl
  *   head: { schema_version, seq, bundle_id, entry_sha256 } | null,   // HEAD.json's content
@@ -115,6 +136,9 @@ function walkGatewaySessions(ctx) {
     if (!ctx.head) {
       return fail(`chain.jsonl has ${chain.length} entry(ies) but HEAD.json is missing -- incomplete append (crash between the chain.jsonl write and the HEAD.json update), needs recovery`, "trusted-core");
     }
+    if (!headShapeOk(ctx.head)) {
+      return fail("HEAD.json has an invalid shape/type -- refusing (fail-closed)", "untrusted-input");
+    }
     if (!(ctx.head.seq === last.seq && ctx.head.bundle_id === last.bundle_id && ctx.head.entry_sha256 === last.entry_sha256)) {
       return fail("HEAD.json does not match the chain's own tail entry -- incomplete append (crash between the chain.jsonl write and the HEAD.json update), needs recovery, never treated as merely short-but-fine", "trusted-core");
     }
@@ -137,7 +161,7 @@ const check = {
   },
 };
 
-module.exports = { ...check, walkGatewaySessions, entryShapeOk };
+module.exports = { ...check, walkGatewaySessions, entryShapeOk, headShapeOk };
 
 if (require.main === module) {
   if (process.argv.includes("--selftest")) {
