@@ -16,6 +16,7 @@ const crypto = require("crypto");
 const http = require("http");
 const readline = require("readline");
 const { isAuthenticated } = require("../../mcp-server/src/auth.js");
+const { MAX_BODY_BYTES, REQUEST_TIMEOUT_MS } = require("../../mcp-server/src/httpTransport.js");
 
 /** Runs the agent-facing stdio transport against `ctx.proxy`. Returns
  * { connectionId, closed, stop } -- `closed` resolves once the session has already been
@@ -54,6 +55,18 @@ function runStdioAgentTransport(ctx) {
 /** Runs the agent-facing HTTP transport (config `agent_listen.transport: "http"`).
  * `token` is the already-resolved bearer token (see config.js#resolveSecretRef). */
 function runHttpAgentTransport(ctx, listenConfig, token) {
+  /* Same hard requirement mcp-server/src/httpTransport.js#createHttpServer already
+   * enforces for its own HTTP listener: the config schema itself does not (and cannot,
+   * since token_ref is only a reference, not the resolved secret) bound the resolved
+   * token's strength, so this is the one place that can actually refuse a
+   * trivially-brute-forceable bearer token before binding a network-accessible socket. */
+  if (!token || typeof token !== "string" || token.length < 16) {
+    throw new Error(
+      "graphsmith-gateway: refusing to start the agent-facing HTTP transport without a strong bearer " +
+        "token. agent_listen.token_ref must resolve to a value of at least 16 characters -- this is a " +
+        "hard requirement for any non-stdio agent transport, not a configurable-away default."
+    );
+  }
   const socketConnectionIds = new WeakMap();
 
   function connectionIdFor(socket) {
@@ -79,9 +92,31 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
       res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthenticated." } }));
       return;
     }
+    /* Bounds an authenticated (or compromised) agent's request body/duration the same
+     * way mcp-server/src/httpTransport.js does for its own listener: an absolute
+     * per-request deadline (a slow-trickled body would never trip Node's default
+     * inactivity-based server timeout) plus a byte cap enforced by counting real bytes
+     * received, not string length (see that module's own header comment on why). Without
+     * this, one connection could exhaust memory or stay open indefinitely, including
+     * during graceful shutdown's drain. */
+    const requestDeadline = setTimeout(() => req.destroy(), REQUEST_TIMEOUT_MS);
+    if (typeof requestDeadline.unref === "function") requestDeadline.unref();
+    req.on("close", () => clearTimeout(requestDeadline));
+
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let bytesReceived = 0;
+    let tooLarge = false;
+    req.on("data", (c) => {
+      bytesReceived += c.length;
+      if (bytesReceived > MAX_BODY_BYTES) {
+        tooLarge = true;
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => {
+      if (tooLarge) return; // connection already destroyed, nothing to respond with
       let msg;
       try {
         msg = JSON.parse(Buffer.concat(chunks).toString("utf8"));
