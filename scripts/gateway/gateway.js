@@ -22,6 +22,7 @@
 
 const path = require("path");
 const crypto = require("crypto");
+const fs = require("fs");
 
 const modeGate = require("./mode-gate.js");
 const gatewayConfig = require("./config.js");
@@ -31,6 +32,7 @@ const downstream = require("./downstream.js");
 const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-transport.js");
 const writerClaimModule = require("../writer-claim.js");
 const { WriterClaim } = writerClaimModule;
+const registerGatewaySessions = require("../../checks/register-gateway-sessions.js");
 
 /** SS3.7's bounded drain: waits (polling) until every open session on `proxy` has no
  * calls still in flight, or `timeoutMs` elapses, whichever first. Extracted as its own
@@ -68,6 +70,20 @@ function loadSigningKeys(config) {
   } catch (error) {
     throw fail(`signing_key_ref did not resolve to a valid private key: ${error.message}`, "GATEWAY_BAD_SIGNING_KEY");
   }
+  /* createPrivateKey() happily accepts an RSA or EC key too -- Node can sign with either
+   * -- but this build unconditionally labels the key "ed25519" regardless of what was
+   * actually loaded. gsa-verify.js#44-49 rejects a declared-algorithm/key-type mismatch,
+   * so every bundle sealed with a non-ed25519 key would persist successfully and then be
+   * unverifiable. Check the real key type before startup completes rather than let that
+   * surface only much later, at verify time. */
+  if (privateKey.asymmetricKeyType !== "ed25519") {
+    throw fail(
+      `signing_key_ref resolved to a ${privateKey.asymmetricKeyType || "unknown"} key, but this gateway ` +
+        'only signs with ed25519 (gsa-verify.js requires the declared algorithm to match the actual key ' +
+        "type). Provide an ed25519 private key.",
+      "GATEWAY_BAD_SIGNING_KEY"
+    );
+  }
   return { privateKey, signer: config.host_id || "graphsmith-standalone-gateway", algo: "ed25519" };
 }
 
@@ -93,16 +109,47 @@ function checkModeGate(root, log) {
  * persisted bundle, and time since the chain tail was last pushed to the remote anchor
  * (always "not implemented" in this build -- see chain.js#pushChainTailToRemoteAnchor). */
 function buildHealthStatus(ctx) {
-  const head = chain.readHead(ctx.config.state_dir);
+  const stateDir = ctx.config.state_dir;
+  const head = chain.readHead(stateDir);
+
+  // Time since the last persisted bundle (SG-NFR-3's stated contract): HEAD.json is
+  // written last in chain.appendSession's write order, so its own mtime is exactly that.
+  let lastPersistedAt = null;
+  try {
+    lastPersistedAt = fs.statSync(chain.headPath(stateDir)).mtime.toISOString();
+  } catch (error) {
+    /* ENOENT (nothing persisted yet) or any other stat failure: report null rather than
+     * let an operator mistake a missing timestamp for "just persisted". */
+  }
+
+  /* SG-FR-7's session-chain integrity walk (checks/register-gateway-sessions.js) existed
+   * only as a synthetic --selftest before this: no production code ever actually ran it
+   * against this deployment's real on-disk chain. Wiring it into the health surface is a
+   * real operational path an operator or monitor can act on -- a non-"verified" result
+   * here is a fail-closed, visible signal (tampering, a sequence gap, or an incomplete
+   * append), not silently invisible until someone thinks to run --selftest by hand. */
+  let sessionChainIntegrity;
+  try {
+    sessionChainIntegrity = registerGatewaySessions.run({
+      chain: chain.readChain(stateDir),
+      head,
+      computeEntrySha256: chain.computeEntrySha256,
+      bundleExists: (bundleId) => fs.existsSync(chain.bundlePath(stateDir, bundleId)),
+    });
+  } catch (error) {
+    sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `session-chain verification threw: ${error.message}` };
+  }
+
   return {
     schema_version: "1.0",
     writer_claim: ctx.writerClaim.status(),
-    downstream_servers: Array.from(ctx.connections.keys()).map((name) => ({
-      name,
-      reachable: !ctx.connections.get(name).isClosed(),
-    })),
+    downstream_servers: Array.from(ctx.connections.keys()).map((name) => {
+      const conn = ctx.connections.get(name);
+      return { name, reachable: typeof conn.isReachable === "function" ? conn.isReachable() : !conn.isClosed() };
+    }),
     active_sessions: ctx.proxy.openSessionCount(),
-    chain: head ? { seq: head.seq, entry_sha256: head.entry_sha256 } : { seq: 0, entry_sha256: null },
+    chain: head ? { seq: head.seq, entry_sha256: head.entry_sha256, last_persisted_at: lastPersistedAt } : { seq: 0, entry_sha256: null, last_persisted_at: lastPersistedAt },
+    session_chain_integrity: sessionChainIntegrity,
     remote_anchor: { implemented: false, reason: "SG-FR-6 not implemented in this build -- see chain.js#pushChainTailToRemoteAnchor" },
   };
 }
@@ -174,21 +221,36 @@ async function startGateway(options) {
   const listenConfig = config.agent_listen || { transport: "stdio" };
   let stdioHandle = null;
   let httpHandle = null;
-  if (listenConfig.transport === "http") {
-    const token = gatewayConfig.resolveSecretRef(listenConfig.token_ref, "agent_listen.token_ref");
-    httpHandle = await runHttpAgentTransport({ proxy }, listenConfig, token);
-    log(`agent-facing HTTP listener on port ${httpHandle.port}`);
-  } else {
-    stdioHandle = runStdioAgentTransport({ proxy });
-    /* stdio is a one-process-per-connection transport (mirrors mcp-server/src/
-     * stdioTransport.js's own "stdin closed -> exit cleanly" convention): once the
-     * agent disconnects, the connection's session is already finalized (inside
-     * runStdioAgentTransport's own rl "close" handler, which resolves this promise
-     * AFTER closeConnection completes) -- there is nothing left for this process to do
-     * but release the claim and exit. Without this, the process would sit idle forever
-     * (the writer-claim heartbeat timer and the still-open downstream child keep the
-     * event loop alive), never actually stopping. */
-    stdioHandle.closed.then(() => stop("agent stdio disconnected").then(() => process.exit(0)));
+  try {
+    if (listenConfig.transport === "http") {
+      const token = gatewayConfig.resolveSecretRef(listenConfig.token_ref, "agent_listen.token_ref");
+      httpHandle = await runHttpAgentTransport({ proxy }, listenConfig, token);
+      log(`agent-facing HTTP listener on port ${httpHandle.port}`);
+    } else {
+      stdioHandle = runStdioAgentTransport({ proxy });
+      /* stdio is a one-process-per-connection transport (mirrors mcp-server/src/
+       * stdioTransport.js's own "stdin closed -> exit cleanly" convention): once the
+       * agent disconnects, the connection's session is already finalized (inside
+       * runStdioAgentTransport's own rl "close" handler, which resolves this promise
+       * AFTER closeConnection completes) -- there is nothing left for this process to do
+       * but release the claim and exit. Without this, the process would sit idle forever
+       * (the writer-claim heartbeat timer and the still-open downstream child keep the
+       * event loop alive), never actually stopping. */
+      stdioHandle.closed.then(() => stop("agent stdio disconnected").then(() => process.exit(0)));
+    }
+  } catch (error) {
+    /* Everything up to here (writer-claim, heartbeat, downstream connections) already
+     * succeeded by the time agent-listener setup can fail (an unresolved token_ref, or a
+     * bind failure) -- without this cleanup, that already-acquired state (in particular
+     * the writer-claim and any still-alive stdio downstream child) would leak: the
+     * process could remain running after setting a non-zero exitCode, block a future
+     * restart's claim acquisition, and need manual termination. */
+    proxy.stopAcceptingNewSessions();
+    for (const conn of downstreamHandles.connections.values()) {
+      try { conn.close(); } catch (closeError) { /* best effort */ }
+    }
+    writerClaim.release();
+    throw error;
   }
 
   const ctx = { config, writerClaim, connections: downstreamHandles.connections, proxy };
