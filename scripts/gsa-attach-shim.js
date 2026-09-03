@@ -55,6 +55,18 @@ const KEY_FILE = "gateway-mode.key";
 const SCHEMA_VERSION = "1.0";
 const BINARY_MODE = "attach";
 
+/* Mirrors writer-claim.js's own private `fail()` helper (not exported from there, so
+ * this file needs its own copy) -- a named .code alongside the Error, matching this
+ * module's fail-closed convention. Previously missing entirely: `throw fail(...)` in
+ * start()'s already-started guard below referenced an undefined `fail`, so a duplicate
+ * start() call threw a bare ReferenceError instead of the intended
+ * ATTACH_SHIM_ALREADY_STARTED-coded error. */
+function fail(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 /* MS-FR-1: validate .graphsmith/gateway-mode.json exactly per the mode-selection
  * contract's §3.2 startup-validation flow / §7 fail-closed table, in the same order:
  * missing -> unreadable -> malformed/invalid -> unconfirmed -> key-missing ->
