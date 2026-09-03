@@ -40,6 +40,16 @@ function fail(message, code = "GATEWAY_DOWNSTREAM_ERROR") {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 
+/* The MCP protocol version this client negotiates on the downstream leg's own
+ * initialize handshake -- matches the literal version scripts/gateway/proxy.js selects
+ * on the agent-facing leg (both legs of this gateway speak the same one version). */
+const MCP_PROTOCOL_VERSION = "2025-06-18";
+
+/* Bounds on how many tools/list pages a downstream may hand back before this client
+ * gives up rather than looping forever on a downstream that returns a cursor cycle or an
+ * unbounded number of pages. */
+const MAX_TOOLS_LIST_PAGES = 1000;
+
 /** A downstream connection over stdio: spawns `endpoint` (a shell command line, split on
  * whitespace -- simplest form; a downstream needing shell quoting can wrap itself in a
  * small launcher script) and speaks newline-delimited JSON-RPC over its stdio, matching
@@ -97,9 +107,10 @@ function connectStdio(endpoint, options = {}) {
     closeError = fail(`downstream process failed to start: ${error.message}`, "GATEWAY_DOWNSTREAM_DISCONNECTED");
   });
 
-  function call(method, params, timeoutMs) {
+  function call(method, params, timeoutMs, onIdAssigned) {
     if (closed) return Promise.reject(closeError || fail("downstream connection is closed", "GATEWAY_DOWNSTREAM_DISCONNECTED"));
     const id = nextId++;
+    if (typeof onIdAssigned === "function") onIdAssigned(id);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
@@ -116,6 +127,21 @@ function connectStdio(endpoint, options = {}) {
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
   }
 
+  /** Cancels a still-pending call by the internal id `call()` assigned it (via
+   * `onIdAssigned`): rejects the caller's promise locally and best-effort notifies the
+   * downstream process so it can stop doing the (possibly expensive/irreversible) work,
+   * per MCP's notifications/cancelled. No-op (returns false) if the id is no longer
+   * pending -- already resolved/rejected/timed out. */
+  function cancel(id) {
+    const entry = pending.get(id);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    pending.delete(id);
+    entry.reject(fail(`downstream call (id ${id}) was cancelled`, "GATEWAY_DOWNSTREAM_CANCELLED"));
+    notify("notifications/cancelled", { requestId: id });
+    return true;
+  }
+
   function close() {
     try { child.stdin.end(); } catch (error) { /* best effort */ }
     try { child.kill(); } catch (error) { /* best effort */ }
@@ -125,6 +151,7 @@ function connectStdio(endpoint, options = {}) {
     transport: "stdio",
     call,
     notify,
+    cancel,
     close,
     onNotification: (handler) => notificationHandlers.push(handler),
     isClosed: () => closed,
@@ -140,11 +167,20 @@ function connectHttp(endpoint, options = {}) {
   const client = url.protocol === "https:" ? https : http;
   let nextId = 1;
   let closed = false;
+  /* Distinct from `closed` (a local, caller-driven "we're done with this connection"
+   * flag): this tracks the last OBSERVED network outcome, so buildHealthStatus's
+   * reachability signal reflects reality instead of a flag that only ever gets set by
+   * this client's own close(). Starts true (optimistic) since no request has failed yet;
+   * a single request error or timeout flips it false, and the next request that actually
+   * completes (success OR a well-formed RPC error -- either proves the endpoint is up)
+   * flips it back true. */
+  let reachable = true;
   const notificationHandlers = []; // never fired: plain request/response HTTP has no server push
 
-  function call(method, params, timeoutMs) {
+  function call(method, params, timeoutMs, onIdAssigned) {
     if (closed) return Promise.reject(fail("downstream connection is closed", "GATEWAY_DOWNSTREAM_DISCONNECTED"));
     const id = nextId++;
+    if (typeof onIdAssigned === "function") onIdAssigned(id);
     const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
       const req = client.request(
@@ -154,6 +190,14 @@ function connectHttp(endpoint, options = {}) {
           headers: {
             "content-type": "application/json",
             "content-length": Buffer.byteLength(body),
+            /* Mirrors the Streamable HTTP "Request Metadata" headers this repo's own MCP
+             * HTTP server requires on every request (mcp-server/src/httpTransport.js) --
+             * a downstream that enforces the same contract (including this repo's own
+             * server, fronted as a downstream) would otherwise reject every request for
+             * missing headers regardless of authentication. */
+            "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+            "mcp-method": method,
+            ...(method === "tools/call" && params && typeof params.name === "string" ? { "mcp-name": params.name } : {}),
             ...(options.headers || {}),
           },
         },
@@ -168,18 +212,41 @@ function connectHttp(endpoint, options = {}) {
               reject(fail(`downstream HTTP response was not valid JSON: ${error.message}`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
               return;
             }
-            if (parsed && parsed.error) {
+            /* Fail-closed on the response envelope itself (matching the stdio path's own
+             * strict id-correlation discipline): a wrong/missing JSON-RPC id, a wrong/
+             * missing "jsonrpc" version, or a non-response object are all rejected rather
+             * than attested as this call's real result. */
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.jsonrpc !== "2.0" || parsed.id !== id) {
+              reject(fail(`downstream HTTP response was not a well-formed JSON-RPC 2.0 response matching request id ${id}`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
+              return;
+            }
+            reachable = true; // a well-formed response (success or RPC error) proves the endpoint IS reachable
+            if (parsed.error) {
               reject(Object.assign(fail(parsed.error.message || "downstream error", "GATEWAY_DOWNSTREAM_RPC_ERROR"), { rpcError: parsed.error }));
             } else {
-              resolve(parsed ? parsed.result : undefined);
+              resolve(parsed.result);
             }
           });
         }
       );
-      req.on("error", (error) => reject(fail(`downstream HTTP request failed: ${error.message}`, "GATEWAY_DOWNSTREAM_DISCONNECTED")));
-      req.setTimeout(timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS, () => req.destroy(fail("downstream HTTP request timed out", "GATEWAY_DOWNSTREAM_TIMEOUT")));
+      req.on("error", (error) => {
+        reachable = false;
+        reject(fail(`downstream HTTP request failed: ${error.message}`, "GATEWAY_DOWNSTREAM_DISCONNECTED"));
+      });
+      req.setTimeout(timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS, () => {
+        reachable = false;
+        req.destroy(fail("downstream HTTP request timed out", "GATEWAY_DOWNSTREAM_TIMEOUT"));
+      });
       req.end(body);
     });
+  }
+
+  /** Plain request/response HTTP has no way to abort work already handed to the
+   * downstream (the request is already sent; there is no persistent connection to send a
+   * follow-up cancellation notification over, per this transport's own doc comment
+   * above). Best-effort no-op, disclosed rather than pretending to cancel. */
+  function cancel() {
+    return false;
   }
 
   function notify(method, params) {
@@ -195,9 +262,11 @@ function connectHttp(endpoint, options = {}) {
     transport: "http",
     call,
     notify,
+    cancel,
     close,
     onNotification: (handler) => notificationHandlers.push(handler),
     isClosed: () => closed,
+    isReachable: () => reachable,
     whenClosed: () => Promise.resolve(null),
   };
 }
@@ -224,16 +293,70 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
       let conn;
       try {
         conn = connectDownstream(serverConfig, options);
-        const initResult = await conn.call("initialize", { clientInfo: options.clientInfo || { name: "graphsmith-standalone-gateway", version: "1.0" } });
+        /* Full MCP initialize params (protocolVersion + capabilities, not just
+         * clientInfo) -- a downstream that actually validates the initialization
+         * contract (this repo's own MCP server included) rejects a request missing
+         * either. Followed by the required post-initialize "initialized" notification
+         * before this client is allowed to send any other request (tools/list here) --
+         * skipping it left the handshake incomplete even though the permissive test
+         * fixture tolerated it. */
+        const initResult = await conn.call("initialize", {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: options.clientInfo || { name: "graphsmith-standalone-gateway", version: "1.0" },
+        });
         serverInfos[serverConfig.name] = (initResult && initResult.serverInfo) || null;
-        const toolsResult = await conn.call("tools/list", {});
-        const tools = (toolsResult && Array.isArray(toolsResult.tools)) ? toolsResult.tools : [];
+        conn.notify("notifications/initialized", {});
+
+        /* Follows tools/list's nextCursor until the downstream reports none, so a
+         * paginated surface is fully advertised rather than silently truncated to its
+         * first page. Bounded (page cap + cursor-cycle detection) so a downstream that
+         * never terminates pagination fails this server's startup instead of hanging it
+         * forever. */
+        const tools = [];
+        const seenCursors = new Set();
+        let cursor;
+        let pages = 0;
+        do {
+          const toolsResult = await conn.call("tools/list", cursor !== undefined ? { cursor } : {});
+          const pageTools = (toolsResult && Array.isArray(toolsResult.tools)) ? toolsResult.tools : [];
+          tools.push(...pageTools);
+          pages++;
+          const nextCursor = toolsResult && toolsResult.nextCursor;
+          if (nextCursor === undefined || nextCursor === null) {
+            cursor = undefined;
+          } else if (pages >= MAX_TOOLS_LIST_PAGES || seenCursors.has(nextCursor)) {
+            throw fail(
+              `downstream server "${serverConfig.name}" tools/list pagination did not terminate ` +
+                `(page cap ${MAX_TOOLS_LIST_PAGES} reached or a repeated cursor was returned)`,
+              "GATEWAY_DOWNSTREAM_PAGINATION_LOOP"
+            );
+          } else {
+            seenCursors.add(nextCursor);
+            cursor = nextCursor;
+          }
+        } while (cursor !== undefined);
+
         for (const tool of tools) {
-          const owned = { name: tool.name, server: serverConfig.name, schema: tool.inputSchema || tool.schema || null };
+          if (toolOwners.has(tool.name)) {
+            throw fail(
+              `Refusing to start: tool name "${tool.name}" is advertised by both downstream server ` +
+                `"${toolOwners.get(tool.name)}" and "${serverConfig.name}" -- configure unique tool ` +
+                "names across downstreams (colliding names would silently route an agent's call for " +
+                "the second server's tool to the first server's implementation).",
+              "GATEWAY_TOOL_NAME_COLLISION"
+            );
+          }
+          // Preserve the tool's full descriptor (description, annotations, outputSchema,
+          // etc.) rather than keeping only name+schema -- GatewayProxy's tools/list
+          // response reads t.description, which a narrower projection would discard.
+          const owned = { ...tool, name: tool.name, server: serverConfig.name, schema: tool.inputSchema || tool.schema || null };
           mergedTools.push(owned);
-          if (!toolOwners.has(tool.name)) toolOwners.set(tool.name, serverConfig.name);
+          toolOwners.set(tool.name, serverConfig.name);
         }
       } catch (error) {
+        if (conn) { try { conn.close(); } catch (closeError) { /* best effort */ } }
+        if (error.code === "GATEWAY_TOOL_NAME_COLLISION" || error.code === "GATEWAY_DOWNSTREAM_PAGINATION_LOOP") throw error;
         throw fail(
           `Refusing to start: downstream server "${serverConfig.name}" (${serverConfig.transport} ${serverConfig.endpoint}) ` +
             `is unreachable or failed its handshake: ${error.message}`,
@@ -257,4 +380,4 @@ module.exports = {
   connectDownstream,
   connectAllDownstreams,
   DEFAULT_REQUEST_TIMEOUT_MS,
-};
+}
