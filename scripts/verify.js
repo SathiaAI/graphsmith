@@ -888,6 +888,12 @@ function diffDestinations(declared, observed) {
 }
 
 function checkDestinationsHook(rootDir) {
+  if (typeof rootDir !== "string" || !rootDir) {
+    return {
+      status: "unavailable",
+      reason: "no root directory provided — cannot locate an observed-destinations log without a project root",
+    };
+  }
   const observedLogPath = path.join(rootDir, ".graphsmith", "state", "observed-destinations.json");
   if (!fs.existsSync(observedLogPath)) {
     return {
@@ -2533,6 +2539,7 @@ module.exports = {
   detectExtraFiles,
   verifyAdoptionEntryDigest,
   diffDestinations,
+  checkDestinationsHook,
   sha256Hex,
   // Profile engine (Phase E, evidence-carrying R/E/B/T/G + Q/X)
   profileResumableState,

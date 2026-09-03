@@ -15,6 +15,13 @@ const ROOT = path.resolve(__dirname, "../../..");
 const GATE_PATH = path.join(ROOT, "scripts", "gate.js");
 const STATE_STORE_PATH = path.join(ROOT, "scripts", "state-store.js");
 
+/* Stryker always runs the command test runner from a copied .stryker-tmp/sandbox-*
+   working directory, even during its pre-mutation dry run. Static source-text
+   checks below read GATE_PATH back and pattern-match exact unmutated snippets;
+   Stryker's instrumentation rewrites that literal text (mutant-switch scaffolding),
+   so those checks cannot pass under instrumentation regardless of correctness. */
+const UNDER_STRYKER = ROOT.includes(".stryker-tmp") || __dirname.includes(".stryker-tmp");
+
 const gate = require(GATE_PATH);
 const { createStore } = require(STATE_STORE_PATH);
 
@@ -656,29 +663,37 @@ function attackAlphaLedger() {
 
   /* confirmation data must not be "read" (governance) before reserve —
      structural source order attack */
-  try {
-    const src = fs.readFileSync(GATE_PATH, "utf8");
-    const confResolveIdx = src.indexOf("const confirmation = confirmationPairs.map");
-    const reserveIdx = src.indexOf("alphaLedger.reserve");
-    const winsIdx = src.indexOf("const wins = discordant.filter");
-    assert(confResolveIdx > 0 && reserveIdx > 0 && winsIdx > 0, "markers missing");
-    /* Contract 03: Before ANY confirmation data is accessed, RESERVED is fsync'd.
-       If wins are computed before reserve → DEFECT */
-    if (winsIdx < reserveIdx) {
-      report(
-        "03e-reserve-before-confirmation-access",
-        "FAIL",
-        "DEFECT: confirmation wins/n_d computed before alphaLedger.reserve (contract 03 order)"
-      );
-    } else {
-      report(
-        "03e-reserve-before-confirmation-access",
-        "PASS",
-        "reserve precedes confirmation outcome use"
-      );
+  if (UNDER_STRYKER) {
+    report(
+      "03e-reserve-before-confirmation-access",
+      "SKIPPED",
+      "static source-order check cannot run under Stryker instrumentation (source text is rewritten); this test has no runtime-behavior component, so no mutation-kill coverage is lost -- see contract 03"
+    );
+  } else {
+    try {
+      const src = fs.readFileSync(GATE_PATH, "utf8");
+      const confResolveIdx = src.indexOf("const confirmation = confirmationPairs.map");
+      const reserveIdx = src.indexOf("alphaLedger.reserve");
+      const winsIdx = src.indexOf("const wins = discordant.filter");
+      assert(confResolveIdx > 0 && reserveIdx > 0 && winsIdx > 0, "markers missing");
+      /* Contract 03: Before ANY confirmation data is accessed, RESERVED is fsync'd.
+         If wins are computed before reserve → DEFECT */
+      if (winsIdx < reserveIdx) {
+        report(
+          "03e-reserve-before-confirmation-access",
+          "FAIL",
+          "DEFECT: confirmation wins/n_d computed before alphaLedger.reserve (contract 03 order)"
+        );
+      } else {
+        report(
+          "03e-reserve-before-confirmation-access",
+          "PASS",
+          "reserve precedes confirmation outcome use"
+        );
+      }
+    } catch (e) {
+      report("03e-reserve-before-confirmation-access", "FAIL", e.message);
     }
-  } catch (e) {
-    report("03e-reserve-before-confirmation-access", "FAIL", e.message);
   }
 }
 
@@ -1639,6 +1654,37 @@ function attackExtra() {
     }
   } catch (e) {
     report("09e-minWins-table", "FAIL", e.message);
+  }
+
+  /* CLI --selftest: exit code AND internal check count must both be honored.
+     gate.js has its own Gate1/Gate2/Gate3 selftest harness (selftestMain()) that no
+     external suite previously invoked at all -- a deleted/hollowed internal check
+     would silently drop `tests.length` with no external test noticing. Mirrors the
+     verify.js selftest-floor fix: don't just check exit==0, check the count too. */
+  try {
+    const r = spawnSync(process.execPath, [GATE_PATH, "--selftest"], {
+      encoding: "utf8",
+    });
+    assert(r.status === 0, `exit want 0 got ${r.status}`);
+    const result = JSON.parse(r.stdout);
+    assert(result.status === "pass", `status=${result.status}`);
+    assert(Array.isArray(result.errors) && result.errors.length === 0, `errors=${JSON.stringify(result.errors)}`);
+    assert(Array.isArray(result.tests), "tests must be an array");
+    /* Baseline observed on release/v0.5.0-candidate @ 5aecb3b: 24 checks
+       (8 gate1 + 14 gate2 + 1 arithmetic + 1 gate3). Floor, not exact match,
+       so legitimately adding new checks later doesn't break this test --
+       only a check silently disappearing does. */
+    assert(
+      result.tests.length >= 24,
+      `selftest tests.length regressed: got ${result.tests.length}, want >= 24`
+    );
+    report(
+      "09f-cli-selftest-exit0-and-count",
+      "PASS",
+      `exit=${r.status} status=${result.status} tests=${result.tests.length} errors=${result.errors.length}`
+    );
+  } catch (e) {
+    report("09f-cli-selftest-exit0-and-count", "FAIL", e.message);
   }
 }
 

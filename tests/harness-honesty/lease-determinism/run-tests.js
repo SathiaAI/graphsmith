@@ -90,6 +90,30 @@ function discoverTargets() {
   return found.sort();
 }
 
+/* Discovered suites that legitimately construct ZERO StateStore instances.
+ *
+ * discoverTargets() assumes every discovered tests/state-store subdirectory's run-tests.js
+ * builds a StateStore -- true when this suite was written, false the day Track 3.4 and
+ * Track 3.6 landed suites
+ * that test free functions the module exports directly (atomicCreateExclusive,
+ * atomicOverwriteFile, validateNamedRecord, pidAlive) without ever instantiating the
+ * class. checkEnforcedRun's zero-audit branch exists to catch a broken breadcrumb wire or
+ * a target that silently built nothing; treating these two the same way misattributes
+ * "this suite doesn't test what I audit" as "the audit is broken", which is a false FAIL,
+ * not a passed check narrowed to fit -- the suites still get their exit status checked, so
+ * a genuine regression in either one is still caught, just not mislabeled as a clock-
+ * discipline wiring gap. Declared by SITE (the target path), same as
+ * DECLARED_REAL_CLOCK_SITES below, so this list is only ever wrong by omission, never by
+ * silently widening to cover a target that DOES construct a store. */
+const NO_STORE_CONSTRUCTION_TARGETS = {
+  "tests/state-store/atomic-primitives/run-tests.js":
+    "tests atomicCreateExclusive, atomicOverwriteFile, and validateNamedRecord -- exported " +
+    "free functions -- directly, never `new StateStore(...)`.",
+  "tests/state-store/pidalive-zombie/run-tests.js":
+    "requires state-store.js only to call the exported free function pidAlive directly " +
+    "against a forged real Linux zombie process; never constructs the class.",
+};
+
 const results = [];
 function record(name, status, detail) {
   const line = status === "PASS" ? `PASS ${name}${detail ? " - " + detail : ""}`
@@ -154,6 +178,29 @@ function checkEnforcedRun(target) {
 
   const audit = readAudit(auditPath);
   if (audit.length === 0) {
+    if (NO_STORE_CONSTRUCTION_TARGETS[target]) {
+      /* Exit status is still checked below like every other target -- a declared
+       * zero-construction suite that starts crashing is still a real failure, just not a
+       * clock-discipline one. */
+      if (res.status !== 0) {
+        const out = String(res.stdout || "") + String(res.stderr || "");
+        const failing = out.split("\n")
+          .filter((line) => /^\s*(FAIL|FAILED)\b|^FAIL[: ]/.test(line))
+          .slice(0, 4).map((line) => line.trim().slice(0, 200));
+        record(name, "FAIL",
+          `the target exited ${res.status} under ${ENV_FLAG}=1. It is a declared zero-` +
+          "construction suite (tests free functions, never `new StateStore(...)`), so this " +
+          "is NOT a clock finding -- the target failed for its own reasons. Its failing " +
+          "case(s): " + (failing.length ? failing.join(" || ") : "(none matched a FAIL " +
+            "pattern; tail: " + out.split("\n").filter(Boolean).slice(-3).join(" | ")
+              .slice(0, 200) + ")"));
+        return null;
+      }
+      record(name, "PASS",
+        "0 construction(s) -- declared: " + NO_STORE_CONSTRUCTION_TARGETS[target] +
+        ` (${elapsed}ms)`);
+      return [];
+    }
     record(name, "FAIL",
       "the audit recorded ZERO StateStore constructions. Either the breadcrumb is not " +
       "wired (in which case this check proves nothing and is worse than absent), or the " +
@@ -223,6 +270,7 @@ const DECLARED_REAL_CLOCK_SITES = {
       "hammer.js#anon",
       "tests/state-store/grok/run-tests.js#createRealClockStore <- tests/state-store/grok/run-tests.js#anon",
       "tests/state-store/grok/run-tests.js#createRealClockStore <- tests/state-store/grok/run-tests.js#mk",
+      "(unknown)",
     ],
     why:
       "crash.journal-roll-forward-monotonic-no-tear and concurrency.two-process-register-" +
@@ -231,7 +279,15 @@ const DECLARED_REAL_CLOCK_SITES = {
       "sweep saw every parent-written lease as expired by decades and fired a crash hook " +
       "on the recovery sweep instead of the operation under test. Both assert journal " +
       "INVARIANTS, never lease liveness, at a 10-minute lease. The two non-repo sites are " +
-      "generated worker scripts, which is the case a source scan cannot reach at all.",
+      "generated worker scripts, which is the case a source scan cannot reach at all. " +
+      "'(unknown)' is state-store.js's own --selftest CLI mode, which this suite's " +
+      "XTRA/state-store-selftest-cli-floor case spawns as `node scripts/state-store.js " +
+      "--selftest`: selftest() sleeps real milliseconds and asserts against real elapsed " +
+      "time (registry-lease-sweep), so it genuinely needs systemLeaseClock(). Every frame " +
+      "from the constructor up through the CLI dispatch lives inside state-store.js itself, " +
+      "so the breadcrumb's cross-file caller filter -- built for tests calling INTO the " +
+      "store, not the store calling itself -- has nothing external to name past the node " +
+      "module loader; that is the honest limit of a heuristic normalising on file+function.",
   },
   "tests/state-store/deepseek/run-tests.js": {
     sites: [
@@ -247,6 +303,21 @@ const DECLARED_REAL_CLOCK_SITES = {
       "neither. test 2's busy-owner check is real-clock on purpose: it asserts that a lock " +
       "being RENEWED is not stolen, and lock renewal writes an mtime the OS stamps -- there " +
       "is nothing to inject. All three assert invariants, never lease liveness.",
+  },
+  "tests/state-store/writer-claim-shared-storage/run-tests.js": {
+    sites: [
+      "tests/state-store/writer-claim-shared-storage/_worker.js#anon",
+      "tests/state-store/writer-claim-shared-storage/run-tests.js#endToEndSharedVolumeNeverSilentlyProceeds <- tests/state-store/writer-claim-shared-storage/run-tests.js#main",
+    ],
+    why:
+      "AC-2's whole point is a SECOND host racing the same shared directory, so both " +
+      "sites stand in for that second host's own clock and have to be real to reproduce " +
+      "the cross-host skew under test. endToEndSharedVolumeNeverSilentlyProceeds reads a " +
+      "planted claim record whose renewed_at was stamped from real Date.now() +/- a large " +
+      "skew; a frozen clock could not reproduce that skew relationship. _worker.js is a " +
+      "spawned second process racing acquire() against the first (realProcessRaceOverShared" +
+      "Directory) -- a clock thunk does not survive a spawn, same as grok's cross-process " +
+      "sites above. Neither asserts lease liveness; both assert single-writer refusal.",
   },
 };
 

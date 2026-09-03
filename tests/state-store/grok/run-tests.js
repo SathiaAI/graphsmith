@@ -1320,6 +1320,44 @@ function attackSoftWobbleFlagAndHardRollback() {
   }
 }
 
+/* state-store.js has its own internal --selftest mode (6 named checks: lock
+   steal/token refusal, unreadable-lock retry, journal roll-forward, alpha
+   reservation crash persistence, run-registry lease sweep, hostile-key
+   rejection) that no external suite previously invoked at all -- the same
+   blind spot already found and fixed in verify.js, gate.js, manifest.js, and
+   promote.js. A deleted/hollowed internal check would silently drop
+   `tests.length` with no external test noticing. */
+function attackSelftestCliFloor() {
+  const name = "XTRA/state-store-selftest-cli-floor";
+  try {
+    const r = spawnSync(process.execPath, [STATE_STORE, "--selftest"], {
+      encoding: "utf8",
+    });
+    const errs = [];
+    if (r.status !== 0) errs.push(`exit want 0 got ${r.status}`);
+    let result;
+    try {
+      result = JSON.parse(r.stdout);
+    } catch (e) {
+      errs.push(`stdout not JSON: ${e.message}`);
+    }
+    if (result) {
+      if (result.status !== "pass") errs.push(`status=${result.status}`);
+      if (!Array.isArray(result.tests)) errs.push("tests must be an array");
+      else if (result.tests.length < 6) {
+        /* Baseline observed on release/v0.5.0-candidate: 6 checks. Floor, not
+           exact match, so legitimately adding new checks later doesn't break
+           this -- only a check silently disappearing does. */
+        errs.push(`selftest tests.length regressed: got ${result.tests.length}, want >= 6`);
+      }
+    }
+    if (errs.length) throw new Error(errs.join("; "));
+    report(name, "PASS", `exit=${r.status} status=${result.status} tests=${result.tests.length}`);
+  } catch (e) {
+    report(name, "FAIL", e.message);
+  }
+}
+
 function main() {
   attackLockStealAndTokenMismatch();
   attackPidReuseAndEnvOverride();
@@ -1331,6 +1369,7 @@ function main() {
   attackSoftWobbleFlagAndHardRollback();
   attackConcurrencySync();
   attackSchema();
+  attackSelftestCliFloor();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;

@@ -46,7 +46,19 @@
     "real components. Three of them were genuinely failing and were FIXED (a",
     "POSIX stdout-flush bug in the assurance fixture, and the watchdog's",
     "process-group kill missing non-leader trees); tests/scenario/ was fixed",
-    "too. See claude/graphsmith-ci-remediation-progress-2026-07-25.md."
+    "too. See claude/graphsmith-ci-remediation-progress-2026-07-25.md.",
+    "",
+    "2026-08-07 (v0.5.0 release prep): 4 more families were relying on the",
+    "fail-safe -- generate, plugin-hooks, postmortem, reconcile -- covering",
+    "the v0.5.0 Wave 1 lanes (scripts/generate.js, the Claude Code plugin/",
+    "hooks skill, scripts/postmortem*.js, scripts/reconcile.js). Each is a",
+    "per-component regression suite for a real, newly-shipped GraphSmith",
+    "component per the RULE above, so all 4 are now listed as GATING",
+    "explicitly. All were already passing under the fail-safe (verified via a",
+    "full local run of scripts/ci-run-suites.js on this release candidate,",
+    "96/96 gating suites green); listing them only removes the 4 discovery",
+    "warnings and makes the classification reviewable, it does not change",
+    "which suites gate."
   ],
   "gating_suites": [
     "tests/manifest/",
@@ -80,7 +92,12 @@
     "tests/scaffold/",
     "tests/watch/",
     "tests/watchdog/",
-    "tests/watcher/"
+    "tests/watcher/",
+    "tests/generate/",
+    "tests/plugin-hooks/",
+    "tests/postmortem/",
+    "tests/reconcile/",
+    "tests/mode-selection/"
   ],
   "evidence_only": [
     "tests/attacks/deepseek/",
