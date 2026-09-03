@@ -14,7 +14,7 @@
  *      unconditionally terminates the process there) -- mirrors this repo's own existing
  *      precedent (tests/state-store/writer-claim, "skip win32-unreproducible renew()
  *      TOCTOU simulation") of naming and skipping a platform-unreproducible case rather
- *      than writing a test that cannot mean what it claims to mean.
+ *     than writing a test that cannot mean what it claims to mean.
  *   6  second gateway instance started against the same state_dir while the first is
  *      running -> FR-1 refusal, named identity in the error.
  *   15 mode configured as attach but the standalone binary is started anyway -> logs
@@ -199,10 +199,21 @@ async function cleanSigtermDrainsAndExitsZero() {
   const gw = spawnGateway(root, configPath);
 
   gw.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "fixture_echo", arguments: { delayMs: 200 } } });
-  await new Promise((resolve) => setTimeout(resolve, 50)); // let the call actually be in flight before signaling
+  /* Explicit call-start signal, not a fixed sleep: tools/list needs no downstream round-
+   * trip (it's answered straight from the cached tool surface), so sending it right
+   * behind the slow call and awaiting ITS response proves the slow call's handleMessage()
+   * already ran synchronously up to (and including) session.recordCallStart() -- i.e. it
+   * is genuinely pending -- before this test signals. Readline dispatches "line" events,
+   * and therefore these two handleMessage() invocations, strictly in the order the lines
+   * were written, so this ordering holds regardless of scheduler/startup latency (the
+   * flakiness a fixed sleep was exposed to: a 50ms sleep can fire before the gateway has
+   * even read its first line under CI scheduling pressure). */
+  gw.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+  const readinessResp = await gw.nextMessage();
+  check("e2e-sigterm-readiness-signal-received-before-sending-it", readinessResp && readinessResp.id === 2, JSON.stringify(readinessResp));
   gw.child.kill("SIGTERM");
   const callResp = await gw.nextMessage(5000);
-  check("e2e-sigterm-in-flight-call-still-completes-during-drain", callResp && callResp.result, JSON.stringify(callResp));
+  check("e2e-sigterm-in-flight-call-still-completes-during-drain", callResp && callResp.id === 1 && callResp.result, JSON.stringify(callResp));
   const code = await gw.exitCode();
   check("e2e-sigterm-clean-drain-and-release-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
   const head = chain.readHead(stateDir);
