@@ -101,7 +101,17 @@ class AttachModeShim {
     this.projectRoot = path.resolve(projectRoot);
     this.graphsmithDir = path.join(this.projectRoot, ".graphsmith");
     this.stateDir = path.join(this.graphsmithDir, "state");
-    this._claim = new WriterClaim(this.stateDir, {
+    /* WriterClaim is NOT constructed here. CodeRabbit review: WriterClaim's own
+     * constructor can throw synchronously (e.g. an invalid explicit `instanceId`, or
+     * GRAPHSMITH_REQUIRE_EXPLICIT_LEASE_CLOCK=1 with no clock supplied) -- constructing
+     * it eagerly in `new AttachModeShim(...)` let that throw escape before
+     * gateway-mode.json was ever checked, violating this module's documented
+     * mode-first startup ordering (see the header comment: mode selection is a
+     * standalone pre-flight gate, checked BEFORE the writer-claim gate) and landing
+     * outside the `try { shim.start() }` block docs/GSA-ATTACH-MODE-WIRING.md tells
+     * integrators to wrap. Construction is deferred to start(), after (a) succeeds;
+     * options are retained here so start() can build it lazily. */
+    this._claimOptions = {
       hostId: options.hostId,
       instanceId: options.instanceId,
       heartbeatMs: options.heartbeatMs,
@@ -109,7 +119,8 @@ class AttachModeShim {
       skewToleranceMs: options.skewToleranceMs,
       clock: options.clock,
       onClaimLost: options.onClaimLost,
-    });
+    };
+    this._claim = null;
     this._modeRecord = null;
     this._started = false;
   }
@@ -123,6 +134,7 @@ class AttachModeShim {
       throw fail("AttachModeShim.start() was already called on this instance", "ATTACH_SHIM_ALREADY_STARTED");
     }
     this._modeRecord = readAndValidateGatewayMode(this.graphsmithDir);   // (a) MS-FR-1
+    if (!this._claim) this._claim = new WriterClaim(this.stateDir, this._claimOptions);
     const status = this._claim.acquire();                                // (b) FR-1
     this._claim.startHeartbeat();                                        // (c) FR-2
     this._started = true;
@@ -130,11 +142,12 @@ class AttachModeShim {
   }
 
   /* Idempotent: safe to call from a signal handler even if start() never completed (e.g.
-   * it threw before acquiring), and safe to call twice. Mirrors WriterClaim.release()'s
+   * it threw before acquiring, or before gateway-mode.json validation even let a
+   * WriterClaim get constructed), and safe to call twice. Mirrors WriterClaim.release()'s
    * own idempotence. */
   stop() {
     this._started = false;
-    return this._claim.release();
+    return this._claim ? this._claim.release() : false;
   }
 
   /* FR-4-equivalent surface for this shim: current mode-selection + writer-claim state,
@@ -144,7 +157,7 @@ class AttachModeShim {
     return {
       started: this._started,
       mode: this._modeRecord ? this._modeRecord.mode : null,
-      writerClaim: this._claim.status(),
+      writerClaim: this._claim ? this._claim.status() : null,
     };
   }
 }
