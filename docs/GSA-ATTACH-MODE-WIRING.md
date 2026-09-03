@@ -65,11 +65,20 @@ to check per-session.
 
 ```js
 function shutdown(signal) {
+  let releaseError = null;
   try {
     shim.stop();   // stops the heartbeat, releases the writer-claim
-  } finally {
-    process.exit(0);
+  } catch (error) {
+    releaseError = error;
   }
+  if (releaseError) {
+    // Do not report a clean exit: the claim may still be on disk (e.g. the claim file
+    // was corrupt or could not be unlinked), so a supervisor's rolling restart should
+    // see this as a failure rather than assume the state directory was left clean.
+    console.error(releaseError.message);
+    process.exit(1);
+  }
+  process.exit(0);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
