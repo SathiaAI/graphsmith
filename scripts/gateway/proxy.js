@@ -31,6 +31,12 @@ function isModelCallMethod(method) {
   return method === "sampling/createMessage";
 }
 
+/* This build only ever negotiates the one protocol version it actually implements
+ * (matching the literal default this file used to echo back unconditionally). Kept as a
+ * named constant so "what we claim to speak" and "what we validate against" cannot drift
+ * apart independently. */
+const GATEWAY_PROTOCOL_VERSION = "2025-06-18";
+
 class GatewayProxy {
   /**
    * @param {object} opts
@@ -56,6 +62,7 @@ class GatewayProxy {
     this.now = opts.now || (() => Date.now());
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
+    this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
   }
 
   openConnection(connectionId, options = {}) {
@@ -64,6 +71,13 @@ class GatewayProxy {
     }
     if (this.sessions.has(connectionId)) throw fail(`connectionId "${connectionId}" is already open`, "GATEWAY_DUPLICATE_CONNECTION");
     const s = session.createSession(connectionId, { now: this.now, goal: options.goal });
+    /* SS3.3: the granted tool surface must be recorded regardless of whether the agent
+     * ever bothers to issue tools/list on this connection -- otherwise a cached tool
+     * invoked without a prior tools/list would be sealed with an empty granted surface,
+     * making sealBoundaryBundle's granted-tool check falsely report "not granted" for a
+     * call the gateway legitimately authorized. The (idempotent) tools/list handler below
+     * simply re-records the same surface if the agent does ask. */
+    session.recordToolsList(s, this.mergedTools);
     this.sessions.set(connectionId, s);
     return s;
   }
@@ -81,6 +95,36 @@ class GatewayProxy {
     const { method, params, id } = msg;
     const isNotification = id === undefined;
 
+    /* SS3.7/SS7: once the writer-claim is lost, stop admitting NEW work on every
+     * connection, not just new connections (openConnection already refuses those) --
+     * otherwise an already-open agent connection could keep issuing calls indefinitely
+     * after a replacement writer has acquired the state directory, risking concurrent
+     * chain-append corruption. A call already in flight (already past this point in an
+     * earlier handleMessage invocation, already awaiting its downstream response) is
+     * unaffected and is allowed to drain normally -- only messages that arrive AFTER the
+     * flag flips are refused. */
+    if (!this.acceptingNewSessions) {
+      if (isNotification) return null;
+      return { jsonrpc: "2.0", id, error: { code: -32000, message: "Gateway is draining (writer-claim lost or shutting down): not accepting new requests on this connection." } };
+    }
+
+    if (method === "notifications/cancelled") {
+      /* SS3.3: downstream calls run under a gateway-internal id, not the agent's own
+       * JSON-RPC id, so a bare pass-through of the cancellation payload would target the
+       * wrong id on the downstream leg (or no id at all, for a downstream that happens to
+       * reuse numbering). Translate via the mapping recorded when the call started. */
+      const targetRequestId = params && params.requestId;
+      const key = `${connectionId}:${JSON.stringify(targetRequestId)}`;
+      const mapping = this.downstreamCallIds.get(key);
+      if (mapping) {
+        const conn = this.connections.get(mapping.server);
+        if (conn && typeof conn.cancel === "function") {
+          try { conn.cancel(mapping.downstreamId); } catch (error) { /* best effort */ }
+        }
+      }
+      return null;
+    }
+
     if (method === "initialize") {
       /* SS3.2/SS6: the downstream handshake already ran once at gateway startup; this
        * records the AGENT's own clientInfo alongside the already-cached downstream
@@ -97,7 +141,12 @@ class GatewayProxy {
         model: params && params.model,
       });
       if (isNotification) return null;
-      return { jsonrpc: "2.0", id, result: { protocolVersion: (params && params.protocolVersion) || "2025-06-18", capabilities: { tools: {} }, serverInfo: mergedServerInfo } };
+      /* This gateway implements exactly one protocol version (GATEWAY_PROTOCOL_VERSION);
+       * echoing back whatever the agent asked for (SS3.3) would let a client believe
+       * initialization succeeded under a contract this build does not actually implement,
+       * causing later requests to be misinterpreted per the client's own (wrong)
+       * assumption. Always return the version actually selected, never the request. */
+      return { jsonrpc: "2.0", id, result: { protocolVersion: GATEWAY_PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: mergedServerInfo } };
     }
 
     if (method.startsWith("notifications/")) return null;
@@ -125,12 +174,17 @@ class GatewayProxy {
        * JSON-RPC id when present, or a synthetic one for a fire-and-forget call). */
       const correlationKey = isNotification ? Symbol(`notify:${toolName}`) : id;
       session.recordCallStart(s, correlationKey, { tool: toolName, server: method === "tools/call" ? serverName : "sampling", arguments: callArgs, isModelCall: isModelCallMethod(method), ts });
+      const cancelKey = !isNotification ? `${connectionId}:${JSON.stringify(id)}` : null;
       let result, isError = false;
       try {
-        result = await conn.call(method, params);
+        result = await conn.call(method, params, undefined, cancelKey
+          ? (downstreamId) => this.downstreamCallIds.set(cancelKey, { server: serverName, downstreamId })
+          : undefined);
       } catch (error) {
         result = { error: error.message, code: error.code };
         isError = true;
+      } finally {
+        if (cancelKey) this.downstreamCallIds.delete(cancelKey);
       }
       session.recordCallResult(s, correlationKey, { result, isError, ts: this.now() });
       if (isNotification) return null;
@@ -143,15 +197,14 @@ class GatewayProxy {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method: "${method}".` } };
   }
 
-  /** Called when a downstream connection drops mid-session (SS7): marks every call this
-   * connection had pending against that (any) downstream as disconnected, rather than
-   * silently dropping it. This build treats a downstream loss as affecting every
-   * currently-open session uniformly (a real gateway could scope this to only the
-   * sessions that actually called the lost server; disclosed as a simplification, not
-   * a correctness gap for the case that matters -- no evidence is ever silently lost). */
+  /** Called when a downstream connection drops mid-session (SS7): marks only the pending
+   * calls actually routed to `reasonServerName` as disconnected, across every open
+   * session. A pending call to a DIFFERENT, still-healthy downstream is left alone -- if
+   * it later succeeds, the persisted trace must show that real success, not a false
+   * "disconnected" error borrowed from an unrelated server's failure. */
   handleDownstreamDisconnect(reasonServerName) {
     for (const s of this.sessions.values()) {
-      session.markPendingAsDisconnected(s, `downstream server "${reasonServerName}" disconnected`, this.now);
+      session.markPendingAsDisconnected(s, `downstream server "${reasonServerName}" disconnected`, this.now, reasonServerName);
     }
   }
 
