@@ -18,7 +18,7 @@ three methods this shim exposes (`start()`, `stop()`, `status()`).
 ### 1. At process startup, before accepting any MCP session
 
 ```js
-const { AttachModeShim } = require("graphsmith/scripts/gsa-attach-shim.js");
+const { AttachModeShim } = require("graphsmith-skill/scripts/gsa-attach-shim.js");
 
 const shim = new AttachModeShim(process.cwd(), {
   // optional overrides -- all pass straight through to WriterClaim unmodified:
