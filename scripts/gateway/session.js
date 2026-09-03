@@ -42,6 +42,7 @@ function createSession(connectionId, options = {}) {
     goal: typeof options.goal === "string" ? options.goal : undefined,
     startedAt: typeof options.now === "function" ? options.now() : Date.now(),
     finalized: false,
+    nextCallSeq: 1, // monotonic per-session invocation counter; see recordCallStart.
   };
 }
 
@@ -84,6 +85,12 @@ function recordCallStart(session, jsonRpcId, call) {
     arguments: call.arguments,
     model_call: Boolean(call.isModelCall),
     ts: call.ts !== undefined ? call.ts : Date.now(),
+    /* Reserves this call's position in invocation order (SS3.3) at the moment it
+     * STARTS, not when its response happens to arrive. Concurrent calls can complete
+     * in any order (the whole point of id-based correlation), but the persisted
+     * execution_trace's step numbers must reflect when each call was actually
+     * invoked -- see toSealableSession's sort by this field. */
+    seq: session.nextCallSeq++,
   });
 }
 
@@ -113,16 +120,24 @@ function recordCallResult(session, jsonRpcId, result) {
     isError: Boolean(result && result.isError),
     model_call: pending.model_call,
     ts: pending.ts,
+    seq: pending.seq,
   });
   return true;
 }
 
 /** Called when the downstream side of a connection disconnects (or the whole session is
  * finalized) with calls still pending: each is recorded with an explicit disconnect
- * marker, never silently dropped (SS7 failure mode / test plan item 10). */
-function markPendingAsDisconnected(session, reason, now) {
+ * marker, never silently dropped (SS7 failure mode / test plan item 10).
+ *
+ * `serverFilter`, when given, scopes this to only the pending calls whose recorded
+ * `server` matches it -- a downstream disconnect must not corrupt the attestation of a
+ * call pending against a different, still-healthy downstream. Omitted entirely (the
+ * connection-close / full-finalize callers) means "every pending call on this session",
+ * as before. */
+function markPendingAsDisconnected(session, reason, now, serverFilter) {
   const at = typeof now === "function" ? now() : Date.now();
   for (const [jsonRpcId, pending] of session.pendingCalls.entries()) {
+    if (serverFilter !== undefined && pending.server !== serverFilter) continue;
     session.calls.push({
       tool: pending.tool,
       server: pending.server,
@@ -131,6 +146,7 @@ function markPendingAsDisconnected(session, reason, now) {
       isError: true,
       model_call: pending.model_call,
       ts: pending.ts,
+      seq: pending.seq,
       disconnected: true,
       disconnect_reason: reason || "downstream disconnected",
       jsonRpcId,
@@ -140,12 +156,22 @@ function markPendingAsDisconnected(session, reason, now) {
 }
 
 /** Projects the internal session record into the shape sealBoundaryBundle expects
- * (SS5.2: unchanged, this is gsa-mcp-shim.js's existing contract, not a new schema). */
+ * (SS5.2: unchanged, this is gsa-mcp-shim.js's existing contract, not a new schema) --
+ * plus two additive, backward-compatible extensions gsa-mcp-shim.js reads when present
+ * (never required): each call's disconnect marker (so a downstream disconnect or
+ * unmatched response is distinguishable from an ordinary tool error in the persisted
+ * bundle, not just in the gateway's own in-memory state) and the session's anomalies.
+ *
+ * Calls are sorted by invocation order (`seq`, reserved at recordCallStart) rather than
+ * left in response-arrival order, so the execution_trace step numbers sealBoundaryBundle
+ * assigns reflect when each call actually started, even when a later call's response
+ * arrives first. */
 function toSealableSession(session) {
+  const orderedCalls = session.calls.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
   return {
     initialize: session.initialize || {},
     tools: session.tools,
-    calls: session.calls.map((c) => ({
+    calls: orderedCalls.map((c) => ({
       tool: c.tool,
       server: c.server,
       arguments: c.arguments,
@@ -153,8 +179,10 @@ function toSealableSession(session) {
       isError: c.isError,
       model_call: c.model_call,
       ts: c.ts,
+      ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason, jsonRpcId: c.jsonRpcId } : {}),
     })),
     goal: session.goal,
+    anomalies: session.anomalies,
   };
 }
 
