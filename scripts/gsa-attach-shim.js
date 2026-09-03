@@ -118,7 +118,20 @@ class AttachModeShim {
       staleAfterMs: options.staleAfterMs,
       skewToleranceMs: options.skewToleranceMs,
       clock: options.clock,
-      onClaimLost: options.onClaimLost,
+      /* Wrapped rather than passed through unmodified. CodeRabbit review: an
+       * integrator-supplied onClaimLost that only records telemetry (rather than
+       * halting) left `_started` (and therefore status().started) reporting stale
+       * "still running" state after the writer claim was actually gone -- this
+       * process would keep accepting/sealing sessions past the point its
+       * process-lifetime single-writer prerequisite no longer held. Flipping
+       * `_started` here is fail-closed regardless of what the caller's own callback
+       * does; WriterClaim's own default (no onClaimLost given) already halts loudly
+       * by rethrowing inside the heartbeat timer -- this covers the case where one IS
+       * given. */
+      onClaimLost: (error) => {
+        this._started = false;
+        if (typeof options.onClaimLost === "function") options.onClaimLost(error);
+      },
     };
     this._claim = null;
     this._modeRecord = null;
