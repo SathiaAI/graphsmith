@@ -33,93 +33,27 @@
  * caller -- this module reports itself as exactly that caller in FR-7's build note, but
  * building FR-9/FR-10 themselves is separately tracked).
  *
- * The gateway-mode.json validation below (readAndValidateGatewayMode) is a self-contained
- * implementation of the mode-selection contract's §5.1 schema and §7 fail-closed table.
- * It is deliberately NOT shared code from a Track-1.1-owned module -- none exists yet in
- * this repo (the mode-selection TRD's own status line: "DRAFT design, no code, no schema
- * files created in the repo") -- and per that contract's own §9, "[Track 1.3] should read
- * .graphsmith/gateway-mode.json independently, the same way Track 1.2 does". This also
- * means it deliberately does NOT add schemas/mode-selection-contract.schema.json: that
- * schema is independently owned by Track 1.1 per the contract's own §5.1 header, and is
- * not this track's file to create.
+ * The gateway-mode.json validation below (readAndValidateGatewayMode) is a thin
+ * pass-through to the shared mode-selection module (scripts/mode-selection.js, Track
+ * 1.1), which implements the mode-selection contract's §5.1 schema and §7 fail-closed
+ * table. This file used to carry its own private, disclosed transcription of that same
+ * logic (see git history) -- built before scripts/mode-selection.js existed in this repo
+ * (the mode-selection TRD's own status line, at the time: "DRAFT design, no code, no
+ * schema files created in the repo") -- but now that Track 1.1 has landed it, this file
+ * defers to it instead, per that module's own header: "[Track 1.2's and Track 1.3's own
+ * files] should import from here instead once merged". schemas/mode-selection-
+ * contract.schema.json is likewise owned and shipped by Track 1.1, not this file.
  */
 "use strict";
 
-const crypto = require("crypto");
-const fs = require("fs");
 const path = require("path");
 const { WriterClaim } = require("./writer-claim.js");
+const modeSelection = require("./mode-selection.js");
 
 const MODE_FILE = "gateway-mode.json";
 const KEY_FILE = "gateway-mode.key";
 const SCHEMA_VERSION = "1.0";
 const BINARY_MODE = "attach";
-
-function fail(message, code) {
-  const error = new Error(message);
-  error.code = code;
-  return error;
-}
-
-function isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-/* §5.1's root schema: schema_version/mode/confirmation, additionalProperties: false.
- * Deliberately does NOT check confirmation's presence -- that gets its own error code
- * (§7 condition 4), checked separately by the caller so the operator-facing message can
- * name the actual problem instead of a generic schema failure. */
-function validateRootShape(record) {
-  if (!isPlainObject(record)) {
-    throw fail(`${MODE_FILE} must contain a JSON object at its root`, "GATEWAY_MODE_INVALID");
-  }
-  const allowed = ["schema_version", "mode", "confirmation"];
-  for (const key of Object.keys(record)) {
-    if (!allowed.includes(key)) {
-      throw fail(`${MODE_FILE} has an unexpected property "${key}" (additionalProperties: false)`, "GATEWAY_MODE_INVALID");
-    }
-  }
-  if (record.schema_version !== SCHEMA_VERSION) {
-    throw fail(`${MODE_FILE}.schema_version must be "${SCHEMA_VERSION}", got ${JSON.stringify(record.schema_version)}`, "GATEWAY_MODE_INVALID");
-  }
-  if (record.mode !== "standalone" && record.mode !== "attach") {
-    throw fail(`${MODE_FILE}.mode must be "standalone" or "attach", got ${JSON.stringify(record.mode)}`, "GATEWAY_MODE_INVALID");
-  }
-}
-
-/* §5.1's `confirmation` sub-schema. Called only once the block is known to be present
- * (§7 condition 4 is checked by the caller first). */
-function validateConfirmationShape(confirmation) {
-  if (!isPlainObject(confirmation)) {
-    throw fail(`${MODE_FILE}.confirmation must be a JSON object`, "GATEWAY_MODE_INVALID");
-  }
-  const allowed = ["confirmed_by", "confirmed_at", "nonce", "confirmation_token", "pre_authorized"];
-  for (const key of Object.keys(confirmation)) {
-    if (!allowed.includes(key)) {
-      throw fail(`${MODE_FILE}.confirmation has an unexpected property "${key}" (additionalProperties: false)`, "GATEWAY_MODE_INVALID");
-    }
-  }
-  for (const required of ["confirmed_by", "confirmed_at", "nonce", "confirmation_token"]) {
-    if (!(required in confirmation)) {
-      throw fail(`${MODE_FILE}.confirmation is missing required field "${required}"`, "GATEWAY_MODE_INVALID");
-    }
-  }
-  if (typeof confirmation.confirmed_by !== "string" || confirmation.confirmed_by.length < 1) {
-    throw fail(`${MODE_FILE}.confirmation.confirmed_by must be a non-empty string`, "GATEWAY_MODE_INVALID");
-  }
-  if (!Number.isInteger(confirmation.confirmed_at) || confirmation.confirmed_at < 0) {
-    throw fail(`${MODE_FILE}.confirmation.confirmed_at must be a non-negative integer (epoch ms)`, "GATEWAY_MODE_INVALID");
-  }
-  if (typeof confirmation.nonce !== "string" || !/^[a-f0-9]{32}$/.test(confirmation.nonce)) {
-    throw fail(`${MODE_FILE}.confirmation.nonce must match ^[a-f0-9]{32}$`, "GATEWAY_MODE_INVALID");
-  }
-  if (typeof confirmation.confirmation_token !== "string" || !/^[a-f0-9]{64}$/.test(confirmation.confirmation_token)) {
-    throw fail(`${MODE_FILE}.confirmation.confirmation_token must match ^[a-f0-9]{64}$`, "GATEWAY_MODE_INVALID");
-  }
-  if ("pre_authorized" in confirmation && typeof confirmation.pre_authorized !== "boolean") {
-    throw fail(`${MODE_FILE}.confirmation.pre_authorized must be a boolean`, "GATEWAY_MODE_INVALID");
-  }
-}
 
 /* MS-FR-1: validate .graphsmith/gateway-mode.json exactly per the mode-selection
  * contract's §3.2 startup-validation flow / §7 fail-closed table, in the same order:
@@ -128,82 +62,18 @@ function validateConfirmationShape(confirmation) {
  * AttachModeShim.start()) so the gate can be pinned by tests without touching
  * WriterClaim at all -- mirrors writer-claim.js exporting decideOnExisting for the same
  * reason. `graphsmithDir` is the `.graphsmith` directory itself (i.e. the parent of both
- * `gateway-mode.json` and `state/gateway-mode.key`), not the project root. */
+ * `gateway-mode.json` and `state/gateway-mode.key`), not the project root -- this file's
+ * own established convention (AttachModeShim already stores it as `this.graphsmithDir`,
+ * and tests/gsa-attach-shim/run-tests.js's unit tests build one directly per case). The
+ * shared module's own readAndValidateGatewayMode takes the project ROOT instead (it
+ * derives `<root>/.graphsmith/...` itself), so this adapter recovers it via
+ * path.dirname() -- safe because every caller in this codebase constructs `graphsmithDir`
+ * as exactly `path.join(someRoot, ".graphsmith")`. `expectedMode` is always BINARY_MODE
+ * ("attach") here, unconditionally: this file IS the attach-mode binary, so FR-7(a)'s
+ * "declares mode: attach" check is not optional the way the shared module's own
+ * `options.expectedMode` is for its other, mode-agnostic callers (e.g. `status`). */
 function readAndValidateGatewayMode(graphsmithDir) {
-  const modePath = path.join(graphsmithDir, MODE_FILE);
-  let raw;
-  try {
-    raw = fs.readFileSync(modePath, "utf8");
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      throw fail(
-        `Refusing to start: no gateway mode has been declared for this deployment ` +
-        `(${modePath} does not exist). Run "graphsmith gateway mode set attach" before ` +
-        `starting the attach-mode shim.`,
-        "GATEWAY_MODE_NOT_DECLARED"
-      );
-    }
-    throw fail(`Refusing to start: ${modePath} could not be read: ${error.message}`, "GATEWAY_MODE_UNREADABLE");
-  }
-
-  let record;
-  try {
-    record = JSON.parse(raw);
-  } catch (error) {
-    throw fail(`Refusing to start: ${modePath} is not valid JSON: ${error.message}`, "GATEWAY_MODE_MALFORMED");
-  }
-
-  validateRootShape(record);
-
-  if (!("confirmation" in record)) {
-    throw fail(
-      `Refusing to start: gateway mode is declared (mode: "${record.mode}") but has never ` +
-      `been confirmed -- run "graphsmith gateway mode set ${record.mode}" to confirm this ` +
-      `deployment's mode.`,
-      "GATEWAY_MODE_NOT_CONFIRMED"
-    );
-  }
-  validateConfirmationShape(record.confirmation);
-
-  const keyPath = path.join(graphsmithDir, "state", KEY_FILE);
-  let secret;
-  try {
-    secret = fs.readFileSync(keyPath, "utf8").trim();
-  } catch (error) {
-    throw fail(
-      `Refusing to start: a confirmation is present in ${modePath} but its signing key ` +
-      `(${keyPath}) is missing or unreadable, so the confirmation cannot be verified. This ` +
-      `is a distinct, more serious problem than "unconfirmed" -- re-running ` +
-      `"graphsmith gateway mode set" alone will not fix a missing key file.`,
-      "GATEWAY_MODE_KEY_MISSING"
-    );
-  }
-
-  const { schema_version, mode, confirmation } = record;
-  const message = [schema_version, mode, confirmation.confirmed_by, String(confirmation.confirmed_at), confirmation.nonce].join("|");
-  const expectedToken = crypto.createHmac("sha256", secret).update(message, "utf8").digest("hex");
-  const actualToken = confirmation.confirmation_token;
-  const tokensMatch =
-    expectedToken.length === actualToken.length &&
-    crypto.timingSafeEqual(Buffer.from(expectedToken, "utf8"), Buffer.from(actualToken, "utf8"));
-  if (!tokensMatch) {
-    throw fail(
-      `Refusing to start: the mode value in ${modePath} does not match its confirmation ` +
-      `record -- re-run "graphsmith gateway mode set ${mode}" to confirm this change.`,
-      "GATEWAY_MODE_CONFIRMATION_MISMATCH"
-    );
-  }
-
-  if (mode !== BINARY_MODE) {
-    throw fail(
-      `Refusing to start: ${modePath} declares and confirms mode "${mode}", but this is the ` +
-      `${BINARY_MODE}-mode shim. Run the "${mode}" binary/process instead, or re-run ` +
-      `"graphsmith gateway mode set ${BINARY_MODE}" if this deployment should switch modes.`,
-      "GATEWAY_MODE_WRONG_BINARY"
-    );
-  }
-
-  return record;
+  return modeSelection.readAndValidateGatewayMode(path.dirname(graphsmithDir), { expectedMode: BINARY_MODE });
 }
 
 /* The shim itself. A thin, deliberately inert-until-called wrapper -- construction does
