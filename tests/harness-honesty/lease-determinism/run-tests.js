@@ -112,6 +112,14 @@ const NO_STORE_CONSTRUCTION_TARGETS = {
   "tests/state-store/pidalive-zombie/run-tests.js":
     "requires state-store.js only to call the exported free function pidAlive directly " +
     "against a forged real Linux zombie process; never constructs the class.",
+  "tests/state-store/pidalive-crossplatform/run-tests.js":
+    "tests pidAlive directly (Round 9, 2026-08-29) with process.kill and fs.readFileSync " +
+    "mocked, closing the gap left by pidalive-zombie's whole-suite platform guard; never " +
+    "constructs the class.",
+  "tests/state-store/lease-clock-audit/run-tests.js":
+    "tests the exported recordLeaseClockConstruction directly (Round 9, 2026-08-29) with " +
+    "GRAPHSMITH_LEASE_CLOCK_AUDIT pointed at its own temp file and various clockOption " +
+    "shapes, reading back the audit JSON; never constructs StateStore or WriterClaim.",
 };
 
 const results = [];
