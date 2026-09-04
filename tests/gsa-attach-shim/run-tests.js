@@ -248,7 +248,10 @@ async function cleanStartupAcquiresAndStaysUp_thenSigtermReleases() {
 
   worker.child.kill("SIGTERM");
   const code = await waitForExit(worker.child);
-  check("sigterm-exits-zero", code === 0, `expected exit code 0 after SIGTERM, got ${code}`);
+  check("sigterm-exits-zero", code === 0,
+    code === EXIT_DEADLINE_EXCEEDED
+      ? "worker did not exit within the deadline after SIGTERM -- shutdown regression"
+      : `expected exit code 0 after SIGTERM, got ${code}`);
 
   const stopped = await waitForLine(worker.getStdout, (o) => o.phase === "stop");
   check("sigterm-reports-stop-ok", Boolean(stopped) && stopped.ok === true && stopped.released === true,
