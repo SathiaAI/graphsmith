@@ -31,6 +31,7 @@ const https = require("https");
 const readline = require("readline");
 const { URL } = require("url");
 const crypto = require("crypto");
+const { resolveSecretRef } = require("./config.js");
 
 function fail(message, code = "GATEWAY_DOWNSTREAM_ERROR") {
   const error = new Error(message);
@@ -83,6 +84,30 @@ function connectStdio(endpoint, options = {}) {
       else resolve(msg.result);
     } else if (msg && typeof msg.method === "string" && !Object.prototype.hasOwnProperty.call(msg, "id")) {
       for (const handler of notificationHandlers) handler(msg);
+    } else if (msg && typeof msg.method === "string" && Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== null) {
+      /* An unsolicited REQUEST *from* the downstream server itself (has both a method
+       * and an id -- distinct from a notification, which has no id, and distinct from a
+       * response to something this client called, which has no method). The MCP
+       * sampling capability (`sampling/createMessage`) is the motivating case: a
+       * downstream server asks the connected agent's own model to do inference.
+       * Previously fell through both branches above and was silently dropped -- neither
+       * a recognized response nor a notification (board decision 2026-09-04, PR #29
+       * review "forward downstream sampling requests upstream"). `options.onRequest`,
+       * when provided, decides how (or whether) to answer it; this transport client
+       * itself stays a dumb pipe and always writes back whatever response object
+       * onRequest resolves to, so the downstream never hangs waiting on an id that will
+       * never come back. */
+      if (typeof options.onRequest === "function") {
+        Promise.resolve(options.onRequest(msg))
+          .then((response) => {
+            if (response && !closed) child.stdin.write(JSON.stringify(response) + "\n");
+          })
+          .catch((error) => {
+            if (!closed) child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: error.message } }) + "\n");
+          });
+      } else {
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not handle downstream-initiated method "${msg.method}".` } }) + "\n");
+      }
     }
     // A response for an unrecognized id, or any other shape, is silently ignored at
     // THIS layer -- the gateway's own session-correlation layer (scripts/gateway/
@@ -271,10 +296,23 @@ function connectHttp(endpoint, options = {}) {
   };
 }
 
-/** Connects to one configured downstream server per its `transport`. */
-function connectDownstream(serverConfig, options) {
+/** Connects to one configured downstream server per its `transport`. `serverConfig.
+ * token_ref`, when present (http only -- board decision 2026-09-04, PR #29 review "speak
+ * authenticated MCP over downstream HTTP"), is resolved via config.js's own
+ * resolveSecretRef (the same "env var name or file path, never the raw secret"
+ * convention signing_key_ref and agent_listen.token_ref already use) and sent as a
+ * standard bearer Authorization header -- this repo's own MCP HTTP server, and any
+ * downstream enforcing the same contract, requires one on every request. */
+function connectDownstream(serverConfig, options = {}) {
   if (serverConfig.transport === "stdio") return connectStdio(serverConfig.endpoint, options);
-  if (serverConfig.transport === "http") return connectHttp(serverConfig.endpoint, options);
+  if (serverConfig.transport === "http") {
+    let httpOptions = options;
+    if (serverConfig.token_ref) {
+      const token = resolveSecretRef(serverConfig.token_ref, `downstream_servers["${serverConfig.name}"].token_ref`);
+      httpOptions = { ...options, headers: { ...(options.headers || {}), authorization: `Bearer ${token}` } };
+    }
+    return connectHttp(serverConfig.endpoint, httpOptions);
+  }
   throw fail(`Unknown downstream transport "${serverConfig.transport}"`, "INVALID_ARGUMENT");
 }
 
