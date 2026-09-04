@@ -100,6 +100,7 @@ async function unknownToolRejected() {
   const conn = fakeConnection(async () => ({}));
   const proxy = makeProxy(dir, new Map([["A", conn]]), [], new Map());
   proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "nonexistent", arguments: {} } });
   check("unknown-tool-returns-jsonrpc-error", resp.error && /Unknown tool/.test(resp.error.message), JSON.stringify(resp));
   await proxy.closeConnection("conn-1", "test cleanup");
@@ -148,6 +149,7 @@ async function downstreamDisconnectMarksErrorNotCrash() {
   const toolOwners = new Map([["hangs", "srv"]]);
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   const callPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "hangs", arguments: {} } });
   // Simulate the downstream dying while the call is in flight.
   rejectCall(Object.assign(new Error("downstream process exited"), { code: "GATEWAY_DOWNSTREAM_DISCONNECTED" }));
@@ -166,6 +168,7 @@ async function malformedDownstreamResponseFailsClosedPerCall() {
   const toolOwners = new Map([["bad", "bad-srv"], ["good", "good-srv"]]);
   const proxy = makeProxy(dir, new Map([["bad-srv", conn], ["good-srv", goodConn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   const badResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "bad", arguments: {} } });
   check("malformed-response-fails-closed-as-jsonrpc-error", badResp.error !== undefined, JSON.stringify(badResp));
   const goodResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "good", arguments: {} } });
@@ -180,6 +183,7 @@ async function connectionCloseWithPendingCallsMarksDisconnected() {
   const toolOwners = new Map([["neverresponds", "srv"]]);
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "neverresponds", arguments: {} } }); // fire and forget, never resolves
   const entry = await proxy.closeConnection("conn-1", "agent hung up mid-call");
   check("closing-connection-with-pending-call-still-produces-a-chain-entry", entry !== null, "no entry appended");
@@ -201,6 +205,102 @@ async function stopAcceptingNewSessionsRefusesNewButNotExisting() {
   check("already-open-session-still-finalizes-after-stop", entry !== null, "existing session was not finalized");
 }
 
+/* Board decision 2026-09-04, PR #29 review "honor MCP tool-level error results": a
+ * `tools/call` result carrying `isError: true` on the RESULT itself (not a thrown
+ * transport/RPC error) must be recorded as an error in the session, but the JSON-RPC
+ * response sent back to the agent stays a normal `result` (MCP tool-level errors are not
+ * protocol errors). */
+async function toolLevelErrorRecordedButNotProtocolError() {
+  const dir = freshDir("tool-level-error");
+  const conn = fakeConnection(async () => ({ content: [{ type: "text", text: "boom" }], isError: true }));
+  const mergedTools = [{ name: "flaky", server: "srv", schema: {} }];
+  const toolOwners = new Map([["flaky", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "flaky", arguments: {} } });
+  check("tool-level-isError-still-returns-a-normal-result-not-a-protocol-error", resp.result && resp.result.isError === true && resp.error === undefined, JSON.stringify(resp));
+  const s = proxy.sessions.get("conn-1");
+  check("tool-level-isError-recorded-as-error-in-session", s.calls.length === 1 && s.calls[0].isError === true, JSON.stringify(s.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Board decision 2026-09-04, PR #29 review "preserve downstream JSON-RPC error
+ * envelopes": a downstream's own structured JSON-RPC error (code/data) must reach the
+ * agent unchanged, not be flattened into a generic -32000. */
+async function preservesDownstreamJsonRpcErrorEnvelope() {
+  const dir = freshDir("rpc-error");
+  const conn = {
+    transport: "fake",
+    call: async () => { throw Object.assign(new Error("Invalid arguments"), { code: "GATEWAY_DOWNSTREAM_RPC_ERROR", rpcError: { code: -32602, message: "Invalid arguments", data: { field: "arguments.x" } } }); },
+    close: () => {},
+    isClosed: () => false,
+    whenClosed: () => new Promise(() => {}),
+  };
+  const mergedTools = [{ name: "picky", server: "srv", schema: {} }];
+  const toolOwners = new Map([["picky", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "picky", arguments: {} } });
+  check(
+    "downstream-rpc-error-code-and-data-preserved-not-flattened-to--32000",
+    resp.error && resp.error.code === -32602 && resp.error.data && resp.error.data.field === "arguments.x",
+    JSON.stringify(resp)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Board decision 2026-09-04, PR #29 review "enforce the agent initialization
+ * lifecycle". */
+async function initializationLifecycleEnforced() {
+  const dir = freshDir("init-lifecycle");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+
+  const preInitList = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+  check("tools-list-before-initialize-rejected", preInitList.error !== undefined, JSON.stringify(preInitList));
+  const preInitCall = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  check("tools-call-before-initialize-rejected", preInitCall.error !== undefined, JSON.stringify(preInitCall));
+
+  const initResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 3, method: "initialize", params: {} });
+  check("first-initialize-succeeds", initResp.result !== undefined, JSON.stringify(initResp));
+
+  const postInitCall = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "echo", arguments: {} } });
+  check("tools-call-after-initialize-succeeds", postInitCall.result && postInitCall.result.ok === true, JSON.stringify(postInitCall));
+
+  const repeatInit = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 5, method: "initialize", params: {} });
+  check("repeated-initialize-rejected", repeatInit.error !== undefined, JSON.stringify(repeatInit));
+
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Board decision 2026-09-04, PR #29 review "emit the required structured log for each
+ * call": one structured line per completed call, naming the connection, step, tool,
+ * status, and duration -- not only the much-later (or never, on a crash) session-finalize
+ * log. */
+async function structuredLogEmittedPerCompletedCall() {
+  const dir = freshDir("structured-log");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
+  const callLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed");
+  check(
+    "structured-log-line-emitted-for-completed-call",
+    callLog && callLog.connection_id === "conn-1" && callLog.tool === "echo" && callLog.status === "ok" && typeof callLog.duration_ms === "number",
+    JSON.stringify(logLines)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -209,6 +309,10 @@ async function main() {
   await malformedDownstreamResponseFailsClosedPerCall();
   await connectionCloseWithPendingCallsMarksDisconnected();
   await stopAcceptingNewSessionsRefusesNewButNotExisting();
+  await toolLevelErrorRecordedButNotProtocolError();
+  await preservesDownstreamJsonRpcErrorEnvelope();
+  await initializationLifecycleEnforced();
+  await structuredLogEmittedPerCompletedCall();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
