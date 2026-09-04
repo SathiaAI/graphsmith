@@ -24,6 +24,7 @@
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const http = require("http");
 const os = require("os");
 const path = require("path");
 const readline = require("readline");
@@ -158,6 +159,115 @@ async function singleSessionEndToEndVerifies() {
   check("e2e-chain-verifies", chainResult.status === "verified", JSON.stringify(chainResult));
 }
 
+/** Waits for the HTTP agent listener's port announcement on stderr (rather than a
+ * fixed sleep -- matches this suite's own established "signal, not sleep" discipline,
+ * see cleanSigtermDrainsAndExitsZero's comment). */
+function waitForHttpPort(gw, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      const match = /agent-facing HTTP listener on port (\d+)/.exec(gw.stderr());
+      if (match) {
+        resolve(Number(match[1]));
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error(`timed out waiting for the HTTP listener's port announcement (stderr so far: ${gw.stderr()})`));
+        return;
+      }
+      setTimeout(poll, 25);
+    };
+    poll();
+  });
+}
+
+function httpPost(port, token, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request(
+      { host: "127.0.0.1", port, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload), authorization: `Bearer ${token}` } },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+          } catch (error) {
+            reject(new Error(`HTTP response was not valid JSON: ${error.message}`));
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+/** Board decision 2026-09-04 (PR #29 review, Decision 1, Option B): a downstream
+ * server's own unsolicited "sampling/createMessage" request is forwarded to the agent
+ * ONLY when the agent transport is stdio (the only one that can push a request rather
+ * than merely reply to one). Proves the fixture's own upstream request round-trips
+ * through the real gateway process to a real stdio agent and back. */
+async function samplingForwardedToStdioAgent() {
+  const root = freshRoot("sampling-stdio");
+  writeConfirmedMode(root, "standalone");
+  const { configPath } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
+  await gw.nextMessage();
+
+  gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
+
+  const pushed = await gw.nextMessage();
+  check(
+    "e2e-sampling-forwarded-to-stdio-agent",
+    pushed && pushed.method === "sampling/createMessage" && pushed.id !== undefined && pushed.id !== null && !("result" in pushed) && !("error" in pushed),
+    JSON.stringify(pushed)
+  );
+
+  gw.send({ jsonrpc: "2.0", id: pushed && pushed.id, result: { role: "assistant", content: { type: "text", text: "mocked model output" } } });
+
+  const toolResp = await gw.nextMessage();
+  check(
+    "e2e-sampling-tool-call-resolves-with-forwarded-agent-result",
+    toolResp && toolResp.id === 2 && toolResp.result && /mocked model output/.test(JSON.stringify(toolResp.result)),
+    JSON.stringify(toolResp)
+  );
+
+  gw.child.stdin.end();
+  const code = await gw.exitCode();
+  check("e2e-sampling-stdio-clean-disconnect-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
+}
+
+/** Board decision 2026-09-04 (PR #29 review, Decision 1, Option B): when the agent
+ * transport is HTTP, a downstream's sampling request must get back a real JSON-RPC
+ * error naming why -- never the silent drop this was before the fix, and never a hang. */
+async function samplingOverHttpAgentGetsExplicitError() {
+  const root = freshRoot("sampling-http");
+  writeConfirmedMode(root, "standalone");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const gw = spawnGateway(root, configPath);
+
+  const port = await waitForHttpPort(gw);
+  const token = fs.readFileSync(tokenPath, "utf8").trim();
+
+  const initResp = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent-http", version: "1.0" } } });
+  check("e2e-sampling-http-initialize-responds", initResp && initResp.result, JSON.stringify(initResp));
+
+  const callResp = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hi" } } });
+  check(
+    "e2e-sampling-over-http-agent-gets-explicit-error-not-silence",
+    callResp && callResp.id === 2 && callResp.error && /stdio/i.test(callResp.error.message),
+    JSON.stringify(callResp)
+  );
+
+  gw.child.kill();
+  await gw.exitCode();
+}
+
 async function modeDormantExitsZero() {
   const root = freshRoot("dormant");
   writeConfirmedMode(root, "attach");
@@ -222,6 +332,8 @@ async function cleanSigtermDrainsAndExitsZero() {
 
 async function main() {
   await singleSessionEndToEndVerifies();
+  await samplingForwardedToStdioAgent();
+  await samplingOverHttpAgentGetsExplicitError();
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
