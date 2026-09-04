@@ -103,5 +103,17 @@ The design doc ([`.plans/v0.3.0/graphsmith-v0.3.0-mcp-attestation-shim-design.md
 
 **What would be needed to do it properly:** implement one of the four deployment modes in §4 of the design doc — most naturally the local proxy, since it needs no changes to the agent or to any MCP server. That is unbuilt work, not a documentation gap.
 
+## 10. The standalone gateway's HTTP agent sessions are keyed by TCP socket, not MCP identity
+
+`scripts/gateway/agent-transport.js`'s agent-facing HTTP listener identifies a session by the underlying TCP socket (`req.socket`) -- a keep-alive connection's multiple requests share one session, and two separate connections get independent sessions. This is deliberate: it mirrors the stdio transport's own "one process, one connection" trust boundary, and it is the only session-identity model this build implements (`session_boundary: "connection"`, the schema's default; `"time_window"` is accepted by the config schema as a forward-compatible placeholder but rejected at startup as not implemented).
+
+**What this does NOT verify.** Socket identity is not the same thing as MCP session identity in general. If one logical agent opens multiple sockets, or a connection-pooling reverse proxy multiplexes several distinct agents over one shared backend socket to this listener, this design's isolation guarantee (one agent's calls and one agent's audit trail per session) does not hold -- a proxy-pooled deployment could split one agent's trail across sessions, or combine two agents' calls into one.
+
+**What this costs, precisely.** Nothing today: no deployment topology this build targets puts a connection-pooling proxy in front of the agent-facing listener, and `time_window` mode (the only mode where a session would need to outlive or be shared differently from a single physical connection) is not built. The cost is entirely conditional on a future deployment choice, not a live gap.
+
+*Control:* documented here and in `scripts/gateway/agent-transport.js`'s own header comment, as an explicit operational requirement on how this gateway is deployed (no pooling reverse proxy in front of the HTTP agent listener) rather than something enforced in code.
+
+**What would be needed to do it properly.** Real session-id-based identity: a client-supplied header or cookie carrying the session id, independent of the socket, plus an explicit lifecycle policy (idle timeout vs. an explicit termination signal) that this repo has not yet specified anywhere (SS3.4 of the Standalone Gateway TRD remains unresolved). Building that now, ahead of a concrete `time_window` deployment need, was deliberately not done (board decision 2026-09-04, PR #29 review "key HTTP sessions by protocol identity") -- it would be lifecycle machinery built speculatively for a mode nothing currently exercises.
+
 ---
 *This document is publication-hygiene clean. See also the worked offline-verifier transcript in [`docs/examples/offline-verify.md`](docs/examples/offline-verify.md).*
