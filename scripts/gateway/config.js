@@ -36,8 +36,13 @@ function validateDownstreamServer(entry, index, errors) {
   for (const key of ["name", "transport", "endpoint"]) {
     if (!Object.prototype.hasOwnProperty.call(entry, key)) errors.push(`${loc}.${key} is required`);
   }
+  /* token_ref (board decision 2026-09-04, PR #29 review): optional bearer-credential
+   * reference for an authenticated downstream http server -- e.g. this repo's own MCP
+   * HTTP server, which always requires one. Never required (an http downstream may be
+   * unauthenticated), matches signing_key_ref/agent_listen.token_ref's existing "env var
+   * name or file path, never the raw secret" convention rather than inventing a new one. */
   for (const key of Object.keys(entry)) {
-    if (!["name", "transport", "endpoint"].includes(key)) errors.push(`${loc}.${key} is not allowed`);
+    if (!["name", "transport", "endpoint", "token_ref"].includes(key)) errors.push(`${loc}.${key} is not allowed`);
   }
   if (Object.prototype.hasOwnProperty.call(entry, "name") && (typeof entry.name !== "string" || entry.name.length === 0)) {
     errors.push(`${loc}.name must be a non-empty string`);
@@ -47,6 +52,9 @@ function validateDownstreamServer(entry, index, errors) {
   }
   if (Object.prototype.hasOwnProperty.call(entry, "endpoint") && (typeof entry.endpoint !== "string" || entry.endpoint.length === 0)) {
     errors.push(`${loc}.endpoint must be a non-empty string`);
+  }
+  if (Object.prototype.hasOwnProperty.call(entry, "token_ref") && (typeof entry.token_ref !== "string" || entry.token_ref.length === 0)) {
+    errors.push(`${loc}.token_ref must be a non-empty string`);
   }
 }
 
