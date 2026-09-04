@@ -63,6 +63,7 @@ async function drainWaitsForInFlightCallToComplete() {
     stateDir: dir,
   });
   proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   const callPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } });
 
   const drained = await drainOpenSessions(proxy, 2000, 10);
@@ -90,6 +91,7 @@ async function drainTimesOutAndReportsIncomplete() {
     stateDir: dir,
   });
   proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "veryslow", arguments: {} } }); // fire and forget
 
   const drained = await drainOpenSessions(proxy, 100, 10); // budget far shorter than the call
