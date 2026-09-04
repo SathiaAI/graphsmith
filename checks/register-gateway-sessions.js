@@ -115,6 +115,14 @@ function walkGatewaySessions(ctx) {
       }
 
       if (i === 0) {
+        /* Board decision 2026-09-04, PR #29 review "require the verified chain to start
+         * at sequence one": a first entry with seq > 1 and a null predecessor passes
+         * every OTHER check here (its own hash recomputes correctly, and there is no
+         * prior entry for a broken-link check to compare against) even though it is
+         * exactly the missing-genesis-prefix failure mode this schema's contiguous,
+         * monotonic sequence contract exists to catch -- e.g. a chain.jsonl truncated
+         * from the front. Both halves of "this is genuinely the chain root" must hold. */
+        if (e.seq !== 1) return fail(`entry[0] has seq=${e.seq}, expected 1 -- chain does not start at its genesis entry (missing prefix), distinct from a broken hash link`);
         if (e.prev_entry_sha256 !== null) return fail("entry[0].prev_entry_sha256 must be null (chain root)");
       } else {
         if (e.seq !== prevSeq + 1) {
