@@ -46,6 +46,50 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
  * on the agent-facing leg (both legs of this gateway speak the same one version). */
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
+/* Mirrors mcp-server/src/protocol.js's own _meta key names and validateMeta()
+ * contract -- literal duplication rather than a cross-package require, matching this
+ * file's existing convention of mirroring wire-level constants rather than reaching
+ * across the scripts/ <-> mcp-server/ package boundary (see MCP_PROTOCOL_VERSION
+ * above, and the mirrored Streamable HTTP headers in connectHttp below). Needed
+ * because a plain JSON-RPC-over-HTTP downstream is stateless: mcp-server/src/
+ * httpTransport.js hands handleMessage a FRESH connectionState on every single
+ * request, so connectionState.legacyInitialized from an earlier `initialize` call
+ * never carries over -- every tools/list, tools/call, and server/discover request
+ * over HTTP must carry its own complete _meta block or a downstream enforcing this
+ * repo's own stateless MCP contract (SEP-2575) rejects it with "_meta is required"
+ * even though this client's own `initialize` succeeded moments earlier (board
+ * decision 2026-09-04, PR #29 review "send stateless metadata to HTTP downstreams"). */
+const META_PROTOCOL_VERSION_KEY = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo";
+const META_CLIENT_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities";
+const STATELESS_META_METHODS = new Set(["tools/list", "tools/call", "server/discover"]);
+
+/* Mirrors mcp-server/src/protocol.js's own STATELESS_PROTOCOL_VERSION -- a DIFFERENT
+ * literal from MCP_PROTOCOL_VERSION above. That constant is the legacy handshake
+ * version this client negotiates via the top-level `initialize` call (mcp-server's own
+ * handleLegacyInitialize doesn't even check it); _meta's own protocolVersion key is
+ * validated against this separate stateless-protocol literal instead (mcp-server/src/
+ * server.js's validateMeta), and the two must never be conflated -- sending the legacy
+ * version inside _meta is itself an UNSUPPORTED_PROTOCOL_VERSION error there. */
+const STATELESS_META_PROTOCOL_VERSION = "2026-07-28";
+
+function buildStatelessMeta(options) {
+  return {
+    [META_PROTOCOL_VERSION_KEY]: STATELESS_META_PROTOCOL_VERSION,
+    [META_CLIENT_INFO_KEY]: options.clientInfo || { name: "graphsmith-standalone-gateway", version: "1.0" },
+    [META_CLIENT_CAPABILITIES_KEY]: {},
+  };
+}
+
+/* Safety cap on a single downstream HTTP response body, and the absolute wall-clock
+ * deadline (independent of the idle-socket timeout below, which only trips on
+ * inactivity) a response has to finish arriving -- board decision 2026-09-04, PR #29
+ * review "bound downstream HTTP response bodies": without both, a compromised or
+ * faulty configured HTTP downstream could exhaust gateway memory (unbounded buffering)
+ * or keep a call alive indefinitely (a response that keeps trickling bytes never goes
+ * "inactive" long enough to trip req.setTimeout). */
+const MAX_HTTP_RESPONSE_BYTES = 10 * 1024 * 1024;
+
 /* Bounds on how many tools/list pages a downstream may hand back before this client
  * gives up rather than looping forever on a downstream that returns a cursor cycle or an
  * unbounded number of pages. */
@@ -67,6 +111,14 @@ function connectStdio(endpoint, options = {}) {
   const notificationHandlers = [];
 
   const rl = readline.createInterface({ input: child.stdout, terminal: false });
+  /* Correlation order matters: a bidirectional stdio connection gives the downstream
+   * its OWN independent id namespace for requests it initiates (see the sampling-relay
+   * comment below), so a downstream-initiated request can legitimately reuse a numeric
+   * id this client currently has pending on the OTHER direction. Requiring the absence
+   * of "method" before treating a message as "the response to one of our own calls"
+   * (rather than checking `pending.has(msg.id)` alone) is what keeps those two
+   * directions from being confused with each other (board decision 2026-09-04, PR #29
+   * review "distinguish downstream requests before correlating responses"). */
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (trimmed.length === 0) return;
@@ -76,7 +128,7 @@ function connectStdio(endpoint, options = {}) {
     } catch (error) {
       return; // malformed line from downstream: not this client's job to crash on it
     }
-    if (msg && Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== null && pending.has(msg.id)) {
+    if (msg && Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== null && !Object.prototype.hasOwnProperty.call(msg, "method") && pending.has(msg.id)) {
       const { resolve, reject, timer } = pending.get(msg.id);
       clearTimeout(timer);
       pending.delete(msg.id);
@@ -206,8 +258,35 @@ function connectHttp(endpoint, options = {}) {
     if (closed) return Promise.reject(fail("downstream connection is closed", "GATEWAY_DOWNSTREAM_DISCONNECTED"));
     const id = nextId++;
     if (typeof onIdAssigned === "function") onIdAssigned(id);
-    const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    const isStatelessMetaMethod = STATELESS_META_METHODS.has(method);
+    /* See buildStatelessMeta's header comment: this leg is stateless per-request, so
+     * every request under a method the stateless MCP protocol requires _meta on gets
+     * one attached here, centrally, rather than at each call site -- a caller-supplied
+     * _meta (if any) wins over the generated one, field by field. */
+    const effectiveParams = isStatelessMetaMethod
+      ? { ...(params || {}), _meta: { ...buildStatelessMeta(options), ...((params && params._meta) || {}) } }
+      : params;
+    /* The mirrored header (below) must agree with whatever protocol version this
+     * request's own body actually declares -- STATELESS_META_PROTOCOL_VERSION for a
+     * _meta-carrying request, the legacy MCP_PROTOCOL_VERSION for "initialize" (which
+     * carries no _meta at all) -- or mcp-server's own header/body agreement check
+     * (validateMirroredHeaders) rejects the disagreement with HEADER_MISMATCH. */
+    const declaredProtocolVersion = isStatelessMetaMethod ? STATELESS_META_PROTOCOL_VERSION : MCP_PROTOCOL_VERSION;
+    const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: effectiveParams });
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const settleResolve = (value) => { if (!settled) { settled = true; clearTimeout(absoluteDeadline); resolve(value); } };
+      const settleReject = (error) => { if (!settled) { settled = true; clearTimeout(absoluteDeadline); reject(error); } };
+      /* Absolute wall-clock deadline on receiving the COMPLETE response body, separate
+       * from req.setTimeout below (which only trips on socket INACTIVITY -- a downstream
+       * that keeps trickling bytes slowly enough to stay "active" would never trip it,
+       * per MAX_HTTP_RESPONSE_BYTES's header comment). */
+      const absoluteDeadline = setTimeout(() => {
+        reachable = false;
+        req.destroy();
+        settleReject(fail(`downstream HTTP response deadline exceeded after ${timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS}ms`, "GATEWAY_DOWNSTREAM_TIMEOUT"));
+      }, timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS);
+      if (typeof absoluteDeadline.unref === "function") absoluteDeadline.unref();
       const req = client.request(
         url,
         {
@@ -220,7 +299,7 @@ function connectHttp(endpoint, options = {}) {
              * a downstream that enforces the same contract (including this repo's own
              * server, fronted as a downstream) would otherwise reject every request for
              * missing headers regardless of authentication. */
-            "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+            "mcp-protocol-version": declaredProtocolVersion,
             "mcp-method": method,
             ...(method === "tools/call" && params && typeof params.name === "string" ? { "mcp-name": params.name } : {}),
             ...(options.headers || {}),
@@ -228,13 +307,25 @@ function connectHttp(endpoint, options = {}) {
         },
         (res) => {
           const chunks = [];
-          res.on("data", (chunk) => chunks.push(chunk));
+          let bytesReceived = 0;
+          res.on("data", (chunk) => {
+            if (settled) return;
+            bytesReceived += chunk.length;
+            if (bytesReceived > MAX_HTTP_RESPONSE_BYTES) {
+              reachable = false;
+              req.destroy();
+              settleReject(fail(`downstream HTTP response exceeded the ${MAX_HTTP_RESPONSE_BYTES}-byte limit`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
+              return;
+            }
+            chunks.push(chunk);
+          });
           res.on("end", () => {
+            if (settled) return;
             let parsed;
             try {
               parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
             } catch (error) {
-              reject(fail(`downstream HTTP response was not valid JSON: ${error.message}`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
+              settleReject(fail(`downstream HTTP response was not valid JSON: ${error.message}`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
               return;
             }
             /* Fail-closed on the response envelope itself (matching the stdio path's own
@@ -242,21 +333,21 @@ function connectHttp(endpoint, options = {}) {
              * missing "jsonrpc" version, or a non-response object are all rejected rather
              * than attested as this call's real result. */
             if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.jsonrpc !== "2.0" || parsed.id !== id) {
-              reject(fail(`downstream HTTP response was not a well-formed JSON-RPC 2.0 response matching request id ${id}`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
+              settleReject(fail(`downstream HTTP response was not a well-formed JSON-RPC 2.0 response matching request id ${id}`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
               return;
             }
             reachable = true; // a well-formed response (success or RPC error) proves the endpoint IS reachable
             if (parsed.error) {
-              reject(Object.assign(fail(parsed.error.message || "downstream error", "GATEWAY_DOWNSTREAM_RPC_ERROR"), { rpcError: parsed.error }));
+              settleReject(Object.assign(fail(parsed.error.message || "downstream error", "GATEWAY_DOWNSTREAM_RPC_ERROR"), { rpcError: parsed.error }));
             } else {
-              resolve(parsed.result);
+              settleResolve(parsed.result);
             }
           });
         }
       );
       req.on("error", (error) => {
         reachable = false;
-        reject(fail(`downstream HTTP request failed: ${error.message}`, "GATEWAY_DOWNSTREAM_DISCONNECTED"));
+        settleReject(fail(`downstream HTTP request failed: ${error.message}`, "GATEWAY_DOWNSTREAM_DISCONNECTED"));
       });
       req.setTimeout(timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS, () => {
         reachable = false;
