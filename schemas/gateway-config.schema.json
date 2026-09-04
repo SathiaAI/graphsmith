@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/gateway-config.schema.json",
+  "title": "GraphSmith standalone gateway configuration (Track 1.2, SG-FR-*)",
+  "description": "Configuration for the standalone MCP gateway process. Deliberately carries NO mode field and no reference to one -- mode selection lives entirely in the mode-selection contract's own dedicated file, .graphsmith/gateway-mode.json (Track 1.1, independently owned). See the Standalone Gateway TRD (.plans/v0.5.0/STANDALONE-GATEWAY-TRD-2026-08-22.md) section 4 for the frozen upstream design this schema implements verbatim, plus one disclosed addition: `agent_listen`, added by Track 1.2 because the frozen TRD's own architecture (section 2/3.1, 'stdio and/or HTTP' on the agent-facing side) requires knowing how THIS process listens for agents, but the TRD's literal section-4 JSON only specified the downstream side's transport. Everything else below is transcribed unchanged.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "state_dir", "downstream_servers", "signing_key_ref"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "state_dir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Passed straight through to WriterClaim/state-store -- same directory convention as the rest of the pipeline."
+    },
+    "host_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional explicit override, per FR-8's collision-resistance discussion; required (fail startup without it) if this config is used for more than one instance."
+    },
+    "downstream_servers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "transport", "endpoint"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "transport": { "enum": ["stdio", "http"] },
+          "endpoint": { "type": "string", "minLength": 1 },
+          "token_ref": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional. Env var name or file path holding the bearer token this downstream server's http transport requires -- never the raw token, matching signing_key_ref's and agent_listen.token_ref's own convention (board decision 2026-09-04: extend this schema with an optional auth field rather than push authenticated downstream servers out to a reverse-proxy inject). Only meaningful when transport is \"http\"; a stdio downstream ignores it if present."
+          }
+        }
+      }
+    },
+    "signing_key_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A reference (env var name or file path), never the raw key material, per this codebase's existing secrets discipline."
+    },
+    "session_boundary": {
+      "enum": ["connection", "time_window"],
+      "description": "Placeholder pending SS3.4's resolution -- explicit-signal not listed until that transport requirement is designed. This build (Track 1.2) resolves the open question by defaulting to 'connection' when omitted, per the TRD's own stated lean in SS10 OQ-1."
+    },
+    "persistence": {
+      "enum": ["p2_hash_chained_log"],
+      "description": "P2, decided per SS0 -- session-to-session continuity is a confirmed real requirement."
+    },
+    "remote_anchor_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Where the chain tail gets periodically pushed for SG-FR-6's remote-anchoring mitigation. NOT YET IMPLEMENTED in this build -- see scripts/gateway/chain.js's pushChainTailToRemoteAnchor() stub and the build report's named SG-FR-6 follow-up. Accepted and validated here so a deployment's config is forward-compatible, but currently inert."
+    },
+    "agent_listen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport"],
+      "description": "Track-1.2-added (not in the TRD's literal SS4 JSON -- see this schema's top-level description). Governs how THIS gateway process accepts agent connections. Defaults to stdio (one process, one connection, matching this codebase's existing stdio-transport trust-boundary convention) when omitted.",
+      "properties": {
+        "transport": { "enum": ["stdio", "http"] },
+        "port": { "type": "integer", "minimum": 1 },
+        "token_ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Env var name or file path holding the bearer token required of agents on the http transport -- never the raw token, matching signing_key_ref's own convention. Required when transport is http."
+        }
+      }
+    }
+  }
+}
