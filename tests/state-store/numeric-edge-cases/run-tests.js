@@ -22,6 +22,7 @@ const { createManualClock } = require("../../_harness/clock.js");
 
 let failures = 0;
 const results = [];
+const tempDirs = [];
 
 function report(name, status, reason) {
   const line = status === "PASS" ? `PASS ${name}` : `FAIL ${name}+${reason || "unknown"}`;
@@ -34,7 +35,11 @@ function check(name, cond, reason) {
   if (cond) report(name, "PASS"); else report(name, "FAIL", reason);
 }
 
-function tempRoot(label) { return fs.mkdtempSync(path.join(os.tmpdir(), `gs-numeric-${label}-`)); }
+function tempRoot(label) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `gs-numeric-${label}-`));
+  tempDirs.push(dir);
+  return dir;
+}
 function rmrf(dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
 function withEnv(patch, fn) {
   const prev = {};
@@ -136,10 +141,20 @@ function leaseExpiryOverflowIsRejected() {
 }
 
 function main() {
-  admitPendingNAliasAndFallback();
-  maxWindowWallTimeInvalidFallsBackToDefault();
-  heartbeatAutoAdjustsWhenNotBelowLease();
-  leaseExpiryOverflowIsRejected();
+  try {
+    admitPendingNAliasAndFallback();
+    maxWindowWallTimeInvalidFallsBackToDefault();
+    heartbeatAutoAdjustsWhenNotBelowLease();
+    leaseExpiryOverflowIsRejected();
+  } finally {
+    /* Codex review (2026-09-04): several functions above create more than one
+     * tempRoot() per call (store2/store3/store4 for alternate inputs) but each
+     * function's own `finally { rmrf(root); }` only removes the first. Under a
+     * full Stryker mutation run (once per mutant) that leaks thousands of
+     * directories -- sweep every tempRoot()-created dir here too, mirroring the
+     * lease-clock-audit suite's own fix for the same class of leak. */
+    for (const dir of tempDirs) rmrf(dir);
+  }
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
