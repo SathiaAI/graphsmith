@@ -9,6 +9,21 @@
  * http: sessions keyed by the underlying TCP socket (`req.socket`), so a keep-alive
  * connection's multiple requests share one session and two concurrent connections
  * (SS8 test 3) get independent sessions with no cross-contamination.
+ *
+ * **Known, disclosed scope limit (board decision 2026-09-04, PR #29 review "key HTTP
+ * sessions by protocol identity"):** this "one TCP socket = one session" identity is
+ * deliberate and intentional for `session_boundary: "connection"` (the only boundary
+ * this build implements -- "time_window" is rejected at startup, see gateway.js), and
+ * it assumes no connection-pooling reverse proxy sits in front of this listener
+ * multiplexing distinct agents over one shared backend socket. That assumption is not
+ * enforced in code -- it is an operational requirement on how this gateway is deployed,
+ * stated here and in KNOWN-LIMITATIONS.md rather than silently relied on. Real
+ * session-id-based identity (a client-supplied header/cookie, independent of the
+ * socket, with its own lifecycle policy) was deliberately NOT built now -- there is no
+ * concrete "time_window" deployment needing it yet (SS3.4 is still unresolved), and
+ * building that lifecycle machinery speculatively would be scope creep against a
+ * boundary mode that isn't used. Revisit when SS3.4's time_window session boundary is
+ * actually designed, or if a pooling-reverse-proxy deployment is planned.
  */
 "use strict";
 
@@ -17,14 +32,30 @@ const http = require("http");
 const readline = require("readline");
 const { isAuthenticated } = require("../../mcp-server/src/auth.js");
 const { MAX_BODY_BYTES, REQUEST_TIMEOUT_MS } = require("../../mcp-server/src/httpTransport.js");
+const { DEFAULT_REQUEST_TIMEOUT_MS } = require("./downstream.js");
 
 /** Runs the agent-facing stdio transport against `ctx.proxy`. Returns
- * { connectionId, closed, stop } -- `closed` resolves once the session has already been
- * finalized (the caller does not need to call closeConnection itself). */
+ * { connectionId, closed, stop, pushRequest } -- `closed` resolves once the session has
+ * already been finalized (the caller does not need to call closeConnection itself).
+ *
+ * `pushRequest(method, params, timeoutMs)` lets the gateway send the agent a request IT
+ * did not ask for and get back a promise for the agent's reply -- e.g. forwarding a
+ * downstream server's own `sampling/createMessage` request up to this agent's model
+ * (board decision 2026-09-04, PR #29 review "forward downstream sampling requests
+ * upstream"). This is deliberately stdio-only: stdio can write to the agent at any time,
+ * while the HTTP agent transport below is plain request/response with no way to push --
+ * see runHttpAgentTransport's own header note and gateway.js's wiring, which leaves
+ * downstream-initiated requests erroring cleanly (never silently dropped) when the agent
+ * transport is HTTP. Pushed-request ids are namespaced ("gw-push-...") so they cannot
+ * collide with whatever id scheme the agent itself uses for its own requests, mirroring
+ * downstream.js's own "gateway-assigned id, independent of the other leg's ids"
+ * convention for the downstream leg. */
 function runStdioAgentTransport(ctx) {
   const connectionId = "stdio-" + crypto.randomBytes(8).toString("hex");
   ctx.proxy.openConnection(connectionId);
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
+
+  const pendingPushed = new Map(); // gw-push id -> { resolve, reject, timer }
 
   rl.on("line", (line) => {
     const trimmed = line.trim();
@@ -36,6 +67,19 @@ function runStdioAgentTransport(ctx) {
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: `Parse error: ${error.message}` } }) + "\n");
       return;
     }
+    /* A reply to a request THIS gateway pushed to the agent (has an id matching one this
+     * transport itself minted, and no "method" -- a genuine agent-initiated request
+     * always has one) -- must NOT go through proxy.handleMessage, which only understands
+     * new agent-initiated requests and would otherwise reject this as a malformed
+     * envelope. */
+    if (msg && typeof msg === "object" && !Array.isArray(msg) && Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== null && typeof msg.method !== "string" && pendingPushed.has(msg.id)) {
+      const { resolve, reject, timer } = pendingPushed.get(msg.id);
+      clearTimeout(timer);
+      pendingPushed.delete(msg.id);
+      if (msg.error) reject(Object.assign(new Error(msg.error.message || "agent returned an error"), { rpcError: msg.error }));
+      else resolve(msg.result);
+      return;
+    }
     ctx.proxy.handleMessage(connectionId, msg).then((response) => {
       if (response !== null) process.stdout.write(JSON.stringify(response) + "\n");
     }).catch((error) => {
@@ -43,13 +87,34 @@ function runStdioAgentTransport(ctx) {
     });
   });
 
+  function pushRequest(method, params, timeoutMs) {
+    const id = "gw-push-" + crypto.randomBytes(8).toString("hex");
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingPushed.delete(id);
+        reject(Object.assign(new Error(`agent did not respond to pushed "${method}" within ${timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS}ms`), { code: "GATEWAY_AGENT_PUSH_TIMEOUT" }));
+      }, timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS);
+      if (typeof timer.unref === "function") timer.unref();
+      pendingPushed.set(id, { resolve, reject, timer });
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    });
+  }
+
   const closed = new Promise((resolve) => {
     rl.on("close", async () => {
+      // Any request this gateway pushed to the agent and never got a reply for (the
+      // agent hung up first) must be rejected now, not left to time out minutes later
+      // against a connection that is already gone.
+      for (const [id, { reject, timer }] of pendingPushed.entries()) {
+        clearTimeout(timer);
+        reject(new Error("agent stdio disconnected before responding to a pushed request"));
+      }
+      pendingPushed.clear();
       await ctx.proxy.closeConnection(connectionId, "agent stdio disconnected");
       resolve();
     });
   });
-  return { connectionId, closed, stop: () => rl.close() };
+  return { connectionId, closed, stop: () => rl.close(), pushRequest };
 }
 
 /** Runs the agent-facing HTTP transport (config `agent_listen.transport: "http"`).
