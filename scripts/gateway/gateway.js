@@ -56,6 +56,42 @@ function fail(message, code = "GATEWAY_ERROR") {
   return error;
 }
 
+/** Answers a downstream server's own unsolicited request (board decision 2026-09-04, PR
+ * #29 review "forward downstream sampling requests upstream"). Only `sampling/
+ * createMessage` is recognized -- the one MCP-defined case of a server asking the
+ * client's model to do inference. Only forwarded when `agentPusher.current` is set,
+ * which gateway.js's own startGateway() only ever does for the stdio agent transport
+ * (the only one that can push a request to the agent rather than merely reply to one --
+ * see agent-transport.js's header). Any other case (an http agent transport, or no agent
+ * currently connected) gets a real JSON-RPC error naming exactly why, rather than the
+ * silent drop this was before. */
+function forwardDownstreamRequestToAgent(msg, agentPusher, log) {
+  if (msg.method !== "sampling/createMessage") {
+    return Promise.resolve({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not forward downstream-initiated method "${msg.method}" to the agent.` } });
+  }
+  if (!agentPusher.current) {
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32000,
+        message:
+          'Forwarding a downstream server\'s "sampling/createMessage" request to the agent is only ' +
+          "supported when this gateway's agent_listen.transport is \"stdio\" (stdio is the only agent " +
+          "transport that can push a request to the agent rather than only reply to one it sent). This " +
+          "gateway is not currently configured for stdio agent transport, or no agent is connected.",
+      },
+    });
+  }
+  return agentPusher.current(msg.method, msg.params).then(
+    (result) => ({ jsonrpc: "2.0", id: msg.id, result }),
+    (error) => {
+      log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
+      return { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: error.message } };
+    }
+  );
+}
+
 function loadSigningKeys(config) {
   const material = gatewayConfig.resolveSecretRef(config.signing_key_ref, "signing_key_ref");
   /* The signing_key_ref convention (SS4) is "a reference ... never the raw key
@@ -191,10 +227,18 @@ async function startGateway(options) {
   };
   writerClaim.startHeartbeat();
 
+  /* Mutable box, not a plain variable: connectAllDownstreams() below runs (and each
+   * downstream stdio connection's onRequest closure over it is created) BEFORE the
+   * agent transport is started further down, so at closure-creation time there is
+   * nothing to push to yet. `.current` is set once the stdio transport actually starts
+   * (never, for the http transport -- see forwardDownstreamRequestToAgent's own doc). */
+  const agentPusher = { current: null };
+
   let downstreamHandles;
   try {
     downstreamHandles = await downstream.connectAllDownstreams(config.downstream_servers, {
       clientInfo: { name: "graphsmith-standalone-gateway", version: "1.0" },
+      onRequest: (msg) => forwardDownstreamRequestToAgent(msg, agentPusher, log),
     });
   } catch (error) {
     writerClaim.release();
@@ -228,6 +272,9 @@ async function startGateway(options) {
       log(`agent-facing HTTP listener on port ${httpHandle.port}`);
     } else {
       stdioHandle = runStdioAgentTransport({ proxy });
+      // See forwardDownstreamRequestToAgent's doc above: only the stdio transport can
+      // push a request to the agent, so this is the one branch that ever populates it.
+      agentPusher.current = stdioHandle.pushRequest;
       /* stdio is a one-process-per-connection transport (mirrors mcp-server/src/
        * stdioTransport.js's own "stdin closed -> exit cleanly" convention): once the
        * agent disconnects, the connection's session is already finalized (inside
@@ -268,6 +315,7 @@ async function startGateway(options) {
      * a call that was about to succeed as an artificial "disconnected" error. Only a
      * call that is STILL pending once the drain timeout elapses gets that treatment. */
     await drainOpenSessions(proxy, drainTimeoutMs);
+    agentPusher.current = null; // no agent left to push a forwarded sampling request to
     if (stdioHandle) stdioHandle.stop();
     if (httpHandle) await new Promise((resolve) => httpHandle.server.close(resolve));
     // Finalize any still-open sessions (drained above, or forced closed after the timeout).
