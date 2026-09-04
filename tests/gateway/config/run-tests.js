@@ -86,6 +86,35 @@ function duplicateDownstreamNameRejected() {
   check("duplicate-downstream-name-rejected", threw && /duplicate name/.test(threw.message), threw && threw.message);
 }
 
+/** Board decision 2026-09-04, PR #29 review "speak authenticated MCP over downstream
+ * HTTP": downstream_servers entries may now optionally carry a token_ref, resolved the
+ * same way signing_key_ref/agent_listen.token_ref already are. */
+function downstreamTokenRefAccepted() {
+  const good = { ...VALID, downstream_servers: [{ name: "auth-fs", transport: "http", endpoint: "http://localhost:1/mcp", token_ref: "GS_TEST_DOWNSTREAM_TOKEN" }] };
+  const p = freshFile("downstream-token-ref-ok", good);
+  let threw = null;
+  try { gatewayConfig.loadConfig(p); } catch (error) { threw = error; }
+  check("downstream-token-ref-accepted", threw === null, threw && threw.message);
+}
+
+function downstreamTokenRefMustBeNonEmptyString() {
+  const bad = { ...VALID, downstream_servers: [{ name: "auth-fs", transport: "http", endpoint: "http://localhost:1/mcp", token_ref: "" }] };
+  const p = freshFile("downstream-token-ref-empty", bad);
+  let threw = null;
+  try { gatewayConfig.loadConfig(p); } catch (error) { threw = error; }
+  check("downstream-token-ref-empty-string-rejected", threw && /token_ref must be a non-empty string/.test(threw.message), threw && threw.message);
+}
+
+function downstreamTokenRefOptionalOnStdio() {
+  // token_ref is never required -- a stdio downstream (or an unauthenticated http one)
+  // simply omits it, and this must still load cleanly.
+  const good = { ...VALID, downstream_servers: [{ name: "fs", transport: "stdio", endpoint: "node fixture.js" }] };
+  const p = freshFile("downstream-no-token-ref", good);
+  let threw = null;
+  try { gatewayConfig.loadConfig(p); } catch (error) { threw = error; }
+  check("downstream-token-ref-omitted-is-valid", threw === null, threw && threw.message);
+}
+
 function malformedJsonRejected() {
   const p = freshFile("malformed", "{not json");
   let threw = null;
@@ -145,6 +174,9 @@ function main() {
   missingRequiredField();
   additionalPropertyRejected();
   badDownstreamTransportRejected();
+  downstreamTokenRefAccepted();
+  downstreamTokenRefMustBeNonEmptyString();
+  downstreamTokenRefOptionalOnStdio();
   emptyDownstreamServersRejected();
   duplicateDownstreamNameRejected();
   malformedJsonRejected();
