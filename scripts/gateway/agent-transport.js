@@ -147,6 +147,17 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
   }
 
   const server = http.createServer((req, res) => {
+    /* Mirrors mcp-server/src/httpTransport.js#createHttpServer's own contract (that
+     * module explicitly returns 405 for non-POST -- see its own comment on this): reject
+     * every method but POST before authentication or body processing, so a GET/PUT/etc.
+     * intermediaries may treat as safe or replayable can never reach a side-effecting
+     * tools/call the way a POST-only endpoint would refuse to let it (board decision
+     * 2026-09-04, PR #29 review "reject non-POST requests on the agent HTTP listener"). */
+    if (req.method !== "POST") {
+      res.writeHead(405, { "content-type": "application/json", allow: "POST" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Only POST is supported on this endpoint." } }));
+      return;
+    }
     /* Reuses mcp-server/src/auth.js's already-adversarially-reviewed
      * isAuthenticated() (constant-time comparison via crypto.timingSafeEqual, fail-
      * closed on a missing/malformed header or an unconfigured token) rather than a
@@ -206,8 +217,26 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
     });
   });
 
-  return new Promise((resolve) => {
-    server.listen(listenConfig.port || 0, () => resolve({ server, port: server.address().port }));
+  return new Promise((resolve, reject) => {
+    /* server.listen() emits "error" (not a thrown exception) on an async bind failure
+     * (port already in use, EACCES on a privileged port, etc.) -- without a one-shot
+     * handler here, that error had no rejection path, so startGateway()'s own try/catch
+     * never ran its cleanup and the default process crashed uncaught after already
+     * acquiring the writer claim and spawning downstream children (board decision
+     * 2026-09-04, PR #29 review "reject HTTP listener bind failures through the startup
+     * promise"). Removed once "listening" fires so a later, unrelated runtime error
+     * event on the same server doesn't also try to settle this already-settled promise. */
+    function onError(error) {
+      server.removeListener("listening", onListening);
+      reject(Object.assign(new Error(`graphsmith-gateway: failed to start the agent-facing HTTP listener: ${error.message}`), { cause: error }));
+    }
+    function onListening() {
+      server.removeListener("error", onError);
+      resolve({ server, port: server.address().port });
+    }
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(listenConfig.port || 0);
   });
 }
 
