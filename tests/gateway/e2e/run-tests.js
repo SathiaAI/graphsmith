@@ -268,6 +268,107 @@ async function samplingOverHttpAgentGetsExplicitError() {
   await gw.exitCode();
 }
 
+/** Board decision 2026-09-04, PR #29 review "send stateless metadata to HTTP
+ * downstreams": the fixture used by every other test in this suite is permissive and
+ * never exercised the real, stricter contract this repo's OWN in-repo MCP HTTP server
+ * enforces (mcp-server/src/server.js's validateMeta: every tools/list and tools/call
+ * over HTTP needs a fresh, complete _meta block, since connectionState is per-request
+ * and never remembers an earlier `initialize`). Runs the real mcp-server HTTP transport
+ * as the gateway's configured downstream and proves the full handshake, tools/list, and
+ * tools/call all succeed against it -- not just against the lenient fixture. */
+async function httpDownstreamAgainstRealMcpServerSucceeds() {
+  const root = freshRoot("http-downstream-real-server");
+  writeConfirmedMode(root, "standalone");
+  const { createHttpServer } = require(path.join(ROOT, "mcp-server", "src", "httpTransport.js"));
+  const downstreamToken = "a-fake-but-long-enough-downstream-bearer-token";
+  const downstreamServer = createHttpServer({ token: downstreamToken });
+  await new Promise((resolve) => downstreamServer.listen(0, resolve));
+  const downstreamPort = downstreamServer.address().port;
+  const downstreamTokenPath = path.join(root, "downstream-token.txt");
+  fs.writeFileSync(downstreamTokenPath, downstreamToken);
+
+  const { configPath } = writeGatewayConfig(root, {
+    downstream_servers: [{ name: "real-mcp", transport: "http", endpoint: `http://127.0.0.1:${downstreamPort}`, token_ref: downstreamTokenPath }],
+  });
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
+  const initResp = await gw.nextMessage();
+  check("e2e-http-downstream-initialize-responds", initResp && initResp.result, JSON.stringify(initResp));
+
+  gw.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+  const toolsResp = await gw.nextMessage();
+  const toolNames = toolsResp && toolsResp.result && Array.isArray(toolsResp.result.tools) && toolsResp.result.tools.map((t) => t.name);
+  check(
+    "e2e-http-downstream-tools-list-succeeds-against-real-mcp-server",
+    Array.isArray(toolNames) && toolNames.includes("graphsmith_guidance"),
+    JSON.stringify(toolsResp)
+  );
+
+  gw.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "graphsmith_guidance", arguments: {} } });
+  const callResp = await gw.nextMessage();
+  check("e2e-http-downstream-tools-call-succeeds-against-real-mcp-server", callResp && callResp.result && !callResp.error, JSON.stringify(callResp));
+
+  gw.child.stdin.end();
+  await gw.exitCode();
+  await new Promise((resolve) => downstreamServer.close(resolve));
+}
+
+/** Board decision 2026-09-04, PR #29 review "reject non-POST requests on the agent HTTP
+ * listener": a GET carrying a JSON-RPC body must be refused with 405 before
+ * authentication or dispatch, mirroring mcp-server/src/httpTransport.js's own contract
+ * for its listener. */
+async function agentHttpListenerRejectsNonPostMethod() {
+  const root = freshRoot("agent-http-non-post");
+  writeConfirmedMode(root, "standalone");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const gw = spawnGateway(root, configPath);
+  const port = await waitForHttpPort(gw);
+
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, method: "GET" }, (res) => {
+      res.resume();
+      resolve(res.statusCode);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+  check("e2e-agent-http-listener-rejects-get-with-405", status === 405, String(status));
+
+  gw.child.kill();
+  await gw.exitCode();
+}
+
+/** Board decision 2026-09-04, PR #29 review "reject HTTP listener bind failures through
+ * the startup promise": a second gateway configured to bind the SAME already-occupied
+ * agent_listen.port must fail its startup promise (not hang or crash uncaught) and exit
+ * non-zero with a clear message, mirroring secondInstanceRefused's own writer-claim
+ * precedent for a different resource. */
+async function agentHttpListenerBindFailureRejectedCleanly() {
+  const rootA = freshRoot("agent-http-bind-a");
+  writeConfirmedMode(rootA, "standalone");
+  const tokenPathA = path.join(rootA, "agent-token.txt");
+  fs.writeFileSync(tokenPathA, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath: configPathA } = writeGatewayConfig(rootA, { agent_listen: { transport: "http", token_ref: tokenPathA } });
+  const gwA = spawnGateway(rootA, configPathA);
+  const occupiedPort = await waitForHttpPort(gwA);
+
+  const rootB = freshRoot("agent-http-bind-b");
+  writeConfirmedMode(rootB, "standalone");
+  const tokenPathB = path.join(rootB, "agent-token.txt");
+  fs.writeFileSync(tokenPathB, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath: configPathB } = writeGatewayConfig(rootB, { agent_listen: { transport: "http", port: occupiedPort, token_ref: tokenPathB } });
+  const gwB = spawnGateway(rootB, configPathB);
+  const codeB = await gwB.exitCode();
+  check("e2e-agent-http-bind-failure-exits-nonzero-not-hang", codeB !== 0, `exit code ${codeB}`);
+  check("e2e-agent-http-bind-failure-names-listener-in-stderr", /agent-facing HTTP listener/i.test(gwB.stderr()), gwB.stderr());
+
+  gwA.child.kill();
+  await gwA.exitCode();
+}
+
 async function modeDormantExitsZero() {
   const root = freshRoot("dormant");
   writeConfirmedMode(root, "attach");
@@ -308,6 +409,16 @@ async function cleanSigtermDrainsAndExitsZero() {
   const { configPath, stateDir } = writeGatewayConfig(root);
   const gw = spawnGateway(root, configPath);
 
+  /* Board decision 2026-09-04, PR #29 review "enforce the agent initialization
+   * lifecycle": tools/call and tools/list are now both rejected before a connection has
+   * completed initialize, so this test (previously skipping it to focus purely on
+   * SIGTERM-drain behavior) must complete a real handshake first. Awaited on its own
+   * before the two sends below, so it does not disturb their own same-tick ordering
+   * guarantee (see the comment on that below). */
+  gw.send({ jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const initResp = await gw.nextMessage();
+  check("e2e-sigterm-preinitialize-succeeded", initResp && initResp.id === 0 && initResp.result, JSON.stringify(initResp));
+
   gw.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "fixture_echo", arguments: { delayMs: 200 } } });
   /* Explicit call-start signal, not a fixed sleep: tools/list needs no downstream round-
    * trip (it's answered straight from the cached tool surface), so sending it right
@@ -334,6 +445,9 @@ async function main() {
   await singleSessionEndToEndVerifies();
   await samplingForwardedToStdioAgent();
   await samplingOverHttpAgentGetsExplicitError();
+  await httpDownstreamAgainstRealMcpServerSucceeds();
+  await agentHttpListenerRejectsNonPostMethod();
+  await agentHttpListenerBindFailureRejectedCleanly();
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
