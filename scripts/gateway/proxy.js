@@ -63,6 +63,17 @@ class GatewayProxy {
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
     this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
+    /* Per-connection agent-initialization lifecycle (board decision 2026-09-04, PR #29
+     * review "enforce the agent initialization lifecycle"): tracked here rather than on
+     * the session.js record itself, since it is purely a dispatch-gating concern of this
+     * proxy, not part of the sealed session's own attested shape. */
+    this.agentInitialized = new Map(); // connectionId -> boolean
+    /* Optional structured per-call log sink (board decision 2026-09-04, PR #29 review
+     * "emit the required structured log for each call") -- defaults to a no-op so unit
+     * tests that construct a GatewayProxy directly (no logging concern of their own)
+     * stay silent, mirroring onSessionFinalized/onSealFailure's own default-no-op
+     * contract above. */
+    this.log = typeof opts.log === "function" ? opts.log : (() => {});
   }
 
   openConnection(connectionId, options = {}) {
@@ -79,6 +90,7 @@ class GatewayProxy {
      * simply re-records the same surface if the agent does ask. */
     session.recordToolsList(s, this.mergedTools);
     this.sessions.set(connectionId, s);
+    this.agentInitialized.set(connectionId, false);
     return s;
   }
 
@@ -126,6 +138,16 @@ class GatewayProxy {
     }
 
     if (method === "initialize") {
+      /* Board decision 2026-09-04, PR #29 review "enforce the agent initialization
+       * lifecycle": a second initialize on an already-initialized connection would
+       * silently overwrite the metadata already attached to calls made under the first
+       * one (session.recordInitialize below just replaces the recorded clientInfo/
+       * serverInfo/model), producing a sealed trace whose initialize record no longer
+       * matches what was actually true when those earlier calls ran. Reject it instead. */
+      if (this.agentInitialized.get(connectionId)) {
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error: { code: -32600, message: "This connection has already completed \"initialize\" -- a repeated initialize is not permitted." } };
+      }
       /* SS3.2/SS6: the downstream handshake already ran once at gateway startup; this
        * records the AGENT's own clientInfo alongside the already-cached downstream
        * serverInfo (merged: single server's info verbatim, or a composite name when
@@ -140,6 +162,7 @@ class GatewayProxy {
         serverInfo: mergedServerInfo,
         model: params && params.model,
       });
+      this.agentInitialized.set(connectionId, true);
       if (isNotification) return null;
       /* This gateway implements exactly one protocol version (GATEWAY_PROTOCOL_VERSION);
        * echoing back whatever the agent asked for (SS3.3) would let a client believe
@@ -150,6 +173,17 @@ class GatewayProxy {
     }
 
     if (method.startsWith("notifications/")) return null;
+
+    /* Board decision 2026-09-04, PR #29 review "enforce the agent initialization
+     * lifecycle": without this gate, an agent could list or invoke tools under an empty
+     * initialization record (no clientInfo/serverInfo ever attested for that session),
+     * which sealBoundaryBundle would then attest as if it were a normal, complete
+     * session. Gates only the two AGENT-initiated methods this applies to -- a
+     * downstream-pushed sampling/createMessage is not agent-initiated and is unaffected. */
+    if ((method === "tools/list" || method === "tools/call") && !this.agentInitialized.get(connectionId)) {
+      if (isNotification) return null;
+      return { jsonrpc: "2.0", id, error: { code: -32600, message: `Cannot call "${method}" before this connection has completed "initialize".` } };
+    }
 
     if (method === "tools/list") {
       session.recordToolsList(s, this.mergedTools);
@@ -175,22 +209,60 @@ class GatewayProxy {
       const correlationKey = isNotification ? Symbol(`notify:${toolName}`) : id;
       session.recordCallStart(s, correlationKey, { tool: toolName, server: method === "tools/call" ? serverName : "sampling", arguments: callArgs, isModelCall: isModelCallMethod(method), ts });
       const cancelKey = !isNotification ? `${connectionId}:${JSON.stringify(id)}` : null;
-      let result, isError = false;
+      let result, transportFailed = false;
       try {
         result = await conn.call(method, params, undefined, cancelKey
           ? (downstreamId) => this.downstreamCallIds.set(cancelKey, { server: serverName, downstreamId })
           : undefined);
       } catch (error) {
-        result = { error: error.message, code: error.code };
-        isError = true;
+        /* Board decision 2026-09-04, PR #29 review "preserve downstream JSON-RPC error
+         * envelopes": downstream.js's connectStdio/connectHttp both already attach the
+         * original JSON-RPC error object (code, message, optional data) as `error.
+         * rpcError` -- kept here so the response below can propagate it instead of
+         * flattening every downstream failure into a generic -32000. */
+        result = { error: error.message, code: error.code, rpcError: error.rpcError || null };
+        transportFailed = true;
       } finally {
         if (cancelKey) this.downstreamCallIds.delete(cancelKey);
       }
-      session.recordCallResult(s, correlationKey, { result, isError, ts: this.now() });
+      /* Board decision 2026-09-04, PR #29 review "honor MCP tool-level error results":
+       * a `tools/call` result can be a structurally successful, well-transported MCP
+       * response that nonetheless carries `isError: true` on the result itself (the MCP
+       * spec's own way for a TOOL's execution to fail, distinct from a transport/RPC
+       * failure). That must be reflected in the SESSION record (sealed trace, output
+       * manifest) -- but per MCP semantics a tool-level error is still a normal
+       * `tools/call` RESULT, not a JSON-RPC protocol error, so the response sent back to
+       * the agent below is still keyed on `transportFailed` alone, unchanged. */
+      const toolLevelError = !transportFailed && method === "tools/call" && result && typeof result === "object" && result.isError === true;
+      const isError = transportFailed || toolLevelError;
+      const completedAt = this.now();
+      session.recordCallResult(s, correlationKey, { result, isError, ts: completedAt });
+      /* Board decision 2026-09-04, PR #29 review "emit the required structured log for
+       * each call": the only prior gateway log for a call was the session-finalize log
+       * emitted much later (or never, if the process crashes first) -- this gives every
+       * completed call its own operational line, regardless of how the session ends. */
+      const recordedCall = s.calls[s.calls.length - 1];
+      this.log(JSON.stringify({
+        event: "gateway_call_completed",
+        connection_id: connectionId,
+        step: recordedCall ? recordedCall.seq : null,
+        tool: toolName,
+        server: method === "tools/call" ? serverName : "sampling",
+        status: isError ? "error" : "ok",
+        duration_ms: completedAt - ts,
+      }));
       if (isNotification) return null;
-      return isError
-        ? { jsonrpc: "2.0", id, error: { code: -32000, message: typeof result.error === "string" ? result.error : "downstream call failed" } }
-        : { jsonrpc: "2.0", id, result };
+      if (transportFailed) {
+        const rpcError = result.rpcError;
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: rpcError && typeof rpcError === "object" && typeof rpcError.code === "number"
+            ? { code: rpcError.code, message: rpcError.message || "downstream call failed", ...(rpcError.data !== undefined ? { data: rpcError.data } : {}) }
+            : { code: -32000, message: typeof result.error === "string" ? result.error : "downstream call failed" },
+        };
+      }
+      return { jsonrpc: "2.0", id, result };
     }
 
     if (isNotification) return null;
@@ -219,6 +291,7 @@ class GatewayProxy {
     if (!s) return null;
     if (s.pendingCalls.size > 0) session.markPendingAsDisconnected(s, reason || "connection closed with calls still pending", this.now);
     this.sessions.delete(connectionId);
+    this.agentInitialized.delete(connectionId);
     let sealed;
     try {
       sealed = session.finalizeSession(s, this.keys);
