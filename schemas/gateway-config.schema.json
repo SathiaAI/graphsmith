@@ -28,7 +28,12 @@
         "properties": {
           "name": { "type": "string", "minLength": 1 },
           "transport": { "enum": ["stdio", "http"] },
-          "endpoint": { "type": "string", "minLength": 1 }
+          "endpoint": { "type": "string", "minLength": 1 },
+          "token_ref": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional. Env var name or file path holding the bearer token this downstream server's http transport requires -- never the raw token, matching signing_key_ref's and agent_listen.token_ref's own convention (board decision 2026-09-04: extend this schema with an optional auth field rather than push authenticated downstream servers out to a reverse-proxy inject). Only meaningful when transport is \"http\"; a stdio downstream ignores it if present."
+          }
         }
       }
     },
