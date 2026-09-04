@@ -150,6 +150,24 @@ function deletedEntryDetectedDistinctly() {
   check("deleted-entry-reason-names-sequence-gap-distinctly", /SEQUENCE GAP/.test(result.reason || "") && !/TAMPERED/.test(result.reason || ""), JSON.stringify(result));
 }
 
+/* Board decision 2026-09-04, PR #29 review "require the verified chain to start at
+ * sequence one": a chain whose surviving first entry has seq > 1 but an otherwise
+ * self-consistent (recomputable, null-predecessor) hash must still be rejected --
+ * distinct from deletedEntryDetectedDistinctly above, which deletes a MIDDLE entry and
+ * leaves a real seq gap; this forges the FIRST entry to look like a legitimate root. */
+function missingGenesisPrefixDetected() {
+  const dir = freshDir("missing-genesis");
+  const keys = makeKeys();
+  for (let i = 0; i < 2; i++) chain.appendSession(dir, sealTrivialSession(`conn-${i}`, keys));
+  const lines = fs.readFileSync(chain.chainPath(dir), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const forged = { ...lines[1], prev_entry_sha256: null };
+  forged.entry_sha256 = chain.computeEntrySha256({ schema_version: forged.schema_version, seq: forged.seq, bundle_id: forged.bundle_id, prev_entry_sha256: forged.prev_entry_sha256 });
+
+  const result = walkGatewaySessions({ chain: [forged], head: null, computeEntrySha256: chain.computeEntrySha256 });
+  check("missing-genesis-prefix-detected-as-failed", result.status === "failed", JSON.stringify(result));
+  check("missing-genesis-prefix-reason-names-seq-not-one", /seq=2, expected 1/.test(result.reason || ""), JSON.stringify(result));
+}
+
 function bundleIdCollisionRefused() {
   const dir = freshDir("collision");
   const keys = makeKeys();
@@ -173,6 +191,7 @@ function main() {
   incompleteAppendDetected();
   mutatedEntryDetected();
   deletedEntryDetectedDistinctly();
+  missingGenesisPrefixDetected();
   bundleIdCollisionRefused();
   emptyChainIsNotApplicable();
 
