@@ -1,0 +1,18 @@
+# CodeRabbit configuration for this repository.
+#
+# By default, CodeRabbit only auto-reviews pull requests targeting the
+# repository's default branch ("main"). This repo's active development work
+# (the v0.5.0 gateway/attach-mode/mutation-testing tracks) lands PRs against
+# release/v0.5.0-candidate first, then that release branch is merged to main
+# later -- so without this file, CodeRabbit silently skips every PR on that
+# branch ("Auto reviews are disabled on base/target branches other than the
+# default branch"), which went unnoticed until PR #29/#30/#31 were opened.
+#
+# base_branches extends (never replaces) the default-branch auto-review scope
+# with additional regex-matched target branches. "release/.*" covers the
+# current v0.5.0-candidate branch and any future release/* branch without
+# needing to update this file again per release.
+reviews:
+  auto_review:
+    base_branches:
+      - "release/.*"
