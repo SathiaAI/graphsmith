@@ -8,11 +8,24 @@
 # branch ("Auto reviews are disabled on base/target branches other than the
 # default branch"), which went unnoticed until PR #29/#30/#31 were opened.
 #
-# base_branches extends (never replaces) the default-branch auto-review scope
-# with additional regex-matched target branches. "release/.*" covers the
-# current v0.5.0-candidate branch and any future release/* branch without
-# needing to update this file again per release.
+# base_branches extends the default-branch auto-review scope with additional
+# regex-matched target branches -- per CodeRabbit's own docs (Configuration >
+# Automatic review controls, base_branches section): "The default branch is
+# always included. base_branches extends the set of reviewed branches; it
+# does not replace the default branch." "release/.*" covers the current
+# v0.5.0-candidate branch and any future release/* branch without needing to
+# update this file again per release.
+#
+# "main" is listed explicitly below as well, even though the docs above say
+# it's unnecessary. CodeRabbit's own review on PR #32 (the PR that introduced
+# this file) flagged the opposite behavior -- that once base_branches is set,
+# it becomes the complete allowlist and main would stop being auto-reviewed --
+# noting its own inference tool was unavailable when it made that call. Given
+# the direct conflict between the published docs and that in-PR comment,
+# listing "main" explicitly costs nothing and removes the risk regardless of
+# which behavior is actually correct.
 reviews:
   auto_review:
     base_branches:
+      - "main"
       - "release/.*"
