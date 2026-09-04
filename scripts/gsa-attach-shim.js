@@ -118,20 +118,27 @@ class AttachModeShim {
       staleAfterMs: options.staleAfterMs,
       skewToleranceMs: options.skewToleranceMs,
       clock: options.clock,
-      /* Wrapped rather than passed through unmodified. CodeRabbit review: an
-       * integrator-supplied onClaimLost that only records telemetry (rather than
-       * halting) left `_started` (and therefore status().started) reporting stale
-       * "still running" state after the writer claim was actually gone -- this
-       * process would keep accepting/sealing sessions past the point its
-       * process-lifetime single-writer prerequisite no longer held. Flipping
-       * `_started` here is fail-closed regardless of what the caller's own callback
-       * does; WriterClaim's own default (no onClaimLost given) already halts loudly
-       * by rethrowing inside the heartbeat timer -- this covers the case where one IS
-       * given. */
-      onClaimLost: (error) => {
-        this._started = false;
-        if (typeof options.onClaimLost === "function") options.onClaimLost(error);
-      },
+      /* Wrapped rather than passed through unmodified -- but only when the caller
+       * actually supplied one. CodeRabbit review: an integrator-supplied onClaimLost
+       * that only records telemetry (rather than halting) left `_started` (and
+       * therefore status().started) reporting stale "still running" state after the
+       * writer claim was actually gone -- this process would keep accepting/sealing
+       * sessions past the point its process-lifetime single-writer prerequisite no
+       * longer held. Flipping `_started` here is fail-closed regardless of what the
+       * caller's own callback does. Codex review (2026-09-04): the wrapper was being
+       * installed unconditionally, which meant WriterClaim.startHeartbeat() always
+       * took its callback branch and never ran its own default -- rethrow inside the
+       * heartbeat timer, i.e. halt loudly -- for callers who never passed
+       * onClaimLost at all. Passing `undefined` here when none was supplied lets
+       * that default fire unmodified (writer-claim.js only installs a callback when
+       * `typeof options.onClaimLost === "function"`, else null; its heartbeat timer
+       * rethrows whenever there is no callback). */
+      onClaimLost: typeof options.onClaimLost === "function"
+        ? (error) => {
+            this._started = false;
+            options.onClaimLost(error);
+          }
+        : undefined,
     };
     this._claim = null;
     this._modeRecord = null;
