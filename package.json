@@ -13,7 +13,8 @@
     "references/",
     "tests/",
     "generators/",
-    "schemas/"
+    "schemas/",
+    "docs/GSA-ATTACH-MODE-WIRING.md"
   ],
   "engines": {
     "node": ">=18"
