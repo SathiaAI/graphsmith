@@ -1320,6 +1320,67 @@ function attackSoftWobbleFlagAndHardRollback() {
   }
 }
 
+/* state-store.js has its own internal --selftest mode (6 named checks: lock
+   steal/token refusal, unreadable-lock retry, journal roll-forward, alpha
+   reservation crash persistence, run-registry lease sweep, hostile-key
+   rejection) that no external suite previously invoked at all -- the same
+   blind spot already found and fixed in verify.js, gate.js, manifest.js, and
+   promote.js. A deleted/hollowed internal check would silently drop
+   `tests.length` with no external test noticing. */
+function attackSelftestCliFloor() {
+  const name = "XTRA/state-store-selftest-cli-floor";
+  try {
+    const r = spawnSync(process.execPath, [STATE_STORE, "--selftest"], {
+      encoding: "utf8",
+    });
+    const errs = [];
+    if (r.status !== 0) errs.push(`exit want 0 got ${r.status}`);
+    let result;
+    try {
+      result = JSON.parse(r.stdout);
+    } catch (e) {
+      errs.push(`stdout not JSON: ${e.message}`);
+    }
+    if (result) {
+      if (result.status !== "pass") errs.push(`status=${result.status}`);
+      if (!Array.isArray(result.tests)) errs.push("tests must be an array");
+      else if (result.tests.length < 6) {
+        /* Baseline observed on release/v0.5.0-candidate: 6 checks. Floor, not
+           exact match, so legitimately adding new checks later doesn't break
+           this -- only a check silently disappearing does. */
+        errs.push(`selftest tests.length regressed: got ${result.tests.length}, want >= 6`);
+      } else {
+        /* Round 9 (2026-08-29): the floor above only ever checked the ARRAY LENGTH, so a
+         * `tests.push({})` (dropping name/status entirely) or a `status: ""` mutant inside
+         * any individual selftest() check still passed this test -- the array got longer or
+         * stayed the same length either way. Pin each entry's shape and name/status content
+         * directly: every check selftest() KNOWS it ran must say so by name, not just add to
+         * a count. Presence-only (`.every(name => ...)`), not exact-set, so a later selftest()
+         * addition still doesn't break this -- only one of these six going missing, or
+         * reporting anything other than "pass", does. */
+        const EXPECTED_NAMES = [
+          "expired-lock-steal-and-token-refusal",
+          "lock-created-atomically-unreadable-lock-retried-then-condemned",
+          "journal-inspect-and-roll-forward",
+          "alpha-reservation-crash-persistence",
+          "registry-lease-sweep",
+          "schema-rejects-hostile-keys-on-read",
+        ];
+        const byName = new Map(result.tests.map((t) => [t && t.name, t]));
+        for (const expected of EXPECTED_NAMES) {
+          const entry = byName.get(expected);
+          if (!entry) errs.push(`selftest is missing the "${expected}" check entirely`);
+          else if (entry.status !== "pass") errs.push(`selftest check "${expected}" reported status=${JSON.stringify(entry.status)}, want "pass"`);
+        }
+      }
+    }
+    if (errs.length) throw new Error(errs.join("; "));
+    report(name, "PASS", `exit=${r.status} status=${result.status} tests=${result.tests.length}`);
+  } catch (e) {
+    report(name, "FAIL", e.message);
+  }
+}
+
 function main() {
   attackLockStealAndTokenMismatch();
   attackPidReuseAndEnvOverride();
@@ -1331,6 +1392,7 @@ function main() {
   attackSoftWobbleFlagAndHardRollback();
   attackConcurrencySync();
   attackSchema();
+  attackSelftestCliFloor();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;

@@ -251,6 +251,27 @@ try {
     assert.ok(child.status === 1 || child.status === 2, `duplicate entry falsely passed with exit ${child.status}`);
     return `exit ${child.status}`;
   });
+
+  /* manifest.js has its own internal --selftest mode (22 named checks) that no
+     external suite previously invoked at all -- a deleted/hollowed internal check
+     would silently drop the passed-count with no external test noticing. Same
+     blind spot found and fixed in verify.js and gate.js; manifest.js's selftest
+     reports a text summary line ("selftest: N passed, M failed") on stderr rather
+     than a JSON report, so the check parses that line instead of JSON. */
+  test("selftest CLI floor: exit 0 and check-count didn't regress", () => {
+    const child = runCli(["--selftest"]);
+    assert.strictEqual(child.status, 0, `exit want 0 got ${child.status}`);
+    const summary = /selftest:\s*(\d+)\s*passed,\s*(\d+)\s*failed/.exec(child.stderr || "");
+    assert.ok(summary, `selftest summary line not found in stderr: ${concise(child.stderr)}`);
+    const passedCount = Number(summary[1]);
+    const failedCount = Number(summary[2]);
+    assert.strictEqual(failedCount, 0, `selftest reported ${failedCount} internal failures`);
+    /* Baseline observed on release/v0.5.0-candidate @ 5aecb3b: 22 checks. Floor,
+       not exact match, so legitimately adding checks later doesn't break this --
+       only a check silently disappearing does. */
+    assert.ok(passedCount >= 22, `selftest passed-count regressed: got ${passedCount}, want >= 22`);
+    return `exit=${child.status} passed=${passedCount} failed=${failedCount}`;
+  });
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true });
 }
