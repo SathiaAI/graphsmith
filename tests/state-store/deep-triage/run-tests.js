@@ -404,8 +404,29 @@ function fileDescriptorsAreBalancedAcrossACommitCycle() {
       const originalCloseSync = fs.closeSync;
       let opens = 0;
       let closes = 0;
-      fs.openSync = (...args) => { opens++; return originalOpenSync(...args); };
-      fs.closeSync = (...args) => { closes++; return originalCloseSync(...args); };
+      // Scoped to calls whose IMMEDIATE caller frame is state-store.js's own code --
+      // not merely anywhere in the stack, and not every fs.openSync/closeSync call
+      // process-wide. Node 18's fs.readFileSync(path, "utf8") opens through the
+      // public, monkey-patchable fs.openSync but -- on the majority of calls --
+      // closes through an internal path that never touches the public fs.closeSync
+      // (Node 22 bypasses the public export on both ends, so it never shows up
+      // either way). Counting process-wide made this test Node-version-sensitive to
+      // Node's OWN stdlib internals rather than to state-store.js's fd hygiene:
+      // confirmed via /proc/self/fd before/after (the real OS-level fd count, which
+      // this sequence leaves unchanged on both Node 18 and Node 22) and via
+      // per-call-site tracing showing every one of state-store.js's own try/finally
+      // pairs (writeTo, _renewLock, _appendDurable, atomicOverwriteFile's two fds,
+      // _unlinkLockIfOwner) balanced 1:1 on Node 18 -- the entire discrepancy traced
+      // to fs.readFileSync(path)'s own internal open/close routing. Filtering to the
+      // immediate caller keeps the test's real purpose (a dropped finally in one of
+      // state-store.js's own manual open/close pairs) without being sensitive to
+      // however Node's stdlib happens to implement unrelated by-path reads.
+      const isStateStoreCaller = () => {
+        const frame = (new Error().stack.split("\n")[3] || "");
+        return frame.includes(STATE_STORE);
+      };
+      fs.openSync = (...args) => { if (isStateStoreCaller()) opens++; return originalOpenSync(...args); };
+      fs.closeSync = (...args) => { if (isStateStoreCaller()) closes++; return originalCloseSync(...args); };
       try {
         // _appendDurable (pushRejected), lock acquire + _renewLock (via _commit's
         // per-effect _assertStillOwned), and a normal release.
