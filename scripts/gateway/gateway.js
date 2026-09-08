@@ -13,8 +13,10 @@
  * this codebase's existing "the OS process boundary IS the trust boundary" convention
  * for stdio). An HTTP agent-facing listener is also implemented (config `agent_listen.
  * transport: "http"`) for the "multiple concurrent agents" scenario (SS8 test 3) --
- * sessions are keyed by the underlying TCP socket, so multiple requests on one
- * keep-alive connection share a session and two different connections never collide.
+ * sessions are keyed by an explicit, server-minted `Mcp-Session-Id` (board decision
+ * 2026-09-08; see scripts/gateway/agent-transport.js#runHttpAgentTransport's own header
+ * comment), not by TCP socket, so multiple logical sessions can even share one
+ * connection-pooling backend socket without colliding.
  *
  * Zero-dependency, Node >= 18.
  */

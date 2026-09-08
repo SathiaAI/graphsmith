@@ -181,17 +181,25 @@ function waitForHttpPort(gw, timeoutMs = 10000) {
   });
 }
 
-function httpPost(port, token, body, agent) {
+/** Posts one JSON-RPC message to the agent-facing HTTP listener. `sessionId`, when
+ * given, is echoed on the `Mcp-Session-Id` request header (board decision 2026-09-08:
+ * sessions are identified by this explicit header, not by TCP socket identity -- see
+ * scripts/gateway/agent-transport.js#runHttpAgentTransport's own header comment).
+ * Resolves `{ body, headers }` (not just the parsed body) so callers can read the
+ * session ID the server minted/echoed back. */
+function httpPost(port, token, body, agent, sessionId) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
+    const headers = { "content-type": "application/json", "content-length": Buffer.byteLength(payload), authorization: `Bearer ${token}` };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
     const req = http.request(
-      { host: "127.0.0.1", port, method: "POST", agent, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload), authorization: `Bearer ${token}` } },
+      { host: "127.0.0.1", port, method: "POST", agent, headers },
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => {
           try {
-            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+            resolve({ body: JSON.parse(Buffer.concat(chunks).toString("utf8")), headers: res.headers });
           } catch (error) {
             reject(new Error(`HTTP response was not valid JSON: ${error.message}`));
           }
@@ -254,35 +262,26 @@ async function samplingOverHttpAgentGetsExplicitError() {
   const port = await waitForHttpPort(gw);
   const token = fs.readFileSync(tokenPath, "utf8").trim();
 
-  /* The gateway's HTTP agent transport identifies a "connection" (and therefore
-   * whether it has completed "initialize") by TCP SOCKET IDENTITY -- a WeakMap keyed
-   * on req.socket (scripts/gateway/agent-transport.js#connectionIdFor). That only
-   * behaves like one logical connection across these two requests if the underlying
-   * HTTP client actually reuses the same socket (keep-alive), which is NOT this
-   * test's own choice to make unless it says so explicitly: Node's http.globalAgent
-   * defaults to keepAlive:false on Node 18 (a new socket, and therefore a brand new
-   * connectionId that never saw "initialize", per request) and keepAlive:true on
-   * Node 22+ (confirmed empirically, node --version v18.20.4 vs v22.22.2) -- which is
-   * exactly why this test passed on Node 22 and failed on Node 18 with the GATE's
-   * "Cannot call tools/call before this connection has completed initialize" error
-   * instead of ever reaching the stdio-only check this test actually targets. An
-   * explicit keep-alive agent makes the two requests share one socket (and therefore
-   * one connectionId) on every Node version, matching what a real, well-behaved agent
-   * client keeping one persistent HTTP connection to the gateway would do. */
-  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
-  try {
-    const initResp = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent-http", version: "1.0" } } }, agent);
-    check("e2e-sampling-http-initialize-responds", initResp && initResp.result, JSON.stringify(initResp));
+  /* Session identity on the agent-facing HTTP transport is an explicit, server-minted
+   * `Mcp-Session-Id` (board decision 2026-09-08) -- NOT TCP socket identity, so this
+   * test deliberately does NOT rely on connection/keep-alive reuse to make these two
+   * requests share one logical session (that dependency is exactly what the prior
+   * design got wrong: it made this test's outcome depend on http.globalAgent's
+   * keepAlive default, which differs across Node versions). No `agent` option is
+   * passed at all -- each request may or may not reuse a socket; either way, the
+   * session ID captured from `initialize`'s response header is what ties them
+   * together. */
+  const initResp = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent-http", version: "1.0" } } });
+  check("e2e-sampling-http-initialize-responds", initResp.body && initResp.body.result, JSON.stringify(initResp.body));
+  const sessionId = initResp.headers["mcp-session-id"];
+  check("e2e-sampling-http-initialize-returns-session-id", typeof sessionId === "string" && sessionId.length > 0, JSON.stringify(initResp.headers));
 
-    const callResp = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hi" } } }, agent);
-    check(
-      "e2e-sampling-over-http-agent-gets-explicit-error-not-silence",
-      callResp && callResp.id === 2 && callResp.error && /stdio/i.test(callResp.error.message),
-      JSON.stringify(callResp)
-    );
-  } finally {
-    agent.destroy();
-  }
+  const callResp = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hi" } } }, undefined, sessionId);
+  check(
+    "e2e-sampling-over-http-agent-gets-explicit-error-not-silence",
+    callResp.body && callResp.body.id === 2 && callResp.body.error && /stdio/i.test(callResp.body.error.message),
+    JSON.stringify(callResp.body)
+  );
 
   gw.child.kill();
   await gw.exitCode();
@@ -389,6 +388,73 @@ async function agentHttpListenerBindFailureRejectedCleanly() {
   await gwA.exitCode();
 }
 
+/** Board decision 2026-09-08 (external panel consult, x-ai/grok-4.5's dissent adopted
+ * over the socket-scoped alternative): proves the actual reason that design was chosen
+ * over a simpler one -- two DISTINCT logical sessions sharing one physical TCP socket
+ * (the connection-pooling-reverse-proxy scenario this repo's own prior comments already
+ * flagged as an unenforced assumption) must NOT collide, cross-contaminate, or let one
+ * agent call tools before ITS OWN "initialize". A socket-identity design cannot pass
+ * this by construction; an explicit `Mcp-Session-Id` design can. Also covers the new
+ * transport-level session lifecycle surface directly: missing-header rejection, unknown-
+ * session 404, and explicit DELETE termination. */
+async function httpAgentSessionsAreIdBasedNotSocketBased() {
+  const root = freshRoot("agent-http-session-id");
+  writeConfirmedMode(root, "standalone");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const gw = spawnGateway(root, configPath);
+  const port = await waitForHttpPort(gw);
+  const token = fs.readFileSync(tokenPath, "utf8").trim();
+
+  /* One shared, single-socket keep-alive agent: both logical sessions below are forced
+   * onto the SAME underlying TCP connection. Under the prior (superseded) socket-keyed
+   * design this would make the second "initialize" silently reuse the first session --
+   * exactly the pooling-proxy corruption this change exists to fix. */
+  const sharedSocketAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  try {
+    const missingHeaderResp = await httpPost(port, token, { jsonrpc: "2.0", id: 0, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, sharedSocketAgent);
+    check(
+      "e2e-agent-http-missing-session-header-non-initialize-rejected",
+      missingHeaderResp.body && missingHeaderResp.body.error && /mcp-session-id/i.test(missingHeaderResp.body.error.message),
+      JSON.stringify(missingHeaderResp.body)
+    );
+
+    const initA = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-A", version: "1.0" } } }, sharedSocketAgent);
+    const sessionA = initA.headers["mcp-session-id"];
+    const initB = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-B", version: "1.0" } } }, sharedSocketAgent);
+    const sessionB = initB.headers["mcp-session-id"];
+    check("e2e-agent-http-two-sessions-on-one-socket-get-distinct-ids", typeof sessionA === "string" && typeof sessionB === "string" && sessionA !== sessionB, JSON.stringify({ sessionA, sessionB }));
+
+    const callA = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: { prompt: "from A" } } }, sharedSocketAgent, sessionA);
+    check("e2e-agent-http-session-a-tools-call-succeeds", callA.body && callA.body.id === 2 && callA.body.result, JSON.stringify(callA.body));
+
+    const unknownResp = await httpPost(port, token, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, sharedSocketAgent, "http-" + "0".repeat(32));
+    check("e2e-agent-http-unknown-session-id-rejected-404", unknownResp.body && unknownResp.body.error && /unknown or expired/i.test(unknownResp.body.error.message), JSON.stringify(unknownResp.body));
+
+    await new Promise((resolve, reject) => {
+      const req = http.request({ host: "127.0.0.1", port, method: "DELETE", agent: sharedSocketAgent, headers: { authorization: `Bearer ${token}`, "mcp-session-id": sessionA } }, (res) => {
+        check("e2e-agent-http-delete-terminates-session-204", res.statusCode === 204, String(res.statusCode));
+        res.resume();
+        res.on("end", resolve);
+      });
+      req.on("error", reject);
+      req.end();
+    });
+
+    const afterDeleteA = await httpPost(port, token, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, sharedSocketAgent, sessionA);
+    check("e2e-agent-http-deleted-session-now-unknown", afterDeleteA.body && afterDeleteA.body.error && /unknown or expired/i.test(afterDeleteA.body.error.message), JSON.stringify(afterDeleteA.body));
+
+    const callB = await httpPost(port, token, { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "fixture_echo", arguments: { prompt: "from B" } } }, sharedSocketAgent, sessionB);
+    check("e2e-agent-http-session-b-unaffected-by-session-a-deletion", callB.body && callB.body.id === 5 && callB.body.result, JSON.stringify(callB.body));
+  } finally {
+    sharedSocketAgent.destroy();
+  }
+
+  gw.child.kill();
+  await gw.exitCode();
+}
+
 async function modeDormantExitsZero() {
   const root = freshRoot("dormant");
   writeConfirmedMode(root, "attach");
@@ -468,6 +534,7 @@ async function main() {
   await httpDownstreamAgainstRealMcpServerSucceeds();
   await agentHttpListenerRejectsNonPostMethod();
   await agentHttpListenerBindFailureRejectedCleanly();
+  await httpAgentSessionsAreIdBasedNotSocketBased();
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
