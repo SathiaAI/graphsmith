@@ -6,24 +6,14 @@
  *
  * stdio: one process, one connection (mirrors mcp-server/src/stdioTransport.js's own
  * newline-delimited JSON-RPC framing and "stdin closed -> exit cleanly" convention).
- * http: sessions keyed by the underlying TCP socket (`req.socket`), so a keep-alive
- * connection's multiple requests share one session and two concurrent connections
- * (SS8 test 3) get independent sessions with no cross-contamination.
  *
- * **Known, disclosed scope limit (board decision 2026-09-04, PR #29 review "key HTTP
- * sessions by protocol identity"):** this "one TCP socket = one session" identity is
- * deliberate and intentional for `session_boundary: "connection"` (the only boundary
- * this build implements -- "time_window" is rejected at startup, see gateway.js), and
- * it assumes no connection-pooling reverse proxy sits in front of this listener
- * multiplexing distinct agents over one shared backend socket. That assumption is not
- * enforced in code -- it is an operational requirement on how this gateway is deployed,
- * stated here and in KNOWN-LIMITATIONS.md rather than silently relied on. Real
- * session-id-based identity (a client-supplied header/cookie, independent of the
- * socket, with its own lifecycle policy) was deliberately NOT built now -- there is no
- * concrete "time_window" deployment needing it yet (SS3.4 is still unresolved), and
- * building that lifecycle machinery speculatively would be scope creep against a
- * boundary mode that isn't used. Revisit when SS3.4's time_window session boundary is
- * actually designed, or if a pooling-reverse-proxy deployment is planned.
+ * http: sessions keyed by an explicit, server-minted `Mcp-Session-Id` (board decision
+ * 2026-09-08, revising the 2026-09-04 "key HTTP sessions by protocol identity" review
+ * item -- see runHttpAgentTransport's own header comment for the full design and why
+ * this supersedes the prior "one TCP socket = one session" identity). That prior
+ * identity model, and the explicit 2026-09-04 decision NOT to build anything past it,
+ * are preserved here only as history: KNOWN-LIMITATIONS.md documents what changed and
+ * why.
  */
 "use strict";
 
@@ -118,7 +108,42 @@ function runStdioAgentTransport(ctx) {
 }
 
 /** Runs the agent-facing HTTP transport (config `agent_listen.transport: "http"`).
- * `token` is the already-resolved bearer token (see config.js#resolveSecretRef). */
+ * `token` is the already-resolved bearer token (see config.js#resolveSecretRef).
+ *
+ * **Session identity (board decision 2026-09-08).** Sessions are identified by an
+ * explicit, server-minted `Mcp-Session-Id` -- mirroring the MCP streamable-HTTP
+ * transport spec's own convention -- not by the underlying TCP socket (the prior
+ * design; see git history / KNOWN-LIMITATIONS.md for what this replaces and why). Only
+ * `initialize` may be sent without a session ID; the gateway mints one there, opens the
+ * proxy session under it, and returns it on the `Mcp-Session-Id` response header. Every
+ * later request on that session must echo the header back; an unrecognized or expired
+ * ID gets 404 (MCP's own convention for "this session is gone -- start over with
+ * initialize"). A session ends on an explicit `DELETE` (204), after
+ * SESSION_IDLE_TIMEOUT_MS of inactivity, or when the gateway process shuts down
+ * (gateway.js#stop already force-closes every session still open in `proxy.sessions` at
+ * that point, unconditionally, regardless of transport) -- deliberately NOT when the
+ * TCP socket that carried a given request happens to close.
+ *
+ * This was scoped deliberately narrower than "real HTTP session resumption": it fixes
+ * the two concrete problems an explicit ID actually needs to fix --
+ * (1) a pooling reverse proxy multiplexing distinct agents onto one shared backend
+ *     socket can no longer corrupt session identity, because identity no longer comes
+ *     from the socket at all;
+ * (2) one well-behaved agent whose HTTP client rotates connections mid-session (a
+ *     recycled keep-alive socket, a client-side reconnect) no longer loses its already-
+ *     `initialize`d session for a reason entirely outside its control --
+ * without reopening `session_boundary: "time_window"` (still refused at startup, see
+ * gateway.js) or building the fuller reconnect/replay/multi-node session store that
+ * mode would eventually need. Sought a second opinion from an external panel of five
+ * non-Anthropic frontier models before landing on this scope (2026-09-08); see the
+ * project's own decision log for the full brief and dissenting views.
+ *
+ * **Disclosed cost of this scope, not hidden:** an agent that vanishes uncleanly (crash,
+ * network partition, no DELETE) now leaves its session open -- and counted in
+ * `active_sessions`, and un-sealed in the audit chain -- for up to
+ * SESSION_IDLE_TIMEOUT_MS, instead of the near-instant cleanup the old socket-close
+ * handler gave for free. That is the deliberate trade for no longer conflating "this
+ * TCP connection ended" with "this agent is done." */
 function runHttpAgentTransport(ctx, listenConfig, token) {
   /* Same hard requirement mcp-server/src/httpTransport.js#createHttpServer already
    * enforces for its own HTTP listener: the config schema itself does not (and cannot,
@@ -132,37 +157,64 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
         "hard requirement for any non-stdio agent transport, not a configurable-away default."
     );
   }
-  const socketConnectionIds = new WeakMap();
 
-  function connectionIdFor(socket) {
-    if (!socketConnectionIds.has(socket)) {
-      const id = "http-" + crypto.randomBytes(8).toString("hex");
-      socketConnectionIds.set(socket, id);
-      ctx.proxy.openConnection(id);
-      socket.on("close", () => {
-        ctx.proxy.closeConnection(id, "agent HTTP connection closed").catch(() => {});
-      });
-    }
-    return socketConnectionIds.get(socket);
+  const SESSION_ID_HEADER = "mcp-session-id";
+  /* Not yet exposed as a config field. A fixed, documented default matches this change's
+   * own "minimal, non-speculative" scope (see header comment) -- the same discipline the
+   * 2026-09-04 decision applied to `time_window` itself. Make it configurable once a
+   * real deployment needs a different value, not before. */
+  const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+  const httpSessions = new Map(); // sessionId -> { idleTimer } -- transport-level bookkeeping proxy.js has no reason to know about.
+
+  function sealSession(sessionId, reason) {
+    const entry = httpSessions.get(sessionId);
+    if (!entry) return;
+    clearTimeout(entry.idleTimer);
+    httpSessions.delete(sessionId);
+    ctx.proxy.closeConnection(sessionId, reason).catch(() => {});
+  }
+
+  function touchSession(sessionId) {
+    const entry = httpSessions.get(sessionId);
+    if (!entry) return;
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = setTimeout(() => sealSession(sessionId, "agent HTTP session idle timeout exceeded"), SESSION_IDLE_TIMEOUT_MS);
+    if (typeof entry.idleTimer.unref === "function") entry.idleTimer.unref();
+  }
+
+  function openSession() {
+    /* 128 random bits, not the prior design's 64 -- an id that is now a client-visible,
+     * bearer-like session credential (rather than an internal WeakMap key nobody outside
+     * this process ever saw) warrants the larger, standard margin against guessing. */
+    const id = "http-" + crypto.randomBytes(16).toString("hex");
+    ctx.proxy.openConnection(id);
+    httpSessions.set(id, { idleTimer: null });
+    touchSession(id);
+    return id;
   }
 
   const server = http.createServer((req, res) => {
     /* Mirrors mcp-server/src/httpTransport.js#createHttpServer's own contract (that
      * module explicitly returns 405 for non-POST -- see its own comment on this): reject
-     * every method but POST before authentication or body processing, so a GET/PUT/etc.
-     * intermediaries may treat as safe or replayable can never reach a side-effecting
-     * tools/call the way a POST-only endpoint would refuse to let it (board decision
-     * 2026-09-04, PR #29 review "reject non-POST requests on the agent HTTP listener"). */
-    if (req.method !== "POST") {
-      res.writeHead(405, { "content-type": "application/json", allow: "POST" });
-      res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Only POST is supported on this endpoint." } }));
+     * every method but POST/DELETE before authentication or body processing, so a
+     * GET/PUT/etc. intermediaries may treat as safe or replayable can never reach a
+     * side-effecting tools/call the way a POST-only endpoint would refuse to let it
+     * (board decision 2026-09-04, PR #29 review "reject non-POST requests on the agent
+     * HTTP listener"). DELETE is admitted alongside POST for explicit session
+     * termination (board decision 2026-09-08) -- it carries no JSON-RPC payload and is
+     * not itself a side-effecting call. */
+    if (req.method !== "POST" && req.method !== "DELETE") {
+      res.writeHead(405, { "content-type": "application/json", allow: "POST, DELETE" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Only POST and DELETE are supported on this endpoint." } }));
       return;
     }
     /* Reuses mcp-server/src/auth.js's already-adversarially-reviewed
      * isAuthenticated() (constant-time comparison via crypto.timingSafeEqual, fail-
      * closed on a missing/malformed header or an unconfigured token) rather than a
      * second, naive `===` string comparison, which would reopen exactly the
-     * timing-attack surface that module exists to close. */
+     * timing-attack surface that module exists to close. Runs before any session lookup
+     * so an unauthenticated caller learns nothing about which session IDs exist. */
     if (!isAuthenticated(req.headers["authorization"], token)) {
       res.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" });
       res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthenticated." } }));
@@ -178,6 +230,28 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
     const requestDeadline = setTimeout(() => req.destroy(), REQUEST_TIMEOUT_MS);
     if (typeof requestDeadline.unref === "function") requestDeadline.unref();
     req.on("close", () => clearTimeout(requestDeadline));
+
+    const sessionIdHeader = req.headers[SESSION_ID_HEADER];
+
+    if (req.method === "DELETE") {
+      req.resume(); // no body expected; drain and discard whatever the client sends anyway
+      req.on("end", () => {
+        if (!sessionIdHeader) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: `DELETE requires the ${SESSION_ID_HEADER} header.` } }));
+          return;
+        }
+        if (!httpSessions.has(sessionIdHeader)) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unknown or already-ended session." } }));
+          return;
+        }
+        sealSession(sessionIdHeader, "agent explicitly terminated session (DELETE)");
+        res.writeHead(204);
+        res.end();
+      });
+      return;
+    }
 
     const chunks = [];
     let bytesReceived = 0;
@@ -201,17 +275,38 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
         res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: `Parse error: ${error.message}` } }));
         return;
       }
-      const connectionId = connectionIdFor(req.socket);
-      ctx.proxy.handleMessage(connectionId, msg).then((response) => {
+
+      let sessionId = sessionIdHeader;
+      if (!sessionId) {
+        /* No session ID presented: the ONLY message this can legitimately be is
+         * "initialize" (board decision 2026-09-08) -- anything else means either a
+         * client bug or a stale session the server already forgot; both get the same
+         * clear, actionable error rather than proxy.js's generic "no open session"
+         * throw. */
+        if (!msg || typeof msg !== "object" || msg.method !== "initialize") {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32600, message: `Missing ${SESSION_ID_HEADER} header -- a new session must begin with "initialize".` } }));
+          return;
+        }
+        sessionId = openSession();
+      } else if (!httpSessions.has(sessionId)) {
+        res.writeHead(404, { "content-type": "application/json", [SESSION_ID_HEADER]: sessionId });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32001, message: "Unknown or expired session -- start a new session with \"initialize\"." } }));
+        return;
+      } else {
+        touchSession(sessionId);
+      }
+
+      ctx.proxy.handleMessage(sessionId, msg).then((response) => {
         if (response === null) {
-          res.writeHead(202);
+          res.writeHead(202, { [SESSION_ID_HEADER]: sessionId });
           res.end();
         } else {
-          res.writeHead(200, { "content-type": "application/json" });
+          res.writeHead(200, { "content-type": "application/json", [SESSION_ID_HEADER]: sessionId });
           res.end(JSON.stringify(response));
         }
       }).catch((error) => {
-        res.writeHead(500, { "content-type": "application/json" });
+        res.writeHead(500, { "content-type": "application/json", [SESSION_ID_HEADER]: sessionId });
         res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32603, message: error.message } }));
       });
     });
