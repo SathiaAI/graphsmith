@@ -288,11 +288,26 @@ class GatewayProxy {
         }
         if (intentDecision.kind === "replay") {
           if (isNotification) return null;
+          /* Codex PR #33 review "emit complete step logs for replayed and blocked
+           * calls": this used to emit only the special-purpose gateway_intent_replayed
+           * line, missing the step/status/duration fields every other handled call gets
+           * via gateway_call_completed below -- an operator scanning for one
+           * consistently-shaped log line per call would miss this one. Emit both: the
+           * existing event (kept for any consumer already matching on it) and a normal
+           * structured completion record. */
           this.log(JSON.stringify({ event: "gateway_intent_replayed", connection_id: connectionId, tool: toolName, intent_key: intentKey }));
+          this.log(JSON.stringify({ event: "gateway_call_completed", connection_id: connectionId, step: null, tool: toolName, server: serverName, status: "replayed", duration_ms: 0 }));
           return { jsonrpc: "2.0", id, result: intentDecision.cachedResult };
         }
         if (intentDecision.kind === "block") {
           session.recordAnomaly(s, { kind: intentDecision.gatewayCode, tool: toolName, intent_key: intentKey, detail: intentDecision.message });
+          /* Codex PR #33 review "append blocked-retry anomalies to the WAL": the
+           * anomaly above is recorded in-memory only -- a crash before this connection's
+           * own close would silently drop it from the recovered/sealed bundle, even
+           * though the gateway genuinely prevented a duplicate dispatch. Durable WAL
+           * event + the matching structured log line (see the replay branch above). */
+          recovery.appendWalEvent(this.stateDir, connectionId, { type: "ANOMALY", kind: intentDecision.gatewayCode, tool: toolName, intent_key: intentKey, detail: intentDecision.message, ts: this.now() });
+          this.log(JSON.stringify({ event: "gateway_call_completed", connection_id: connectionId, step: null, tool: toolName, server: serverName, status: "blocked", duration_ms: 0 }));
           if (isNotification) return null;
           return {
             jsonrpc: "2.0",
@@ -325,7 +340,25 @@ class GatewayProxy {
       const walCallSeq = s.nextCallSeq;
       session.recordCallStart(s, correlationKey, { tool: toolName, server: method === "tools/call" ? serverName : "sampling", arguments: callArgs, isModelCall: isModelCallMethod(method), ts });
       if (method === "tools/call") {
-        recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: walCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts });
+        /* Codex PR #33 review "undo the fence when CALL_START persistence fails": the
+         * intent was already durably created as "dispatched" above (createIntentIfAbsent),
+         * before downstream dispatch, before this WAL append -- if THIS fails (e.g. the
+         * state volume is full), the call never actually reaches conn.call() below, but
+         * without this catch that exception would escape handleMessage entirely (breaking
+         * its own documented "never throws for a well-formed envelope" contract) while
+         * leaving the intent permanently "dispatched": every identical retry would then be
+         * blocked forever as "still in flight" for an operation that in fact never
+         * dispatched. Roll back both the intent and the just-added pendingCalls entry, and
+         * return a normal, retryable JSON-RPC error instead. */
+        try {
+          recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: walCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts });
+        } catch (walError) {
+          s.pendingCalls.delete(correlationKey);
+          try { recovery.deleteIntent(this.stateDir, intentKey); } catch (cleanupError) { /* best effort */ }
+          session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
+          if (isNotification) return null;
+          return { jsonrpc: "2.0", id, error: { code: -32000, message: `Failed to durably record this call before dispatch: ${walError.message}. Not dispatched -- safe to retry.` } };
+        }
       }
       const cancelKey = !isNotification ? `${connectionId}:${JSON.stringify(id)}` : null;
       let result, transportFailed = false, transportErrorCode = null;
@@ -374,14 +407,28 @@ class GatewayProxy {
        * (if closeConnection already fenced this same intent as ambiguous while this call
        * was in flight, a later proven outcome correctly resolves it here). */
       if (method === "tools/call") {
-        if (!isError) {
-          recovery.updateIntent(this.stateDir, intentKey, { state: "completed", completed_at: completedAt, cached_result: result });
-        } else {
-          recovery.updateIntent(this.stateDir, intentKey, {
-            state: "ambiguous",
-            ambiguous_at: completedAt,
-            ambiguous_reason: transportFailed ? `transport failure: ${transportErrorCode || "unknown"}` : "downstream reported a tool-level error (isError: true)",
-          });
+        /* Codex PR #33 review "guard the post-dispatch intent update": closeConnection
+         * can fence this same intent to "ambiguous" and remove the session WHILE conn.call
+         * above is still being awaited; recovery-resolve --confirmed not-executed (now
+         * writer-claim-gated, but a live gateway can still be mid-shutdown when its own
+         * claim is lost) can also delete it. Either way updateIntent then throws
+         * GATEWAY_RECOVERY_INTENT_NOT_FOUND -- previously uncaught, escaping handleMessage
+         * entirely and preventing the JSON-RPC response for a call that DID complete.
+         * Catch only that specific error and log it; anything else is a real bug and
+         * should still surface. */
+        try {
+          if (!isError) {
+            recovery.updateIntent(this.stateDir, intentKey, { state: "completed", completed_at: completedAt, cached_result: result });
+          } else {
+            recovery.updateIntent(this.stateDir, intentKey, {
+              state: "ambiguous",
+              ambiguous_at: completedAt,
+              ambiguous_reason: transportFailed ? `transport failure: ${transportErrorCode || "unknown"}` : "downstream reported a tool-level error (isError: true)",
+            });
+          }
+        } catch (error) {
+          if (error.code !== "GATEWAY_RECOVERY_INTENT_NOT_FOUND") throw error;
+          this.log(JSON.stringify({ event: "gateway_intent_update_skipped", connection_id: connectionId, tool: toolName, intent_key: intentKey, reason: "intent no longer exists (concurrently removed by close or an operator resolution)" }));
         }
       }
       /* CodeRabbit PR #29 review "recording the result after the session is closed can
