@@ -236,21 +236,35 @@ class GatewayProxy {
       const toolLevelError = !transportFailed && method === "tools/call" && result && typeof result === "object" && result.isError === true;
       const isError = transportFailed || toolLevelError;
       const completedAt = this.now();
-      session.recordCallResult(s, correlationKey, { result, isError, ts: completedAt });
-      /* Board decision 2026-09-04, PR #29 review "emit the required structured log for
-       * each call": the only prior gateway log for a call was the session-finalize log
-       * emitted much later (or never, if the process crashes first) -- this gives every
-       * completed call its own operational line, regardless of how the session ends. */
-      const recordedCall = s.calls[s.calls.length - 1];
-      this.log(JSON.stringify({
-        event: "gateway_call_completed",
-        connection_id: connectionId,
-        step: recordedCall ? recordedCall.seq : null,
-        tool: toolName,
-        server: method === "tools/call" ? serverName : "sampling",
-        status: isError ? "error" : "ok",
-        duration_ms: completedAt - ts,
-      }));
+      /* CodeRabbit PR #29 review "recording the result after the session is closed can
+       * throw or write a false anomaly": closeConnection()/handleDownstreamDisconnect()
+       * can run for this same connectionId WHILE conn.call() above is still being
+       * awaited (both call session.markPendingAsDisconnected, which removes the pending
+       * entry). If that happened, this call's correlationKey is no longer a real pending
+       * call by the time the response lands: recording it anyway would either throw
+       * SESSION_FINALIZED (if the session already finished finalizing -- escaping
+       * handleMessage's own "never throws for a well-formed envelope" contract) or push a
+       * spurious UNMATCHED_RESPONSE anomaly (if not yet finalized) for an entry the
+       * gateway itself removed, not a real downstream protocol violation. Only record
+       * (and log) when the call is still genuinely pending. */
+      const correlatedNow = !s.finalized && s.pendingCalls.has(correlationKey);
+      if (correlatedNow) {
+        session.recordCallResult(s, correlationKey, { result, isError, ts: completedAt });
+        /* Board decision 2026-09-04, PR #29 review "emit the required structured log for
+         * each call": the only prior gateway log for a call was the session-finalize log
+         * emitted much later (or never, if the process crashes first) -- this gives every
+         * completed call its own operational line, regardless of how the session ends. */
+        const recordedCall = s.calls[s.calls.length - 1];
+        this.log(JSON.stringify({
+          event: "gateway_call_completed",
+          connection_id: connectionId,
+          step: recordedCall ? recordedCall.seq : null,
+          tool: toolName,
+          server: method === "tools/call" ? serverName : "sampling",
+          status: isError ? "error" : "ok",
+          duration_ms: completedAt - ts,
+        }));
+      }
       if (isNotification) return null;
       if (transportFailed) {
         const rpcError = result.rpcError;
@@ -299,7 +313,25 @@ class GatewayProxy {
       this.onSealFailure(s, error);
       return null;
     }
-    const entry = chain.appendSession(this.stateDir, sealed);
+    /* CodeRabbit PR #29 review "chain.appendSession is not guarded, so a persistence
+     * failure aborts shutdown and leaks the writer-claim": the doc comment above this
+     * method says closeConnection returns null "if sealing/persistence failed", but only
+     * session.finalizeSession was ever inside a try/catch -- chain.appendSession can
+     * throw GATEWAY_BUNDLE_ID_COLLISION (sealBoundaryBundle derives bundle_id from
+     * {init, grantedTools, n} alone, so the same agent reconnecting with identical
+     * clientInfo and call count reproduces it) or on any filesystem error. Uncaught, that
+     * throw escapes closeConnection entirely -- inside gateway.js's stop()/doStop()
+     * finalize loop this would abort the remaining sessions' finalization, skip every
+     * downstream conn.close(), and skip writerClaim.release(), leaking a stale claim that
+     * blocks the next gateway start. Route it through the same onSealFailure/return-null
+     * contract as a sealing failure so the documented behavior actually holds. */
+    let entry;
+    try {
+      entry = chain.appendSession(this.stateDir, sealed);
+    } catch (error) {
+      this.onSealFailure(s, error);
+      return null;
+    }
     this.onSessionFinalized(connectionId, entry, sealed);
     return entry;
   }

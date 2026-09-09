@@ -306,10 +306,22 @@ async function startGateway(options) {
   const ctx = { config, writerClaim, connections: downstreamHandles.connections, proxy };
 
   const drainTimeoutMs = options.drainTimeoutMs || 5000;
-  let stopped = false;
-  async function stop(reason) {
-    if (stopped) return;
-    stopped = true;
+  /* CodeRabbit PR #29 review "make stop() await the in-progress shutdown instead of
+   * returning early": the SIGTERM/SIGINT handler and the stdio-disconnect path
+   * (stdioHandle.closed.then(...)) can both call stop(), and both call process.exit(0)
+   * once THEIR OWN promise settles. The previous `if (stopped) return;` resolved a
+   * second caller's promise immediately, while the first caller's drain/finalize/
+   * writer-claim-release work was still in flight -- letting the second caller's
+   * process.exit(0) race ahead and kill the process mid-finalize, losing sessions that
+   * were never sealed/appended to the chain. Memoize the actual shutdown promise instead,
+   * so every caller (first or later) awaits the SAME work and only resolves once it is
+   * genuinely done. */
+  let stopPromise = null;
+  function stop(reason) {
+    if (!stopPromise) stopPromise = doStop(reason);
+    return stopPromise;
+  }
+  async function doStop(reason) {
     log(`shutting down (${reason || "requested"}): draining ${proxy.openSessionCount()} open session(s)`);
     proxy.stopAcceptingNewSessions();
     /* SS3.7: "finish in-flight sessions" means actually WAIT (bounded) for calls already
