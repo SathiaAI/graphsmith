@@ -53,6 +53,15 @@ async function drainOpenSessions(proxy, timeoutMs, pollMs = 25) {
   return !Array.from(proxy.sessions.values()).some((s) => s.pendingCalls.size > 0);
 }
 
+/* Codex PR #29 review round 3 "preserve the configured shutdown deadline for HTTP
+ * calls": Node's http.Server#close() waits for every still-active response to finish
+ * before its callback fires -- a request still awaiting a slow (up to
+ * DEFAULT_REQUEST_TIMEOUT_MS, 30s) downstream call can hold shutdown well past the
+ * nominal drainTimeoutMs (default 5s) drain cap above. This bounds how long doStop()
+ * will wait for the listener to close cleanly before force-terminating any sockets
+ * still open on it, so a slow HTTP call can no longer extend shutdown indefinitely. */
+const HTTP_LISTENER_CLOSE_TIMEOUT_MS = 2000;
+
 function fail(message, code = "GATEWAY_ERROR") {
   const error = new Error(message);
   error.code = code;
@@ -97,14 +106,37 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
    * a strict one-process-one-connection transport (agent-transport.js's own header). */
   const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
   const correlationKey = s ? Symbol("downstream-initiated-sample") : null;
+  const startTs = proxy ? proxy.now() : Date.now();
   if (s) {
     session.recordCallStart(s, correlationKey, {
       tool: "sampling/createMessage",
       server: "sampling",
       arguments: msg.params,
       isModelCall: true,
-      ts: proxy.now(),
+      ts: startTs,
     });
+  }
+  /* Codex PR #29 review round 3 "log completed downstream-initiated sampling steps":
+   * proxy.js's own agent-initiated call path (GatewayProxy#handleMessage) emits a
+   * structured "gateway_call_completed" log line for every call it records -- this
+   * separate downstream-initiated sampling path records the same kind of execution-trace
+   * step (model_call:true) but previously emitted no matching completion log on success,
+   * and its failure log above lacked the connection id, step, status, and duration every
+   * other completed-call log line carries. Mirror that same structured shape here so a
+   * session containing a downstream-initiated sampling call has a complete, consistent
+   * operational log regardless of which side (agent or downstream) initiated the call. */
+  function logCompletion(isError) {
+    const completedAt = proxy ? proxy.now() : Date.now();
+    const recordedCall = s ? s.calls[s.calls.length - 1] : null;
+    log(JSON.stringify({
+      event: "gateway_call_completed",
+      connection_id: agentPusher.connectionId || null,
+      step: recordedCall ? recordedCall.seq : null,
+      tool: "sampling/createMessage",
+      server: "sampling",
+      status: isError ? "error" : "ok",
+      duration_ms: completedAt - startTs,
+    }));
   }
   return agentPusher.current(msg.method, msg.params).then(
     (result) => {
@@ -113,12 +145,20 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
        * still in flight awaiting the agent's model. Only record if it's still genuinely
        * pending, so this never throws SESSION_FINALIZED or logs a spurious anomaly for an
        * entry the gateway itself already removed. */
-      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
+      const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
+      if (correlatedNow) {
+        session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
+        logCompletion(false);
+      }
       return { jsonrpc: "2.0", id: msg.id, result };
     },
     (error) => {
       log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
-      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
+      const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
+      if (correlatedNow) {
+        session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
+        logCompletion(true);
+      }
       return { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: error.message } };
     }
   );
@@ -305,7 +345,7 @@ async function startGateway(options) {
     stateDir: config.state_dir,
     log,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
-    onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size })),
+    onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size, quarantinedTo: error.quarantinedTo || null })),
   });
 
   for (const [name, conn] of downstreamHandles.connections.entries()) {
@@ -383,7 +423,22 @@ async function startGateway(options) {
     agentPusher.current = null; // no agent left to push a forwarded sampling request to
     agentPusher.connectionId = null;
     if (stdioHandle) stdioHandle.stop();
-    if (httpHandle) await new Promise((resolve) => httpHandle.server.close(resolve));
+    if (httpHandle) {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
+        httpHandle.server.close(finish);
+        const forceCloseTimer = setTimeout(() => {
+          // Stop accepting new connections is already implied by close() above; this
+          // forcibly ends any still-open sockets/responses so the callback above (or
+          // this fallback) fires within the bounded deadline rather than whenever the
+          // last active response happens to finish.
+          if (typeof httpHandle.server.closeAllConnections === "function") httpHandle.server.closeAllConnections();
+          finish();
+        }, HTTP_LISTENER_CLOSE_TIMEOUT_MS);
+        if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
+      });
+    }
     // Finalize any still-open sessions (drained above, or forced closed after the timeout).
     for (const connectionId of Array.from(proxy.sessions.keys())) {
       await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
