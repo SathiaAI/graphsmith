@@ -12,8 +12,8 @@
  *      exit, claim released, process exits 0. SKIPPED ON WIN32: Node cannot deliver a
  *      real SIGTERM for graceful in-process handling on Windows (child.kill('SIGTERM')
  *      unconditionally terminates the process there) -- mirrors this repo's own existing
- *      precedent (tests/state-store/writer-claim, "skip win32-unreproducible renew()
- *      TOCTOU simulation") of naming and skipping a platform-unreproducible case rather
+ *     precedent (tests/state-store/writer-claim, "skip win32-unreproducible renew()
+ *     TOCTOU simulation") of naming and skipping a platform-unreproducible case rather
  *     than writing a test that cannot mean what it claims to mean.
  *   6  second gateway instance started against the same state_dir while the first is
  *      running -> FR-1 refusal, named identity in the error.
@@ -219,7 +219,7 @@ function httpPost(port, token, body, agent, sessionId) {
 async function samplingForwardedToStdioAgent() {
   const root = freshRoot("sampling-stdio");
   writeConfirmedMode(root, "standalone");
-  const { configPath } = writeGatewayConfig(root);
+  const { configPath, stateDir } = writeGatewayConfig(root);
   const gw = spawnGateway(root, configPath);
 
   gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
@@ -246,6 +246,24 @@ async function samplingForwardedToStdioAgent() {
   gw.child.stdin.end();
   const code = await gw.exitCode();
   check("e2e-sampling-stdio-clean-disconnect-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
+
+  /* Codex PR #29 review "record downstream-initiated sampling in the session": before
+   * that fix, this forwarded exchange never touched session.js at all, so the sealed
+   * bundle attested only the outer fixture_sample tool call -- the model invocation
+   * itself (and its hashed prompt/result) was silently absent even though the gateway
+   * observed and relayed it. Assert it now actually lands in the persisted trace with
+   * model_call:true, not just that the tool call round-tripped in-memory. */
+  const head = chain.readHead(stateDir);
+  const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(stateDir, head.bundle_id), "utf8"));
+  const traceLines = bundle.contents["execution_trace.jsonl"].trim().split("\n").map((l) => JSON.parse(l));
+  const sampleStep = traceLines.find((t) => t.tool === "sampling:sampling/createMessage");
+  check(
+    "e2e-sampling-recorded-as-model-call-in-sealed-bundle",
+    // execution_trace.jsonl records only hashes of input/result (SS5.2), never plaintext
+    // -- assert the step exists, is attributed as a real model call, and is not an error.
+    sampleStep && sampleStep.model_call === true && sampleStep.is_error === false && typeof sampleStep.result_sha256 === "string" && sampleStep.result_sha256.length > 0,
+    traceLines.map((t) => JSON.stringify(t)).join("\n")
+  );
 }
 
 /** Board decision 2026-09-04 (PR #29 review, Decision 1, Option B): when the agent

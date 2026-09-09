@@ -301,6 +301,70 @@ async function structuredLogEmittedPerCompletedCall() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* Codex PR #29 review "forward the full cached tool descriptor": tools/list previously
+ * projected each tool down to {name, description, inputSchema}, discarding whatever else
+ * the downstream actually advertised (outputSchema, annotations, title, ...) even though
+ * downstream.js already preserves it on the cached descriptor. Only the two
+ * gateway-private fields (`server`, and the internal `schema` alias of inputSchema)
+ * should ever be stripped. */
+async function toolsListForwardsFullDescriptor() {
+  const dir = freshDir("full-descriptor");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [
+    {
+      name: "echo",
+      description: "echoes its arguments",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object", properties: { echoed: {} } },
+      annotations: { title: "Echo", readOnlyHint: true },
+      server: "srv", // gateway-private ownership field: must NOT reach the agent
+      schema: { type: "object" }, // gateway-private internal alias: must NOT reach the agent
+    },
+  ];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const listResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+  const tool = listResp.result && listResp.result.tools && listResp.result.tools[0];
+  check(
+    "tools-list-forwards-outputSchema-and-annotations",
+    tool && tool.name === "echo" && tool.description === "echoes its arguments" &&
+      JSON.stringify(tool.outputSchema) === JSON.stringify(mergedTools[0].outputSchema) &&
+      JSON.stringify(tool.annotations) === JSON.stringify(mergedTools[0].annotations) &&
+      JSON.stringify(tool.inputSchema) === JSON.stringify(mergedTools[0].inputSchema),
+    JSON.stringify(tool)
+  );
+  check(
+    "tools-list-strips-gateway-private-server-and-schema-fields",
+    tool && tool.server === undefined && tool.schema === undefined,
+    JSON.stringify(tool)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #29 review "handle JSON-RPC null IDs before recording calls": JSON-RPC 2.0
+ * permits an explicit `id: null` on a request (distinct from a notification, which omits
+ * "id" entirely). Using it directly as the internal correlation key previously reached
+ * session.recordCallStart's Map key, which throws INVALID_ARGUMENT on null -- turning a
+ * legal-if-unusual request into an escaped internal error instead of a normal response. */
+async function nullJsonRpcIdDoesNotCrash() {
+  const dir = freshDir("null-id");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: null, method: "tools/call", params: { name: "echo", arguments: {} } });
+  check(
+    "null-jsonrpc-id-tools-call-does-not-throw-and-echoes-null-id",
+    resp && resp.id === null && resp.result && resp.result.ok === true,
+    JSON.stringify(resp)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -313,6 +377,8 @@ async function main() {
   await preservesDownstreamJsonRpcErrorEnvelope();
   await initializationLifecycleEnforced();
   await structuredLogEmittedPerCompletedCall();
+  await toolsListForwardsFullDescriptor();
+  await nullJsonRpcIdDoesNotCrash();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
