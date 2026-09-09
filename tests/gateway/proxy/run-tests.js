@@ -365,6 +365,52 @@ async function nullJsonRpcIdDoesNotCrash() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* Codex PR #29 review round 3 "retain sessions when persistence fails": closeConnection
+ * used to discard the fully-sealed bundle the moment chain.appendSession threw, leaving
+ * only a summary log line. Two connections given identical initialize params and an
+ * identical call count deterministically produce the same bundle_id (gsa-mcp-shim.js
+ * hashes only {init, grantedTools, n} -- see chain.js's own "same agent reconnecting ...
+ * reproduces it" comment), so the second one's real chain.appendSession call genuinely
+ * throws GATEWAY_BUNDLE_ID_COLLISION here rather than a synthetic/forced failure. */
+async function persistenceFailureQuarantinesSealedBundle() {
+  const dir = freshDir("quarantine");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const sealFailures = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    onSealFailure: (s, error) => sealFailures.push(error),
+  });
+
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  const entry1 = await proxy.closeConnection("conn-1", "test cleanup");
+  check("quarantine-setup-first-append-succeeds", Boolean(entry1 && typeof entry1.bundle_id === "string"), JSON.stringify(entry1));
+
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  const entry2 = await proxy.closeConnection("conn-2", "test cleanup");
+  check("persistence-failure-returns-null", entry2 === null, JSON.stringify(entry2));
+  check(
+    "persistence-failure-invokes-onSealFailure-with-collision-code",
+    sealFailures.length === 1 && sealFailures[0].code === "GATEWAY_BUNDLE_ID_COLLISION",
+    JSON.stringify(sealFailures.map((e) => e && e.code))
+  );
+
+  const quarantinedTo = sealFailures[0] && sealFailures[0].quarantinedTo;
+  check("persistence-failure-quarantines-sealed-bundle", typeof quarantinedTo === "string" && fs.existsSync(quarantinedTo), String(quarantinedTo));
+  if (typeof quarantinedTo === "string" && fs.existsSync(quarantinedTo)) {
+    const quarantined = JSON.parse(fs.readFileSync(quarantinedTo, "utf8"));
+    check(
+      "quarantined-file-preserves-the-sealed-bundle",
+      Boolean(quarantined.sealed && quarantined.sealed.bundle && quarantined.sealed.bundle.manifest),
+      JSON.stringify(Object.keys(quarantined))
+    );
+  }
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -379,6 +425,7 @@ async function main() {
   await structuredLogEmittedPerCompletedCall();
   await toolsListForwardsFullDescriptor();
   await nullJsonRpcIdDoesNotCrash();
+  await persistenceFailureQuarantinesSealedBundle();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
