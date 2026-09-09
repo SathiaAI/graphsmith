@@ -66,8 +66,24 @@ function runStdioAgentTransport(ctx) {
       const { resolve, reject, timer } = pendingPushed.get(msg.id);
       clearTimeout(timer);
       pendingPushed.delete(msg.id);
-      if (msg.error) reject(Object.assign(new Error(msg.error.message || "agent returned an error"), { rpcError: msg.error }));
-      else resolve(msg.result);
+      /* Codex PR #29 review round 3 "validate agent replies to pushed sampling
+       * requests": this previously accepted any id-matching, method-less message as a
+       * valid reply, without requiring "jsonrpc": "2.0" or exactly one of "result"/
+       * "error" -- mirroring the same gap downstream.js's connectStdio had (and already
+       * fixed) on its own response-correlation path. A malformed reply such as
+       * `{"id":"gw-push-..."}` would resolve as a successful `undefined` sampling result
+       * and be forwarded to the downstream, and be attested, as though it had genuinely
+       * succeeded. */
+      const hasResult = Object.prototype.hasOwnProperty.call(msg, "result");
+      const hasError = Object.prototype.hasOwnProperty.call(msg, "error");
+      const wellFormed = msg.jsonrpc === "2.0" && (hasResult || hasError) && !(hasResult && hasError);
+      if (!wellFormed) {
+        reject(new Error(`agent's reply to pushed request (id ${JSON.stringify(msg.id)}) was not a well-formed JSON-RPC 2.0 response (missing/invalid "jsonrpc", or not exactly one of "result"/"error" present)`));
+      } else if (msg.error) {
+        reject(Object.assign(new Error(msg.error.message || "agent returned an error"), { rpcError: msg.error }));
+      } else {
+        resolve(msg.result);
+      }
       return;
     }
     ctx.proxy.handleMessage(connectionId, msg).then((response) => {
