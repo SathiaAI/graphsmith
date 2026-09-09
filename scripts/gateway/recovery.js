@@ -74,15 +74,54 @@ function activeDir(stateDir) {
 function intentsDir(stateDir) {
   return path.join(recoveryDir(stateDir), INTENTS_DIRNAME);
 }
+function quarantineDir(stateDir) {
+  return path.join(recoveryDir(stateDir), "quarantine");
+}
+
+/* CodeRabbit PR #33 review "reject path-bearing recovery identifiers": connectionId and
+ * intentKey normally come from this codebase's own generated IDs (safe), but
+ * recovery-resolve/recovery-abandon's CLI flags and this module's exported API both also
+ * accept them directly from a caller, unvalidated -- and path.join happily normalizes a
+ * "../" segment, so an unvalidated value could address a file outside its recovery
+ * directory. Applied at the two path-construction points below, not at every call site
+ * individually, so nothing can reach fs.* with an unsafe path regardless of caller. */
+const SAFE_ID = /^[A-Za-z0-9._-]+$/;
+function assertSafeId(value, what) {
+  if (typeof value !== "string" || !SAFE_ID.test(value) || value === "." || value === "..") {
+    throw fail(`Unsafe ${what} ${JSON.stringify(value)} -- refusing to build a recovery path from it.`, "GATEWAY_RECOVERY_UNSAFE_ID");
+  }
+  return value;
+}
 function walPath(stateDir, connectionId) {
-  return path.join(activeDir(stateDir), `${connectionId}.jsonl`);
+  return path.join(activeDir(stateDir), `${assertSafeId(connectionId, "connectionId")}.jsonl`);
 }
 function intentPath(stateDir, intentKey) {
-  return path.join(intentsDir(stateDir), `${intentKey}.json`);
+  return path.join(intentsDir(stateDir), `${assertSafeId(intentKey, "intentKey")}.json`);
 }
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+/* CodeRabbit PR #33 review "fsync the recovery directory after creating WAL files": a
+ * file's own fsync (appendDurableLine, atomicCreateExclusive) guarantees its CONTENT is
+ * durable, but not that the new directory entry (its name appearing in its parent
+ * directory) survives a power loss -- that needs the parent directory's own fd fsynced
+ * too. Mirrors state-store.js's atomicOverwriteFile, which already fsyncs its target
+ * directory on every write for the same reason; called after every append/create here
+ * rather than only on first creation, matching that existing convention. Best-effort: a
+ * directory that cannot be opened for this (e.g. mid-teardown in a test) should not mask
+ * the real error from the write that already durably succeeded. */
+function fsyncDir(dir) {
+  let fd;
+  try {
+    fd = fs.openSync(dir, "r");
+    fs.fsyncSync(fd);
+  } catch (error) {
+    /* best effort -- see doc comment above */
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 /* Mirrors chain.js's own appendDurableLine, which is not exported from that module --
@@ -108,6 +147,27 @@ function appendDurableLine(filePath, line) {
 function appendWalEvent(stateDir, connectionId, event) {
   ensureDir(activeDir(stateDir));
   appendDurableLine(walPath(stateDir, connectionId), JSON.stringify({ ...event, recorded_at: Date.now() }));
+  fsyncDir(activeDir(stateDir));
+}
+
+/** Best-effort: moves a connection's WAL out of `active/` into `gateway-recovery/
+ * quarantine/` rather than deleting it, for the case where the file could not even be
+ * read (permission/I/O error, not a JSON/content problem -- see readWalEvents) and an
+ * operator has explicitly decided to give up on recovering it (gateway.js#abandonConnection).
+ * A rename does not require read access to the file's own content, only to its directory
+ * entry, so this can succeed even when the read that motivated it could not. Returns the
+ * quarantined path, or null if there was no WAL file to move. */
+function quarantineWal(stateDir, connectionId) {
+  ensureDir(quarantineDir(stateDir));
+  const from = walPath(stateDir, connectionId);
+  const to = path.join(quarantineDir(stateDir), `${connectionId}-${Date.now()}.jsonl`);
+  try {
+    fs.renameSync(from, to);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  return to;
 }
 
 function deleteWal(stateDir, connectionId) {
@@ -217,6 +277,11 @@ function createIntentIfAbsent(stateDir, intentKey, data) {
     if (error.code === "EEXIST") return null;
     throw error;
   }
+  // See fsyncDir's own doc comment: atomicCreateExclusive (state-store.js, shared with
+  // callers outside this module) fsyncs the file's own content but not the directory
+  // entry that makes this new intent file discoverable after a crash -- done here,
+  // locally, rather than changing that shared helper's behavior for every other caller.
+  fsyncDir(intentsDir(stateDir));
   return record;
 }
 
@@ -295,11 +360,26 @@ function resolveIntentExecuted(stateDir, intentKey, result) {
   });
 }
 
-/** Confirmed NOT executed: deletes the intent entirely so a future identical dispatch is
- * treated as brand new, not as "retrying a resolved failure" (there is no such state --
- * the fence is either up or gone). */
+/** Confirmed NOT executed. Codex PR #33 review "persist a terminal not-executed
+ * resolution": this used to delete the intent immediately, on the reasoning that a
+ * future identical dispatch should be treated as brand new. That is correct for a LIVE
+ * connection, but recovery-resolve only ever runs while no gateway process holds the
+ * writer-claim for this state_dir (gateway.js#runRecoveryResolveCli now acquires it
+ * itself) -- so the connection this intent belongs to is always a crashed one, still
+ * sitting on a WAL with the same call's CALL_START still pending replay. Deleting the
+ * intent outright left recoverCrashedSessions with no record of the operator's decision
+ * on the next restart: it would find the same pending call, find no "completed" intent,
+ * and re-flag the same connection for operator review forever -- this CLI resolution
+ * could never actually finish recovery. Persisting a terminal `not_executed` state
+ * instead lets recoverCrashedSessions replay it as a real (failed) call result and then
+ * clean up the intent itself once the connection is actually sealed -- see
+ * gateway.js#recoverCrashedSessions's own handling of this state. */
 function resolveIntentNotExecuted(stateDir, intentKey) {
-  deleteIntent(stateDir, intentKey);
+  return updateIntent(stateDir, intentKey, {
+    state: "not_executed",
+    resolved_at: Date.now(),
+    resolution: "operator_confirmed_not_executed",
+  });
 }
 
 module.exports = {
@@ -307,10 +387,12 @@ module.exports = {
   recoveryDir,
   activeDir,
   intentsDir,
+  quarantineDir,
   walPath,
   intentPath,
   appendWalEvent,
   deleteWal,
+  quarantineWal,
   readWalEvents,
   listActiveConnections,
   canonicalJson,
