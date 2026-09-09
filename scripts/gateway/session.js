@@ -125,6 +125,19 @@ function recordCallResult(session, jsonRpcId, result) {
   return true;
 }
 
+/** Records a protocol-level irregularity that is not itself a call outcome -- generic
+ * and additive, mirroring recordCallResult's own UNMATCHED_RESPONSE anomaly shape so
+ * sealBoundaryBundle's existing anomaly handling needs no changes. Added for Option C
+ * (Codex PR #29 Finding 2, external-panel-reviewed design -- see
+ * option-c-hardened-design.md): records an ambiguous-retry-blocked event so the sealed
+ * bundle attests that a duplicate dispatch was prevented, not just that one happened to
+ * not occur. This is the one addition Option C makes to this file; every other function
+ * here is unchanged. */
+function recordAnomaly(session, anomaly) {
+  if (session.finalized) throw fail("Cannot record into a finalized session", "SESSION_FINALIZED");
+  session.anomalies.push({ ts: Date.now(), ...anomaly });
+}
+
 /** Called when the downstream side of a connection disconnects (or the whole session is
  * finalized) with calls still pending: each is recorded with an explicit disconnect
  * marker, never silently dropped (SS7 failure mode / test plan item 10).
@@ -224,6 +237,7 @@ module.exports = {
   recordToolsList,
   recordCallStart,
   recordCallResult,
+  recordAnomaly,
   markPendingAsDisconnected,
   toSealableSession,
   finalizeSession,
