@@ -110,7 +110,35 @@ function connectStdio(endpoint, options = {}) {
   let closeError = null;
   const notificationHandlers = [];
 
+  /* Codex PR #29 review round 3 "handle errors from the downstream stdin stream": a
+   * downstream that exits just before or during a write can make child.stdin emit an
+   * asynchronous EPIPE (or ERR_STREAM_WRITE_AFTER_END) error rather than throwing into
+   * the call()/notify()/write-back call sites below -- Node treats an unhandled "error"
+   * event on a stream as fatal and crashes the whole gateway process. Every write already
+   * goes through call()/notify()'s own `closed` guard or the unhandled-method write below
+   * (now also guarded, see there), so the pending calls this would have failed are already
+   * rejected via the child's own "close"/"error" handlers; this listener exists solely to
+   * absorb the stream-level error event itself so it cannot crash the process. */
+  child.stdin.on("error", () => { /* best effort: absorbed to prevent an unhandled 'error' event from crashing the gateway */ });
+
   const rl = readline.createInterface({ input: child.stdout, terminal: false });
+  /* Codex PR #29 review round 3 "bound newline-delimited responses from stdio
+   * downstreams": readline buffers an unbounded amount of input while waiting for a
+   * newline, so a faulty or compromised downstream that never terminates a line could
+   * exhaust gateway memory even though the HTTP path already caps a single response at
+   * MAX_HTTP_RESPONSE_BYTES. Track bytes received since the last completed line and
+   * force-close the connection if a single unterminated line grows past that same cap. */
+  let bytesSinceLastLine = 0;
+  child.stdout.on("data", (chunk) => {
+    bytesSinceLastLine += chunk.length;
+    if (bytesSinceLastLine > MAX_HTTP_RESPONSE_BYTES) {
+      bytesSinceLastLine = 0;
+      if (!closed) {
+        closeError = fail(`downstream stdio produced an unterminated line exceeding the ${MAX_HTTP_RESPONSE_BYTES}-byte limit`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE");
+        close();
+      }
+    }
+  });
   /* Correlation order matters: a bidirectional stdio connection gives the downstream
    * its OWN independent id namespace for requests it initiates (see the sampling-relay
    * comment below), so a downstream-initiated request can legitimately reuse a numeric
@@ -120,6 +148,7 @@ function connectStdio(endpoint, options = {}) {
    * directions from being confused with each other (board decision 2026-09-04, PR #29
    * review "distinguish downstream requests before correlating responses"). */
   rl.on("line", (line) => {
+    bytesSinceLastLine = 0; // a completed line: reset the unterminated-line byte counter above
     const trimmed = line.trim();
     if (trimmed.length === 0) return;
     let msg;
@@ -169,7 +198,14 @@ function connectStdio(endpoint, options = {}) {
           .catch((error) => {
             if (!closed) child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: error.message } }) + "\n");
           });
-      } else {
+      } else if (!closed) {
+        /* Codex PR #29 review round 3 "handle errors from the downstream stdin stream":
+         * this branch previously wrote unconditionally, unlike the two onRequest branches
+         * above it -- a downstream that has already exited (closed=true, e.g. its own
+         * "close"/"error" handlers already ran) would still attempt a write here, which
+         * could throw synchronously or, with the stdin error listener above absorbing the
+         * async case, would otherwise be a pointless write to a stream nobody reads from
+         * anymore. Consistent with those two branches' own `!closed` guard. */
         child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not handle downstream-initiated method "${msg.method}".` } }) + "\n");
       }
     }
@@ -352,8 +388,15 @@ function connectHttp(endpoint, options = {}) {
             /* Fail-closed on the response envelope itself (matching the stdio path's own
              * strict id-correlation discipline): a wrong/missing JSON-RPC id, a wrong/
              * missing "jsonrpc" version, or a non-response object are all rejected rather
-             * than attested as this call's real result. */
-            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.jsonrpc !== "2.0" || parsed.id !== id) {
+             * than attested as this call's real result. Codex PR #29 review round 3
+             * "require a result or error in HTTP responses": this previously stopped short
+             * of the stdio path's own "neither/both result-and-error present" check, so an
+             * envelope with the right jsonrpc/id but no "result" and no "error" (e.g.
+             * `{"jsonrpc":"2.0","id":1}`) fell through to the success branch below and
+             * resolved `undefined` as though the call had genuinely succeeded. */
+            const hasResult = parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "result");
+            const hasError = parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "error");
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.jsonrpc !== "2.0" || parsed.id !== id || (!hasResult && !hasError) || (hasResult && hasError)) {
               settleReject(fail(`downstream HTTP response was not a well-formed JSON-RPC 2.0 response matching request id ${id}`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
               return;
             }
@@ -468,7 +511,14 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
   const connections = new Map();
   const toolOwners = new Map(); // toolName -> serverName (first-registered wins, duplicates flagged)
   const mergedTools = [];
-  const serverInfos = {};
+  /* Codex PR #29 review round 3 "store server information without prototype-sensitive
+   * keys": downstream server names are arbitrary configured strings, and a plain object
+   * literal treats a name of "__proto__" as a prototype assignment rather than an
+   * enumerable own property -- silently corrupting this object's prototype instead of
+   * recording that server's info, while the server's tools remain routable through the
+   * (Map-keyed, not affected by this) toolOwners/mergedTools structures. A null-prototype
+   * object accepts any string as a genuine own key. */
+  const serverInfos = Object.create(null);
   try {
     for (const serverConfig of downstreamServers) {
       let conn;
@@ -505,15 +555,20 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
            * would previously fall through to the "[]" default -- gateway startup then
            * succeeds with a silently truncated (or entirely empty) tool surface instead
            * of failing loudly, unlike this same function's own tool-name-collision and
-           * pagination-loop guards a few lines below. */
-          if (toolsResult && typeof toolsResult === "object" && Object.prototype.hasOwnProperty.call(toolsResult, "tools") && !Array.isArray(toolsResult.tools)) {
+           * pagination-loop guards a few lines below. Round 3 tightened this further
+           * ("require the tools array in every tools/list result"): the MCP spec requires
+           * "tools" to be present (as an array, possibly empty) on every successful
+           * tools/list result, but the check above only rejected a WRONG-TYPE "tools" --
+           * a result missing the property entirely (e.g. `{}`) still silently fell through
+           * to the same "[]" default this comment already flags as the wrong behavior. */
+          if (!toolsResult || typeof toolsResult !== "object" || !Object.prototype.hasOwnProperty.call(toolsResult, "tools") || !Array.isArray(toolsResult.tools)) {
             throw fail(
-              `downstream server "${serverConfig.name}" returned a malformed tools/list result: "tools" is present ` +
-                `but is not an array (got ${typeof toolsResult.tools}).`,
+              `downstream server "${serverConfig.name}" returned a malformed tools/list result: "tools" must be ` +
+                `present and an array (got ${toolsResult && typeof toolsResult === "object" ? typeof toolsResult.tools : "no result object"}).`,
               "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"
             );
           }
-          const pageTools = (toolsResult && Array.isArray(toolsResult.tools)) ? toolsResult.tools : [];
+          const pageTools = toolsResult.tools;
           for (const tool of pageTools) {
             if (!tool || typeof tool !== "object" || typeof tool.name !== "string" || tool.name.length === 0) {
               throw fail(
