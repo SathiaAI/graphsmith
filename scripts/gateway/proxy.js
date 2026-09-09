@@ -13,6 +13,8 @@
  */
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const session = require("./session.js");
 const chain = require("./chain.js");
 
@@ -20,6 +22,32 @@ function fail(message, code = "GATEWAY_PROXY_ERROR") {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+/* Codex PR #29 review round 3 "retain sessions when persistence fails": chain.
+ * appendSession can throw on a transient or environmental failure (ENOSPC, EACCES, a
+ * one-off filesystem error) well after session.finalizeSession has already produced the
+ * fully sealed, signed bundle -- until now, that already-computed `sealed` object was
+ * discarded the moment closeConnection's catch block returned null, leaving nothing but
+ * onSealFailure's own summary log (call count, pending count) to show a session ever
+ * existed. This does not change closeConnection's documented null-on-failure contract or
+ * decide retry/halt policy (a genuine architecture question, given every append also
+ * upholds the sole-writer chain-sequencing invariant) -- it only keeps the one thing that
+ * was about to be lost forever: a best-effort, non-throwing write of the sealed bundle to
+ * a quarantine directory an operator can inspect and manually re-append once the
+ * underlying failure (e.g. disk full) is resolved. */
+function quarantineSealedBundle(stateDir, connectionId, sealed, cause) {
+  try {
+    const dir = path.join(chain.sessionsDir(stateDir), "quarantine");
+    fs.mkdirSync(dir, { recursive: true });
+    const target = path.join(dir, `${connectionId}-${Date.now()}.json`);
+    fs.writeFileSync(target, JSON.stringify({ sealed, quarantined_at: new Date().toISOString(), reason: cause && cause.message }, null, 2), { encoding: "utf8", flag: "wx" });
+    return target;
+  } catch (quarantineError) {
+    // Best effort only: a quarantine-write failure (e.g. the same ENOSPC that caused the
+    // original append failure) must never mask or replace the original error/callback.
+    return null;
+  }
 }
 
 /* MCP sampling requests are how a downstream server asks the AGENT'S model to do
@@ -350,6 +378,7 @@ class GatewayProxy {
     try {
       entry = chain.appendSession(this.stateDir, sealed);
     } catch (error) {
+      error.quarantinedTo = quarantineSealedBundle(this.stateDir, connectionId, sealed, error);
       this.onSealFailure(s, error);
       return null;
     }
