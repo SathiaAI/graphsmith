@@ -183,7 +183,7 @@ function canonicalJson(value) {
  * same way, so an in-flight call's fence is preserved across a crash even though a NEW
  * connectionId after reconnect would not itself match the old key). */
 function computeIntentKey(connectionId, tool, args) {
-  const material = `${connectionId} ${tool} ${canonicalJson(args === undefined ? null : args)}`;
+  const material = `${connectionId}\0${tool}\0${canonicalJson(args === undefined ? null : args)}`;
   return "gs_" + crypto.createHash("sha256").update(material, "utf8").digest("hex").slice(0, 32);
 }
 
