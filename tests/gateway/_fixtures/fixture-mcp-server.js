@@ -101,5 +101,12 @@ rl.on("line", (line) => {
     }
     return;
   }
+  // CodeRabbit PR #29 review "do not answer notifications/initialized with an error
+  // response": a notification (no "id") must never get a reply per JSON-RPC/MCP, even an
+  // error one -- err(undefined, ...) below drops the id key from the JSON entirely
+  // (JSON.stringify omits an undefined property), which downstream.js's real client
+  // silently ignores today (harmless in practice), but this fixture stands in for "an
+  // independent, spec-conforming downstream" and should not itself violate the spec.
+  if (id === undefined || id === null) return;
   err(id, `Unknown method: ${method}`);
 });

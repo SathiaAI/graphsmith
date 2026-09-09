@@ -66,13 +66,16 @@ function validateAgentListen(value, errors) {
   }
   if (!Object.prototype.hasOwnProperty.call(value, "transport")) errors.push(`${loc}.transport is required`);
   for (const key of Object.keys(value)) {
-    if (!["transport", "port", "token_ref"].includes(key)) errors.push(`${loc}.${key} is not allowed`);
+    if (!["transport", "port", "host", "token_ref"].includes(key)) errors.push(`${loc}.${key} is not allowed`);
   }
   if (Object.prototype.hasOwnProperty.call(value, "transport") && !["stdio", "http"].includes(value.transport)) {
     errors.push(`${loc}.transport must be "stdio" or "http"`);
   }
   if (Object.prototype.hasOwnProperty.call(value, "port") && (!Number.isInteger(value.port) || value.port < 1)) {
     errors.push(`${loc}.port must be an integer >= 1`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "host") && (typeof value.host !== "string" || value.host.length === 0)) {
+    errors.push(`${loc}.host must be a non-empty string`);
   }
   if (value.transport === "http" && (typeof value.token_ref !== "string" || value.token_ref.length === 0)) {
     errors.push(`${loc}.token_ref is required (and must be a non-empty string) when transport is "http"`);
@@ -145,7 +148,11 @@ function validateConfigShape(config) {
 function resolveSecretRef(ref, label) {
   if (typeof ref !== "string" || ref.length === 0) throw fail(`${label} must be a non-empty string`, "INVALID_ARGUMENT");
   if (fs.existsSync(ref) && fs.statSync(ref).isFile()) {
-    return fs.readFileSync(ref, "utf8").trim();
+    const contents = fs.readFileSync(ref, "utf8").trim();
+    if (contents.length === 0) {
+      throw fail(`${label} ("${ref}") names a file that is empty (or only whitespace).`, "GATEWAY_SECRET_REF_UNRESOLVED");
+    }
+    return contents;
   }
   const value = process.env[ref];
   if (typeof value !== "string" || value.length === 0) {
