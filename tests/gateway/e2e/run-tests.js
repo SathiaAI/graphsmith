@@ -266,6 +266,43 @@ async function samplingForwardedToStdioAgent() {
   );
 }
 
+/** Codex PR #29 review round 3 "validate agent replies to pushed sampling requests":
+ * a reply to a gateway-pushed request that is missing "jsonrpc": "2.0" and carries
+ * neither "result" nor "error" must be rejected as malformed, not resolved as a
+ * successful `undefined` sampling result and forwarded to the downstream as success. */
+async function malformedPushedReplyIsRejectedNotSilentlyAccepted() {
+  const root = freshRoot("sampling-malformed-reply");
+  writeConfirmedMode(root, "standalone");
+  const { configPath } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
+  await gw.nextMessage();
+
+  gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
+
+  const pushed = await gw.nextMessage();
+  check(
+    "e2e-malformed-reply-setup-sampling-request-pushed",
+    Boolean(pushed && pushed.method === "sampling/createMessage" && pushed.id !== undefined && pushed.id !== null),
+    JSON.stringify(pushed)
+  );
+
+  // Malformed reply: right id, no "jsonrpc", and neither "result" nor "error".
+  gw.send({ id: pushed && pushed.id });
+
+  const toolResp = await gw.nextMessage();
+  check(
+    "e2e-malformed-pushed-reply-surfaces-as-tool-call-error-not-fake-success",
+    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/mocked/.test(JSON.stringify(toolResp))),
+    JSON.stringify(toolResp)
+  );
+
+  gw.child.stdin.end();
+  const code = await gw.exitCode();
+  check("e2e-malformed-pushed-reply-clean-disconnect-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
+}
+
 /** Board decision 2026-09-04 (PR #29 review, Decision 1, Option B): when the agent
  * transport is HTTP, a downstream's sampling request must get back a real JSON-RPC
  * error naming why -- never the silent drop this was before the fix, and never a hang. */
@@ -548,6 +585,7 @@ async function cleanSigtermDrainsAndExitsZero() {
 async function main() {
   await singleSessionEndToEndVerifies();
   await samplingForwardedToStdioAgent();
+  await malformedPushedReplyIsRejectedNotSilentlyAccepted();
   await samplingOverHttpAgentGetsExplicitError();
   await httpDownstreamAgainstRealMcpServerSucceeds();
   await agentHttpListenerRejectsNonPostMethod();
