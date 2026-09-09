@@ -63,6 +63,11 @@
       "properties": {
         "transport": { "enum": ["stdio", "http"] },
         "port": { "type": "integer", "minimum": 1 },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Interface to bind the http transport's listener to. Defaults to \"127.0.0.1\" when omitted (CodeRabbit PR #29 review \"bind the agent HTTP listener to an explicit host\") -- omitting host from Node's server.listen() binds the wildcard address, exposing this bearer-token-protected listener on every network interface instead of just localhost."
+        },
         "token_ref": {
           "type": "string",
           "minLength": 1,
