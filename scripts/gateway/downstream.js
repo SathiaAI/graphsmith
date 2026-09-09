@@ -64,6 +64,18 @@ const META_CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo";
 const META_CLIENT_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities";
 const STATELESS_META_METHODS = new Set(["tools/list", "tools/call", "server/discover"]);
 
+/* Option C (Codex PR #29 Finding 2, external-panel-reviewed design -- see
+ * option-c-hardened-design.md, "Both transports" paragraph): the gateway's own durable
+ * per-operation identity (scripts/gateway/recovery.js#computeIntentKey), propagated to
+ * the downstream as a conventional idempotency key so a downstream that itself
+ * recognizes one gets genuine at-most-once execution too. A downstream that ignores this
+ * key is unaffected -- the gateway-side dispatch fence in proxy.js is what actually
+ * protects against a double dispatch either way; this is defense in depth, not the
+ * mechanism the guarantee depends on. Scoped to exactly the calls proxy.js itself fences
+ * (real `tools/call` dispatch only, per that file's own "deliberately scoped" comment) --
+ * call() below only ever receives this for those. */
+const META_IDEMPOTENCY_KEY = "graphsmith/idempotency_key";
+
 /* Mirrors mcp-server/src/protocol.js's own STATELESS_PROTOCOL_VERSION -- a DIFFERENT
  * literal from MCP_PROTOCOL_VERSION above. That constant is the legacy handshake
  * version this client negotiates via the top-level `initialize` call (mcp-server's own
@@ -196,10 +208,21 @@ function connectStdio(endpoint, options = {}) {
     closeError = fail(`downstream process failed to start: ${error.message}`, "GATEWAY_DOWNSTREAM_DISCONNECTED");
   });
 
-  function call(method, params, timeoutMs, onIdAssigned) {
+  function call(method, params, timeoutMs, onIdAssigned, idempotencyKey) {
     if (closed) return Promise.reject(closeError || fail("downstream connection is closed", "GATEWAY_DOWNSTREAM_DISCONNECTED"));
     const id = nextId++;
     if (typeof onIdAssigned === "function") onIdAssigned(id);
+    /* See META_IDEMPOTENCY_KEY's header comment above. Unlike the HTTP leg's stateless
+     * _meta block, stdio needs no per-request protocolVersion/clientInfo (those are
+     * negotiated once, at this connection's own initialize) -- this is the only _meta
+     * merge stdio ever needs, and only when a key is actually supplied. Placed LAST in
+     * the merge (after any `_meta` the caller's own params happened to carry) so this
+     * gateway-internal correlation id always wins -- unlike buildStatelessMeta's own
+     * agent-overridable fields, this one is not a negotiable protocol value the agent is
+     * meant to be able to supply or override. */
+    const effectiveParams = idempotencyKey
+      ? { ...(params || {}), _meta: { ...((params && params._meta) || {}), [META_IDEMPOTENCY_KEY]: idempotencyKey } }
+      : params;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
@@ -207,7 +230,7 @@ function connectStdio(endpoint, options = {}) {
       }, timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS);
       if (typeof timer.unref === "function") timer.unref();
       pending.set(id, { resolve, reject, timer });
-      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: effectiveParams }) + "\n");
     });
   }
 
@@ -275,7 +298,7 @@ function connectHttp(endpoint, options = {}) {
   let reachable = true;
   const notificationHandlers = []; // never fired: plain request/response HTTP has no server push
 
-  function call(method, params, timeoutMs, onIdAssigned) {
+  function call(method, params, timeoutMs, onIdAssigned, idempotencyKey) {
     if (closed) return Promise.reject(fail("downstream connection is closed", "GATEWAY_DOWNSTREAM_DISCONNECTED"));
     const id = nextId++;
     if (typeof onIdAssigned === "function") onIdAssigned(id);
@@ -283,9 +306,22 @@ function connectHttp(endpoint, options = {}) {
     /* See buildStatelessMeta's header comment: this leg is stateless per-request, so
      * every request under a method the stateless MCP protocol requires _meta on gets
      * one attached here, centrally, rather than at each call site -- a caller-supplied
-     * _meta (if any) wins over the generated one, field by field. */
-    const effectiveParams = isStatelessMetaMethod
-      ? { ...(params || {}), _meta: { ...buildStatelessMeta(options), ...((params && params._meta) || {}) } }
+     * _meta (if any) wins over the generated one, field by field. The idempotency key
+     * (see META_IDEMPOTENCY_KEY's header comment) is spread in LAST, after the caller's
+     * own _meta, so -- unlike the fields above it -- it always wins: it is this gateway's
+     * own internal correlation id, never a value the agent is meant to supply or
+     * override, so it is merged even on a call whose method isn't itself one of the
+     * stateless-protocol methods (defensive; in practice proxy.js only ever supplies one
+     * for "tools/call", which already is). */
+    const effectiveParams = isStatelessMetaMethod || idempotencyKey
+      ? {
+          ...(params || {}),
+          _meta: {
+            ...(isStatelessMetaMethod ? buildStatelessMeta(options) : {}),
+            ...((params && params._meta) || {}),
+            ...(idempotencyKey ? { [META_IDEMPOTENCY_KEY]: idempotencyKey } : {}),
+          },
+        }
       : params;
     /* The mirrored header (below) must agree with whatever protocol version this
      * request's own body actually declares -- STATELESS_META_PROTOCOL_VERSION for a

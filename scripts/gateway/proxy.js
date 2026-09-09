@@ -15,6 +15,7 @@
 
 const session = require("./session.js");
 const chain = require("./chain.js");
+const recovery = require("./recovery.js");
 
 function fail(message, code = "GATEWAY_PROXY_ERROR") {
   const error = new Error(message);
@@ -91,6 +92,18 @@ class GatewayProxy {
     session.recordToolsList(s, this.mergedTools);
     this.sessions.set(connectionId, s);
     this.agentInitialized.set(connectionId, false);
+    /* Codex PR #29 Finding 1 (Option C, external-panel-reviewed design -- see
+     * option-c-hardened-design.md): crash-recovery WAL, recorded from the very start of
+     * the connection so a crash before any tool call still leaves a durable record of
+     * the granted tool surface and goal. Separate, unsigned, outside the hash chain --
+     * see recovery.js's own header for why this makes zero changes to session.js's own
+     * call-recording functions or to sealBoundaryBundle. */
+    recovery.appendWalEvent(this.stateDir, connectionId, {
+      type: "SESSION_START",
+      started_at: s.startedAt,
+      goal: s.goal || null,
+      tools: this.mergedTools.map((t) => ({ name: t.name, server: t.server, schema: t.schema })),
+    });
     return s;
   }
 
@@ -163,6 +176,12 @@ class GatewayProxy {
         model: params && params.model,
       });
       this.agentInitialized.set(connectionId, true);
+      recovery.appendWalEvent(this.stateDir, connectionId, {
+        type: "INITIALIZE",
+        clientInfo: params && params.clientInfo,
+        serverInfo: mergedServerInfo,
+        model: params && params.model,
+      });
       if (isNotification) return null;
       /* This gateway implements exactly one protocol version (GATEWAY_PROTOCOL_VERSION);
        * echoing back whatever the agent asked for (SS3.3) would let a client believe
@@ -213,6 +232,77 @@ class GatewayProxy {
       }
       const conn = method === "tools/call" ? this.connections.get(serverName) : this.connections.values().next().value;
       const callArgs = method === "tools/call" ? (params && params.arguments) : params;
+
+      /* Codex PR #29 Finding 2 (Option C, external-panel-reviewed design -- see
+       * option-c-hardened-design.md): a durable idempotency fence for real tools/call
+       * dispatch, keyed by (connectionId, tool, canonicalized arguments) so a retry
+       * under a NEW JSON-RPC id is still recognized as the same logical operation.
+       * Deliberately scoped to real tools/call only -- the isModelCallMethod branch
+       * (an agent sending "sampling/createMessage" into this dispatcher, a different
+       * case from gateway.js's own downstream-initiated sampling forward) is out of
+       * scope for this fix; see the design doc's disclosed limitations. */
+      let intentKey = null;
+      if (method === "tools/call") {
+        intentKey = recovery.computeIntentKey(connectionId, toolName, callArgs);
+        let intentDecision = null;
+        for (let attempt = 0; attempt < 2 && !intentDecision; attempt++) {
+          const existing = recovery.readIntent(this.stateDir, intentKey);
+          if (existing && existing.state === "completed") {
+            intentDecision = { kind: "replay", cachedResult: existing.cached_result };
+          } else if (existing && existing.state === "dispatched") {
+            intentDecision = {
+              kind: "block",
+              code: -32080,
+              gatewayCode: "GATEWAY_AMBIGUOUS_RETRY",
+              message: "A prior attempt of this exact operation is still in flight -- dispatch halted to avoid a duplicate side effect.",
+            };
+          } else if (existing && existing.state === "ambiguous") {
+            intentDecision = {
+              kind: "block",
+              code: -32081,
+              gatewayCode: "GATEWAY_DOWNSTREAM_OUTCOME_UNKNOWN",
+              message: "A prior attempt of this exact operation did not reach a confirmed successful outcome -- dispatch halted pending operator resolution (see recovery-resolve).",
+            };
+          } else {
+            const created = recovery.createIntentIfAbsent(this.stateDir, intentKey, {
+              connection_id: connectionId,
+              tool: toolName,
+              arguments: callArgs,
+              state: "dispatched",
+              dispatched_at: this.now(),
+            });
+            if (created) intentDecision = { kind: "dispatch" };
+            // else: lost a race to a concurrent identical call on this connection --
+            // loop once to re-read its freshly-created state and respond consistently.
+          }
+        }
+        if (!intentDecision) {
+          // Two races back to back is vanishingly unlikely; fail closed rather than loop
+          // forever or risk a double dispatch on an assumption.
+          intentDecision = {
+            kind: "block",
+            code: -32080,
+            gatewayCode: "GATEWAY_AMBIGUOUS_RETRY",
+            message: "Could not establish a durable dispatch intent for this operation -- halted rather than risk a duplicate side effect.",
+          };
+        }
+        if (intentDecision.kind === "replay") {
+          if (isNotification) return null;
+          this.log(JSON.stringify({ event: "gateway_intent_replayed", connection_id: connectionId, tool: toolName, intent_key: intentKey }));
+          return { jsonrpc: "2.0", id, result: intentDecision.cachedResult };
+        }
+        if (intentDecision.kind === "block") {
+          session.recordAnomaly(s, { kind: intentDecision.gatewayCode, tool: toolName, intent_key: intentKey, detail: intentDecision.message });
+          if (isNotification) return null;
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: { code: intentDecision.code, message: intentDecision.message, data: { gateway_code: intentDecision.gatewayCode, intent_key: intentKey, retryable: false } },
+          };
+        }
+        // intentDecision.kind === "dispatch": fall through to the existing dispatch path.
+      }
+
       const ts = this.now();
       /* Correlate by an internally-generated marker even for notification-shaped calls
        * (SS3.3's Map-keyed-by-id requirement is about the DOWNSTREAM leg's own id, which
@@ -228,13 +318,27 @@ class GatewayProxy {
        * response below (the outer `id` variable, unchanged, is echoed back as JSON-RPC
        * requires) -- only the internal bookkeeping key needs to never be null. */
       const correlationKey = isNotification || id === null ? Symbol(`${isNotification ? "notify" : "null-id"}:${toolName}`) : id;
+      // Captured BEFORE recordCallStart consumes it -- see recovery.js's header on why
+      // this already-monotonic per-session counter is exactly the stable, JSON-safe
+      // replay identity Option C's WAL needs (a live correlationKey can be a Symbol,
+      // which cannot round-trip through the WAL's JSON lines).
+      const walCallSeq = s.nextCallSeq;
       session.recordCallStart(s, correlationKey, { tool: toolName, server: method === "tools/call" ? serverName : "sampling", arguments: callArgs, isModelCall: isModelCallMethod(method), ts });
+      if (method === "tools/call") {
+        recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: walCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts });
+      }
       const cancelKey = !isNotification ? `${connectionId}:${JSON.stringify(id)}` : null;
-      let result, transportFailed = false;
+      let result, transportFailed = false, transportErrorCode = null;
       try {
+        /* Option C: propagate this call's durable intent key to downstream.js's _meta
+         * merge (both transports) so a downstream that itself understands a conventional
+         * idempotency key gets genuine at-most-once execution too -- see downstream.js's
+         * META_IDEMPOTENCY_KEY header comment. Only ever set for real tools/call dispatch
+         * (intentKey is null for the isModelCallMethod branch, matching the dispatch
+         * guard above's own "deliberately scoped to tools/call only" decision). */
         result = await conn.call(method, params, undefined, cancelKey
           ? (downstreamId) => this.downstreamCallIds.set(cancelKey, { server: serverName, downstreamId })
-          : undefined);
+          : undefined, intentKey || undefined);
       } catch (error) {
         /* Board decision 2026-09-04, PR #29 review "preserve downstream JSON-RPC error
          * envelopes": downstream.js's connectStdio/connectHttp both already attach the
@@ -243,6 +347,7 @@ class GatewayProxy {
          * flattening every downstream failure into a generic -32000. */
         result = { error: error.message, code: error.code, rpcError: error.rpcError || null };
         transportFailed = true;
+        transportErrorCode = error.code;
       } finally {
         if (cancelKey) this.downstreamCallIds.delete(cancelKey);
       }
@@ -257,6 +362,28 @@ class GatewayProxy {
       const toolLevelError = !transportFailed && method === "tools/call" && result && typeof result === "object" && result.isError === true;
       const isError = transportFailed || toolLevelError;
       const completedAt = this.now();
+
+      /* Codex PR #29 Finding 2 (Option C): resolve the intent based on the outcome. Only
+       * a structurally CLEAN success (no transport failure, no tool-level isError)
+       * proves the downstream reached a known-good terminal state -- deliberately
+       * stricter than treating an explicit downstream error as "safe to retry" (design
+       * doc point 7a: a tool can commit a side effect and still report failure).
+       * Everything else becomes `ambiguous`, a durable fence only an operator can clear.
+       * Runs regardless of `correlatedNow` below: the intent tracks the downstream's
+       * real outcome, independent of whether this session is still around to record it
+       * (if closeConnection already fenced this same intent as ambiguous while this call
+       * was in flight, a later proven outcome correctly resolves it here). */
+      if (method === "tools/call") {
+        if (!isError) {
+          recovery.updateIntent(this.stateDir, intentKey, { state: "completed", completed_at: completedAt, cached_result: result });
+        } else {
+          recovery.updateIntent(this.stateDir, intentKey, {
+            state: "ambiguous",
+            ambiguous_at: completedAt,
+            ambiguous_reason: transportFailed ? `transport failure: ${transportErrorCode || "unknown"}` : "downstream reported a tool-level error (isError: true)",
+          });
+        }
+      }
       /* CodeRabbit PR #29 review "recording the result after the session is closed can
        * throw or write a false anomaly": closeConnection()/handleDownstreamDisconnect()
        * can run for this same connectionId WHILE conn.call() above is still being
@@ -271,6 +398,9 @@ class GatewayProxy {
       const correlatedNow = !s.finalized && s.pendingCalls.has(correlationKey);
       if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result, isError, ts: completedAt });
+        if (method === "tools/call") {
+          recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt });
+        }
         /* Board decision 2026-09-04, PR #29 review "emit the required structured log for
          * each call": the only prior gateway log for a call was the session-finalize log
          * emitted much later (or never, if the process crashes first) -- this gives every
@@ -325,8 +455,24 @@ class GatewayProxy {
     const s = this.sessions.get(connectionId);
     if (!s) return null;
     if (s.pendingCalls.size > 0) session.markPendingAsDisconnected(s, reason || "connection closed with calls still pending", this.now);
+    /* Codex PR #29 Finding 2 (Option C): a "dispatched" intent whose owning connection
+     * is closing (agent hung up, or the connection is being force-closed) is exactly
+     * Finding 2's ambiguous case -- the downstream may still complete the side effect
+     * after this point even though the session itself is ending. Fence it the same way
+     * a crash mid-flight would; do not leave it looking permanently "in flight" once
+     * nothing is left to receive its response, and do not guess it failed. */
+    for (const intent of recovery.listIntentsForConnection(this.stateDir, connectionId)) {
+      if (intent.state === "dispatched") {
+        recovery.updateIntent(this.stateDir, intent.intent_key, {
+          state: "ambiguous",
+          ambiguous_at: this.now(),
+          ambiguous_reason: reason || "connection closed with this call still in flight",
+        });
+      }
+    }
     this.sessions.delete(connectionId);
     this.agentInitialized.delete(connectionId);
+    recovery.appendWalEvent(this.stateDir, connectionId, { type: "CLOSING", reason: reason || null });
     let sealed;
     try {
       sealed = session.finalizeSession(s, this.keys);
@@ -352,6 +498,14 @@ class GatewayProxy {
     } catch (error) {
       this.onSealFailure(s, error);
       return null;
+    }
+    /* Durably sealed: the WAL's job is done, and any intent that reached a clean
+     * "completed" state before close is no longer needed either. An `ambiguous` intent
+     * (see above) is NOT cleaned up here -- the fence must survive this session's own
+     * lifecycle; only an explicit operator resolution (recovery-resolve) removes one. */
+    recovery.deleteWal(this.stateDir, connectionId);
+    for (const intent of recovery.listIntentsForConnection(this.stateDir, connectionId)) {
+      if (intent.state === "completed") recovery.deleteIntent(this.stateDir, intent.intent_key);
     }
     this.onSessionFinalized(connectionId, entry, sealed);
     return entry;

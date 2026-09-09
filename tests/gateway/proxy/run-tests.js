@@ -23,6 +23,7 @@ const path = require("path");
 const ROOT = path.resolve(__dirname, "../../..");
 const { GatewayProxy } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
+const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
 
 let failures = 0;
 const results = [];
@@ -63,6 +64,26 @@ function fakeConnection(impl) {
     close: () => { closed = true; },
     isClosed: () => closed,
     whenClosed: () => new Promise(() => {}), // never resolves unless the test wants it to
+  };
+}
+
+/** Like fakeConnection, but also records every call's full argument list -- needed for
+ * the Option C tests below to assert on `idempotencyKey` (call()'s 5th argument) and on
+ * how many times a logical operation was actually dispatched downstream. */
+function fakeConnectionCapturing(impl) {
+  let closed = false;
+  const calls = [];
+  return {
+    transport: "fake",
+    calls,
+    call: async (method, params, timeoutMs, onIdAssigned, idempotencyKey) => {
+      calls.push({ method, params, idempotencyKey });
+      if (closed) throw Object.assign(new Error("closed"), { code: "GATEWAY_DOWNSTREAM_DISCONNECTED" });
+      return impl(method, params);
+    },
+    close: () => { closed = true; },
+    isClosed: () => closed,
+    whenClosed: () => new Promise(() => {}),
   };
 }
 
@@ -365,6 +386,120 @@ async function nullJsonRpcIdDoesNotCrash() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* Option C (Codex PR #29 Finding 1 + 2, external-panel-reviewed design -- see
+ * option-c-hardened-design.md): recovery.js's WAL + idempotency-intent wiring inside
+ * proxy.js's real dispatch path. These use fakeConnectionCapturing (not the plain
+ * fakeConnection above) specifically to observe how many times a logical operation was
+ * actually dispatched downstream and what idempotency key (if any) it carried. */
+
+async function idempotencyKeyPropagatedToRealToolCallOnly() {
+  const dir = freshDir("idem-key");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  const expectedKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
+  check(
+    "idempotency-key-propagated-to-downstream-tools-call",
+    conn.calls.length === 1 && conn.calls[0].idempotencyKey === expectedKey,
+    JSON.stringify(conn.calls)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+async function inFlightRetryBlockedAsAmbiguousRetry() {
+  const dir = freshDir("in-flight-retry");
+  let resolveCall;
+  const conn = fakeConnectionCapturing(() => new Promise((resolve) => { resolveCall = resolve; }));
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  // Deliberately not awaited: an async function body runs synchronously up to its first
+  // `await` (here, `conn.call(...)`), so by the time control returns to this line the
+  // intent has already been durably created as "dispatched" -- no extra tick needed.
+  const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
+  const retryResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
+  check("in-flight-retry-blocked-with-ambiguous-retry-code", retryResp && retryResp.error && retryResp.error.code === -32080, JSON.stringify(retryResp));
+  check("in-flight-retry-did-not-redispatch-downstream", conn.calls.length === 1, JSON.stringify(conn.calls));
+  resolveCall({ ok: true });
+  await firstPromise;
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+async function completedCallReplaysCachedResultOnRetry() {
+  const dir = freshDir("replay");
+  const conn = fakeConnectionCapturing(async () => ({ value: 42 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  check("retry-of-completed-call-replays-cached-result", retry && retry.result && retry.result.value === 42, JSON.stringify(retry));
+  check("retry-of-completed-call-did-not-redispatch-downstream", conn.calls.length === 1, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+async function ambiguousOutcomeBlocksRetryUntilOperatorResolves() {
+  const dir = freshDir("ambiguous");
+  const conn = fakeConnectionCapturing(async () => { throw Object.assign(new Error("boom"), { code: "GATEWAY_DOWNSTREAM_RPC_ERROR" }); });
+  const mergedTools = [{ name: "flaky", server: "srv", schema: {} }];
+  const toolOwners = new Map([["flaky", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const first = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "flaky", arguments: {} } });
+  check("first-attempt-surfaces-the-real-transport-error", Boolean(first && first.error), JSON.stringify(first));
+  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "flaky", arguments: {} } });
+  check("ambiguous-retry-blocked-with-downstream-outcome-unknown-code", retry && retry.error && retry.error.code === -32081, JSON.stringify(retry));
+  check("ambiguous-retry-did-not-redispatch-downstream", conn.calls.length === 1, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+async function closeConnectionFencesInFlightIntentAsAmbiguous() {
+  const dir = freshDir("close-fence");
+  let resolveCall;
+  const conn = fakeConnectionCapturing(() => new Promise((resolve) => { resolveCall = resolve; }));
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const inFlight = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } });
+  const intentKey = recovery.computeIntentKey("conn-1", "slow", {});
+  await proxy.closeConnection("conn-1", "agent hung up mid-call");
+  const intent = recovery.readIntent(dir, intentKey);
+  check("close-connection-fences-in-flight-intent-as-ambiguous", Boolean(intent) && intent.state === "ambiguous", JSON.stringify(intent));
+  resolveCall({ ok: true }); // let the now-orphaned call settle so nothing is left hanging
+  await inFlight.catch(() => {});
+}
+
+async function walRecordsLifecycleEventsAndIsCleanedUpOnClose() {
+  const dir = freshDir("wal-lifecycle");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
+  const eventsBeforeClose = recovery.readWalEvents(dir, "conn-1").map((e) => e.type);
+  check(
+    "wal-records-session-start-initialize-call-start-call-result-in-order",
+    JSON.stringify(eventsBeforeClose) === JSON.stringify(["SESSION_START", "INITIALIZE", "CALL_START", "CALL_RESULT"]),
+    JSON.stringify(eventsBeforeClose)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+  const eventsAfterClose = recovery.readWalEvents(dir, "conn-1");
+  check("wal-deleted-after-a-clean-close", eventsAfterClose.length === 0, JSON.stringify(eventsAfterClose));
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -379,6 +514,12 @@ async function main() {
   await structuredLogEmittedPerCompletedCall();
   await toolsListForwardsFullDescriptor();
   await nullJsonRpcIdDoesNotCrash();
+  await idempotencyKeyPropagatedToRealToolCallOnly();
+  await inFlightRetryBlockedAsAmbiguousRetry();
+  await completedCallReplaysCachedResultOnRetry();
+  await ambiguousOutcomeBlocksRetryUntilOperatorResolves();
+  await closeConnectionFencesInFlightIntentAsAmbiguous();
+  await walRecordsLifecycleEventsAndIsCleanedUpOnClose();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
