@@ -331,7 +331,13 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
     }
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(listenConfig.port || 0);
+    /* CodeRabbit PR #29 review "bind the agent HTTP listener to an explicit host":
+     * omitting `host` from Node's server.listen() binds Node's wildcard address (::  or
+     * 0.0.0.0), exposing this bearer-token-protected listener on every network interface
+     * instead of just the local machine. Default to loopback-only; an operator who
+     * genuinely needs a different bind interface can say so via agent_listen.host
+     * (schemas/gateway-config.schema.json / config.js's validateAgentListen). */
+    server.listen(listenConfig.port || 0, listenConfig.host || "127.0.0.1");
   });
 }
 
