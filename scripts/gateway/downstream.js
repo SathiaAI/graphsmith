@@ -220,6 +220,15 @@ function connectStdio(endpoint, options = {}) {
   }
 
   function close() {
+    /* CodeRabbit PR #29 review "set closed inside connectStdio's close() method":
+     * closed was previously only set by the child's own "close"/"error" events, which
+     * fire asynchronously after this function returns. In that gap, call()/notify()'s own
+     * `if (closed) return...` guards (above) would not yet trip, so a caller invoking
+     * either between this close() and the child actually exiting could still write to
+     * child.stdin after .end() -- child.stdin has no "error" listener, so that write
+     * throws as an unhandled stream error. Set the flag synchronously, first. */
+    closed = true;
+    if (!closeError) closeError = fail("downstream connection is closed", "GATEWAY_DOWNSTREAM_DISCONNECTED");
     try { child.stdin.end(); } catch (error) { /* best effort */ }
     try { child.kill(); } catch (error) { /* best effort */ }
   }
@@ -366,8 +375,39 @@ function connectHttp(endpoint, options = {}) {
   }
 
   function notify(method, params) {
-    // Best-effort, fire-and-forget POST; response (if any) is ignored.
-    call(method, params).catch(() => {});
+    /* CodeRabbit PR #29 review "send notifications/initialized without an id": call()
+     * unconditionally assigns a JSON-RPC `id` (nextId++), which turns every notification
+     * sent through it into a request instead -- a real protocol violation (JSON-RPC 2.0 /
+     * MCP both define a notification as exactly "no id member"), and a conforming
+     * downstream is free to reject it. Post the notification directly, with no id, rather
+     * than delegating to call(). Best-effort, fire-and-forget: the response (if any) is
+     * ignored, and a downstream that is unreachable is not this caller's problem (matches
+     * call()'s own "closed" short-circuit). */
+    if (closed) return;
+    const isStatelessMetaMethod = STATELESS_META_METHODS.has(method);
+    const effectiveParams = isStatelessMetaMethod
+      ? { ...(params || {}), _meta: { ...buildStatelessMeta(options), ...((params && params._meta) || {}) } }
+      : params;
+    const declaredProtocolVersion = isStatelessMetaMethod ? STATELESS_META_PROTOCOL_VERSION : MCP_PROTOCOL_VERSION;
+    // No "id" field: this must stay a real JSON-RPC/MCP notification (see comment above),
+    // unlike call()'s request body which always assigns one.
+    const body = JSON.stringify({ jsonrpc: "2.0", method, params: effectiveParams });
+    const req = client.request(url, {
+      method: "POST",
+      // Mirrors call()'s own header construction above (kept in sync manually --
+      // notify() has no id/response to correlate, so it cannot share call()'s promise body).
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+        "mcp-protocol-version": declaredProtocolVersion,
+        "mcp-method": method,
+        ...(method === "tools/call" && params && typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+        ...(options.headers || {}),
+      },
+    });
+    req.on("error", () => { reachable = false; }); // best-effort: nothing to reject, no caller is awaiting this
+    req.on("response", (res) => { res.resume(); }); // drain and discard; notify() never reads a result
+    req.end(body);
   }
 
   function close() {
