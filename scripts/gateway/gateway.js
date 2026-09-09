@@ -29,6 +29,7 @@ const fs = require("fs");
 const modeGate = require("./mode-gate.js");
 const gatewayConfig = require("./config.js");
 const chain = require("./chain.js");
+const session = require("./session.js");
 const { GatewayProxy } = require("./proxy.js");
 const downstream = require("./downstream.js");
 const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-transport.js");
@@ -67,7 +68,7 @@ function fail(message, code = "GATEWAY_ERROR") {
  * see agent-transport.js's header). Any other case (an http agent transport, or no agent
  * currently connected) gets a real JSON-RPC error naming exactly why, rather than the
  * silent drop this was before. */
-function forwardDownstreamRequestToAgent(msg, agentPusher, log) {
+function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
   if (msg.method !== "sampling/createMessage") {
     return Promise.resolve({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not forward downstream-initiated method "${msg.method}" to the agent.` } });
   }
@@ -85,10 +86,39 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log) {
       },
     });
   }
+  /* Codex PR #29 review "record downstream-initiated sampling in the session": this
+   * forward previously ran entirely outside session.js's bookkeeping -- the sealed
+   * bundle for the connection that actually observed and relayed this model invocation
+   * never recorded it (model_call:true and its hashed input/result), even though the
+   * gateway genuinely handled it. An attestation gap, not just a missing log line.
+   * agentPusher.connectionId unambiguously names the one session this belongs to: this
+   * branch is only ever reachable when agentPusher.current is set, which gateway.js only
+   * does for the stdio agent transport (see this function's own doc above), and stdio is
+   * a strict one-process-one-connection transport (agent-transport.js's own header). */
+  const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
+  const correlationKey = s ? Symbol("downstream-initiated-sample") : null;
+  if (s) {
+    session.recordCallStart(s, correlationKey, {
+      tool: "sampling/createMessage",
+      server: "sampling",
+      arguments: msg.params,
+      isModelCall: true,
+      ts: proxy.now(),
+    });
+  }
   return agentPusher.current(msg.method, msg.params).then(
-    (result) => ({ jsonrpc: "2.0", id: msg.id, result }),
+    (result) => {
+      /* Mirrors proxy.js's own "correlatedNow" guard (CodeRabbit PR #29 review, round 1):
+       * the session can finalize (agent disconnects) while this forwarded request is
+       * still in flight awaiting the agent's model. Only record if it's still genuinely
+       * pending, so this never throws SESSION_FINALIZED or logs a spurious anomaly for an
+       * entry the gateway itself already removed. */
+      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
+      return { jsonrpc: "2.0", id: msg.id, result };
+    },
     (error) => {
       log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
+      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
       return { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: error.message } };
     }
   );
@@ -148,7 +178,18 @@ function checkModeGate(root, log) {
  * (always "not implemented" in this build -- see chain.js#pushChainTailToRemoteAnchor). */
 function buildHealthStatus(ctx) {
   const stateDir = ctx.config.state_dir;
-  const head = chain.readHead(stateDir);
+  /* Codex PR #29 review "return a health report when HEAD is corrupt": chain.readHead
+   * fails closed BY DESIGN (see chain.js's own header) on an unreadable or malformed
+   * HEAD.json -- but that throw was previously unguarded here, so the one moment an
+   * operator most needs this health surface to keep responding (chain corruption) was
+   * exactly the moment it threw instead, taking the whole status/health endpoint down. */
+  let head = null;
+  let headError = null;
+  try {
+    head = chain.readHead(stateDir);
+  } catch (error) {
+    headError = error.message;
+  }
 
   // Time since the last persisted bundle (SG-NFR-3's stated contract): HEAD.json is
   // written last in chain.appendSession's write order, so its own mtime is exactly that.
@@ -167,15 +208,21 @@ function buildHealthStatus(ctx) {
    * here is a fail-closed, visible signal (tampering, a sequence gap, or an incomplete
    * append), not silently invisible until someone thinks to run --selftest by hand. */
   let sessionChainIntegrity;
-  try {
-    sessionChainIntegrity = registerGatewaySessions.run({
-      chain: chain.readChain(stateDir),
-      head,
-      computeEntrySha256: chain.computeEntrySha256,
-      bundleExists: (bundleId) => fs.existsSync(chain.bundlePath(stateDir, bundleId)),
-    });
-  } catch (error) {
-    sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `session-chain verification threw: ${error.message}` };
+  if (headError) {
+    // HEAD.json is already known corrupt/unreadable -- don't bother attempting the walk
+    // (which needs `head`) just to rediscover the same failure less clearly.
+    sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `HEAD.json is corrupt or unreadable: ${headError}` };
+  } else {
+    try {
+      sessionChainIntegrity = registerGatewaySessions.run({
+        chain: chain.readChain(stateDir),
+        head,
+        computeEntrySha256: chain.computeEntrySha256,
+        bundleExists: (bundleId) => fs.existsSync(chain.bundlePath(stateDir, bundleId)),
+      });
+    } catch (error) {
+      sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `session-chain verification threw: ${error.message}` };
+    }
   }
 
   return {
@@ -186,7 +233,9 @@ function buildHealthStatus(ctx) {
       return { name, reachable: typeof conn.isReachable === "function" ? conn.isReachable() : !conn.isClosed() };
     }),
     active_sessions: ctx.proxy.openSessionCount(),
-    chain: head ? { seq: head.seq, entry_sha256: head.entry_sha256, last_persisted_at: lastPersistedAt } : { seq: 0, entry_sha256: null, last_persisted_at: lastPersistedAt },
+    chain: head
+      ? { seq: head.seq, entry_sha256: head.entry_sha256, last_persisted_at: lastPersistedAt }
+      : { seq: 0, entry_sha256: null, last_persisted_at: lastPersistedAt, ...(headError ? { error: headError } : {}) },
     session_chain_integrity: sessionChainIntegrity,
     remote_anchor: { implemented: false, reason: "SG-FR-6 not implemented in this build -- see chain.js#pushChainTailToRemoteAnchor" },
   };
@@ -234,13 +283,13 @@ async function startGateway(options) {
    * agent transport is started further down, so at closure-creation time there is
    * nothing to push to yet. `.current` is set once the stdio transport actually starts
    * (never, for the http transport -- see forwardDownstreamRequestToAgent's own doc). */
-  const agentPusher = { current: null };
+  const agentPusher = { current: null, connectionId: null };
 
   let downstreamHandles;
   try {
     downstreamHandles = await downstream.connectAllDownstreams(config.downstream_servers, {
       clientInfo: { name: "graphsmith-standalone-gateway", version: "1.0" },
-      onRequest: (msg) => forwardDownstreamRequestToAgent(msg, agentPusher, log),
+      onRequest: (msg) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy),
     });
   } catch (error) {
     writerClaim.release();
@@ -278,6 +327,7 @@ async function startGateway(options) {
       // See forwardDownstreamRequestToAgent's doc above: only the stdio transport can
       // push a request to the agent, so this is the one branch that ever populates it.
       agentPusher.current = stdioHandle.pushRequest;
+      agentPusher.connectionId = stdioHandle.connectionId;
       /* stdio is a one-process-per-connection transport (mirrors mcp-server/src/
        * stdioTransport.js's own "stdin closed -> exit cleanly" convention): once the
        * agent disconnects, the connection's session is already finalized (inside
@@ -331,6 +381,7 @@ async function startGateway(options) {
      * call that is STILL pending once the drain timeout elapses gets that treatment. */
     await drainOpenSessions(proxy, drainTimeoutMs);
     agentPusher.current = null; // no agent left to push a forwarded sampling request to
+    agentPusher.connectionId = null;
     if (stdioHandle) stdioHandle.stop();
     if (httpHandle) await new Promise((resolve) => httpHandle.server.close(resolve));
     // Finalize any still-open sessions (drained above, or forced closed after the timeout).

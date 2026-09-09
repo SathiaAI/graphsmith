@@ -188,7 +188,19 @@ class GatewayProxy {
     if (method === "tools/list") {
       session.recordToolsList(s, this.mergedTools);
       if (isNotification) return null;
-      return { jsonrpc: "2.0", id, result: { tools: this.mergedTools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.schema })) } };
+      /* Codex PR #29 review "forward the full cached tool descriptor": downstream.js's
+       * connectAllDownstreams already preserves each tool's complete descriptor
+       * (description, outputSchema, annotations, title, etc. -- see its own comment
+       * "Preserve the tool's full descriptor ... rather than keeping only name+schema")
+       * onto `t`, alongside two gateway-private bookkeeping fields it adds: `server`
+       * (tool ownership, internal routing only) and `schema` (an internal alias of
+       * `inputSchema` session.js/this dispatch code reads). Projecting down to just
+       * {name, description, inputSchema} here discarded everything else the downstream
+       * actually advertised, handing the agent a narrower tool contract than the
+       * downstream provides -- e.g. no outputSchema for a client that validates
+       * structured results against it. Strip only the two gateway-private fields; forward
+       * the rest of the real descriptor (including the original `inputSchema`) verbatim. */
+      return { jsonrpc: "2.0", id, result: { tools: this.mergedTools.map((t) => { const { server, schema, ...descriptor } = t; return descriptor; }) } };
     }
 
     if (method === "tools/call" || isModelCallMethod(method)) {
@@ -206,7 +218,16 @@ class GatewayProxy {
        * (SS3.3's Map-keyed-by-id requirement is about the DOWNSTREAM leg's own id, which
        * downstream.js already manages; here we key the SESSION record by the AGENT's own
        * JSON-RPC id when present, or a synthetic one for a fire-and-forget call). */
-      const correlationKey = isNotification ? Symbol(`notify:${toolName}`) : id;
+      /* Codex PR #29 review "handle JSON-RPC null IDs before recording calls": JSON-RPC
+       * 2.0 permits an explicit `id: null` on a REQUEST (distinct from a notification,
+       * which omits the id key entirely) -- `isNotification` above only catches the
+       * latter. Using `id` (null) directly as this call's correlation key made it into
+       * session.recordCallStart's Map key, which explicitly throws INVALID_ARGUMENT on a
+       * null/undefined key -- turning a legal-if-unusual request into an uncaught
+       * internal error instead of a normal response. A null id still gets a real
+       * response below (the outer `id` variable, unchanged, is echoed back as JSON-RPC
+       * requires) -- only the internal bookkeeping key needs to never be null. */
+      const correlationKey = isNotification || id === null ? Symbol(`${isNotification ? "notify" : "null-id"}:${toolName}`) : id;
       session.recordCallStart(s, correlationKey, { tool: toolName, server: method === "tools/call" ? serverName : "sampling", arguments: callArgs, isModelCall: isModelCallMethod(method), ts });
       const cancelKey = !isNotification ? `${connectionId}:${JSON.stringify(id)}` : null;
       let result, transportFailed = false;
