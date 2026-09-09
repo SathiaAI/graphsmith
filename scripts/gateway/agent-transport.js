@@ -164,6 +164,14 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
    * 2026-09-04 decision applied to `time_window` itself. Make it configurable once a
    * real deployment needs a different value, not before. */
   const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+  /* Codex PR #29 review "cap concurrently retained HTTP sessions": without a bound, a
+   * client that repeatedly sends headerless "initialize" (each one opens a brand-new
+   * session -- see the no-sessionId branch below) and never DELETEs could grow
+   * httpSessions/proxy.sessions/idle-timer state without limit, exhausting memory despite
+   * the per-request body-size cap. Same "fixed, non-speculative default" discipline as
+   * SESSION_IDLE_TIMEOUT_MS just above -- make it configurable once a real deployment
+   * needs a different number, not before. */
+  const MAX_HTTP_SESSIONS = 10000;
 
   const httpSessions = new Map(); // sessionId -> { idleTimer } -- transport-level bookkeeping proxy.js has no reason to know about.
 
@@ -288,7 +296,25 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
           res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32600, message: `Missing ${SESSION_ID_HEADER} header -- a new session must begin with "initialize".` } }));
           return;
         }
-        sessionId = openSession();
+        if (httpSessions.size >= MAX_HTTP_SESSIONS) {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32000, message: `This gateway is already at its concurrent HTTP session limit (${MAX_HTTP_SESSIONS}); cannot start a new session right now.` } }));
+          return;
+        }
+        /* Codex PR #29 review "reject new HTTP sessions cleanly while draining":
+         * ctx.proxy.openConnection() (called inside openSession()) throws synchronously
+         * once stopAcceptingNewSessions() has run (writer-claim lost, or graceful
+         * shutdown draining) -- this call sat outside any try/catch, so that throw
+         * escaped this synchronous req "end" handler uncaught, crashing the process
+         * exactly when a clean, finished shutdown mattered most. Catch the expected
+         * refusal and answer it like any other "not accepting requests" case instead. */
+        try {
+          sessionId = openSession();
+        } catch (error) {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32000, message: `Cannot start a new session: ${error.message}` } }));
+          return;
+        }
       } else if (!httpSessions.has(sessionId)) {
         res.writeHead(404, { "content-type": "application/json", [SESSION_ID_HEADER]: sessionId });
         res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32001, message: "Unknown or expired session -- start a new session with \"initialize\"." } }));
