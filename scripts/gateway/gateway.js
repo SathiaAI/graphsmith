@@ -794,6 +794,10 @@ async function startGateway(options) {
     keys,
     stateDir: config.state_dir,
     log,
+    // Frontier-panel decision (Paul, 2026-09-10, cluster E2): see proxy.js's own
+    // pendingOperatorReviewConnections constructor comment for why a startup snapshot
+    // is sufficient here.
+    pendingOperatorReviewConnections: pendingOperatorReview,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
     onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size })),
   });
