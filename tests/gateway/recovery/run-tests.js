@@ -35,7 +35,7 @@ const ROOT = path.resolve(__dirname, "../../..");
 const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
 const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
-const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli, forwardDownstreamRequestToAgent } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
 const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 
 let failures = 0;
@@ -416,6 +416,92 @@ function notExecutedIntentReplaysAsAFailedCallAndIsThenCleanedUp() {
 }
 
 // ---------------------------------------------------------------------------
+// PR #33 round-3 fix: forwardDownstreamRequestToAgent's own WAL persistence for
+// downstream-initiated sampling/createMessage forwards (Codex "persist sampling calls
+// in the recovery WAL"), and that recovery replay preserves the isModelCall flag and
+// does not block auto-seal on an unresolved (unfenced) sampling call.
+// ---------------------------------------------------------------------------
+
+/** Minimal fake GatewayProxy shape forwardDownstreamRequestToAgent actually reads:
+ * .stateDir, .now(), and .sessions (a Map already containing the one live session). */
+function fakeProxyWithSession(dir, connectionId, s) {
+  return { stateDir: dir, now: () => 1000, sessions: new Map([[connectionId, s]]) };
+}
+
+function samplingForwardSuccessIsPersistedToWalWithModelCallFlag() {
+  const dir = freshDir("sampling-success");
+  const connectionId = "conn-sample";
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  const agentPusher = { current: () => Promise.resolve({ content: [{ type: "text", text: "hi" }] }), connectionId };
+  const msg = { method: "sampling/createMessage", id: 5, params: { prompt: "hi" } };
+  return forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy).then((resp) => {
+    check("sampling-forward-returns-the-agents-result", resp.result && resp.result.content[0].text === "hi", JSON.stringify(resp));
+    const events = recovery.readWalEvents(dir, connectionId);
+    const start = events.find((e) => e.type === "CALL_START");
+    const result = events.find((e) => e.type === "CALL_RESULT");
+    check("sampling-forward-wal-records-call-start-with-model-call-flag", Boolean(start) && start.isModelCall === true && start.tool === "sampling/createMessage", JSON.stringify(events));
+    check("sampling-forward-wal-records-call-result-not-an-error", Boolean(result) && result.isError === false, JSON.stringify(events));
+    check("sampling-forward-session-records-it-as-a-model-call", s.calls.length === 1 && s.calls[0].model_call === true && s.calls[0].isError === false, JSON.stringify(s.calls));
+  });
+}
+
+function samplingForwardErrorIsPersistedAsFailedResult() {
+  const dir = freshDir("sampling-error");
+  const connectionId = "conn-sample-err";
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  const agentPusher = { current: () => Promise.reject(new Error("agent unreachable")), connectionId };
+  const msg = { method: "sampling/createMessage", id: 6, params: { prompt: "hi" } };
+  return forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy).then((resp) => {
+    check("sampling-forward-error-still-returns-a-jsonrpc-error", Boolean(resp.error), JSON.stringify(resp));
+    const events = recovery.readWalEvents(dir, connectionId);
+    const result = events.find((e) => e.type === "CALL_RESULT");
+    check("sampling-forward-error-wal-records-call-result-as-an-error", Boolean(result) && result.isError === true, JSON.stringify(events));
+    check("sampling-forward-error-session-records-it-as-an-error", s.calls.length === 1 && s.calls[0].isError === true, JSON.stringify(s.calls));
+  });
+}
+
+function recoverPreservesModelCallFlagOnSamplingReplay() {
+  const dir = freshDir("recover-sampling-replay");
+  const keys = makeKeys();
+  const connectionId = "conn-sampling-replay";
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "sampling/createMessage", server: "sampling", arguments: { prompt: "hi" }, isModelCall: true, ts: 10 });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { content: [{ type: "text", text: "hi back" }] }, isError: false, ts: 11 });
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("recover-sampling-replay-no-operator-review-needed", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+  const headEntry = chain.readHead(dir);
+  check("recover-sampling-replay-produces-a-sealed-chain-entry", headEntry && headEntry.seq === 1, JSON.stringify(headEntry));
+  const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, headEntry.bundle_id), "utf8"));
+  const trace = bundle.contents["execution_trace.jsonl"];
+  check("recover-sampling-replay-preserves-model-call-flag-not-hardcoded-false", /"model_call":true/.test(trace), trace);
+}
+
+function recoverDoesNotBlockAutoSealOnAnUnresolvedSamplingCall() {
+  const dir = freshDir("recover-sampling-unresolved");
+  const keys = makeKeys();
+  const connectionId = "conn-sampling-crash";
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  // No CALL_RESULT: the gateway crashed while the agent was still computing its model
+  // response. There is no intent/fence for a sampling call (unlike a fenced tools/call),
+  // so this must NOT be treated the same as an unproven fenced call -- it should auto-seal
+  // as a real, disconnected/failed result rather than block on operator review forever.
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "sampling/createMessage", server: "sampling", arguments: { prompt: "hi" }, isModelCall: true, ts: 10 });
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("recover-unresolved-sampling-call-does-not-need-operator-review", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+  const headEntry = chain.readHead(dir);
+  check("recover-unresolved-sampling-call-still-auto-seals", headEntry && headEntry.seq === 1, JSON.stringify(headEntry));
+  const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, headEntry.bundle_id), "utf8"));
+  const trace = bundle.contents["execution_trace.jsonl"];
+  check("recover-unresolved-sampling-call-recorded-as-an-error-not-a-guessed-success", /"is_error":true/.test(trace), trace);
+}
+
+// ---------------------------------------------------------------------------
 // gateway.js#abandonConnection -- explicit operator override
 // ---------------------------------------------------------------------------
 
@@ -599,12 +685,19 @@ function main() {
   recoveryResolveRequiresResultFileForExecuted();
   recoveryResolveRefusesWhileAnotherWriterHoldsTheClaim();
 
-  return writerClaimIsReleasedWhenStartupRecoveryThrows().then(() => {
-    const passed = results.filter((r) => r.status === "PASS").length;
-    const failed = results.filter((r) => r.status === "FAIL").length;
-    console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
-    process.exit(failures ? 1 : 0);
-  });
+  return samplingForwardSuccessIsPersistedToWalWithModelCallFlag()
+    .then(() => samplingForwardErrorIsPersistedAsFailedResult())
+    .then(() => {
+      recoverPreservesModelCallFlagOnSamplingReplay();
+      recoverDoesNotBlockAutoSealOnAnUnresolvedSamplingCall();
+    })
+    .then(() => writerClaimIsReleasedWhenStartupRecoveryThrows())
+    .then(() => {
+      const passed = results.filter((r) => r.status === "PASS").length;
+      const failed = results.filter((r) => r.status === "FAIL").length;
+      console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
+      process.exit(failures ? 1 : 0);
+    });
 }
 
 main().catch((error) => {
