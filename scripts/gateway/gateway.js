@@ -98,7 +98,29 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
    * a strict one-process-one-connection transport (agent-transport.js's own header). */
   const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
   const correlationKey = s ? Symbol("downstream-initiated-sample") : null;
+  /* Codex PR #33 review "persist sampling calls in the recovery WAL": this forward is
+   * recorded into the in-memory session (above) but, before this fix, NEVER into
+   * recovery.js's WAL at all -- unlike proxy.js's own tools/call path. A crash after the
+   * agent answers this sampling request but before the connection's own close would
+   * silently omit that model invocation from a recovered/sealed bundle: recoverCrashedSessions
+   * replays this connection's WAL from scratch and previously had no event type for it,
+   * and even hard-coded isModelCall:false on every CALL_START it did replay. This is
+   * deliberately NOT the same gap as the disclosed one in KNOWN-LIMITATIONS.md item 11
+   * ("an agent-initiated sampling/createMessage forwarded through proxy.js's own dispatch
+   * branch is out of scope for the fence") -- that disclosure is scoped to the opposite
+   * direction (an AGENT sending sampling/createMessage INTO this gateway) and says so
+   * explicitly ("rather than a downstream server"); this is a downstream SERVER's own
+   * request being forwarded UP to the agent, a different code path (this function, not
+   * proxy.js's handleMessage) with no matching disclosure. Reuses the same CALL_START/
+   * CALL_RESULT WAL event shape proxy.js's tools/call path uses (same recoverCrashedSessions/
+   * abandonConnection replay code handles both), with isModelCall:true now carried through
+   * so replay can tell the two apart instead of assuming every replayed call is a plain
+   * tool call. No idempotency-intent fencing is added here (Finding 2's fence is
+   * deliberately scoped to tools/call only, unchanged) -- only Finding 1's WAL/attestation
+   * coverage is extended to this path. */
+  let walCallSeq = null;
   if (s) {
+    walCallSeq = s.nextCallSeq;
     session.recordCallStart(s, correlationKey, {
       tool: "sampling/createMessage",
       server: "sampling",
@@ -106,6 +128,24 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
       isModelCall: true,
       ts: proxy.now(),
     });
+    try {
+      recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, {
+        type: "CALL_START",
+        call_seq: walCallSeq,
+        tool: "sampling/createMessage",
+        server: "sampling",
+        arguments: msg.params,
+        isModelCall: true,
+        ts: proxy.now(),
+      });
+    } catch (walError) {
+      // Best-effort: this forward is already in flight and cannot be rolled back the way
+      // proxy.js's own pre-dispatch WAL append can (there is no "don't dispatch" option
+      // once the downstream server is already waiting on this reply) -- a WAL write
+      // failure here degrades recovery coverage for this one call but must not break the
+      // actual sampling forward the downstream server is waiting on.
+      log(`Failed to durably record a downstream-initiated sampling call before forwarding it to the agent: ${walError.message}`);
+    }
   }
   return agentPusher.current(msg.method, msg.params).then(
     (result) => {
@@ -114,12 +154,30 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
        * still in flight awaiting the agent's model. Only record if it's still genuinely
        * pending, so this never throws SESSION_FINALIZED or logs a spurious anomaly for an
        * entry the gateway itself already removed. */
-      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
+      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) {
+        session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
+        if (walCallSeq !== null) {
+          try {
+            recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError: false, ts: proxy.now() });
+          } catch (walError) {
+            log(`Failed to durably record a downstream-initiated sampling call's result: ${walError.message}`);
+          }
+        }
+      }
       return { jsonrpc: "2.0", id: msg.id, result };
     },
     (error) => {
       log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
-      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
+      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) {
+        session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
+        if (walCallSeq !== null) {
+          try {
+            recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result: { error: error.message }, isError: true, ts: proxy.now() });
+          } catch (walError) {
+            log(`Failed to durably record a downstream-initiated sampling call's error result: ${walError.message}`);
+          }
+        }
+      }
       return { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: error.message } };
     }
   );
@@ -321,7 +379,7 @@ function recoverCrashedSessions(stateDir, keys, log) {
           // the crashed process originally used.
           const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
           keyToStartEvent.set(key, event);
-          session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: false, ts: event.ts });
+          session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
         } else if (event.type === "CALL_RESULT") {
           const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
           if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts });
@@ -344,6 +402,23 @@ function recoverCrashedSessions(stateDir, keys, log) {
       for (const [key] of Array.from(s.pendingCalls.entries())) {
         const startedFrom = keyToStartEvent.get(key);
         if (!startedFrom) continue; // defensive; should not happen
+        if (startedFrom.isModelCall) {
+          /* A downstream-initiated sampling/createMessage forward (see
+           * forwardDownstreamRequestToAgent's own WAL comment above) has no
+           * idempotency-intent fence at all -- Finding 2's fence is deliberately scoped to
+           * real tools/call dispatch only, so there is no intent record to consult here and
+           * never will be. Unlike a fenced tool call, there is also no external side effect
+           * this gateway must avoid duplicating: the only real risk of an unresolved
+           * sampling call is an incomplete attestation of what the agent was asked, which
+           * this WAL replay has already captured (the CALL_START event, recorded above).
+           * Record it as a real, disconnected/unproven result and move on rather than
+           * blocking this whole connection's auto-seal on operator review for a call that
+           * has nothing an operator could actually resolve (there is no --result-file or
+           * --confirmed answer that applies to "did the agent's model happen to finish
+           * replying before the crash"). */
+          session.recordCallResult(s, key, { result: { error: "gateway restarted after a crash while this downstream-initiated sampling/createMessage forward was still awaiting the agent's response" }, isError: true, ts: Date.now() });
+          continue;
+        }
         const intentKey = recovery.computeIntentKey(connectionId, startedFrom.tool, startedFrom.arguments);
         const intent = recovery.readIntent(stateDir, intentKey);
         if (intent && intent.state === "completed") {
@@ -496,7 +571,7 @@ function abandonConnection(stateDir, keys, connectionId, log) {
       session.recordInitialize(s, { clientInfo: event.clientInfo, serverInfo: event.serverInfo, model: event.model });
     } else if (event.type === "CALL_START") {
       const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
-      session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: false, ts: event.ts });
+      session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
     } else if (event.type === "CALL_RESULT") {
       const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
       if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts });
@@ -855,6 +930,7 @@ module.exports = {
   buildHealthStatus,
   loadSigningKeys,
   drainOpenSessions,
+  forwardDownstreamRequestToAgent,
   recoverCrashedSessions,
   abandonConnection,
   runRecoveryResolveCli,
