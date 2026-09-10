@@ -500,6 +500,130 @@ async function walRecordsLifecycleEventsAndIsCleanedUpOnClose() {
   check("wal-deleted-after-a-clean-close", eventsAfterClose.length === 0, JSON.stringify(eventsAfterClose));
 }
 
+// ---------------------------------------------------------------------------
+// PR #33 round-2 fixes.
+// ---------------------------------------------------------------------------
+
+/* Codex PR #33 review "append blocked-retry anomalies to the WAL": a blocked duplicate
+ * used to be recorded in-memory only (session.recordAnomaly) -- a crash before this
+ * connection's own close would silently drop that attestation from a recovered/sealed
+ * bundle. Now also durably WAL-logged and given a normal structured completion log. */
+async function blockedRetryAnomalyIsDurablyRecorded() {
+  const dir = freshDir("blocked-anomaly-wal");
+  let resolveCall;
+  const conn = fakeConnectionCapturing(() => new Promise((resolve) => { resolveCall = resolve; }));
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
+  const walEvents = recovery.readWalEvents(dir, "conn-1");
+  const anomalyEvent = walEvents.find((e) => e.type === "ANOMALY");
+  check("blocked-retry-anomaly-appended-to-wal", Boolean(anomalyEvent) && anomalyEvent.kind === "GATEWAY_AMBIGUOUS_RETRY" && anomalyEvent.tool === "slow", JSON.stringify(walEvents));
+  const parsedLogs = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } });
+  const blockedLog = parsedLogs.find((l) => l && l.event === "gateway_call_completed" && l.status === "blocked");
+  check("blocked-retry-gets-a-structured-completion-log", Boolean(blockedLog) && blockedLog.tool === "slow", JSON.stringify(logLines));
+  resolveCall({ ok: true });
+  await firstPromise;
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "emit complete step logs for replayed and blocked calls": a
+ * completed-intent replay previously logged only the special-purpose
+ * gateway_intent_replayed event, missing the normal step/status/duration shape every
+ * other handled call gets. */
+async function replayedCallGetsAStructuredCompletionLogToo() {
+  const dir = freshDir("replay-structured-log");
+  const conn = fakeConnectionCapturing(async () => ({ value: 1 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  logLines.length = 0; // only care about the retry's own logging below
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  const parsedLogs = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } });
+  const replayedLog = parsedLogs.find((l) => l && l.event === "gateway_call_completed" && l.status === "replayed");
+  check("replayed-call-gets-a-structured-completion-log", Boolean(replayedLog) && replayedLog.tool === "echo", JSON.stringify(logLines));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "undo the fence when CALL_START persistence fails": the intent is
+ * created (dispatched) before this WAL append -- if the append itself fails (e.g. a full
+ * disk), the call never actually reaches conn.call(). Without a rollback, the intent
+ * stays "dispatched" forever (every retry permanently blocked) and, worse, the exception
+ * used to escape handleMessage entirely, breaking its documented "never throws" contract. */
+async function callStartWalAppendFailureRollsBackAndStaysRetryable() {
+  const dir = freshDir("call-start-wal-failure");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  let failNextCallStart = true;
+  recovery.appendWalEvent = (...args) => {
+    if (failNextCallStart && args[2] && args[2].type === "CALL_START") {
+      failNextCallStart = false;
+      throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+    }
+    return realAppendWalEvent(...args);
+  };
+  let resp, threw = null;
+  try {
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("call-start-wal-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("call-start-wal-failure-returns-a-retryable-jsonrpc-error", Boolean(resp && resp.error && resp.error.code === -32000), JSON.stringify(resp));
+  check("call-start-wal-failure-did-not-dispatch-downstream", conn.calls.length === 0, JSON.stringify(conn.calls));
+  const intentKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
+  check("call-start-wal-failure-rolled-back-the-intent", recovery.readIntent(dir, intentKey) === null, "intent still present");
+
+  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  check("call-start-wal-failure-retry-dispatches-normally-afterward", Boolean(retry && retry.result && retry.result.ok === true), JSON.stringify(retry));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "guard the post-dispatch intent update": a concurrent removal of
+ * this call's intent (an operator's recovery-resolve, or a race with closeConnection)
+ * while conn.call() is still in flight used to make the post-dispatch updateIntent throw
+ * GATEWAY_RECOVERY_INTENT_NOT_FOUND uncaught -- preventing the JSON-RPC response for a
+ * call that DID complete. */
+async function postDispatchUpdateSkippedWhenIntentConcurrentlyRemoved() {
+  const dir = freshDir("intent-removed-midflight");
+  let resolveCall;
+  const conn = fakeConnectionCapturing(() => new Promise((resolve) => { resolveCall = resolve; }));
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const callPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { a: 1 } } });
+  const intentKey = recovery.computeIntentKey("conn-1", "slow", { a: 1 });
+  recovery.deleteIntent(dir, intentKey); // simulate the concurrent removal
+  resolveCall({ ok: true });
+  let resp, threw = null;
+  try {
+    resp = await callPromise;
+  } catch (error) {
+    threw = error;
+  }
+  check("post-dispatch-update-does-not-throw-when-intent-concurrently-removed", threw === null, threw && threw.message);
+  check("post-dispatch-update-still-returns-the-real-result-to-the-agent", Boolean(resp && resp.result && resp.result.ok === true), JSON.stringify(resp));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -520,6 +644,11 @@ async function main() {
   await ambiguousOutcomeBlocksRetryUntilOperatorResolves();
   await closeConnectionFencesInFlightIntentAsAmbiguous();
   await walRecordsLifecycleEventsAndIsCleanedUpOnClose();
+
+  await blockedRetryAnomalyIsDurablyRecorded();
+  await replayedCallGetsAStructuredCompletionLogToo();
+  await callStartWalAppendFailureRollsBackAndStaysRetryable();
+  await postDispatchUpdateSkippedWhenIntentConcurrentlyRemoved();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
