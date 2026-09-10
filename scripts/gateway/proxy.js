@@ -50,6 +50,8 @@ class GatewayProxy {
    * @param {(session: object, error: Error) => void} [opts.onSealFailure] SS7: sealBoundaryBundle throws
    * @param {string} opts.stateDir passed straight to chain.appendSession (SG-FR-5)
    * @param {() => number} [opts.now]
+   * @param {string[]} [opts.pendingOperatorReviewConnections] connectionIds startup
+   *   recovery flagged for operator review (E2 tool-level quarantine, see constructor body)
    */
   constructor(opts) {
     this.connections = opts.connections;
@@ -69,6 +71,15 @@ class GatewayProxy {
      * the session.js record itself, since it is purely a dispatch-gating concern of this
      * proxy, not part of the sealed session's own attested shape. */
     this.agentInitialized = new Map(); // connectionId -> boolean
+    /* Frontier-panel decision (Paul, 2026-09-10, cluster E2): connectionIds this
+     * gateway's own startup recovery (gateway.js#recoverCrashedSessions) flagged as
+     * pendingOperatorReview -- consulted at dispatch time to quarantine a TOOL (not just
+     * an exact intent key) until an operator resolves the connection that left it
+     * ambiguous. A plain snapshot from startup, not live-updated: recovery-resolve/
+     * recovery-abandon require the writer-claim this live gateway process already holds,
+     * so nothing else can change these connections' outcome while this process is up --
+     * see recovery.js#resolveIntentNotExecuted's own header comment. */
+    this.pendingOperatorReviewConnections = new Set(opts.pendingOperatorReviewConnections || []);
     /* Optional structured per-call log sink (board decision 2026-09-04, PR #29 review
      * "emit the required structured log for each call") -- defaults to a no-op so unit
      * tests that construct a GatewayProxy directly (no logging concern of their own)
@@ -242,13 +253,56 @@ class GatewayProxy {
        * case from gateway.js's own downstream-initiated sampling forward) is out of
        * scope for this fix; see the design doc's disclosed limitations. */
       let intentKey = null;
+      let dispatchGeneration = 1;
       if (method === "tools/call") {
         intentKey = recovery.computeIntentKey(connectionId, toolName, callArgs);
+        /* Frontier-panel decision (Paul, 2026-09-10, PR #33 review clusters E1/E2 -- see
+         * graphsmith-pr33-panel-verdict-pr29-round4-halt-status-2026-09-10.md): a
+         * caller-supplied idempotency key, carried in `params._meta.idempotencyKey`,
+         * disambiguates "replay a call that already completed" from "dispatch a new,
+         * independent call that happens to share this tool+arguments" -- argument
+         * equality alone cannot tell those apart, so two deliberate identical calls used
+         * to silently collapse into one (both reviewers' finding). Only the COMPLETED
+         * branch below is key-gated; the dispatched/ambiguous blocking branches stay
+         * unconditional, since an unproven-outcome retry is a real double-dispatch risk
+         * independent of caller intent. */
+        const callerIdempotencyKey =
+          params && params._meta && typeof params._meta.idempotencyKey === "string" && params._meta.idempotencyKey.length > 0
+            ? params._meta.idempotencyKey
+            : null;
         let intentDecision = null;
         for (let attempt = 0; attempt < 2 && !intentDecision; attempt++) {
           const existing = recovery.readIntent(this.stateDir, intentKey);
           if (existing && existing.state === "completed") {
-            intentDecision = { kind: "replay", cachedResult: existing.cached_result };
+            if (callerIdempotencyKey && existing.idempotency_key && callerIdempotencyKey === existing.idempotency_key) {
+              intentDecision = { kind: "replay", cachedResult: existing.cached_result };
+            } else {
+              /* No caller-signaled retry: this is a new, independent dispatch that
+               * happens to share this connection+tool+arguments with a call that already
+               * completed. Supersede the record in place with a fresh "dispatched"
+               * generation under the SAME intentKey -- still fenced against an
+               * in-flight/crashed retry of THIS new attempt -- rather than creating a
+               * second file, keeping exactly one record per (connection, tool, args). */
+              try {
+                recovery.updateIntent(this.stateDir, intentKey, {
+                  state: "dispatched",
+                  dispatched_at: this.now(),
+                  idempotency_key: callerIdempotencyKey,
+                  generation: (existing.generation || 1) + 1,
+                  cached_result: undefined,
+                  completed_at: undefined,
+                  resolved_at: undefined,
+                  resolution: undefined,
+                });
+                dispatchGeneration = (existing.generation || 1) + 1;
+                intentDecision = { kind: "dispatch" };
+                this.log(JSON.stringify({ event: "gateway_intent_signature_reused_without_key", connection_id: connectionId, tool: toolName, intent_key: intentKey, generation: dispatchGeneration, detail: "a completed call's signature was reused without a matching idempotency key -- dispatched as a new, independent call rather than replayed" }));
+              } catch (updateError) {
+                if (updateError.code !== "GATEWAY_RECOVERY_INTENT_NOT_FOUND") throw updateError;
+                // else: intent was concurrently removed -- loop again, this attempt's
+                // re-read will see no existing intent and take the fresh-dispatch path.
+              }
+            }
           } else if (existing && existing.state === "dispatched") {
             intentDecision = {
               kind: "block",
@@ -264,16 +318,50 @@ class GatewayProxy {
               message: "A prior attempt of this exact operation did not reach a confirmed successful outcome -- dispatch halted pending operator resolution (see recovery-resolve).",
             };
           } else {
-            const created = recovery.createIntentIfAbsent(this.stateDir, intentKey, {
-              connection_id: connectionId,
-              tool: toolName,
-              arguments: callArgs,
-              state: "dispatched",
-              dispatched_at: this.now(),
-            });
-            if (created) intentDecision = { kind: "dispatch" };
-            // else: lost a race to a concurrent identical call on this connection --
-            // loop once to re-read its freshly-created state and respond consistently.
+            /* Frontier-panel decision (Paul, 2026-09-10, cluster E2): a reconnecting
+             * agent gets a brand-new connectionId, so its retry of "the same" logical
+             * operation computes a DIFFERENT intentKey than a still-unresolved intent its
+             * own crashed predecessor connection left behind -- the exact-key lookup
+             * above would never see it. Before dispatching a genuinely new key, also
+             * check whether this TOOL (any arguments) has an unresolved intent
+             * (dispatched or ambiguous) belonging to a connection this gateway's own
+             * startup recovery already flagged as pendingOperatorReview -- if so, this
+             * tool stays quarantined until an operator resolves that connection,
+             * regardless of which connection or arguments are now trying to use it.
+             * Deliberately scoped to pendingOperatorReview connections only -- concurrent
+             * use of the same tool by unrelated, healthy live connections is normal and
+             * unaffected (same O(all intents on disk) disclosed cost as
+             * recovery.listAllIntents' other callers; only reached on a brand-new key). */
+            const quarantine = this.pendingOperatorReviewConnections.size > 0
+              ? recovery.listAllIntents(this.stateDir).find(
+                  (i) =>
+                    i.tool === toolName &&
+                    i.intent_key !== intentKey &&
+                    this.pendingOperatorReviewConnections.has(i.connection_id) &&
+                    (i.state === "dispatched" || i.state === "ambiguous")
+                )
+              : null;
+            if (quarantine) {
+              intentDecision = {
+                kind: "block",
+                code: -32082,
+                gatewayCode: "GATEWAY_TOOL_QUARANTINED_PENDING_OPERATOR_REVIEW",
+                message: `Tool "${toolName}" is quarantined: connection "${quarantine.connection_id}" left an unresolved call to this tool from a crash, pending operator review -- resolve it via recovery-resolve/recovery-abandon before dispatching this tool again.`,
+              };
+            } else {
+              const created = recovery.createIntentIfAbsent(this.stateDir, intentKey, {
+                connection_id: connectionId,
+                tool: toolName,
+                arguments: callArgs,
+                state: "dispatched",
+                dispatched_at: this.now(),
+                idempotency_key: callerIdempotencyKey,
+                generation: 1,
+              });
+              if (created) intentDecision = { kind: "dispatch" };
+              // else: lost a race to a concurrent identical call on this connection --
+              // loop once to re-read its freshly-created state and respond consistently.
+            }
           }
         }
         if (!intentDecision) {
@@ -368,10 +456,18 @@ class GatewayProxy {
          * idempotency key gets genuine at-most-once execution too -- see downstream.js's
          * META_IDEMPOTENCY_KEY header comment. Only ever set for real tools/call dispatch
          * (intentKey is null for the isModelCallMethod branch, matching the dispatch
-         * guard above's own "deliberately scoped to tools/call only" decision). */
+         * guard above's own "deliberately scoped to tools/call only" decision). Suffixed
+         * with the generation number (E1 above) whenever this dispatch superseded a prior
+         * completed intent under the same key: without this, a downstream implementing
+         * its own idempotency-key dedup would see the SAME key as the earlier, unrelated
+         * completed call and could wrongly treat this new, independent dispatch as a
+         * duplicate of it -- undermining the very "treat as independent" outcome E1
+         * exists to guarantee. The first generation keeps the plain, unsuffixed key
+         * (unchanged wire behavior for the common single-generation case). */
+        const downstreamIdempotencyKey = intentKey ? (dispatchGeneration > 1 ? `${intentKey}.g${dispatchGeneration}` : intentKey) : undefined;
         result = await conn.call(method, params, undefined, cancelKey
           ? (downstreamId) => this.downstreamCallIds.set(cancelKey, { server: serverName, downstreamId })
-          : undefined, intentKey || undefined);
+          : undefined, downstreamIdempotencyKey);
       } catch (error) {
         /* Board decision 2026-09-04, PR #29 review "preserve downstream JSON-RPC error
          * envelopes": downstream.js's connectStdio/connectHttp both already attach the
