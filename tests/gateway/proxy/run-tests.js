@@ -431,7 +431,11 @@ async function inFlightRetryBlockedAsAmbiguousRetry() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
-async function completedCallReplaysCachedResultOnRetry() {
+/* Frontier-panel decision (Paul, 2026-09-10, cluster E1): completed-intent replay now
+ * requires the retry to present the SAME caller-supplied idempotency key
+ * (params._meta.idempotencyKey) the original dispatch carried -- argument equality alone
+ * is no longer sufficient to trigger a silent replay. */
+async function completedCallReplaysCachedResultOnRetryWithMatchingKey() {
   const dir = freshDir("replay");
   const conn = fakeConnectionCapturing(async () => ({ value: 42 }));
   const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
@@ -439,10 +443,57 @@ async function completedCallReplaysCachedResultOnRetry() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
-  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
-  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
-  check("retry-of-completed-call-replays-cached-result", retry && retry.result && retry.result.value === 42, JSON.stringify(retry));
-  check("retry-of-completed-call-did-not-redispatch-downstream", conn.calls.length === 1, JSON.stringify(conn.calls));
+  const params = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "caller-key-1" } };
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params });
+  check("retry-of-completed-call-replays-cached-result-with-matching-key", retry && retry.result && retry.result.value === 42, JSON.stringify(retry));
+  check("retry-of-completed-call-did-not-redispatch-downstream-with-matching-key", conn.calls.length === 1, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* E1's actual fix: WITHOUT a caller-supplied idempotency key, a repeated identical call
+ * after completion is no longer silently replayed -- it dispatches as a new, independent
+ * call (this is precisely the two reviewers' finding: argument equality alone cannot
+ * distinguish an intentional second call from a lost-response retry). The intent's
+ * generation is bumped and the downstream-facing idempotency key is suffixed so a
+ * downstream implementing its own dedup does not mistake this for the earlier call. */
+async function retryOfCompletedCallWithoutKeyDispatchesIndependently() {
+  const dir = freshDir("no-key-supersede");
+  const conn = fakeConnectionCapturing(async () => ({ value: 42 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const params = { name: "echo", arguments: { a: 1 } }; // no _meta.idempotencyKey
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params });
+  check("retry-without-key-redispatched-downstream", conn.calls.length === 2, JSON.stringify(conn.calls));
+  check("retry-without-key-still-returns-a-real-result", Boolean(retry && retry.result && retry.result.value === 42), JSON.stringify(retry));
+  const intentKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
+  check(
+    "retry-without-key-downstream-call-uses-generation-suffixed-key",
+    conn.calls[0].idempotencyKey === intentKey && conn.calls[1].idempotencyKey === `${intentKey}.g2`,
+    JSON.stringify(conn.calls)
+  );
+  const finalIntent = recovery.readIntent(dir, intentKey);
+  check("retry-without-key-intent-generation-bumped", Boolean(finalIntent) && finalIntent.generation === 2 && finalIntent.state === "completed", JSON.stringify(finalIntent));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* A retry presenting a DIFFERENT idempotency key than the original dispatch is also not a
+ * caller-signaled retry of that specific attempt -- treated the same as no key at all. */
+async function retryWithMismatchedKeyDispatchesIndependently() {
+  const dir = freshDir("mismatched-key");
+  const conn = fakeConnectionCapturing(async () => ({ value: 7 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "key-A" } } });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "key-B" } } });
+  check("retry-with-mismatched-key-redispatched-downstream", conn.calls.length === 2, JSON.stringify(conn.calls));
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
@@ -544,13 +595,83 @@ async function replayedCallGetsAStructuredCompletionLogToo() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
-  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  const params = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "structured-log-key" } };
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   logLines.length = 0; // only care about the retry's own logging below
-  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params });
   const parsedLogs = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } });
   const replayedLog = parsedLogs.find((l) => l && l.event === "gateway_call_completed" && l.status === "replayed");
   check("replayed-call-gets-a-structured-completion-log", Boolean(replayedLog) && replayedLog.tool === "echo", JSON.stringify(logLines));
   await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Frontier-panel decision (Paul, 2026-09-10, cluster E2): a reconnecting agent gets a
+ * brand-new connectionId, so its retry of "the same" logical operation computes a
+ * DIFFERENT intentKey than a still-unresolved intent its crashed predecessor connection
+ * left behind. A tool with an unresolved (dispatched/ambiguous) intent belonging to a
+ * connection startup recovery flagged pendingOperatorReview is quarantined for every
+ * connection until an operator resolves it -- regardless of connectionId or arguments. */
+async function toolQuarantinedWhileACrashedConnectionIsPendingOperatorReview() {
+  const dir = freshDir("quarantine");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "email", server: "srv", schema: {} }];
+  const toolOwners = new Map([["email", "srv"]]);
+  // Simulate a crash-left "ambiguous" intent belonging to a now-defunct connection, the
+  // way gateway.js#recoverCrashedSessions would leave one on disk at startup.
+  const staleIntentKey = recovery.computeIntentKey("crashed-conn", "email", { to: "x" });
+  recovery.createIntentIfAbsent(dir, staleIntentKey, {
+    connection_id: "crashed-conn",
+    tool: "email",
+    arguments: { to: "x" },
+    state: "dispatched",
+    dispatched_at: Date.now(),
+  });
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    pendingOperatorReviewConnections: ["crashed-conn"],
+  });
+  proxy.openConnection("conn-2"); // a brand-new (e.g. reconnecting) connection
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const resp = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "email", arguments: { to: "y" } } });
+  check("tool-quarantined-for-different-connection-and-arguments", Boolean(resp && resp.error && resp.error.code === -32082), JSON.stringify(resp));
+  check("tool-quarantined-did-not-redispatch-downstream", conn.calls.length === 0, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-2", "test cleanup");
+}
+
+/* The quarantine must not over-block: a DIFFERENT tool on the same gateway, and the SAME
+ * tool once its owning connection is no longer in pendingOperatorReview (i.e. resolved),
+ * must dispatch normally. */
+async function toolQuarantineScopedToTheAffectedToolAndConnectionOnly() {
+  const dir = freshDir("quarantine-scope");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "email", server: "srv", schema: {} }, { name: "increment", server: "srv", schema: {} }];
+  const toolOwners = new Map([["email", "srv"], ["increment", "srv"]]);
+  const staleIntentKey = recovery.computeIntentKey("crashed-conn", "email", { to: "x" });
+  recovery.createIntentIfAbsent(dir, staleIntentKey, {
+    connection_id: "crashed-conn",
+    tool: "email",
+    arguments: { to: "x" },
+    state: "dispatched",
+    dispatched_at: Date.now(),
+  });
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    pendingOperatorReviewConnections: ["crashed-conn"],
+  });
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const otherTool = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "increment", arguments: {} } });
+  check("unrelated-tool-not-quarantined", Boolean(otherTool && otherTool.result && otherTool.result.ok === true), JSON.stringify(otherTool));
+  // Simulate the operator resolving the crashed connection (recovery-abandon deletes the
+  // intent; recovery-resolve --confirmed executed/not-executed sets a terminal state --
+  // either way this connection no longer belongs in pendingOperatorReviewConnections on
+  // the NEXT gateway startup, which is what a fresh GatewayProxy instance below models).
+  recovery.deleteIntent(dir, staleIntentKey);
+  const proxy2 = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { pendingOperatorReviewConnections: [] });
+  proxy2.openConnection("conn-3");
+  await proxy2.handleMessage("conn-3", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const afterResolve = await proxy2.handleMessage("conn-3", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "email", arguments: { to: "y" } } });
+  check("tool-dispatches-normally-once-crashed-connection-resolved", Boolean(afterResolve && afterResolve.result && afterResolve.result.ok === true), JSON.stringify(afterResolve));
+  await proxy.closeConnection("conn-2", "test cleanup");
+  await proxy2.closeConnection("conn-3", "test cleanup");
 }
 
 /* Codex PR #33 review "undo the fence when CALL_START persistence fails": the intent is
@@ -640,7 +761,11 @@ async function main() {
   await nullJsonRpcIdDoesNotCrash();
   await idempotencyKeyPropagatedToRealToolCallOnly();
   await inFlightRetryBlockedAsAmbiguousRetry();
-  await completedCallReplaysCachedResultOnRetry();
+  await completedCallReplaysCachedResultOnRetryWithMatchingKey();
+  await retryOfCompletedCallWithoutKeyDispatchesIndependently();
+  await retryWithMismatchedKeyDispatchesIndependently();
+  await toolQuarantinedWhileACrashedConnectionIsPendingOperatorReview();
+  await toolQuarantineScopedToTheAffectedToolAndConnectionOnly();
   await ambiguousOutcomeBlocksRetryUntilOperatorResolves();
   await closeConnectionFencesInFlightIntentAsAmbiguous();
   await walRecordsLifecycleEventsAndIsCleanedUpOnClose();
