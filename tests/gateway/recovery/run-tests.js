@@ -35,7 +35,8 @@ const ROOT = path.resolve(__dirname, "../../..");
 const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
 const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
-const { recoverCrashedSessions, abandonConnection } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 
 let failures = 0;
 const results = [];
@@ -207,8 +208,15 @@ function operatorResolutionExecutedAndNotExecuted() {
   const resolved = recovery.resolveIntentExecuted(dir, keyExecuted, { charged: true });
   check("resolve-intent-executed-marks-completed-with-cached-result", resolved.state === "completed" && resolved.cached_result.charged === true, JSON.stringify(resolved));
 
-  recovery.resolveIntentNotExecuted(dir, keyNotExecuted);
-  check("resolve-intent-not-executed-deletes-the-fence-entirely", recovery.readIntent(dir, keyNotExecuted) === null, "still present");
+  // PR #33 round-2 fix (Codex "persist a terminal not-executed resolution"): this used
+  // to delete the intent immediately. It now persists a terminal `not_executed` state
+  // instead, so a crashed connection's still-pending WAL replay can resolve to this real
+  // decision on the next restart rather than looping back to operator review forever --
+  // see gateway.js#recoverCrashedSessions's own handling of this state. The intent is
+  // deleted only once that replay actually consumes it and the connection is sealed.
+  const resolvedNotExecuted = recovery.resolveIntentNotExecuted(dir, keyNotExecuted);
+  check("resolve-intent-not-executed-persists-a-terminal-state", resolvedNotExecuted.state === "not_executed", JSON.stringify(resolvedNotExecuted));
+  check("resolve-intent-not-executed-is-not-immediately-deleted", recovery.readIntent(dir, keyNotExecuted) !== null, "was deleted immediately");
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +316,106 @@ function recoverDeletesEmptyOrFullyTornWalWithoutFlagging() {
 }
 
 // ---------------------------------------------------------------------------
+// PR #33 round-2 fixes: path-safety, bundle-collision content verification,
+// per-connection isolation, not_executed replay, and anomaly-WAL replay.
+// ---------------------------------------------------------------------------
+
+function pathBearingIdentifiersAreRejected() {
+  const dir = freshDir("path-safety");
+  let threwWal = null;
+  try { recovery.walPath(dir, "../../etc/passwd"); } catch (error) { threwWal = error; }
+  check("wal-path-rejects-traversal-connection-id", threwWal && threwWal.code === "GATEWAY_RECOVERY_UNSAFE_ID", threwWal && threwWal.message);
+  let threwIntent = null;
+  try { recovery.intentPath(dir, "../outside"); } catch (error) { threwIntent = error; }
+  check("intent-path-rejects-traversal-intent-key", threwIntent && threwIntent.code === "GATEWAY_RECOVERY_UNSAFE_ID", threwIntent && threwIntent.message);
+  // A normal, real-shaped id (gs_<hex>, or a plain connection id) must still work.
+  let ok = null;
+  try { ok = recovery.walPath(dir, "conn-abc123_.-"); } catch (error) { ok = error; }
+  check("wal-path-accepts-a-normal-id", typeof ok === "string", ok && ok.message);
+}
+
+function bundleCollisionWithDifferentContentIsFlaggedNotDiscarded() {
+  const dir = freshDir("recover-collision");
+  const keys = makeKeys();
+  // First connection: seals normally, occupying a bundle_id derived only from
+  // {init, grantedTools, n: calls.length} -- NOT from the actual call content.
+  seedCleanCallWal(dir, "conn-x");
+  recovery.appendWalEvent(dir, "conn-x", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const firstHead = chain.readHead(dir);
+
+  // Second, DIFFERENT connection: same tool, same init shape, same call COUNT (1) --
+  // deliberately different arguments/result, which gsa-mcp-shim.js's bundle_id formula
+  // does not account for, so this collides on bundle_id despite being a genuinely
+  // different session's content.
+  const connectionId = "conn-y";
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [{ name: "echo", server: "srv", schema: {} }] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "echo", server: "srv", arguments: { a: 999 }, ts: 10 });
+  const intentKeyY = recovery.computeIntentKey(connectionId, "echo", { a: 999 });
+  recovery.createIntentIfAbsent(dir, intentKeyY, { connection_id: connectionId, tool: "echo", arguments: { a: 999 }, state: "dispatched", dispatched_at: 9 });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: false, different: true }, isError: false, ts: 11 });
+
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("bundle-collision-genuine-conflict-flagged-for-operator", pendingOperatorReview.includes(connectionId), JSON.stringify(pendingOperatorReview));
+  check("bundle-collision-genuine-conflict-wal-not-discarded", recovery.readWalEvents(dir, connectionId).length > 0, "WAL was deleted despite unverified collision");
+  check("bundle-collision-genuine-conflict-intent-not-discarded", recovery.readIntent(dir, intentKeyY) !== null, "intent was deleted despite unverified collision");
+  const headAfter = chain.readHead(dir);
+  check("bundle-collision-genuine-conflict-no-second-chain-entry-appended", headAfter && headAfter.seq === firstHead.seq, JSON.stringify(headAfter));
+}
+
+function unreadableWalForOneConnectionDoesNotBlockAnother() {
+  const dir = freshDir("recover-isolation");
+  const keys = makeKeys();
+  // conn-bad's WAL "file" is actually a directory -- fs.readFileSync fails with EISDIR,
+  // a genuine fs-level read error (GATEWAY_RECOVERY_WAL_UNREADABLE), not a content/JSON
+  // problem readWalEvents already tolerates.
+  fs.mkdirSync(recovery.activeDir(dir), { recursive: true });
+  fs.mkdirSync(recovery.walPath(dir, "conn-bad"));
+  // conn-good is a normal, cleanly-recoverable connection.
+  seedCleanCallWal(dir, "conn-good");
+  recovery.appendWalEvent(dir, "conn-good", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("isolation-unreadable-connection-flagged-not-thrown", pendingOperatorReview.includes("conn-bad"), JSON.stringify(pendingOperatorReview));
+  check("isolation-good-connection-still-recovered", !pendingOperatorReview.includes("conn-good"), JSON.stringify(pendingOperatorReview));
+  const headEntry = chain.readHead(dir);
+  check("isolation-good-connections-chain-entry-appended-despite-sibling-failure", headEntry && headEntry.seq === 1, JSON.stringify(headEntry));
+}
+
+function abandonConnectionQuarantinesAnUnreadableWal() {
+  const dir = freshDir("abandon-quarantine");
+  const keys = makeKeys();
+  const connectionId = "conn-corrupt";
+  fs.mkdirSync(recovery.activeDir(dir), { recursive: true });
+  fs.mkdirSync(recovery.walPath(dir, connectionId));
+  let threw = null;
+  try { abandonConnection(dir, keys, connectionId, silentLog); } catch (error) { threw = error; }
+  check("abandon-quarantine-does-not-throw", threw === null, threw && threw.message);
+  check("abandon-quarantine-removes-the-active-wal", recovery.listActiveConnections(dir).includes(connectionId) === false, "still listed as active");
+  const quarantined = fs.existsSync(recovery.quarantineDir(dir)) ? fs.readdirSync(recovery.quarantineDir(dir)) : [];
+  check("abandon-quarantine-moves-it-to-the-quarantine-dir", quarantined.some((f) => f.startsWith(connectionId)), JSON.stringify(quarantined));
+}
+
+function notExecutedIntentReplaysAsAFailedCallAndIsThenCleanedUp() {
+  const dir = freshDir("recover-not-executed");
+  const keys = makeKeys();
+  const connectionId = "conn-not-executed";
+  const intentKey = seedCleanCallWal(dir, connectionId);
+  // Simulates the operator having already run
+  // "recovery-resolve --confirmed not-executed" on this crashed, still-pending call --
+  // no CALL_RESULT exists in the WAL (it never got one), but the intent now records the
+  // operator's decision as a persisted terminal state (see recovery.js#resolveIntentNotExecuted).
+  recovery.resolveIntentNotExecuted(dir, intentKey);
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("not-executed-replay-does-not-need-further-operator-review", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+  check("not-executed-replay-cleans-up-the-wal", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present");
+  check("not-executed-replay-cleans-up-the-intent-once-consumed", recovery.readIntent(dir, intentKey) === null, "intent still present");
+  const headEntry = chain.readHead(dir);
+  check("not-executed-replay-still-produces-a-sealed-chain-entry", headEntry && headEntry.seq === 1, JSON.stringify(headEntry));
+}
+
+// ---------------------------------------------------------------------------
 // gateway.js#abandonConnection -- explicit operator override
 // ---------------------------------------------------------------------------
 
@@ -333,6 +441,126 @@ function abandonConnectionOnAlreadyCleanConnectionIsANoOp() {
   let threw = null;
   try { abandonConnection(dir, keys, "never-existed", silentLog); } catch (error) { threw = error; }
   check("abandon-of-a-connection-with-no-wal-does-not-throw", threw === null, threw && threw.message);
+}
+
+// ---------------------------------------------------------------------------
+// PR #33 round-2 fixes that need a real WriterClaim / real startGateway plumbing.
+// ---------------------------------------------------------------------------
+
+function writerClaimIsReleasedWhenStartupRecoveryThrows() {
+  const root = freshDir("release-on-recovery-failure");
+  const stateDir = path.join(root, "state");
+  fs.mkdirSync(path.join(root, ".graphsmith", "state"), { recursive: true });
+  const { writeConfirmedMode } = require(path.join(ROOT, "tests", "gateway", "_fixtures", "mode-file.js"));
+  writeConfirmedMode(root, "standalone");
+  const kp = crypto.generateKeyPairSync("ed25519");
+  const keyPath = path.join(root, "signing-key.pem");
+  fs.writeFileSync(keyPath, kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  const configPath = path.join(root, "gateway-config.json");
+  fs.writeFileSync(configPath, JSON.stringify({
+    schema_version: "1.0",
+    state_dir: stateDir,
+    // Never actually reached -- recovery throws before connectAllDownstreams runs.
+    downstream_servers: [{ name: "unused", transport: "stdio", endpoint: "node -e process.exit(1)" }],
+    signing_key_ref: keyPath,
+  }));
+  // Make gateway-recovery/active a FILE, not a directory: recovery.listActiveConnections'
+  // own fs.readdirSync then fails with ENOTDIR, a genuine non-ENOENT error this function
+  // does not (and should not) swallow -- an unlistable recovery directory is a real,
+  // whole-pass failure distinct from any single connection's own unreadable state.
+  fs.mkdirSync(recovery.recoveryDir(stateDir), { recursive: true });
+  fs.writeFileSync(recovery.activeDir(stateDir), "not a directory");
+
+  let rejection = null;
+  return startGateway({ configPath, root, log: () => {} }).then(
+    () => { rejection = null; },
+    (error) => { rejection = error; }
+  ).then(() => {
+    check("recovery-listActiveConnections-failure-rejects-startGateway", rejection !== null, "startGateway resolved instead of rejecting");
+    // The writer-claim file must be gone -- proof that writerClaim.release() actually ran
+    // rather than leaking a claim an immediate restart would then be refused for.
+    const { WriterClaim: WC } = require(path.join(ROOT, "scripts", "writer-claim.js"));
+    const fresh = new WC(stateDir, { hostId: "test-second-instance" });
+    let acquireError = null;
+    try { fresh.acquire(); fresh.release(); } catch (error) { acquireError = error; }
+    check("writer-claim-released-so-a-fresh-instance-can-immediately-acquire-it", acquireError === null, acquireError && acquireError.message);
+  });
+}
+
+function recoveryResolveRequiresResultFileForExecuted() {
+  const dir = freshDir("cli-result-file");
+  const root = freshDir("cli-result-file-root");
+  const kp = crypto.generateKeyPairSync("ed25519");
+  const keyPath = path.join(root, "signing-key.pem");
+  fs.writeFileSync(keyPath, kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  const configPath = path.join(root, "gateway-config.json");
+  fs.writeFileSync(configPath, JSON.stringify({
+    schema_version: "1.0",
+    state_dir: dir,
+    downstream_servers: [{ name: "unused", transport: "stdio", endpoint: "node -e process.exit(1)" }],
+    signing_key_ref: keyPath,
+  }));
+  const intentKey = recovery.computeIntentKey("conn-cli", "toolX", { x: 1 });
+  recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-cli", tool: "toolX", arguments: { x: 1 }, state: "ambiguous" });
+
+  let threw = null;
+  try {
+    runRecoveryResolveCli(["--connection", "conn-cli", "--intent", intentKey, "--confirmed", "executed", "--config", configPath], () => {});
+  } catch (error) {
+    threw = error;
+  }
+  check("recovery-resolve-executed-without-result-file-is-rejected", threw !== null && threw.code === "GATEWAY_RECOVERY_CLI_USAGE", threw ? threw.message : "did not throw");
+  check("recovery-resolve-rejected-attempt-does-not-mutate-the-intent", recovery.readIntent(dir, intentKey).state === "ambiguous", JSON.stringify(recovery.readIntent(dir, intentKey)));
+
+  // Providing --result-file must still work.
+  const resultFile = path.join(root, "result.json");
+  fs.writeFileSync(resultFile, JSON.stringify({ charged: true }));
+  runRecoveryResolveCli(["--connection", "conn-cli", "--intent", intentKey, "--confirmed", "executed", "--result-file", resultFile, "--config", configPath], () => {});
+  const resolved = recovery.readIntent(dir, intentKey);
+  check("recovery-resolve-executed-with-result-file-succeeds", resolved.state === "completed" && resolved.cached_result.charged === true, JSON.stringify(resolved));
+
+  // The writer-claim taken internally by runRecoveryResolveCli must be released
+  // afterward -- a second call against a different intent must not be refused.
+  const intentKey2 = recovery.computeIntentKey("conn-cli", "toolY", {});
+  recovery.createIntentIfAbsent(dir, intentKey2, { connection_id: "conn-cli", tool: "toolY", arguments: {}, state: "ambiguous" });
+  let secondThrew = null;
+  try {
+    runRecoveryResolveCli(["--connection", "conn-cli", "--intent", intentKey2, "--confirmed", "not-executed", "--config", configPath], () => {});
+  } catch (error) {
+    secondThrew = error;
+  }
+  check("recovery-resolve-releases-its-writer-claim-after-each-run", secondThrew === null, secondThrew && secondThrew.message);
+}
+
+function recoveryResolveRefusesWhileAnotherWriterHoldsTheClaim() {
+  const dir = freshDir("cli-writer-claim");
+  const root = freshDir("cli-writer-claim-root");
+  const kp = crypto.generateKeyPairSync("ed25519");
+  const keyPath = path.join(root, "signing-key.pem");
+  fs.writeFileSync(keyPath, kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  const configPath = path.join(root, "gateway-config.json");
+  fs.writeFileSync(configPath, JSON.stringify({
+    schema_version: "1.0",
+    state_dir: dir,
+    downstream_servers: [{ name: "unused", transport: "stdio", endpoint: "node -e process.exit(1)" }],
+    signing_key_ref: keyPath,
+    host_id: "owning-host",
+  }));
+  const intentKey = recovery.computeIntentKey("conn-locked", "toolZ", {});
+  recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-locked", tool: "toolZ", arguments: {}, state: "ambiguous" });
+
+  const owner = new WriterClaim(dir, { hostId: "owning-host-2" });
+  owner.acquire();
+  let threw = null;
+  try {
+    runRecoveryResolveCli(["--connection", "conn-locked", "--intent", intentKey, "--confirmed", "not-executed", "--config", configPath], () => {});
+  } catch (error) {
+    threw = error;
+  } finally {
+    owner.release();
+  }
+  check("recovery-resolve-refuses-while-another-writer-holds-the-claim", threw !== null && String(threw.code || "").startsWith("WRITER_CLAIM"), threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("recovery-resolve-refused-attempt-did-not-mutate-the-intent", recovery.readIntent(dir, intentKey).state === "ambiguous", JSON.stringify(recovery.readIntent(dir, intentKey)));
 }
 
 function main() {
@@ -362,10 +590,24 @@ function main() {
   abandonConnectionSealsAndReleasesTheFenceForAnUnprovenCall();
   abandonConnectionOnAlreadyCleanConnectionIsANoOp();
 
-  const passed = results.filter((r) => r.status === "PASS").length;
-  const failed = results.filter((r) => r.status === "FAIL").length;
-  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
-  process.exit(failures ? 1 : 0);
+  pathBearingIdentifiersAreRejected();
+  bundleCollisionWithDifferentContentIsFlaggedNotDiscarded();
+  unreadableWalForOneConnectionDoesNotBlockAnother();
+  abandonConnectionQuarantinesAnUnreadableWal();
+  notExecutedIntentReplaysAsAFailedCallAndIsThenCleanedUp();
+
+  recoveryResolveRequiresResultFileForExecuted();
+  recoveryResolveRefusesWhileAnotherWriterHoldsTheClaim();
+
+  return writerClaimIsReleasedWhenStartupRecoveryThrows().then(() => {
+    const passed = results.filter((r) => r.status === "PASS").length;
+    const failed = results.filter((r) => r.status === "FAIL").length;
+    console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
+    process.exit(failures ? 1 : 0);
+  });
 }
 
-main();
+main().catch((error) => {
+  console.error("FATAL:", error);
+  process.exit(1);
+});
