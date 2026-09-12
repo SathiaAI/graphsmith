@@ -122,14 +122,40 @@ function nextResidualLineBytes(prevResidualBytes, buf) {
   return lastNewline === -1 ? prevResidualBytes + buf.length : buf.length - lastNewline - 1;
 }
 
+/** Codex PR #29 review "keep gateway secrets out of downstream subprocess environments":
+ * spawn() with no explicit `env` inherits this process's COMPLETE process.env, so any
+ * configured stdio downstream previously received the resolved signing_key_ref /
+ * agent_listen.token_ref / downstream token_ref env vars even though it needs none of
+ * them -- a compromised or malicious stdio server could read the attestation signing key
+ * or the agent bearer token straight out of its own environment. Returns a shallow copy
+ * of process.env with exactly the gateway's own secret-holding variable NAMES (never
+ * their values, which this function never needs) deleted, so a stdio child still gets
+ * everything else (PATH, HOME, locale, its own unrelated env) unchanged. Returns
+ * `process.env` itself, not a copy, when there is nothing to strip. */
+function buildStdioChildEnv(secretEnvNames) {
+  if (!secretEnvNames || (typeof secretEnvNames.size === "number" && secretEnvNames.size === 0) || (Array.isArray(secretEnvNames) && secretEnvNames.length === 0)) {
+    return process.env;
+  }
+  const env = { ...process.env };
+  for (const name of secretEnvNames) {
+    if (typeof name === "string" && name.length > 0) delete env[name];
+  }
+  return env;
+}
+
 /** A downstream connection over stdio: spawns `endpoint` (a shell command line, split on
  * whitespace -- simplest form; a downstream needing shell quoting can wrap itself in a
  * small launcher script) and speaks newline-delimited JSON-RPC over its stdio, matching
- * stdioTransport.js's own framing. */
+ * stdioTransport.js's own framing. `options.secretEnvNames` (a Set/array of env var
+ * names), when provided, is stripped from the spawned child's environment -- see
+ * buildStdioChildEnv above. */
 function connectStdio(endpoint, options = {}) {
   const parts = String(endpoint).trim().split(/\s+/);
   const [command, ...args] = parts;
-  const child = spawn(command, args, { stdio: ["pipe", "pipe", options.inheritStderr ? "inherit" : "ignore"] });
+  const child = spawn(command, args, {
+    stdio: ["pipe", "pipe", options.inheritStderr ? "inherit" : "ignore"],
+    env: buildStdioChildEnv(options.secretEnvNames),
+  });
 
   const pending = new Map();
   let nextId = 1;
@@ -277,11 +303,19 @@ function connectStdio(endpoint, options = {}) {
          * anymore. Consistent with those two branches' own `!closed` guard. */
         child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not handle downstream-initiated method "${msg.method}".` } }) + "\n");
       }
+    } else if (msg && Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== null && !Object.prototype.hasOwnProperty.call(msg, "method")) {
+      /* Codex PR #29 review "surface unmatched stdio responses to the session recorder":
+       * a response whose id has no live entry in `pending` above (already timed out, or
+       * the downstream fabricated/replayed an id this client never sent) previously hit
+       * neither branch above and fell through to the comment below -- which PROMISES the
+       * session-correlation layer records this as an anomaly, but nothing actually called
+       * into it. `options.onUnmatchedResponse`, when provided, is this transport client's
+       * only way to surface the observed protocol violation upward; this file still stays
+       * a dumb pipe and does not itself decide how (or whether) it gets attributed to a
+       * session. */
+      if (typeof options.onUnmatchedResponse === "function") options.onUnmatchedResponse(msg);
     }
-    // A response for an unrecognized id, or any other shape, is silently ignored at
-    // THIS layer -- the gateway's own session-correlation layer (scripts/gateway/
-    // session.js) is where an "unmatched response" anomaly is recorded, keeping this
-    // transport client itself a dumb, honest pipe.
+    // Any other shape (a response missing "id", etc.) is silently ignored at this layer.
   });
 
   const closedPromise = new Promise((resolve) => {
@@ -662,9 +696,13 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
          * instead of the real originating server. Bind this server's own name into its
          * own connection's callback here, once, rather than have every caller of
          * connectAllDownstreams re-derive it. */
-        const perServerOptions = typeof options.onRequest === "function"
-          ? { ...options, onRequest: (msg) => options.onRequest(msg, serverConfig.name) }
-          : options;
+        let perServerOptions = options;
+        if (typeof options.onRequest === "function") perServerOptions = { ...perServerOptions, onRequest: (msg) => options.onRequest(msg, serverConfig.name) };
+        /* Same per-server name binding as onRequest just above, applied to the newly
+         * added onUnmatchedResponse callback (Codex PR #29 review "surface unmatched
+         * stdio responses to the session recorder") so a caller logging/attributing an
+         * unmatched response can name which downstream produced it. */
+        if (typeof options.onUnmatchedResponse === "function") perServerOptions = { ...perServerOptions, onUnmatchedResponse: (msg) => options.onUnmatchedResponse(msg, serverConfig.name) };
         conn = connectDownstream(serverConfig, perServerOptions);
         /* Full MCP initialize params (protocolVersion + capabilities, not just
          * clientInfo) -- a downstream that actually validates the initialization
@@ -687,7 +725,36 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
           capabilities: options.supportsSampling ? { sampling: {} } : {},
           clientInfo: options.clientInfo || { name: "graphsmith-standalone-gateway", version: "1.0" },
         });
-        serverInfos[serverConfig.name] = (initResult && initResult.serverInfo) || null;
+        /* Codex PR #29 review "validate the downstream initialize result": a successful
+         * JSON-RPC envelope whose "result" is empty or missing the MCP-required
+         * protocolVersion/capabilities/serverInfo fields previously fell straight through
+         * to serverInfos[...] = null and startup continued with an unnegotiated protocol
+         * -- GatewayProxy then advertises `serverInfo: null` to the agent (an invalid
+         * initialize result a conforming client can reject) instead of failing loudly the
+         * same way the tools/list validation below already does for a malformed
+         * downstream payload. */
+        if (
+          !initResult ||
+          typeof initResult !== "object" ||
+          typeof initResult.protocolVersion !== "string" ||
+          initResult.protocolVersion.length === 0 ||
+          !initResult.capabilities ||
+          typeof initResult.capabilities !== "object" ||
+          Array.isArray(initResult.capabilities) ||
+          !initResult.serverInfo ||
+          typeof initResult.serverInfo !== "object" ||
+          Array.isArray(initResult.serverInfo) ||
+          typeof initResult.serverInfo.name !== "string" ||
+          initResult.serverInfo.name.length === 0
+        ) {
+          throw fail(
+            `downstream server "${serverConfig.name}" returned a malformed initialize result: ` +
+              `"protocolVersion" (non-empty string), "capabilities" (object) and "serverInfo.name" ` +
+              `(non-empty string) are all required by the MCP initialize handshake.`,
+            "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"
+          );
+        }
+        serverInfos[serverConfig.name] = initResult.serverInfo;
         /* Codex PR #29 review round 5 "await HTTP initialized delivery before listing
          * tools": notify() now returns a Promise that resolves once this notification
          * has actually settled (see its own header comment in connectHttp) -- awaited
@@ -825,4 +892,5 @@ module.exports = {
   MAX_HTTP_RESPONSE_BYTES,
   MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES,
   nextResidualLineBytes,
+  buildStdioChildEnv,
 }
