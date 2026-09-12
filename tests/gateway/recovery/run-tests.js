@@ -467,6 +467,81 @@ function recoverDeletesEmptyOrFullyTornWalWithoutFlagging() {
   check("recover-deletes-the-unusable-wal", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present");
 }
 
+/* Cluster A (generation-aware crash recovery): the intent file's `generation` is
+ * overwritten IN PLACE on every supersede -- by the time recovery runs it always
+ * reflects the MOST RECENT generation, not necessarily the one a specific crashed
+ * CALL_START event belongs to. Reproduces the exact gap this closes: generation 1
+ * completes for real but its own CALL_RESULT WAL write never lands (proxy.js's
+ * documented best-effort append -- a real ENOSPC, not a crash), then the SAME
+ * connection later dispatches and cleanly completes generation 2 of the identical
+ * (tool, arguments), whose CALL_RESULT WAL write DOES land. A subsequent real crash
+ * leaves generation 1's own CALL_START forever unresolved in the WAL while the intent
+ * file now sits at generation 2. Before this fix, recoverCrashedSessions would have
+ * bound generation 2's cached_result (a DIFFERENT call's real outcome) to generation 1's
+ * pending call -- a false attestation. */
+function recoverDoesNotBindALaterGenerationsResultToAnEarlierCrashedGenerationsCall() {
+  const dir = freshDir("recover-generation-mismatch");
+  const keys = makeKeys();
+  const connectionId = "conn-gen-mismatch";
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [{ name: "echo", server: "srv", schema: {} }] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  // Generation 1: dispatched, completes for real, but its CALL_RESULT WAL line never lands.
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "echo", server: "srv", arguments: { a: 1 }, ts: 10, generation: 1 });
+  const intentKey = recovery.computeIntentKey(connectionId, "echo", { a: 1 });
+  recovery.createIntentIfAbsent(dir, intentKey, { connection_id: connectionId, tool: "echo", arguments: { a: 1 }, state: "dispatched", dispatched_at: 9, generation: 1 });
+  recovery.updateIntent(dir, intentKey, { state: "completed", completed_at: 11, cached_result: { from: "generation-1" }, generation: 1 });
+  // Generation 2 (same connection, same tool+arguments, no caller idempotency key --
+  // proxy.js's supersede path): dispatched, ALSO completes for real, and this time its
+  // CALL_RESULT WAL line DOES land.
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 2, tool: "echo", server: "srv", arguments: { a: 1 }, ts: 20, generation: 2 });
+  recovery.updateIntent(dir, intentKey, { state: "dispatched", dispatched_at: 19, generation: 2, cached_result: undefined, completed_at: undefined });
+  recovery.updateIntent(dir, intentKey, { state: "completed", completed_at: 21, cached_result: { from: "generation-2" }, generation: 2 });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 2, result: { from: "generation-2" }, isError: false, ts: 21, generation: 2 });
+
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check(
+    "recover-does-not-auto-seal-a-generation-mismatched-crashed-call",
+    pendingOperatorReview.includes(connectionId),
+    JSON.stringify(pendingOperatorReview)
+  );
+  check("recover-leaves-the-wal-in-place-for-a-generation-mismatch", recovery.readWalEvents(dir, connectionId).length > 0, "WAL was deleted despite an unresolved generation-1 call");
+  check("recover-does-not-seal-a-chain-entry-for-a-generation-mismatch", chain.readHead(dir) === null, "a chain entry was appended despite generation 1's own outcome being unproven");
+}
+
+/* Cluster B (session-identity distinctness in the audit trail): replaying the identical
+ * crash-left WAL -- including its own persisted session_id, exactly as proxy.js's real
+ * openConnection writes it -- in two completely independent recovery runs must produce
+ * the identical bundle_id both times (replay reuses the persisted session_id; it never
+ * mints a fresh one -- see session.js#createSession's own doc comment). */
+function walReplayedTwiceInIndependentStateDirsProducesIdenticalBundleId() {
+  const keys = makeKeys();
+  const connectionId = "conn-replay-twice";
+  function buildAndRecover() {
+    const dir = freshDir("replay-twice");
+    recovery.appendWalEvent(dir, connectionId, {
+      type: "SESSION_START",
+      started_at: 1,
+      goal: null,
+      session_id: "fixed-session-id-for-replay-determinism-test",
+      tools: [{ name: "echo", server: "srv", schema: {} }],
+    });
+    recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+    recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "echo", server: "srv", arguments: { a: 1 }, ts: 10, generation: 1 });
+    const intentKey = recovery.computeIntentKey(connectionId, "echo", { a: 1 });
+    recovery.createIntentIfAbsent(dir, intentKey, { connection_id: connectionId, tool: "echo", arguments: { a: 1 }, state: "dispatched", dispatched_at: 9, generation: 1 });
+    recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11, generation: 1 });
+    recoverCrashedSessions(dir, keys, silentLog);
+    return chain.readHead(dir);
+  }
+  const headA = buildAndRecover();
+  const headB = buildAndRecover();
+  check(
+    "wal-replayed-twice-in-independent-envs-produces-identical-bundle-id",
+    Boolean(headA && headB && typeof headA.bundle_id === "string" && headA.bundle_id === headB.bundle_id),
+    JSON.stringify({ headA, headB })
+  );
+}
+
 // ---------------------------------------------------------------------------
 // PR #33 round-2 fixes: path-safety, bundle-collision content verification,
 // per-connection isolation, not_executed replay, and anomaly-WAL replay.
@@ -1074,6 +1149,8 @@ function main() {
   recoverLeavesUnprovenInFlightCallForOperatorReview();
   recoverIsIdempotentAcrossACrashDuringRecoveryItself();
   recoverDeletesEmptyOrFullyTornWalWithoutFlagging();
+  recoverDoesNotBindALaterGenerationsResultToAnEarlierCrashedGenerationsCall();
+  walReplayedTwiceInIndependentStateDirsProducesIdenticalBundleId();
 
   abandonConnectionSealsAndReleasesTheFenceForAnUnprovenCall();
   abandonConnectionOnAlreadyCleanConnectionIsANoOp();
