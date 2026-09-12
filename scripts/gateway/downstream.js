@@ -461,8 +461,25 @@ function connectHttp(endpoint, options = {}) {
               return;
             }
             reachable = true; // a well-formed response (success or RPC error) proves the endpoint IS reachable
-            if (parsed.error) {
-              settleReject(Object.assign(fail(parsed.error.message || "downstream error", "GATEWAY_DOWNSTREAM_RPC_ERROR"), { rpcError: parsed.error }));
+            /* Codex PR #29 review round 4 "branch on HTTP error-property presence": this
+             * previously branched on parsed.error's truthiness, so an envelope shaped like
+             * {"jsonrpc":"2.0","id":1,"error":null} -- which passes the exactly-one-of
+             * hasResult/hasError check above via hasError, since "error" is present as an
+             * own property even though its value is falsy -- fell through to the success
+             * branch and resolved parsed.result (undefined) as though the call had
+             * genuinely succeeded. Branch on the hasError presence flag instead, matching
+             * connectStdio's own fix for the identical shape just above in this file. */
+            if (hasError) {
+              const errObj = parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error) ? parsed.error : null;
+              if (!errObj) {
+                // hasError is a presence check, not a shape check: {"error":null} and
+                // {"error":"oops"} both satisfy it. Fail closed rather than crash on
+                // parsed.error.message (null/string has no .message) or silently attest
+                // a non-error value as this call's genuine failure detail.
+                settleReject(fail(`downstream HTTP response's "error" field for request id ${id} was present but not a JSON-RPC error object`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
+                return;
+              }
+              settleReject(Object.assign(fail(errObj.message || "downstream error", "GATEWAY_DOWNSTREAM_RPC_ERROR"), { rpcError: errObj }));
             } else {
               settleResolve(parsed.result);
             }
