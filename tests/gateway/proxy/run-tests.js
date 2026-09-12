@@ -478,6 +478,67 @@ async function persistenceFailureQuarantinesSealedBundle() {
   }
 }
 
+/* Cluster C: onClaimLost (gateway.js) only calls proxy.stopAcceptingNewSessions() --
+ * an already-open session is deliberately left alone to finish and finalize (SS7). This
+ * covers the narrower fix: closeConnection must re-check isWriterClaimValid()
+ * synchronously immediately before chain.appendSession, and refuse to append (quarantine
+ * instead) if the claim is no longer valid at THAT moment -- not just at the moment
+ * claim-loss was first detected. */
+async function writerClaimRevalidatedImmediatelyBeforeAppend() {
+  const dir = freshDir("writer-claim-append");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const sealFailures = [];
+  let claimValid = true;
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    onSealFailure: (s, error) => sealFailures.push(error),
+    isWriterClaimValid: () => claimValid,
+  });
+
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  // Simulate the claim being lost/stolen by a replacement writer AFTER this session
+  // opened (and even after it ran its call) but before it happens to finalize --
+  // exactly the window onClaimLost's own "in-flight sessions are left alone" comment
+  // describes.
+  claimValid = false;
+  const entry = await proxy.closeConnection("conn-1", "test cleanup");
+  check("append-refused-when-writer-claim-invalid-at-close-time", entry === null, JSON.stringify(entry));
+  check(
+    "refused-append-invokes-onSealFailure-with-claim-lost-code",
+    sealFailures.length === 1 && sealFailures[0].code === "GATEWAY_WRITER_CLAIM_LOST_AT_APPEND",
+    JSON.stringify(sealFailures.map((e) => e && e.code))
+  );
+  const quarantinedTo = sealFailures[0] && sealFailures[0].quarantinedTo;
+  check("claim-lost-append-quarantines-sealed-bundle-for-recovery", typeof quarantinedTo === "string" && fs.existsSync(quarantinedTo), String(quarantinedTo));
+  check("no-chain-entry-was-actually-written", chain.readHead(dir) === null, JSON.stringify(chain.readHead(dir)));
+
+  // A session opened AFTER the claim is valid again finalizes normally -- this is a
+  // per-append check, not a permanent proxy-wide latch.
+  claimValid = true;
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "y", version: "1" } } });
+  const entry2 = await proxy.closeConnection("conn-2", "test cleanup");
+  check("append-succeeds-once-writer-claim-is-valid-again", Boolean(entry2 && typeof entry2.bundle_id === "string"), JSON.stringify(entry2));
+}
+
+/* Default behavior (no isWriterClaimValid passed, e.g. every other test in this suite,
+ * and any production caller that hasn't wired a writer-claim at all): appends must not
+ * be refused. Mirrors onSessionFinalized/onSealFailure's own default-no-op contract. */
+async function writerClaimCheckDefaultsToValidWhenNotProvided() {
+  const dir = freshDir("writer-claim-default");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners); // no isWriterClaimValid
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  const entry = await proxy.closeConnection("conn-1", "test cleanup");
+  check("append-not-refused-when-no-writer-claim-check-configured", Boolean(entry && typeof entry.bundle_id === "string"), JSON.stringify(entry));
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -495,6 +556,8 @@ async function main() {
   await toolsListForwardsFullDescriptor();
   await nullJsonRpcIdDoesNotCrash();
   await persistenceFailureQuarantinesSealedBundle();
+  await writerClaimRevalidatedImmediatelyBeforeAppend();
+  await writerClaimCheckDefaultsToValidWhenNotProvided();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
