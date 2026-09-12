@@ -169,6 +169,38 @@ function resolveSecretRefUnresolved() {
   check("resolve-secret-ref-unresolved-throws", threw && threw.code === "GATEWAY_SECRET_REF_UNRESOLVED", threw && threw.code);
 }
 
+/** CodeRabbit PR #29 review round 4 "trim and reject whitespace-only environment
+ * variables": a whitespace-only env var value must be treated the same as an unset one --
+ * previously it passed the emptiness check untrimmed, then failed much later and less
+ * clearly (a whitespace-only signing key inside crypto.createPrivateKey(), or a
+ * whitespace bearer token that can never authenticate). */
+function resolveSecretRefWhitespaceOnlyRejected() {
+  process.env.GS_TEST_WHITESPACE_SECRET = "   \t  ";
+  let threw = null;
+  try {
+    gatewayConfig.resolveSecretRef("GS_TEST_WHITESPACE_SECRET", "signing_key_ref");
+  } catch (error) {
+    threw = error;
+  } finally {
+    delete process.env.GS_TEST_WHITESPACE_SECRET;
+  }
+  check("resolve-secret-ref-whitespace-only-env-rejected", threw && threw.code === "GATEWAY_SECRET_REF_UNRESOLVED", threw && threw.code);
+}
+
+/** Sanity companion to the above: a value that is non-empty AFTER trimming must still
+ * resolve normally (surrounding whitespace stripped), matching the file-secret branch's
+ * existing trim behavior. */
+function resolveSecretRefTrimsSurroundingWhitespace() {
+  process.env.GS_TEST_PADDED_SECRET = "  padded-secret-value  ";
+  let value;
+  try {
+    value = gatewayConfig.resolveSecretRef("GS_TEST_PADDED_SECRET", "signing_key_ref");
+  } finally {
+    delete process.env.GS_TEST_PADDED_SECRET;
+  }
+  check("resolve-secret-ref-trims-surrounding-whitespace", value === "padded-secret-value", JSON.stringify(value));
+}
+
 function main() {
   validConfigLoads();
   missingRequiredField();
@@ -186,6 +218,8 @@ function main() {
   resolveSecretRefFromEnv();
   resolveSecretRefFromFile();
   resolveSecretRefUnresolved();
+  resolveSecretRefWhitespaceOnlyRejected();
+  resolveSecretRefTrimsSurroundingWhitespace();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
