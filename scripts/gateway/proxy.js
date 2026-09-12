@@ -151,8 +151,17 @@ class GatewayProxy {
      * downstream side effect, and come back in a response/correlation record no
      * spec-conforming caller could use. Reject before computing isNotification/dispatch;
      * the offending id is never echoed back since its type is exactly what is invalid. */
-    if (msg.id !== undefined && msg.id !== null && typeof msg.id !== "string" && typeof msg.id !== "number") {
-      return { jsonrpc: "2.0", id: null, error: { code: -32600, message: `Invalid JSON-RPC "id": must be a string, a number, or null (or omitted for a notification).` } };
+    /* CodeRabbit PR #29 review round 7 "reject numeric identifiers outside the
+     * safe-integer range": handleMessage uses a numeric id both as a pendingCalls Map key
+     * and (serialized) as a downstream correlation id -- JS numbers cannot distinguish
+     * some adjacent JSON integers once they exceed Number.MAX_SAFE_INTEGER (or are
+     * non-finite), so two distinct requests could collide on the same correlation key.
+     * The round-6 fix above only ruled out non-string/non-number/non-null types, not an
+     * out-of-safe-range or non-finite number. */
+    const invalidNumericId = typeof msg.id === "number" && (!Number.isFinite(msg.id) || !Number.isSafeInteger(msg.id));
+    const invalidIdType = msg.id !== undefined && msg.id !== null && typeof msg.id !== "string" && typeof msg.id !== "number";
+    if (invalidIdType || invalidNumericId) {
+      return { jsonrpc: "2.0", id: null, error: { code: -32600, message: `Invalid JSON-RPC "id": must be a string, a finite safe-integer number, or null (or omitted for a notification).` } };
     }
     const { method, params, id } = msg;
     const isNotification = id === undefined;

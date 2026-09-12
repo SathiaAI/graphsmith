@@ -564,7 +564,18 @@ function connectHttp(endpoint, options = {}) {
     return new Promise((resolve) => {
       let settled = false;
       const settle = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
-      const timer = setTimeout(settle, DEFAULT_REQUEST_TIMEOUT_MS);
+      /* CodeRabbit PR #29 review round 7 "destroy the request when the notification
+       * deadline fires": settle() only clears the timer and resolves the promise -- it
+       * never touches the in-flight ClientRequest/socket. A downstream that never responds
+       * and never errors previously left this request (and its socket) open past the
+       * deadline this very promise already gave up on, instead of tearing it down the way
+       * call()'s own timeout path does. Mark reachable=false and best-effort destroy the
+       * request before settling, matching call()'s cleanup on its own timeout. */
+      const timer = setTimeout(() => {
+        reachable = false;
+        try { req.destroy(); } catch (error) { /* best effort */ }
+        settle();
+      }, DEFAULT_REQUEST_TIMEOUT_MS);
       if (typeof timer.unref === "function") timer.unref();
       const req = client.request(url, {
         method: "POST",
