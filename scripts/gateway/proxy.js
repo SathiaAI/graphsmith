@@ -99,6 +99,13 @@ class GatewayProxy {
    * @param {(session: object, error: Error) => void} [opts.onSealFailure] SS7: sealBoundaryBundle throws
    * @param {string} opts.stateDir passed straight to chain.appendSession (SG-FR-5)
    * @param {() => number} [opts.now]
+   * @param {() => boolean} [opts.isWriterClaimValid] Cluster C narrow fix: a synchronous,
+   *   read-fresh-from-disk liveness check (e.g. `() => writerClaim.status().held_by_this_instance`)
+   *   consulted immediately before chain.appendSession in closeConnection -- see that method's
+   *   own comment for why this is checked THERE rather than by halting every in-flight session
+   *   the moment onClaimLost first fires. Defaults to always-valid so existing callers/tests that
+   *   construct a GatewayProxy directly (no writer-claim of their own) are unaffected, mirroring
+   *   onSessionFinalized/onSealFailure's own default-no-op contract above.
    */
   constructor(opts) {
     this.connections = opts.connections;
@@ -110,6 +117,7 @@ class GatewayProxy {
     this.onSealFailure = opts.onSealFailure || (() => {});
     this.stateDir = opts.stateDir;
     this.now = opts.now || (() => Date.now());
+    this.isWriterClaimValid = typeof opts.isWriterClaimValid === "function" ? opts.isWriterClaimValid : () => true;
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
     this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
@@ -445,8 +453,9 @@ class GatewayProxy {
    * Any pending calls are first marked disconnected (SS7: "any of that connection's
    * in-flight calls that never get a response must be recorded ... never silently
    * dropped") -- covers both a genuine downstream disconnect and an agent that hangs up
-   * mid-call. Returns the appended chain entry, or null if sealing/persistence failed
-   * (already reported via onSealFailure). */
+   * mid-call. Returns the appended chain entry, or null if sealing/persistence failed, or
+   * if this instance's writer-claim was no longer valid at append time (Cluster C -- see
+   * the isWriterClaimValid check below) -- all three already reported via onSealFailure. */
   async closeConnection(connectionId, reason) {
     const s = this.sessions.get(connectionId);
     if (!s) return null;
@@ -468,6 +477,38 @@ class GatewayProxy {
       this.onSealFailure(s, error);
       return null;
     }
+    /* Cluster C narrow fix (board decision): onClaimLost (gateway.js) only calls
+     * proxy.stopAcceptingNewSessions() -- it deliberately does NOT force-close sessions
+     * already open at the moment claim loss is detected (SS7: "in-flight sessions ...
+     * should still attempt to finalize and persist"). But this integrity-critical write
+     * is exactly the point where the single-writer invariant chain.appendSession depends
+     * on can actually be violated: if a REPLACEMENT writer has since acquired this state
+     * directory (this instance's claim record was stolen/expired) and is itself
+     * appending, this session's append would interleave with the new writer's and
+     * corrupt the shared chain. Re-validate the claim synchronously, right here, right
+     * before the write that matters -- not eagerly at claim-loss-detection time (that
+     * would abandon every in-flight session's work the instant a heartbeat renewal
+     * failed, which is the broader behavior SS7 explicitly did not ask for) and not by
+     * trusting a value cached earlier (isWriterClaimValid reads fresh from disk -- see
+     * WriterClaim#status's own doc comment -- so a claim lost between this session
+     * opening and finalizing now is still caught). A stale/lost claim is treated exactly
+     * like a persistence failure below: quarantine the already-sealed bundle so an
+     * operator or the next writer can inspect/replay it, report via onSealFailure, and
+     * return null -- never append. */
+    if (!this.isWriterClaimValid()) {
+      const error = fail(
+        `Refusing to append session ${connectionId} to the gateway-session chain: this ` +
+          "instance's writer-claim is no longer valid (lost or superseded between this " +
+          "session opening and its finalization). Appending now would risk two writers " +
+          "interleaving chain entries, corrupting the single-writer hash-chain invariant -- " +
+          "quarantining the sealed bundle instead of appending it.",
+        "GATEWAY_WRITER_CLAIM_LOST_AT_APPEND"
+      );
+      error.quarantinedTo = quarantineSealedBundle(this.stateDir, connectionId, sealed, error);
+      this.onSealFailure(s, error);
+      return null;
+    }
+
     /* CodeRabbit PR #29 review "chain.appendSession is not guarded, so a persistence
      * failure aborts shutdown and leaks the writer-claim": the doc comment above this
      * method says closeConnection returns null "if sealing/persistence failed", but only
