@@ -13,6 +13,8 @@
  */
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const session = require("./session.js");
 const chain = require("./chain.js");
 const recovery = require("./recovery.js");
@@ -21,6 +23,32 @@ function fail(message, code = "GATEWAY_PROXY_ERROR") {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+/* Codex PR #29 review round 3 "retain sessions when persistence fails": chain.
+ * appendSession can throw on a transient or environmental failure (ENOSPC, EACCES, a
+ * one-off filesystem error) well after session.finalizeSession has already produced the
+ * fully sealed, signed bundle -- until now, that already-computed `sealed` object was
+ * discarded the moment closeConnection's catch block returned null, leaving nothing but
+ * onSealFailure's own summary log (call count, pending count) to show a session ever
+ * existed. This does not change closeConnection's documented null-on-failure contract or
+ * decide retry/halt policy (a genuine architecture question, given every append also
+ * upholds the sole-writer chain-sequencing invariant) -- it only keeps the one thing that
+ * was about to be lost forever: a best-effort, non-throwing write of the sealed bundle to
+ * a quarantine directory an operator can inspect and manually re-append once the
+ * underlying failure (e.g. disk full) is resolved. */
+function quarantineSealedBundle(stateDir, connectionId, sealed, cause) {
+  try {
+    const dir = path.join(chain.sessionsDir(stateDir), "quarantine");
+    fs.mkdirSync(dir, { recursive: true });
+    const target = path.join(dir, `${connectionId}-${Date.now()}.json`);
+    fs.writeFileSync(target, JSON.stringify({ sealed, quarantined_at: new Date().toISOString(), reason: cause && cause.message }, null, 2), { encoding: "utf8", flag: "wx" });
+    return target;
+  } catch (quarantineError) {
+    // Best effort only: a quarantine-write failure (e.g. the same ENOSPC that caused the
+    // original append failure) must never mask or replace the original error/callback.
+    return null;
+  }
 }
 
 /* MCP sampling requests are how a downstream server asks the AGENT'S model to do
@@ -38,6 +66,28 @@ function isModelCallMethod(method) {
  * apart independently. */
 const GATEWAY_PROTOCOL_VERSION = "2025-06-18";
 
+/* Codex PR #29 review round 5 "cap in-flight calls per agent session": without a bound,
+ * one authenticated client (stdio, or one HTTP session) could open arbitrarily many
+ * concurrent tools/call or sampling requests -- each retaining session state, a
+ * downstream pending entry, and a timer -- without ever waiting for a response. The
+ * active-session cap (MAX_HTTP_SESSIONS in agent-transport.js) bounds how many SESSIONS
+ * exist; it does nothing to bound growth WITHIN one session. Same "fixed,
+ * non-speculative default" discipline as that constant and MAX_TOOLS_LIST_PAGES/
+ * MAX_HTTP_RESPONSE_BYTES/MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES in downstream.js -- make it
+ * configurable once a real deployment needs a different number, not before. */
+const MAX_PENDING_CALLS_PER_SESSION = 1000;
+
+/* Codex PR #29 review "bound completed call history retained by each session":
+ * MAX_PENDING_CALLS_PER_SESSION above bounds only calls genuinely IN FLIGHT at once --
+ * once a call resolves, session.recordCallResult moves it out of pendingCalls and into
+ * session.calls (SS3.3's execution_trace), which has no cap at all. A connection with no
+ * enforced lifetime (stdio) or one that keeps resetting its own idle timer (an active
+ * HTTP client issuing calls sequentially, never exceeding the pending cap) can therefore
+ * grow session.calls -- full arguments and result retained per entry -- without bound
+ * until this process exhausts memory, entirely bypassing the pending-call admission
+ * check above. Same "fixed, non-speculative default" discipline as that constant. */
+const MAX_COMPLETED_CALLS_PER_SESSION = 100000;
+
 class GatewayProxy {
   /**
    * @param {object} opts
@@ -52,6 +102,13 @@ class GatewayProxy {
    * @param {() => number} [opts.now]
    * @param {string[]} [opts.pendingOperatorReviewConnections] connectionIds startup
    *   recovery flagged for operator review (E2 tool-level quarantine, see constructor body)
+   * @param {() => boolean} [opts.isWriterClaimValid] Cluster C narrow fix: a synchronous,
+   *   read-fresh-from-disk liveness check (e.g. `() => writerClaim.status().held_by_this_instance`)
+   *   consulted immediately before chain.appendSession in closeConnection -- see that method's
+   *   own comment for why this is checked THERE rather than by halting every in-flight session
+   *   the moment onClaimLost first fires. Defaults to always-valid so existing callers/tests that
+   *   construct a GatewayProxy directly (no writer-claim of their own) are unaffected, mirroring
+   *   onSessionFinalized/onSealFailure's own default-no-op contract above.
    */
   constructor(opts) {
     this.connections = opts.connections;
@@ -63,6 +120,7 @@ class GatewayProxy {
     this.onSealFailure = opts.onSealFailure || (() => {});
     this.stateDir = opts.stateDir;
     this.now = opts.now || (() => Date.now());
+    this.isWriterClaimValid = typeof opts.isWriterClaimValid === "function" ? opts.isWriterClaimValid : () => true;
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
     this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
@@ -137,24 +195,40 @@ class GatewayProxy {
     if (!msg || typeof msg !== "object" || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
       return { jsonrpc: "2.0", id: msg && typeof msg === "object" && !Array.isArray(msg) ? msg.id : null, error: { code: -32600, message: "Malformed JSON-RPC 2.0 request envelope." } };
     }
+    /* Codex PR #29 review round 6 "reject invalid JSON-RPC identifier types": JSON-RPC
+     * 2.0 restricts "id" to a string, a number, or null (a request with no "id" at all is
+     * a notification, handled via isNotification below) -- this check previously accepted
+     * any other type (boolean, object, array) since it only ever compared id to
+     * `undefined`. For "tools/call" that let a malformed id reach dispatch, execute a real
+     * downstream side effect, and come back in a response/correlation record no
+     * spec-conforming caller could use. Reject before computing isNotification/dispatch;
+     * the offending id is never echoed back since its type is exactly what is invalid. */
+    /* CodeRabbit PR #29 review round 7 "reject numeric identifiers outside the
+     * safe-integer range": handleMessage uses a numeric id both as a pendingCalls Map key
+     * and (serialized) as a downstream correlation id -- JS numbers cannot distinguish
+     * some adjacent JSON integers once they exceed Number.MAX_SAFE_INTEGER (or are
+     * non-finite), so two distinct requests could collide on the same correlation key.
+     * The round-6 fix above only ruled out non-string/non-number/non-null types, not an
+     * out-of-safe-range or non-finite number. */
+    const invalidNumericId = typeof msg.id === "number" && (!Number.isFinite(msg.id) || !Number.isSafeInteger(msg.id));
+    const invalidIdType = msg.id !== undefined && msg.id !== null && typeof msg.id !== "string" && typeof msg.id !== "number";
+    if (invalidIdType || invalidNumericId) {
+      return { jsonrpc: "2.0", id: null, error: { code: -32600, message: `Invalid JSON-RPC "id": must be a string, a finite safe-integer number, or null (or omitted for a notification).` } };
+    }
     const { method, params, id } = msg;
     const isNotification = id === undefined;
 
-    /* SS3.7/SS7: once the writer-claim is lost, stop admitting NEW work on every
-     * connection, not just new connections (openConnection already refuses those) --
-     * otherwise an already-open agent connection could keep issuing calls indefinitely
-     * after a replacement writer has acquired the state directory, risking concurrent
-     * chain-append corruption. A call already in flight (already past this point in an
-     * earlier handleMessage invocation, already awaiting its downstream response) is
-     * unaffected and is allowed to drain normally -- only messages that arrive AFTER the
-     * flag flips are refused. */
-    if (!this.acceptingNewSessions) {
-      if (isNotification) return null;
-      return { jsonrpc: "2.0", id, error: { code: -32000, message: "Gateway is draining (writer-claim lost or shutting down): not accepting new requests on this connection." } };
-    }
-
     if (method === "notifications/cancelled") {
-      /* SS3.3: downstream calls run under a gateway-internal id, not the agent's own
+      /* Codex PR #29 review round 5 "continue processing cancellations while draining":
+       * this must run BEFORE the acceptingNewSessions gate below, not after -- a
+       * cancellation notification for an already-in-flight call is not "new work" the
+       * drain is refusing to admit, it is how an agent asks the gateway to stop existing
+       * work SOONER. Gating it behind acceptingNewSessions silently dropped every
+       * cancellation once shutdown began, so an agent's cancel request during drain could
+       * never reach conn.cancel() and the gateway would wait out the full drain deadline
+       * even though the agent had already asked to stop the call.
+       *
+       * SS3.3: downstream calls run under a gateway-internal id, not the agent's own
        * JSON-RPC id, so a bare pass-through of the cancellation payload would target the
        * wrong id on the downstream leg (or no id at all, for a downstream that happens to
        * reuse numbering). Translate via the mapping recorded when the call started. */
@@ -168,6 +242,20 @@ class GatewayProxy {
         }
       }
       return null;
+    }
+
+    /* SS3.7/SS7: once the writer-claim is lost, stop admitting NEW work on every
+     * connection, not just new connections (openConnection already refuses those) --
+     * otherwise an already-open agent connection could keep issuing calls indefinitely
+     * after a replacement writer has acquired the state directory, risking concurrent
+     * chain-append corruption. A call already in flight (already past this point in an
+     * earlier handleMessage invocation, already awaiting its downstream response) is
+     * unaffected and is allowed to drain normally -- only messages that arrive AFTER the
+     * flag flips are refused. notifications/cancelled is exempted above: it never admits
+     * new work, only stops existing work sooner. */
+    if (!this.acceptingNewSessions) {
+      if (isNotification) return null;
+      return { jsonrpc: "2.0", id, error: { code: -32000, message: "Gateway is draining (writer-claim lost or shutting down): not accepting new requests on this connection." } };
     }
 
     if (method === "initialize") {
@@ -262,6 +350,27 @@ class GatewayProxy {
       const serverName = method === "tools/call" ? this.toolOwners.get(toolName) : (params && params.server);
       if (method === "tools/call" && !serverName) {
         const error = { code: -32602, message: `Unknown tool "${String(toolName)}" -- not present in this gateway's granted tool surface.` };
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error };
+      }
+      /* Codex PR #29 review round 5 "cap in-flight calls per agent session": refuse
+       * admitting another concurrent call once this session already has
+       * MAX_PENDING_CALLS_PER_SESSION genuinely pending, rather than let one session's
+       * own pending-call bookkeeping (and the downstream timers/sockets each entry
+       * retains) grow without bound. */
+      if (s.pendingCalls.size >= MAX_PENDING_CALLS_PER_SESSION) {
+        const error = { code: -32000, message: `This session already has ${MAX_PENDING_CALLS_PER_SESSION} call(s) pending -- refusing to admit another concurrent call until at least one resolves.` };
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error };
+      }
+      /* Codex PR #29 review "bound completed call history retained by each session": a
+       * client issuing calls one at a time (never tripping the pending-call cap above)
+       * can still grow this session's completed-call history without bound over the
+       * connection's lifetime. Refuse admission the same way the pending-call cap does --
+       * the client must end this session and start a new one -- rather than let one
+       * long-lived connection's retained history grow unbounded. */
+      if (s.calls.length >= MAX_COMPLETED_CALLS_PER_SESSION) {
+        const error = { code: -32000, message: `This session has already completed ${MAX_COMPLETED_CALLS_PER_SESSION} call(s) -- refusing to admit another call on this connection; start a new session.` };
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error };
       }
@@ -710,6 +819,25 @@ class GatewayProxy {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method: "${method}".` } };
   }
 
+  /** Codex PR #29 review round 4 "log calls finalized as disconnected": every OTHER path
+   * that finishes a call (GatewayProxy#handleMessage's own completion above) emits a
+   * structured "gateway_call_completed" log line for it; a call finalized instead via
+   * session.markPendingAsDisconnected got no such line from anywhere -- handleMessage
+   * can't log it later because the pending entry is already gone by the time its own
+   * response (if any) arrives. Shared by both call sites below so the log shape stays
+   * identical to handleMessage's own. */
+  logDisconnectedCall(connectionId, call, at) {
+    this.log(JSON.stringify({
+      event: "gateway_call_completed",
+      connection_id: connectionId,
+      step: call.seq,
+      tool: call.tool,
+      server: call.server,
+      status: "disconnected",
+      duration_ms: at - call.ts,
+    }));
+  }
+
   /** Called when a downstream connection drops mid-session (SS7): marks only the pending
    * calls actually routed to `reasonServerName` as disconnected, across every open
    * session. A pending call to a DIFFERENT, still-healthy downstream is left alone -- if
@@ -717,7 +845,13 @@ class GatewayProxy {
    * "disconnected" error borrowed from an unrelated server's failure. */
   handleDownstreamDisconnect(reasonServerName) {
     for (const s of this.sessions.values()) {
-      session.markPendingAsDisconnected(s, `downstream server "${reasonServerName}" disconnected`, this.now, reasonServerName);
+      session.markPendingAsDisconnected(
+        s,
+        `downstream server "${reasonServerName}" disconnected`,
+        this.now,
+        reasonServerName,
+        (call, at) => this.logDisconnectedCall(s.connectionId, call, at)
+      );
     }
   }
 
@@ -725,12 +859,21 @@ class GatewayProxy {
    * Any pending calls are first marked disconnected (SS7: "any of that connection's
    * in-flight calls that never get a response must be recorded ... never silently
    * dropped") -- covers both a genuine downstream disconnect and an agent that hangs up
-   * mid-call. Returns the appended chain entry, or null if sealing/persistence failed
-   * (already reported via onSealFailure). */
+   * mid-call. Returns the appended chain entry, or null if sealing/persistence failed, or
+   * if this instance's writer-claim was no longer valid at append time (Cluster C -- see
+   * the isWriterClaimValid check below) -- all three already reported via onSealFailure. */
   async closeConnection(connectionId, reason) {
     const s = this.sessions.get(connectionId);
     if (!s) return null;
-    if (s.pendingCalls.size > 0) session.markPendingAsDisconnected(s, reason || "connection closed with calls still pending", this.now);
+    if (s.pendingCalls.size > 0) {
+      session.markPendingAsDisconnected(
+        s,
+        reason || "connection closed with calls still pending",
+        this.now,
+        undefined,
+        (call, at) => this.logDisconnectedCall(connectionId, call, at)
+      );
+    }
     /* Codex PR #29 Finding 2 (Option C): a "dispatched" intent whose owning connection
      * is closing (agent hung up, or the connection is being force-closed) is exactly
      * Finding 2's ambiguous case -- the downstream may still complete the side effect
@@ -756,6 +899,38 @@ class GatewayProxy {
       this.onSealFailure(s, error);
       return null;
     }
+    /* Cluster C narrow fix (board decision): onClaimLost (gateway.js) only calls
+     * proxy.stopAcceptingNewSessions() -- it deliberately does NOT force-close sessions
+     * already open at the moment claim loss is detected (SS7: "in-flight sessions ...
+     * should still attempt to finalize and persist"). But this integrity-critical write
+     * is exactly the point where the single-writer invariant chain.appendSession depends
+     * on can actually be violated: if a REPLACEMENT writer has since acquired this state
+     * directory (this instance's claim record was stolen/expired) and is itself
+     * appending, this session's append would interleave with the new writer's and
+     * corrupt the shared chain. Re-validate the claim synchronously, right here, right
+     * before the write that matters -- not eagerly at claim-loss-detection time (that
+     * would abandon every in-flight session's work the instant a heartbeat renewal
+     * failed, which is the broader behavior SS7 explicitly did not ask for) and not by
+     * trusting a value cached earlier (isWriterClaimValid reads fresh from disk -- see
+     * WriterClaim#status's own doc comment -- so a claim lost between this session
+     * opening and finalizing now is still caught). A stale/lost claim is treated exactly
+     * like a persistence failure below: quarantine the already-sealed bundle so an
+     * operator or the next writer can inspect/replay it, report via onSealFailure, and
+     * return null -- never append. */
+    if (!this.isWriterClaimValid()) {
+      const error = fail(
+        `Refusing to append session ${connectionId} to the gateway-session chain: this ` +
+          "instance's writer-claim is no longer valid (lost or superseded between this " +
+          "session opening and its finalization). Appending now would risk two writers " +
+          "interleaving chain entries, corrupting the single-writer hash-chain invariant -- " +
+          "quarantining the sealed bundle instead of appending it.",
+        "GATEWAY_WRITER_CLAIM_LOST_AT_APPEND"
+      );
+      error.quarantinedTo = quarantineSealedBundle(this.stateDir, connectionId, sealed, error);
+      this.onSealFailure(s, error);
+      return null;
+    }
+
     /* CodeRabbit PR #29 review "chain.appendSession is not guarded, so a persistence
      * failure aborts shutdown and leaks the writer-claim": the doc comment above this
      * method says closeConnection returns null "if sealing/persistence failed", but only
@@ -772,6 +947,7 @@ class GatewayProxy {
     try {
       entry = chain.appendSession(this.stateDir, sealed);
     } catch (error) {
+      error.quarantinedTo = quarantineSealedBundle(this.stateDir, connectionId, sealed, error);
       this.onSealFailure(s, error);
       return null;
     }
@@ -798,4 +974,4 @@ class GatewayProxy {
   }
 }
 
-module.exports = { GatewayProxy, isModelCallMethod };
+module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION };
