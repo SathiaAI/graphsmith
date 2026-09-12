@@ -153,6 +153,26 @@ function fsyncDir(dir) {
   }
 }
 
+/* Codex PR #33 review "complete WAL writes before treating them as durable": fs.writeSync
+ * is permitted by Node's own docs to write FEWER bytes than requested in one call (short
+ * write) -- this previously trusted a single call to have written the whole line before
+ * fsyncSync'ing it. A short write here is silently invisible to the caller (appendWalEvent
+ * has already returned success to a dispatch decision), but readWalEvents' own "stop at
+ * the first malformed line" replay logic (see its header) treats the truncated line as a
+ * torn crash-tail and discards it AND every real, complete event appended after it. Loops
+ * until every byte of the encoded line has actually been written, on the same fd, before
+ * the fsync that is supposed to make it durable. */
+function writeFullySync(fd, buffer) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = fs.writeSync(fd, buffer, offset, buffer.length - offset);
+    if (!(written > 0)) {
+      throw fail(`fs.writeSync made no progress (wrote ${written} of ${buffer.length - offset} remaining byte(s)) -- refusing to fsync a possibly-incomplete record.`, "GATEWAY_RECOVERY_SHORT_WRITE");
+    }
+    offset += written;
+  }
+}
+
 /* Mirrors chain.js's own appendDurableLine, which is not exported from that module --
  * this codebase's own established convention (see config.js's header on why a second,
  * small hand-rolled helper scoped to its own file is preferred over reaching into
@@ -161,7 +181,7 @@ function fsyncDir(dir) {
 function appendDurableLine(filePath, line) {
   const fd = fs.openSync(filePath, "a");
   try {
-    fs.writeSync(fd, `${line}\n`);
+    writeFullySync(fd, Buffer.from(`${line}\n`, "utf8"));
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -342,6 +362,16 @@ function deleteIntent(stateDir, intentKey) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
+  /* Codex PR #33 review "fsync the intent directory after rollback deletion": proxy.js's
+   * CALL_START-failure rollback (handleMessage) calls this to remove a just-created
+   * "dispatched" intent it now knows never actually dispatched, then tells the caller the
+   * retry is safe -- but the unlink's directory-entry removal was never itself fsynced.
+   * A crash/power-loss shortly after can leave the OLD directory entry (and therefore the
+   * stale "dispatched" record) resurrected on the next mount, permanently blocking every
+   * future retry of that same operation until an operator notices and cleans it up by
+   * hand. Same fsyncDir convention as createIntentIfAbsent's own directory-entry fsync
+   * above, applied here for the deletion side too. */
+  fsyncDir(intentsDir(stateDir));
 }
 
 /** Lists every intent belonging to `connectionId` -- used to find ambiguous intents
@@ -394,7 +424,25 @@ function listAllIntents(stateDir) {
  * not "should we allow a retry?" -- those are different questions and conflating them is
  * exactly the mistake this module's stricter (dispatched -> completed | ambiguous, no
  * "failed") state machine is designed to avoid (see option-c-hardened-design.md point 7a). */
+/* Codex PR #33 review "reject resolutions that overwrite terminal intents": both resolve*
+ * functions used to patch unconditionally regardless of the intent's CURRENT state -- a
+ * stale or repeated operator command (e.g. a shell history re-run, or two operators
+ * racing to resolve the same intent) could silently rewrite an already-`completed`
+ * intent's own observed result, or flip it to `not_executed`, discarding the original
+ * evidence recovery already signed into a sealed bundle for another connection's replay.
+ * Only a `dispatched`/`ambiguous` intent may transition; a repeat of the SAME terminal
+ * resolution is a harmless no-op (returns the existing record unchanged, no write), and
+ * any other terminal state is refused outright rather than silently overwritten. */
 function resolveIntentExecuted(stateDir, intentKey, result) {
+  const current = readIntent(stateDir, intentKey);
+  if (!current) throw fail(`Cannot update unknown intent "${intentKey}"`, "GATEWAY_RECOVERY_INTENT_NOT_FOUND");
+  if (current.state === "completed") return current; // identical terminal resolution: no-op
+  if (current.state !== "dispatched" && current.state !== "ambiguous") {
+    throw fail(
+      `Cannot mark intent "${intentKey}" executed: it is already resolved as "${current.state}" -- refusing to overwrite a different terminal resolution with a new one.`,
+      "GATEWAY_RECOVERY_INTENT_TERMINAL"
+    );
+  }
   return updateIntent(stateDir, intentKey, {
     state: "completed",
     resolved_at: Date.now(),
@@ -418,6 +466,15 @@ function resolveIntentExecuted(stateDir, intentKey, result) {
  * clean up the intent itself once the connection is actually sealed -- see
  * gateway.js#recoverCrashedSessions's own handling of this state. */
 function resolveIntentNotExecuted(stateDir, intentKey) {
+  const current = readIntent(stateDir, intentKey);
+  if (!current) throw fail(`Cannot update unknown intent "${intentKey}"`, "GATEWAY_RECOVERY_INTENT_NOT_FOUND");
+  if (current.state === "not_executed") return current; // identical terminal resolution: no-op
+  if (current.state !== "dispatched" && current.state !== "ambiguous") {
+    throw fail(
+      `Cannot mark intent "${intentKey}" not-executed: it is already resolved as "${current.state}" -- refusing to overwrite a different terminal resolution with a new one.`,
+      "GATEWAY_RECOVERY_INTENT_TERMINAL"
+    );
+  }
   return updateIntent(stateDir, intentKey, {
     state: "not_executed",
     resolved_at: Date.now(),
