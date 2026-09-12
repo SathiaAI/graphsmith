@@ -36,6 +36,8 @@ const { writeConfirmedMode } = require("../_fixtures/mode-file.js");
 const { walkGatewaySessions } = require(path.join(ROOT, "checks", "register-gateway-sessions.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
 const { verifyBundle } = require(path.join(ROOT, "scripts", "gsa-verify.js"));
+const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
+const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 
 let failures = 0;
 const results = [];
@@ -545,6 +547,47 @@ async function cleanSigtermDrainsAndExitsZero() {
   check("e2e-sigterm-session-still-finalized-and-persisted", head && head.seq === 1, JSON.stringify(head));
 }
 
+/* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
+ * closeConnection's own recovery.listIntentsForConnection can throw on a genuinely
+ * unreadable/corrupt intent FILE (a real fs-level problem, distinct from the content
+ * issues it already tolerates) -- previously unguarded in gateway.js's shutdown loop, so
+ * that exception escaped doStop() entirely, skipping every remaining step including
+ * writerClaim.release() and leaking a stale claim that blocks the next start. */
+async function sigtermStillReleasesClaimWhenAConnectionsCloseFails() {
+  if (process.platform === "win32") {
+    skip("e2e-sigterm-releases-claim-despite-close-failure", "Windows cannot deliver a real SIGTERM for graceful in-process handling -- same platform limitation as the other SIGTERM test.");
+    return;
+  }
+  const root = freshRoot("sigterm-close-failure");
+  writeConfirmedMode(root, "standalone");
+  const { configPath, stateDir } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const initResp = await gw.nextMessage();
+  check("e2e-close-failure-preinitialize-succeeded", initResp && initResp.id === 0 && initResp.result, JSON.stringify(initResp));
+
+  // Corrupt an intent record on disk -- listIntentsForConnection's own readdirSync scan
+  // reads EVERY intent file regardless of which connection it names, so this breaks the
+  // scan for the live stdio connection's own closeConnection() at shutdown, the same way
+  // a real fs-level I/O error would (a directory where a file is expected reproduces
+  // EISDIR, mirroring this suite's own existing "unreadable WAL" fixtures elsewhere).
+  fs.mkdirSync(recovery.intentsDir(stateDir), { recursive: true });
+  fs.mkdirSync(recovery.intentPath(stateDir, "corrupt-intent"));
+
+  gw.child.kill("SIGTERM");
+  const code = await gw.exitCode();
+  check("e2e-close-failure-still-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
+  check("e2e-close-failure-logged-the-isolated-failure", gw.stderr().includes("SHUTDOWN CLOSE FAILURE"), gw.stderr());
+
+  // Decisive proof the claim was actually released (not merely that the process exited):
+  // a brand-new instance must be able to acquire it immediately, with no stale lease wait.
+  const fresh = new WriterClaim(stateDir, { hostId: "post-shutdown-check" });
+  let acquireError = null;
+  try { fresh.acquire(); fresh.release(); } catch (error) { acquireError = error; }
+  check("e2e-close-failure-writer-claim-still-released", acquireError === null, acquireError && acquireError.message);
+}
+
 async function main() {
   await singleSessionEndToEndVerifies();
   await samplingForwardedToStdioAgent();
@@ -556,6 +599,7 @@ async function main() {
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
+  await sigtermStillReleasesClaimWhenAConnectionsCloseFails();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
