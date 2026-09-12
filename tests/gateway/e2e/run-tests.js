@@ -252,11 +252,16 @@ async function samplingForwardedToStdioAgent() {
    * bundle attested only the outer fixture_sample tool call -- the model invocation
    * itself (and its hashed prompt/result) was silently absent even though the gateway
    * observed and relayed it. Assert it now actually lands in the persisted trace with
-   * model_call:true, not just that the tool call round-tripped in-memory. */
+   * model_call:true, not just that the tool call round-tripped in-memory.
+   *
+   * The recorded id is "fixture:sampling/createMessage" (the real downstream server's
+   * configured name, not a placeholder) per Codex PR #29 review round 4 "preserve the
+   * originating server for sampling" -- writeGatewayConfig's single downstream is named
+   * "fixture". */
   const head = chain.readHead(stateDir);
   const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(stateDir, head.bundle_id), "utf8"));
   const traceLines = bundle.contents["execution_trace.jsonl"].trim().split("\n").map((l) => JSON.parse(l));
-  const sampleStep = traceLines.find((t) => t.tool === "sampling:sampling/createMessage");
+  const sampleStep = traceLines.find((t) => t.tool === "fixture:sampling/createMessage");
   check(
     "e2e-sampling-recorded-as-model-call-in-sealed-bundle",
     // execution_trace.jsonl records only hashes of input/result (SS5.2), never plaintext
@@ -301,6 +306,46 @@ async function malformedPushedReplyIsRejectedNotSilentlyAccepted() {
   gw.child.stdin.end();
   const code = await gw.exitCode();
   check("e2e-malformed-pushed-reply-clean-disconnect-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
+}
+
+/** CodeRabbit PR #29 review round 4 "a reply with a present but falsy error resolves as
+ * a successful undefined result": a pushed-reply of the well-formed SHAPE
+ * {"jsonrpc":"2.0","id":..., "error":null} passes the exactly-one-of-result-or-error
+ * check (it HAS an "error" key), but branching on msg.error's truthiness afterward
+ * treated it as "no error" and resolved undefined as a fake success -- silently turning
+ * an agent-signaled failure into a tool call that looks like it succeeded. */
+async function pushedReplyWithPresentButFalsyErrorIsRejected() {
+  const root = freshRoot("sampling-falsy-error-reply");
+  writeConfirmedMode(root, "standalone");
+  const { configPath } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
+  await gw.nextMessage();
+
+  gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
+
+  const pushed = await gw.nextMessage();
+  check(
+    "e2e-falsy-error-reply-setup-sampling-request-pushed",
+    Boolean(pushed && pushed.method === "sampling/createMessage" && pushed.id !== undefined && pushed.id !== null),
+    JSON.stringify(pushed)
+  );
+
+  // Well-formed per the "exactly one of result/error PRESENT" check -- "error" is a real
+  // own key -- but its VALUE is falsy (null). Must still be treated as an error reply.
+  gw.send({ jsonrpc: "2.0", id: pushed && pushed.id, error: null });
+
+  const toolResp = await gw.nextMessage();
+  check(
+    "e2e-falsy-error-reply-surfaces-as-tool-call-error-not-fake-success",
+    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/"sampled"/.test(JSON.stringify(toolResp))),
+    JSON.stringify(toolResp)
+  );
+
+  gw.child.stdin.end();
+  const code = await gw.exitCode();
+  check("e2e-falsy-error-reply-clean-disconnect-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
 }
 
 /** Board decision 2026-09-04 (PR #29 review, Decision 1, Option B): when the agent
@@ -586,6 +631,7 @@ async function main() {
   await singleSessionEndToEndVerifies();
   await samplingForwardedToStdioAgent();
   await malformedPushedReplyIsRejectedNotSilentlyAccepted();
+  await pushedReplyWithPresentButFalsyErrorIsRejected();
   await samplingOverHttpAgentGetsExplicitError();
   await httpDownstreamAgainstRealMcpServerSucceeds();
   await agentHttpListenerRejectsNonPostMethod();
