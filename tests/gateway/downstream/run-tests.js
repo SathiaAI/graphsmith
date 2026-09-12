@@ -176,11 +176,163 @@ async function unboundedUnterminatedLineForcesClose() {
   }
 }
 
+/** CodeRabbit PR #29 review round 4 "track only the bytes after the last newline": a
+ * single chunk containing several COMPLETE, well-formed, newline-terminated lines whose
+ * combined length exceeds MAX_HTTP_RESPONSE_BYTES must NOT force-close the connection --
+ * only a genuinely unterminated line that itself exceeds the cap should. Before the fix,
+ * readline's own "data" listener (registered first) consumed and reset the byte counter
+ * for each line, and then this listener still added the WHOLE chunk's length on top,
+ * misreporting bounded, healthy traffic as a single oversized unterminated line. */
+async function completeLinesBatchedInOneChunkDoNotForceClose() {
+  const dir = freshDir("batched-lines");
+  const fixturePath = path.join(dir, "batched-lines-fixture.js");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "batch", version: "1.0" } } });
+        return;
+      }
+      if (msg.method === "tools/list") {
+        // Write several complete, newline-terminated, oversized-when-combined lines in
+        // ONE process.stdout.write() call -- i.e. one "data" event downstream.js's side.
+        const big = "x".repeat(4 * 1024 * 1024); // 4MiB per padded line, 3 lines = 12MiB > 10MiB cap
+        const lines = [0, 1, 2].map((i) => JSON.stringify({ jsonrpc: "2.0", id: "extra-" + i, unexpected: big }));
+        process.stdout.write(lines.join("\\n") + "\\n");
+        send({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
+        return;
+      }
+    });
+    `
+  );
+  const conn = downstream.connectStdio(`node ${fixturePath}`);
+  try {
+    await conn.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } });
+    const toolsResult = await conn.call("tools/list", {}, 4000);
+    check("complete-lines-batched-in-one-chunk-do-not-force-close", Array.isArray(toolsResult && toolsResult.tools), JSON.stringify(toolsResult));
+  } finally {
+    conn.close();
+  }
+}
+
+/** Codex PR #29 review round 4 "advertise sampling before accepting sampling requests":
+ * connectAllDownstreams must declare the MCP `sampling` client capability during
+ * initialize when the caller says the agent transport can relay it, and must NOT declare
+ * it otherwise -- a conforming downstream only sends sampling/createMessage to a client
+ * that has actually negotiated support for it. */
+async function samplingCapabilityAdvertisedOnlyWhenSupported() {
+  const dir = freshDir("sampling-capability");
+  const fixturePath = path.join(dir, "capture-init-fixture.js");
+  const capturePath = path.join(dir, "captured-init.json");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    const fs = require("fs");
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") {
+        fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(msg.params));
+        send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "cap", version: "1.0" } } });
+        return;
+      }
+      if (msg.method === "tools/list") { send({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } }); return; }
+    });
+    `
+  );
+  const serverConfig = { name: "cap", transport: "stdio", endpoint: `node ${fixturePath}` };
+
+  const withSampling = await downstream.connectAllDownstreams([serverConfig], { supportsSampling: true });
+  const capturedWith = JSON.parse(fs.readFileSync(capturePath, "utf8"));
+  for (const conn of withSampling.connections.values()) conn.close();
+  check(
+    "sampling-capability-advertised-when-supported",
+    Boolean(capturedWith.capabilities && capturedWith.capabilities.sampling && typeof capturedWith.capabilities.sampling === "object"),
+    JSON.stringify(capturedWith.capabilities)
+  );
+
+  const withoutSampling = await downstream.connectAllDownstreams([serverConfig], { supportsSampling: false });
+  const capturedWithout = JSON.parse(fs.readFileSync(capturePath, "utf8"));
+  for (const conn of withoutSampling.connections.values()) conn.close();
+  check(
+    "sampling-capability-omitted-when-not-supported",
+    Boolean(capturedWithout.capabilities) && !("sampling" in capturedWithout.capabilities),
+    JSON.stringify(capturedWithout.capabilities)
+  );
+}
+
+/** Codex PR #29 review round 4 "preserve the originating server for sampling": with
+ * multiple stdio downstreams sharing one `onRequest` callback, connectAllDownstreams must
+ * bind each connection's OWN configured server name into its own callback invocation --
+ * not have every downstream's unsolicited request reach onRequest indistinguishably. */
+async function onRequestReceivesOwnServerName() {
+  const dir = freshDir("onrequest-server-name");
+  function writeSamplerFixture(name) {
+    const fixturePath = path.join(dir, `${name}-fixture.js`);
+    fs.writeFileSync(
+      fixturePath,
+      `
+      "use strict";
+      const readline = require("readline");
+      const rl = readline.createInterface({ input: process.stdin, terminal: false });
+      function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+      rl.on("line", (line) => {
+        let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+        if (typeof msg.method !== "string" && msg.id === "upstream-1") { return; } // reply to our own request, ignored here
+        if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: ${JSON.stringify(name)}, version: "1.0" } } }); return; }
+        if (msg.method === "tools/list") {
+          send({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
+          // Immediately after the handshake, fire our own unsolicited request upstream.
+          send({ jsonrpc: "2.0", id: "upstream-1", method: "sampling/createMessage", params: {} });
+          return;
+        }
+      });
+      `
+    );
+    return fixturePath;
+  }
+  const fixtureA = writeSamplerFixture("server-a");
+  const fixtureB = writeSamplerFixture("server-b");
+  const seenServerNames = [];
+  const handles = await downstream.connectAllDownstreams(
+    [
+      { name: "server-a", transport: "stdio", endpoint: `node ${fixtureA}` },
+      { name: "server-b", transport: "stdio", endpoint: `node ${fixtureB}` },
+    ],
+    {
+      supportsSampling: true,
+      onRequest: (msg, serverName) => { seenServerNames.push(serverName); return Promise.resolve(null); },
+    }
+  );
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 500)); // let both fixtures' unsolicited requests arrive
+    check(
+      "onrequest-receives-each-connections-own-server-name",
+      seenServerNames.includes("server-a") && seenServerNames.includes("server-b") && seenServerNames.length === 2,
+      JSON.stringify(seenServerNames)
+    );
+  } finally {
+    for (const conn of handles.connections.values()) conn.close();
+  }
+}
+
 async function main() {
   await prototypePollutingServerNameIsStoredSafely();
   await malformedToolsListMissingArrayRejected();
   await httpResponseRequiresExactlyOneOfResultOrError();
   await unboundedUnterminatedLineForcesClose();
+  await completeLinesBatchedInOneChunkDoNotForceClose();
+  await samplingCapabilityAdvertisedOnlyWhenSupported();
+  await onRequestReceivesOwnServerName();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
