@@ -181,7 +181,8 @@ async function connectionCloseWithPendingCallsMarksDisconnected() {
   const conn = { transport: "fake", call: () => new Promise(() => {}), close: () => {}, isClosed: () => false, whenClosed: () => Promise.resolve() };
   const mergedTools = [{ name: "neverresponds", server: "srv", schema: {} }];
   const toolOwners = new Map([["neverresponds", "srv"]]);
-  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "neverresponds", arguments: {} } }); // fire and forget, never resolves
@@ -190,6 +191,44 @@ async function connectionCloseWithPendingCallsMarksDisconnected() {
   const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, entry.bundle_id), "utf8"));
   const trace = bundle.contents["execution_trace.jsonl"];
   check("finalized-bundle-trace-shows-the-pending-call-as-an-error", /"is_error":true/.test(trace), trace);
+
+  /* Codex PR #29 review round 4 "log calls finalized as disconnected": a call finalized
+   * via closeConnection's own pending-call cleanup previously got no matching
+   * "gateway_call_completed" operational log line at all, unlike every other way a call
+   * can complete. */
+  const disconnectLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed" && l.status === "disconnected");
+  check(
+    "close-connection-with-pending-call-emits-completion-log",
+    Boolean(disconnectLog && disconnectLog.connection_id === "conn-1" && disconnectLog.tool === "neverresponds" && typeof disconnectLog.duration_ms === "number"),
+    JSON.stringify(logLines)
+  );
+}
+
+/** Codex PR #29 review round 4 "log calls finalized as disconnected": a downstream
+ * disconnect mid-session (handleDownstreamDisconnect, distinct from closeConnection
+ * above) marks that server's pending calls disconnected too, and must emit the same
+ * structured completion log for each -- otherwise those steps have no run ID, status, or
+ * duration anywhere in the operational log despite being fully recorded in the trace. */
+async function downstreamDisconnectEmitsCompletionLog() {
+  const dir = freshDir("disconnect-log");
+  const conn = { transport: "fake", call: () => new Promise(() => {}), close: () => {}, isClosed: () => false, whenClosed: () => new Promise(() => {}) };
+  const mergedTools = [{ name: "hangs", server: "srv", schema: {} }];
+  const toolOwners = new Map([["hangs", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "hangs", arguments: {} } }); // fire and forget, never resolves
+  proxy.handleDownstreamDisconnect("srv");
+  const s = proxy.sessions.get("conn-1");
+  check("downstream-disconnect-marks-pending-call-disconnected", s.calls.length === 1 && s.calls[0].disconnected === true, JSON.stringify(s.calls));
+  const disconnectLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed" && l.status === "disconnected");
+  check(
+    "downstream-disconnect-emits-completion-log",
+    Boolean(disconnectLog && disconnectLog.connection_id === "conn-1" && disconnectLog.tool === "hangs" && disconnectLog.server === "srv" && typeof disconnectLog.duration_ms === "number"),
+    JSON.stringify(logLines)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
 }
 
 async function stopAcceptingNewSessionsRefusesNewButNotExisting() {
@@ -418,6 +457,7 @@ async function main() {
   await downstreamDisconnectMarksErrorNotCrash();
   await malformedDownstreamResponseFailsClosedPerCall();
   await connectionCloseWithPendingCallsMarksDisconnected();
+  await downstreamDisconnectEmitsCompletionLog();
   await stopAcceptingNewSessionsRefusesNewButNotExisting();
   await toolLevelErrorRecordedButNotProtocolError();
   await preservesDownstreamJsonRpcErrorEnvelope();
