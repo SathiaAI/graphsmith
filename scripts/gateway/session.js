@@ -19,6 +19,7 @@
  */
 "use strict";
 
+const crypto = require("crypto");
 const { sealBoundaryBundle } = require("../gsa-mcp-shim.js");
 
 function fail(message, code = "GATEWAY_SESSION_ERROR") {
@@ -27,13 +28,44 @@ function fail(message, code = "GATEWAY_SESSION_ERROR") {
   return error;
 }
 
-/** Creates a fresh, empty in-memory session record (SS5.1's shape). */
+/** Creates a fresh, empty in-memory session record (SS5.1's shape).
+ *
+ * `options.sessionId` (Cluster B: session-identity distinctness in the audit trail --
+ * see gsa-mcp-shim.js#sealBoundaryBundle's own doc comment on why bundle_id needs this):
+ * a permanent, unique identifier for this session, generated ONCE, folded into the
+ * sealed bundle's bundle_id so two sessions that happen to record identical
+ * {init, tools, calls} content are never treated as "the same session" just because a
+ * content-only hash cannot tell them apart.
+ *
+ * Three ways this argument is used, distinguished so replay never invents a new
+ * identity for an old session (which would break replay-idempotency -- the same
+ * session's own WAL replayed twice must produce the same bundle_id) while a genuinely
+ * new live session always gets a real one:
+ *   - omitted entirely (proxy.js#openConnection, the live-dispatch path): a fresh
+ *     `crypto.randomUUID()` is minted here, once, and the caller is expected to persist
+ *     it (proxy.js writes it into the WAL's own SESSION_START event) so a later replay
+ *     of this exact session reads the SAME id back rather than minting a new one.
+ *   - a non-empty string (gateway.js#recoverCrashedSessions/abandonConnection replaying
+ *     a WAL whose SESSION_START event already carries a `session_id`): reused verbatim,
+ *     so replaying the same WAL twice yields the same session_id and therefore the same
+ *     bundle_id.
+ *   - explicitly `null`/absent-on-the-event (replaying an older WAL written before this
+ *     field existed): stays `null` rather than randomly generated -- an old WAL replayed
+ *     twice must still be idempotent, and inventing a random id here on every replay
+ *     would break that for data that predates this fix. */
 function createSession(connectionId, options = {}) {
   if (typeof connectionId !== "string" || connectionId.length === 0) {
     throw fail("connectionId must be a non-empty string", "INVALID_ARGUMENT");
   }
+  const sessionId =
+    typeof options.sessionId === "string" && options.sessionId.length > 0
+      ? options.sessionId
+      : options.sessionId === undefined
+      ? crypto.randomUUID()
+      : null;
   return {
     connectionId,
+    sessionId,
     initialize: null,
     tools: [],
     calls: [],
@@ -213,6 +245,7 @@ function markPendingAsDisconnected(session, reason, now, serverFilter, onDisconn
 function toSealableSession(session) {
   const orderedCalls = session.calls.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
   return {
+    session_id: session.sessionId || null,
     initialize: session.initialize || {},
     tools: session.tools,
     calls: orderedCalls.map((c) => ({
