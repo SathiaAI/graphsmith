@@ -231,6 +231,34 @@ async function downstreamDisconnectEmitsCompletionLog() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* Codex PR #29 review "bound completed call history retained by each session": a
+ * session that never trips MAX_PENDING_CALLS_PER_SESSION (calls issued one at a time,
+ * never concurrently) could previously grow session.calls without any bound at all.
+ * Drives the session's own recorded-call count up to the cap directly (issuing that many
+ * real calls would make this test absurdly slow) rather than through 100000 real round
+ * trips, then asserts the NEXT call is refused exactly the way the pending-call cap
+ * already refuses admission once its own limit is hit. */
+async function completedCallHistoryCapped() {
+  const { MAX_COMPLETED_CALLS_PER_SESSION } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
+  const dir = freshDir("completed-call-cap");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "tool", server: "srv", schema: {} }];
+  const toolOwners = new Map([["tool", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const s = proxy.sessions.get("conn-1");
+  s.calls.length = MAX_COMPLETED_CALLS_PER_SESSION; // cheap stand-in for MAX_COMPLETED_CALLS_PER_SESSION genuinely-completed calls
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tool", arguments: {} } });
+  check(
+    "completed-call-history-cap-refuses-further-admission",
+    Boolean(resp.error && resp.error.code === -32000 && /already completed/.test(resp.error.message)),
+    JSON.stringify(resp)
+  );
+  check("completed-call-history-cap-does-not-grow-past-the-cap", s.calls.length === MAX_COMPLETED_CALLS_PER_SESSION, String(s.calls.length));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
 async function stopAcceptingNewSessionsRefusesNewButNotExisting() {
   const dir = freshDir("stop-accepting");
   const conn = fakeConnection(async () => ({ ok: true }));
@@ -458,6 +486,7 @@ async function main() {
   await malformedDownstreamResponseFailsClosedPerCall();
   await connectionCloseWithPendingCallsMarksDisconnected();
   await downstreamDisconnectEmitsCompletionLog();
+  await completedCallHistoryCapped();
   await stopAcceptingNewSessionsRefusesNewButNotExisting();
   await toolLevelErrorRecordedButNotProtocolError();
   await preservesDownstreamJsonRpcErrorEnvelope();
