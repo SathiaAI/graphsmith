@@ -578,7 +578,17 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
       }
 
       const startEvent = events.find((e) => e.type === "SESSION_START");
-      const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined });
+      // Cluster B: reuse the exact session_id this session's own SESSION_START event
+      // persisted (proxy.js#openConnection) rather than letting session.createSession
+      // mint a fresh one -- replaying the SAME crash-left WAL twice (e.g. this recovery
+      // pass itself crashing before cleanup, see recoverIsIdempotentAcrossACrashDuring
+      // RecoveryItself in tests/gateway/recovery/run-tests.js) must produce the SAME
+      // bundle_id both times. An older WAL written before this field existed has no
+      // session_id on its SESSION_START event; passed through as `null` explicitly
+      // (never generated here) for the same reason -- see session.js#createSession's own
+      // doc comment on the three-way distinction this argument makes.
+      const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
+      const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
       // Maps this replay's own stable Symbol.for() keys back to the CALL_START event that
       // produced them, needed only to look up that call's real intent record below.
       const keyToStartEvent = new Map();
@@ -646,9 +656,28 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
         }
         const intentKey = recovery.computeIntentKey(connectionId, startedFrom.tool, startedFrom.arguments);
         const intent = recovery.readIntent(stateDir, intentKey);
-        if (intent && intent.state === "completed") {
+        /* Cluster A (generation-aware crash recovery): the intent file's own `generation`
+         * field is overwritten IN PLACE on every supersede (proxy.js's dispatch guard),
+         * so by the time recovery runs it always reflects the MOST RECENT generation --
+         * which is not necessarily the generation THIS specific crashed CALL_START event
+         * belongs to. Concretely: generation 1 completes, but its own CALL_RESULT WAL
+         * write fails (best-effort, logged, not fatal -- see proxy.js's own comment on
+         * that append); the SAME connection later dispatches generation 2 of the exact
+         * same (tool, arguments), which also completes and DOES get its CALL_RESULT
+         * durably written. A later crash then leaves generation 1's CALL_START forever
+         * unresolved in the WAL while the intent file now sits at generation 2. Without
+         * this check, the loop below would bind generation 2's cached_result (a
+         * DIFFERENT call's real outcome) to generation 1's own pending call -- a false
+         * attestation. Comparing against the generation THIS CALL_START event itself
+         * recorded (defaulting to 1 for a WAL line written before this field existed)
+         * ensures a proven outcome is only ever applied to the generation it actually
+         * belongs to; any other generation's crashed call is left for operator review,
+         * exactly like a call with no intent record at all. */
+        const expectedGeneration = typeof startedFrom.generation === "number" ? startedFrom.generation : 1;
+        const intentGeneration = intent && typeof intent.generation === "number" ? intent.generation : 1;
+        if (intent && intent.state === "completed" && intentGeneration === expectedGeneration) {
           session.recordCallResult(s, key, { result: intent.cached_result, isError: false, ts: Date.now() });
-        } else if (intent && intent.state === "not_executed") {
+        } else if (intent && intent.state === "not_executed" && intentGeneration === expectedGeneration) {
           /* Codex PR #33 review "persist a terminal not-executed resolution": an operator
            * already answered "did it execute?" (no) via recovery-resolve while this
            * connection was crashed -- record that as a real (failed) terminal result now,
@@ -775,7 +804,10 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
     return;
   }
   const startEvent = events.find((e) => e.type === "SESSION_START");
-  const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined });
+  // Cluster B: same reuse-not-regenerate rule as recoverCrashedSessions' own replay
+  // above -- see that call site's doc comment and session.js#createSession's.
+  const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
+  const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
   for (const event of events) {
     if (event.type === "SESSION_START") {
       session.recordToolsList(s, event.tools || []);
