@@ -221,6 +221,51 @@ async function completeLinesBatchedInOneChunkDoNotForceClose() {
   }
 }
 
+/** CodeRabbit PR #29 review round 4 "make this regression test deterministic":
+ * completeLinesBatchedInOneChunkDoNotForceClose above drives the fix indirectly through
+ * a real child process's stdout, relying on a single process.stdout.write() call
+ * arriving as one "data" chunk on this side -- but the OS pipe is free to (and on Linux
+ * typically does, with its ~64KB default pipe buffer) split that into many smaller
+ * chunks regardless, so that test could pass against the OLD buggy logic too without
+ * ever actually exercising the multiple-complete-lines-in-one-chunk case it claims to
+ * cover. This test instead drives downstream.js's own exported, pure
+ * nextResidualLineBytes helper directly with explicit in-memory Buffers -- no child
+ * process or OS pipe chunking involved, so it deterministically reproduces (and would
+ * fail against) the exact old bug: several complete, individually-under-the-cap lines
+ * combined into one chunk whose SUM exceeds MAX_HTTP_RESPONSE_BYTES. */
+function residualLineBytesHelperIsDeterministic() {
+  const MAX = downstream.MAX_HTTP_RESPONSE_BYTES;
+
+  // Three complete, newline-terminated lines combined into ONE chunk, each individually
+  // well under the cap but whose sum exceeds it.
+  const perLine = Math.floor(MAX / 3) + 1000;
+  const line = "x".repeat(perLine);
+  const oneChunk = Buffer.from([line, line, line].join("\n") + "\n", "utf8");
+  check("residual-line-bytes-setup-batched-chunk-exceeds-cap-if-misreported", oneChunk.length > MAX, String(oneChunk.length));
+  const afterBatchedChunk = downstream.nextResidualLineBytes(0, oneChunk);
+  check(
+    "residual-line-bytes-batched-complete-lines-in-one-chunk-resets-to-zero-not-the-whole-chunk",
+    afterBatchedChunk === 0,
+    String(afterBatchedChunk)
+  );
+
+  // A genuinely unterminated chunk (no newline at all) extends the residual by its full
+  // length, and that residual carries forward correctly across successive chunks.
+  const afterFirstPartial = downstream.nextResidualLineBytes(0, Buffer.from("x".repeat(100), "utf8"));
+  check("residual-line-bytes-no-newline-chunk-extends-residual", afterFirstPartial === 100, String(afterFirstPartial));
+  const afterSecondPartial = downstream.nextResidualLineBytes(afterFirstPartial, Buffer.from("y".repeat(50), "utf8"));
+  check("residual-line-bytes-residual-carries-forward-across-chunks", afterSecondPartial === 150, String(afterSecondPartial));
+
+  // A chunk containing a newline followed by trailing unterminated bytes resets to just
+  // those trailing bytes, discarding whatever residual had built up before the newline.
+  const afterNewlineThenTrailing = downstream.nextResidualLineBytes(999999, Buffer.from("z".repeat(10) + "\n" + "w".repeat(7), "utf8"));
+  check(
+    "residual-line-bytes-newline-then-trailing-bytes-resets-to-trailing-length",
+    afterNewlineThenTrailing === 7,
+    String(afterNewlineThenTrailing)
+  );
+}
+
 /** Codex PR #29 review round 4 "advertise sampling before accepting sampling requests":
  * connectAllDownstreams must declare the MCP `sampling` client capability during
  * initialize when the caller says the agent transport can relay it, and must NOT declare
@@ -331,6 +376,7 @@ async function main() {
   await httpResponseRequiresExactlyOneOfResultOrError();
   await unboundedUnterminatedLineForcesClose();
   await completeLinesBatchedInOneChunkDoNotForceClose();
+  residualLineBytesHelperIsDeterministic();
   await samplingCapabilityAdvertisedOnlyWhenSupported();
   await onRequestReceivesOwnServerName();
 
