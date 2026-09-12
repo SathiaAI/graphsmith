@@ -669,6 +669,96 @@ async function cleanSigtermDrainsAndExitsZero() {
   check("e2e-sigterm-session-still-finalized-and-persisted", head && head.seq === 1, JSON.stringify(head));
 }
 
+/* Cluster E (partial fix): checkModeGate's root must track configPath's own directory,
+ * not process.cwd() -- `gateway.js --config /path/to/project-b/gateway.json` run with
+ * cwd somewhere else entirely must still validate project B's own
+ * .graphsmith/gateway-mode.json, not whatever (if anything) sits under cwd. Spawns the
+ * CLI with cwd deliberately set to a directory that has NO .graphsmith/ at all, passing
+ * an ABSOLUTE configPath pointing into a completely different, properly-mode-confirmed
+ * project root -- before this fix, checkModeGate would have looked for
+ * <cwd>/.graphsmith/gateway-mode.json, found nothing, and refused to start. */
+async function modeGateRootTracksConfigPathNotCwd() {
+  const projectRoot = freshRoot("mode-root-project");
+  writeConfirmedMode(projectRoot, "standalone");
+  const { configPath } = writeGatewayConfig(projectRoot);
+
+  const unrelatedCwd = freshRoot("mode-root-elsewhere");
+  check("e2e-mode-gate-root-elsewhere-cwd-has-no-dot-graphsmith", !fs.existsSync(path.join(unrelatedCwd, ".graphsmith")), "test setup invariant violated");
+
+  const child = spawn(process.execPath, [GATEWAY_CLI, configPath], { cwd: unrelatedCwd, stdio: ["pipe", "pipe", "pipe"] });
+  const rl = readline.createInterface({ input: child.stdout, terminal: false });
+  const firstLine = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for a response; stderr so far: ${stderr}`)), 10000);
+    rl.once("line", (line) => { clearTimeout(timer); resolve(line); });
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) + "\n");
+  let initResp = null;
+  try {
+    initResp = JSON.parse(await firstLine);
+  } catch (error) {
+    // fall through with initResp === null; the check below reports stderr for diagnosis
+  }
+  check(
+    "e2e-mode-gate-root-derived-from-configpath-not-cwd",
+    Boolean(initResp && initResp.id === 1 && initResp.result),
+    `initResp=${JSON.stringify(initResp)}; stderr=${stderr}`
+  );
+  child.kill();
+  await new Promise((resolve) => child.on("close", resolve));
+}
+
+/* Cluster D: `gateway.js status <configPath>` reads the status file a running gateway
+ * periodically writes and pretty-prints it -- exercised here as a genuinely separate CLI
+ * invocation (not an in-process call), matching how an operator would actually use it. */
+async function statusCommandReadsRunningGatewaysStatusFile() {
+  const root = freshRoot("status-cmd");
+  writeConfirmedMode(root, "standalone");
+  const { configPath } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  const initResp = await gw.nextMessage();
+  check("e2e-status-command-gateway-initialized", initResp && initResp.id === 1 && initResp.result, JSON.stringify(initResp));
+
+  // writeStatusFile() runs once synchronously at startup (before the first interval
+  // tick) specifically so a `status` call right after start already finds fresh data --
+  // no polling/sleep needed here.
+  const statusRun = spawn(process.execPath, [GATEWAY_CLI, "status", configPath], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  let statusStdout = "";
+  let statusStderr = "";
+  statusRun.stdout.on("data", (c) => { statusStdout += c.toString("utf8"); });
+  statusRun.stderr.on("data", (c) => { statusStderr += c.toString("utf8"); });
+  const statusCode = await new Promise((resolve) => statusRun.on("close", resolve));
+  check("e2e-status-command-exits-zero-while-gateway-running", statusCode === 0, `exit ${statusCode}; stderr: ${statusStderr}`);
+
+  let parsed = null;
+  try { parsed = JSON.parse(statusStdout); } catch (error) { /* leave null; checked below */ }
+  check("e2e-status-command-prints-valid-json", parsed !== null, statusStdout);
+  check(
+    "e2e-status-command-reports-writer-claim-held-and-one-active-session",
+    Boolean(parsed && parsed.writer_claim && parsed.writer_claim.held_by_this_instance === true && parsed.active_sessions === 1),
+    JSON.stringify(parsed)
+  );
+  check("e2e-status-command-reports-schema-version", parsed && parsed.schema_version === "1.0", JSON.stringify(parsed));
+
+  gw.child.kill();
+  await gw.exitCode();
+
+  // No gateway has ever run against THIS config -> no status file yet -> clear,
+  // non-zero-exit error rather than a stack trace.
+  const freshCfgRoot = freshRoot("status-cmd-none-yet");
+  writeConfirmedMode(freshCfgRoot, "standalone");
+  const { configPath: freshConfigPath } = writeGatewayConfig(freshCfgRoot);
+  const noStatusRun = spawn(process.execPath, [GATEWAY_CLI, "status", freshConfigPath], { cwd: freshCfgRoot, stdio: ["ignore", "ignore", "pipe"] });
+  let noStatusStderr = "";
+  noStatusRun.stderr.on("data", (c) => { noStatusStderr += c.toString("utf8"); });
+  const noStatusCode = await new Promise((resolve) => noStatusRun.on("close", resolve));
+  check("e2e-status-command-nonzero-exit-when-no-status-file-yet", noStatusCode !== 0, `exit ${noStatusCode}`);
+  check("e2e-status-command-names-the-config-when-no-status-file-yet", /gateway-status\.json/.test(noStatusStderr), noStatusStderr);
+}
+
 async function main() {
   await singleSessionEndToEndVerifies();
   await samplingForwardedToStdioAgent();
@@ -683,6 +773,8 @@ async function main() {
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
+  await modeGateRootTracksConfigPathNotCwd();
+  await statusCommandReadsRunningGatewaysStatusFile();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
