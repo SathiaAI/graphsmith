@@ -202,7 +202,8 @@ async function connectionCloseWithPendingCallsMarksDisconnected() {
   const conn = { transport: "fake", call: () => new Promise(() => {}), close: () => {}, isClosed: () => false, whenClosed: () => Promise.resolve() };
   const mergedTools = [{ name: "neverresponds", server: "srv", schema: {} }];
   const toolOwners = new Map([["neverresponds", "srv"]]);
-  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "neverresponds", arguments: {} } }); // fire and forget, never resolves
@@ -211,6 +212,72 @@ async function connectionCloseWithPendingCallsMarksDisconnected() {
   const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, entry.bundle_id), "utf8"));
   const trace = bundle.contents["execution_trace.jsonl"];
   check("finalized-bundle-trace-shows-the-pending-call-as-an-error", /"is_error":true/.test(trace), trace);
+
+  /* Codex PR #29 review round 4 "log calls finalized as disconnected": a call finalized
+   * via closeConnection's own pending-call cleanup previously got no matching
+   * "gateway_call_completed" operational log line at all, unlike every other way a call
+   * can complete. */
+  const disconnectLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed" && l.status === "disconnected");
+  check(
+    "close-connection-with-pending-call-emits-completion-log",
+    Boolean(disconnectLog && disconnectLog.connection_id === "conn-1" && disconnectLog.tool === "neverresponds" && typeof disconnectLog.duration_ms === "number"),
+    JSON.stringify(logLines)
+  );
+}
+
+/** Codex PR #29 review round 4 "log calls finalized as disconnected": a downstream
+ * disconnect mid-session (handleDownstreamDisconnect, distinct from closeConnection
+ * above) marks that server's pending calls disconnected too, and must emit the same
+ * structured completion log for each -- otherwise those steps have no run ID, status, or
+ * duration anywhere in the operational log despite being fully recorded in the trace. */
+async function downstreamDisconnectEmitsCompletionLog() {
+  const dir = freshDir("disconnect-log");
+  const conn = { transport: "fake", call: () => new Promise(() => {}), close: () => {}, isClosed: () => false, whenClosed: () => new Promise(() => {}) };
+  const mergedTools = [{ name: "hangs", server: "srv", schema: {} }];
+  const toolOwners = new Map([["hangs", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "hangs", arguments: {} } }); // fire and forget, never resolves
+  proxy.handleDownstreamDisconnect("srv");
+  const s = proxy.sessions.get("conn-1");
+  check("downstream-disconnect-marks-pending-call-disconnected", s.calls.length === 1 && s.calls[0].disconnected === true, JSON.stringify(s.calls));
+  const disconnectLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed" && l.status === "disconnected");
+  check(
+    "downstream-disconnect-emits-completion-log",
+    Boolean(disconnectLog && disconnectLog.connection_id === "conn-1" && disconnectLog.tool === "hangs" && disconnectLog.server === "srv" && typeof disconnectLog.duration_ms === "number"),
+    JSON.stringify(logLines)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #29 review "bound completed call history retained by each session": a
+ * session that never trips MAX_PENDING_CALLS_PER_SESSION (calls issued one at a time,
+ * never concurrently) could previously grow session.calls without any bound at all.
+ * Drives the session's own recorded-call count up to the cap directly (issuing that many
+ * real calls would make this test absurdly slow) rather than through 100000 real round
+ * trips, then asserts the NEXT call is refused exactly the way the pending-call cap
+ * already refuses admission once its own limit is hit. */
+async function completedCallHistoryCapped() {
+  const { MAX_COMPLETED_CALLS_PER_SESSION } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
+  const dir = freshDir("completed-call-cap");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "tool", server: "srv", schema: {} }];
+  const toolOwners = new Map([["tool", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const s = proxy.sessions.get("conn-1");
+  s.calls.length = MAX_COMPLETED_CALLS_PER_SESSION; // cheap stand-in for MAX_COMPLETED_CALLS_PER_SESSION genuinely-completed calls
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tool", arguments: {} } });
+  check(
+    "completed-call-history-cap-refuses-further-admission",
+    Boolean(resp.error && resp.error.code === -32000 && /already completed/.test(resp.error.message)),
+    JSON.stringify(resp)
+  );
+  check("completed-call-history-cap-does-not-grow-past-the-cap", s.calls.length === MAX_COMPLETED_CALLS_PER_SESSION, String(s.calls.length));
+  await proxy.closeConnection("conn-1", "test cleanup");
 }
 
 async function stopAcceptingNewSessionsRefusesNewButNotExisting() {
@@ -1029,6 +1096,113 @@ async function callResultWalFailureDoesNotEscapeHandleMessage() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* Codex PR #29 review round 3 "retain sessions when persistence fails": closeConnection
+ * used to discard the fully-sealed bundle the moment chain.appendSession threw, leaving
+ * only a summary log line. Two connections given identical initialize params and an
+ * identical call count deterministically produce the same bundle_id (gsa-mcp-shim.js
+ * hashes only {init, grantedTools, n} -- see chain.js's own "same agent reconnecting ...
+ * reproduces it" comment), so the second one's real chain.appendSession call genuinely
+ * throws GATEWAY_BUNDLE_ID_COLLISION here rather than a synthetic/forced failure. */
+async function persistenceFailureQuarantinesSealedBundle() {
+  const dir = freshDir("quarantine");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const sealFailures = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    onSealFailure: (s, error) => sealFailures.push(error),
+  });
+
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  const entry1 = await proxy.closeConnection("conn-1", "test cleanup");
+  check("quarantine-setup-first-append-succeeds", Boolean(entry1 && typeof entry1.bundle_id === "string"), JSON.stringify(entry1));
+
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  const entry2 = await proxy.closeConnection("conn-2", "test cleanup");
+  check("persistence-failure-returns-null", entry2 === null, JSON.stringify(entry2));
+  check(
+    "persistence-failure-invokes-onSealFailure-with-collision-code",
+    sealFailures.length === 1 && sealFailures[0].code === "GATEWAY_BUNDLE_ID_COLLISION",
+    JSON.stringify(sealFailures.map((e) => e && e.code))
+  );
+
+  const quarantinedTo = sealFailures[0] && sealFailures[0].quarantinedTo;
+  check("persistence-failure-quarantines-sealed-bundle", typeof quarantinedTo === "string" && fs.existsSync(quarantinedTo), String(quarantinedTo));
+  if (typeof quarantinedTo === "string" && fs.existsSync(quarantinedTo)) {
+    const quarantined = JSON.parse(fs.readFileSync(quarantinedTo, "utf8"));
+    check(
+      "quarantined-file-preserves-the-sealed-bundle",
+      Boolean(quarantined.sealed && quarantined.sealed.bundle && quarantined.sealed.bundle.manifest),
+      JSON.stringify(Object.keys(quarantined))
+    );
+  }
+}
+
+/* Cluster C: onClaimLost (gateway.js) only calls proxy.stopAcceptingNewSessions() --
+ * an already-open session is deliberately left alone to finish and finalize (SS7). This
+ * covers the narrower fix: closeConnection must re-check isWriterClaimValid()
+ * synchronously immediately before chain.appendSession, and refuse to append (quarantine
+ * instead) if the claim is no longer valid at THAT moment -- not just at the moment
+ * claim-loss was first detected. */
+async function writerClaimRevalidatedImmediatelyBeforeAppend() {
+  const dir = freshDir("writer-claim-append");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const sealFailures = [];
+  let claimValid = true;
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    onSealFailure: (s, error) => sealFailures.push(error),
+    isWriterClaimValid: () => claimValid,
+  });
+
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  // Simulate the claim being lost/stolen by a replacement writer AFTER this session
+  // opened (and even after it ran its call) but before it happens to finalize --
+  // exactly the window onClaimLost's own "in-flight sessions are left alone" comment
+  // describes.
+  claimValid = false;
+  const entry = await proxy.closeConnection("conn-1", "test cleanup");
+  check("append-refused-when-writer-claim-invalid-at-close-time", entry === null, JSON.stringify(entry));
+  check(
+    "refused-append-invokes-onSealFailure-with-claim-lost-code",
+    sealFailures.length === 1 && sealFailures[0].code === "GATEWAY_WRITER_CLAIM_LOST_AT_APPEND",
+    JSON.stringify(sealFailures.map((e) => e && e.code))
+  );
+  const quarantinedTo = sealFailures[0] && sealFailures[0].quarantinedTo;
+  check("claim-lost-append-quarantines-sealed-bundle-for-recovery", typeof quarantinedTo === "string" && fs.existsSync(quarantinedTo), String(quarantinedTo));
+  check("no-chain-entry-was-actually-written", chain.readHead(dir) === null, JSON.stringify(chain.readHead(dir)));
+
+  // A session opened AFTER the claim is valid again finalizes normally -- this is a
+  // per-append check, not a permanent proxy-wide latch.
+  claimValid = true;
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "y", version: "1" } } });
+  const entry2 = await proxy.closeConnection("conn-2", "test cleanup");
+  check("append-succeeds-once-writer-claim-is-valid-again", Boolean(entry2 && typeof entry2.bundle_id === "string"), JSON.stringify(entry2));
+}
+
+/* Default behavior (no isWriterClaimValid passed, e.g. every other test in this suite,
+ * and any production caller that hasn't wired a writer-claim at all): appends must not
+ * be refused. Mirrors onSessionFinalized/onSealFailure's own default-no-op contract. */
+async function writerClaimCheckDefaultsToValidWhenNotProvided() {
+  const dir = freshDir("writer-claim-default");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners); // no isWriterClaimValid
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  const entry = await proxy.closeConnection("conn-1", "test cleanup");
+  check("append-not-refused-when-no-writer-claim-check-configured", Boolean(entry && typeof entry.bundle_id === "string"), JSON.stringify(entry));
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -1036,6 +1210,8 @@ async function main() {
   await downstreamDisconnectMarksErrorNotCrash();
   await malformedDownstreamResponseFailsClosedPerCall();
   await connectionCloseWithPendingCallsMarksDisconnected();
+  await downstreamDisconnectEmitsCompletionLog();
+  await completedCallHistoryCapped();
   await stopAcceptingNewSessionsRefusesNewButNotExisting();
   await toolLevelErrorRecordedButNotProtocolError();
   await preservesDownstreamJsonRpcErrorEnvelope();
@@ -1068,6 +1244,11 @@ async function main() {
   await initializeWalFailureDoesNotEscapeAndRollsBack();
   await openConnectionWalFailureDoesNotPublishGhostSession();
   await callResultWalFailureDoesNotEscapeHandleMessage();
+
+  // From feature/track-1.2-standalone-gateway (merged into PR #33):
+  await persistenceFailureQuarantinesSealedBundle();
+  await writerClaimRevalidatedImmediatelyBeforeAppend();
+  await writerClaimCheckDefaultsToValidWhenNotProvided();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
