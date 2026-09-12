@@ -254,11 +254,16 @@ async function samplingForwardedToStdioAgent() {
    * bundle attested only the outer fixture_sample tool call -- the model invocation
    * itself (and its hashed prompt/result) was silently absent even though the gateway
    * observed and relayed it. Assert it now actually lands in the persisted trace with
-   * model_call:true, not just that the tool call round-tripped in-memory. */
+   * model_call:true, not just that the tool call round-tripped in-memory.
+   *
+   * The recorded id is "fixture:sampling/createMessage" (the real downstream server's
+   * configured name, not a placeholder) per Codex PR #29 review round 4 "preserve the
+   * originating server for sampling" -- writeGatewayConfig's single downstream is named
+   * "fixture". */
   const head = chain.readHead(stateDir);
   const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(stateDir, head.bundle_id), "utf8"));
   const traceLines = bundle.contents["execution_trace.jsonl"].trim().split("\n").map((l) => JSON.parse(l));
-  const sampleStep = traceLines.find((t) => t.tool === "sampling:sampling/createMessage");
+  const sampleStep = traceLines.find((t) => t.tool === "fixture:sampling/createMessage");
   check(
     "e2e-sampling-recorded-as-model-call-in-sealed-bundle",
     // execution_trace.jsonl records only hashes of input/result (SS5.2), never plaintext
@@ -266,6 +271,83 @@ async function samplingForwardedToStdioAgent() {
     sampleStep && sampleStep.model_call === true && sampleStep.is_error === false && typeof sampleStep.result_sha256 === "string" && sampleStep.result_sha256.length > 0,
     traceLines.map((t) => JSON.stringify(t)).join("\n")
   );
+}
+
+/** Codex PR #29 review round 3 "validate agent replies to pushed sampling requests":
+ * a reply to a gateway-pushed request that is missing "jsonrpc": "2.0" and carries
+ * neither "result" nor "error" must be rejected as malformed, not resolved as a
+ * successful `undefined` sampling result and forwarded to the downstream as success. */
+async function malformedPushedReplyIsRejectedNotSilentlyAccepted() {
+  const root = freshRoot("sampling-malformed-reply");
+  writeConfirmedMode(root, "standalone");
+  const { configPath } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
+  await gw.nextMessage();
+
+  gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
+
+  const pushed = await gw.nextMessage();
+  check(
+    "e2e-malformed-reply-setup-sampling-request-pushed",
+    Boolean(pushed && pushed.method === "sampling/createMessage" && pushed.id !== undefined && pushed.id !== null),
+    JSON.stringify(pushed)
+  );
+
+  // Malformed reply: right id, no "jsonrpc", and neither "result" nor "error".
+  gw.send({ id: pushed && pushed.id });
+
+  const toolResp = await gw.nextMessage();
+  check(
+    "e2e-malformed-pushed-reply-surfaces-as-tool-call-error-not-fake-success",
+    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/mocked/.test(JSON.stringify(toolResp))),
+    JSON.stringify(toolResp)
+  );
+
+  gw.child.stdin.end();
+  const code = await gw.exitCode();
+  check("e2e-malformed-pushed-reply-clean-disconnect-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
+}
+
+/** CodeRabbit PR #29 review round 4 "a reply with a present but falsy error resolves as
+ * a successful undefined result": a pushed-reply of the well-formed SHAPE
+ * {"jsonrpc":"2.0","id":..., "error":null} passes the exactly-one-of-result-or-error
+ * check (it HAS an "error" key), but branching on msg.error's truthiness afterward
+ * treated it as "no error" and resolved undefined as a fake success -- silently turning
+ * an agent-signaled failure into a tool call that looks like it succeeded. */
+async function pushedReplyWithPresentButFalsyErrorIsRejected() {
+  const root = freshRoot("sampling-falsy-error-reply");
+  writeConfirmedMode(root, "standalone");
+  const { configPath } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
+  await gw.nextMessage();
+
+  gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
+
+  const pushed = await gw.nextMessage();
+  check(
+    "e2e-falsy-error-reply-setup-sampling-request-pushed",
+    Boolean(pushed && pushed.method === "sampling/createMessage" && pushed.id !== undefined && pushed.id !== null),
+    JSON.stringify(pushed)
+  );
+
+  // Well-formed per the "exactly one of result/error PRESENT" check -- "error" is a real
+  // own key -- but its VALUE is falsy (null). Must still be treated as an error reply.
+  gw.send({ jsonrpc: "2.0", id: pushed && pushed.id, error: null });
+
+  const toolResp = await gw.nextMessage();
+  check(
+    "e2e-falsy-error-reply-surfaces-as-tool-call-error-not-fake-success",
+    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/"sampled"/.test(JSON.stringify(toolResp))),
+    JSON.stringify(toolResp)
+  );
+
+  gw.child.stdin.end();
+  const code = await gw.exitCode();
+  check("e2e-falsy-error-reply-clean-disconnect-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
 }
 
 /** Board decision 2026-09-04 (PR #29 review, Decision 1, Option B): when the agent
@@ -475,6 +557,48 @@ async function httpAgentSessionsAreIdBasedNotSocketBased() {
   await gw.exitCode();
 }
 
+/** Codex PR #29 review "validate initialize before allocating an HTTP session": a
+ * headerless request whose method is "initialize" but whose envelope is otherwise
+ * malformed (missing "jsonrpc": "2.0" here) previously still got a real session with a
+ * 30-minute idle timer before proxy.handleMessage's own envelope check rejected it. The
+ * session must instead be sealed immediately, so a later call against that same session
+ * id sees it as unknown, not merely inert until the idle timeout. */
+async function httpFailedInitializeDoesNotLeakSession() {
+  const root = freshRoot("agent-http-failed-init");
+  writeConfirmedMode(root, "standalone");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const gw = spawnGateway(root, configPath);
+  const port = await waitForHttpPort(gw);
+  const token = fs.readFileSync(tokenPath, "utf8").trim();
+  const agent = new http.Agent({ keepAlive: true });
+  try {
+    // No "jsonrpc": "2.0" -- fails proxy.js's own envelope check, but agent-transport.js's
+    // pre-session gate only looks at msg.method, so this still reaches openSession().
+    const badInit = await httpPost(port, token, { id: 1, method: "initialize", params: {} }, agent);
+    const leakedSessionId = badInit.headers["mcp-session-id"];
+    check(
+      "e2e-agent-http-failed-initialize-returns-error",
+      Boolean(badInit.body && badInit.body.error),
+      JSON.stringify(badInit.body)
+    );
+    check("e2e-agent-http-failed-initialize-still-names-a-session-id", typeof leakedSessionId === "string", JSON.stringify(badInit.headers));
+    if (typeof leakedSessionId === "string") {
+      const followUp = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, agent, leakedSessionId);
+      check(
+        "e2e-agent-http-session-from-failed-initialize-is-sealed-not-leaked",
+        followUp.body && followUp.body.error && /unknown or expired/i.test(followUp.body.error.message),
+        JSON.stringify(followUp.body)
+      );
+    }
+  } finally {
+    agent.destroy();
+  }
+  gw.child.kill();
+  await gw.exitCode();
+}
+
 async function modeDormantExitsZero() {
   const root = freshRoot("dormant");
   writeConfirmedMode(root, "attach");
@@ -588,18 +712,113 @@ async function sigtermStillReleasesClaimWhenAConnectionsCloseFails() {
   check("e2e-close-failure-writer-claim-still-released", acquireError === null, acquireError && acquireError.message);
 }
 
+/* Cluster E (partial fix): checkModeGate's root must track configPath's own directory,
+ * not process.cwd() -- `gateway.js --config /path/to/project-b/gateway.json` run with
+ * cwd somewhere else entirely must still validate project B's own
+ * .graphsmith/gateway-mode.json, not whatever (if anything) sits under cwd. Spawns the
+ * CLI with cwd deliberately set to a directory that has NO .graphsmith/ at all, passing
+ * an ABSOLUTE configPath pointing into a completely different, properly-mode-confirmed
+ * project root -- before this fix, checkModeGate would have looked for
+ * <cwd>/.graphsmith/gateway-mode.json, found nothing, and refused to start. */
+async function modeGateRootTracksConfigPathNotCwd() {
+  const projectRoot = freshRoot("mode-root-project");
+  writeConfirmedMode(projectRoot, "standalone");
+  const { configPath } = writeGatewayConfig(projectRoot);
+
+  const unrelatedCwd = freshRoot("mode-root-elsewhere");
+  check("e2e-mode-gate-root-elsewhere-cwd-has-no-dot-graphsmith", !fs.existsSync(path.join(unrelatedCwd, ".graphsmith")), "test setup invariant violated");
+
+  const child = spawn(process.execPath, [GATEWAY_CLI, configPath], { cwd: unrelatedCwd, stdio: ["pipe", "pipe", "pipe"] });
+  const rl = readline.createInterface({ input: child.stdout, terminal: false });
+  const firstLine = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for a response; stderr so far: ${stderr}`)), 10000);
+    rl.once("line", (line) => { clearTimeout(timer); resolve(line); });
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) + "\n");
+  let initResp = null;
+  try {
+    initResp = JSON.parse(await firstLine);
+  } catch (error) {
+    // fall through with initResp === null; the check below reports stderr for diagnosis
+  }
+  check(
+    "e2e-mode-gate-root-derived-from-configpath-not-cwd",
+    Boolean(initResp && initResp.id === 1 && initResp.result),
+    `initResp=${JSON.stringify(initResp)}; stderr=${stderr}`
+  );
+  child.kill();
+  await new Promise((resolve) => child.on("close", resolve));
+}
+
+/* Cluster D: `gateway.js status <configPath>` reads the status file a running gateway
+ * periodically writes and pretty-prints it -- exercised here as a genuinely separate CLI
+ * invocation (not an in-process call), matching how an operator would actually use it. */
+async function statusCommandReadsRunningGatewaysStatusFile() {
+  const root = freshRoot("status-cmd");
+  writeConfirmedMode(root, "standalone");
+  const { configPath } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+  gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  const initResp = await gw.nextMessage();
+  check("e2e-status-command-gateway-initialized", initResp && initResp.id === 1 && initResp.result, JSON.stringify(initResp));
+
+  // writeStatusFile() runs once synchronously at startup (before the first interval
+  // tick) specifically so a `status` call right after start already finds fresh data --
+  // no polling/sleep needed here.
+  const statusRun = spawn(process.execPath, [GATEWAY_CLI, "status", configPath], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  let statusStdout = "";
+  let statusStderr = "";
+  statusRun.stdout.on("data", (c) => { statusStdout += c.toString("utf8"); });
+  statusRun.stderr.on("data", (c) => { statusStderr += c.toString("utf8"); });
+  const statusCode = await new Promise((resolve) => statusRun.on("close", resolve));
+  check("e2e-status-command-exits-zero-while-gateway-running", statusCode === 0, `exit ${statusCode}; stderr: ${statusStderr}`);
+
+  let parsed = null;
+  try { parsed = JSON.parse(statusStdout); } catch (error) { /* leave null; checked below */ }
+  check("e2e-status-command-prints-valid-json", parsed !== null, statusStdout);
+  check(
+    "e2e-status-command-reports-writer-claim-held-and-one-active-session",
+    Boolean(parsed && parsed.writer_claim && parsed.writer_claim.held_by_this_instance === true && parsed.active_sessions === 1),
+    JSON.stringify(parsed)
+  );
+  check("e2e-status-command-reports-schema-version", parsed && parsed.schema_version === "1.0", JSON.stringify(parsed));
+
+  gw.child.kill();
+  await gw.exitCode();
+
+  // No gateway has ever run against THIS config -> no status file yet -> clear,
+  // non-zero-exit error rather than a stack trace.
+  const freshCfgRoot = freshRoot("status-cmd-none-yet");
+  writeConfirmedMode(freshCfgRoot, "standalone");
+  const { configPath: freshConfigPath } = writeGatewayConfig(freshCfgRoot);
+  const noStatusRun = spawn(process.execPath, [GATEWAY_CLI, "status", freshConfigPath], { cwd: freshCfgRoot, stdio: ["ignore", "ignore", "pipe"] });
+  let noStatusStderr = "";
+  noStatusRun.stderr.on("data", (c) => { noStatusStderr += c.toString("utf8"); });
+  const noStatusCode = await new Promise((resolve) => noStatusRun.on("close", resolve));
+  check("e2e-status-command-nonzero-exit-when-no-status-file-yet", noStatusCode !== 0, `exit ${noStatusCode}`);
+  check("e2e-status-command-names-the-config-when-no-status-file-yet", /gateway-status\.json/.test(noStatusStderr), noStatusStderr);
+}
+
 async function main() {
   await singleSessionEndToEndVerifies();
   await samplingForwardedToStdioAgent();
+  await malformedPushedReplyIsRejectedNotSilentlyAccepted();
+  await pushedReplyWithPresentButFalsyErrorIsRejected();
   await samplingOverHttpAgentGetsExplicitError();
   await httpDownstreamAgainstRealMcpServerSucceeds();
   await agentHttpListenerRejectsNonPostMethod();
   await agentHttpListenerBindFailureRejectedCleanly();
   await httpAgentSessionsAreIdBasedNotSocketBased();
+  await httpFailedInitializeDoesNotLeakSession();
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
   await sigtermStillReleasesClaimWhenAConnectionsCloseFails();
+  await modeGateRootTracksConfigPathNotCwd();
+  await statusCommandReadsRunningGatewaysStatusFile();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
