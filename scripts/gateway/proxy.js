@@ -151,7 +151,14 @@ class GatewayProxy {
       throw fail("Gateway is no longer accepting new sessions (writer-claim lost or shutting down)", "GATEWAY_NOT_ACCEPTING");
     }
     if (this.sessions.has(connectionId)) throw fail(`connectionId "${connectionId}" is already open`, "GATEWAY_DUPLICATE_CONNECTION");
-    const s = session.createSession(connectionId, { now: this.now, goal: options.goal });
+    /* `options.sessionId` (Cluster B): normally omitted so session.createSession mints a
+     * fresh UUID for this live session -- see that function's own doc comment. Exposed
+     * here only so tests can deliberately force two DIFFERENT connections to share a
+     * session_id (and therefore a bundle_id) to exercise bundle-id-collision handling,
+     * exactly as they could before session_id existed by giving two connections
+     * identical {init, tools, calls} content; no real caller of openConnection has a
+     * reason to ever pass this. */
+    const s = session.createSession(connectionId, { now: this.now, goal: options.goal, sessionId: options.sessionId });
     /* SS3.3: the granted tool surface must be recorded regardless of whether the agent
      * ever bothers to issue tools/list on this connection -- otherwise a cached tool
      * invoked without a prior tools/list would be sealed with an empty granted surface,
@@ -178,6 +185,12 @@ class GatewayProxy {
       type: "SESSION_START",
       started_at: s.startedAt,
       goal: s.goal || null,
+      // Cluster B: persists the session_id session.createSession minted for this live
+      // session so a later replay (gateway.js#recoverCrashedSessions/abandonConnection)
+      // reads the SAME id back instead of minting a new one -- see session.js#
+      // createSession's own doc comment on why that distinction matters for
+      // replay-idempotency.
+      session_id: s.sessionId || null,
       tools: this.mergedTools.map((t) => ({ name: t.name, server: t.server, schema: t.schema })),
     });
     this.sessions.set(connectionId, s);
@@ -414,6 +427,11 @@ class GatewayProxy {
        * scope for this fix; see the design doc's disclosed limitations. */
       let intentKey = null;
       let dispatchGeneration = 1;
+      // Hoisted above the tools/call-only block below (unlike its previous purely-local
+      // declaration) so the post-dispatch completion handling further down -- which
+      // records this call's outcome into the Cluster A retained-signature store -- can
+      // still see which idempotency key (if any) the caller actually supplied.
+      let callerIdempotencyKey = null;
       /* Codex PR #33 review "restore the prior completed intent when CALL_START WAL
        * persistence fails" / CodeRabbit PR #33 review (same finding): when a completed
        * intent is superseded below, this snapshot is the complete pre-supersede record --
@@ -436,7 +454,7 @@ class GatewayProxy {
          * branch below is key-gated; the dispatched/ambiguous blocking branches stay
          * unconditional, since an unproven-outcome retry is a real double-dispatch risk
          * independent of caller intent. */
-        const callerIdempotencyKey =
+        callerIdempotencyKey =
           params && params._meta && typeof params._meta.idempotencyKey === "string" && params._meta.idempotencyKey.length > 0
             ? params._meta.idempotencyKey
             : null;
@@ -555,18 +573,54 @@ class GatewayProxy {
                 message: `Tool "${toolName}" is quarantined: connection "${quarantine.connection_id}" left an unresolved call to this tool from a crash, pending operator review -- resolve it via recovery-resolve/recovery-abandon before dispatching this tool again.`,
               };
             } else {
-              const created = recovery.createIntentIfAbsent(this.stateDir, intentKey, {
-                connection_id: connectionId,
-                tool: toolName,
-                arguments: callArgs,
-                state: "dispatched",
-                dispatched_at: this.now(),
-                idempotency_key: callerIdempotencyKey,
-                generation: 1,
-              });
-              if (created) intentDecision = { kind: "dispatch" };
-              // else: lost a race to a concurrent identical call on this connection --
-              // loop once to re-read its freshly-created state and respond consistently.
+              /* Cluster A (cross-connection replay): this connectionId has never itself
+               * dispatched this exact (tool, arguments) before (that is what "brand new
+               * intentKey" means, since intentKey is scoped to THIS connectionId -- see
+               * computeIntentKey's own header). A reconnecting agent's retry after its
+               * old connection crashed looks EXACTLY like this from the gateway's point
+               * of view: new connectionId, same tool+arguments. Consult the
+               * connection-independent retained-signature store -- but ONLY when the
+               * caller supplies an idempotencyKey that matches the one recorded at the
+               * time that prior call completed, mirroring the live, same-connection
+               * replay gate above exactly (an unkeyed retry is always treated as a new,
+               * independent dispatch, never silently collapsed onto an old result).
+               * Deliberately placed AFTER the quarantine check above, not before: a tool
+               * quarantined because SOME crashed connection left it with an unresolved
+               * outcome must stay blocked even for a caller that also happens to supply
+               * a matching idempotency key for a DIFFERENT, already-resolved signature --
+               * "extend the existing quarantine mechanism to also cover this case" per
+               * this fix's own design note, rather than give the retained-signature path
+               * a way to bypass it. */
+              let replayed = null;
+              if (callerIdempotencyKey) {
+                let retained = null;
+                try {
+                  retained = recovery.readCompletedSignature(this.stateDir, recovery.computeSignatureKey(toolName, callArgs));
+                } catch (signatureError) {
+                  // Fail closed, same rationale as the quarantine scan above: a retained
+                  // signature that cannot be proven safe to use must not be replayed.
+                  retained = null;
+                }
+                if (retained && retained.idempotency_key && retained.idempotency_key === callerIdempotencyKey) {
+                  replayed = retained;
+                }
+              }
+              if (replayed) {
+                intentDecision = { kind: "replay", cachedResult: replayed.cached_result };
+              } else {
+                const created = recovery.createIntentIfAbsent(this.stateDir, intentKey, {
+                  connection_id: connectionId,
+                  tool: toolName,
+                  arguments: callArgs,
+                  state: "dispatched",
+                  dispatched_at: this.now(),
+                  idempotency_key: callerIdempotencyKey,
+                  generation: 1,
+                });
+                if (created) intentDecision = { kind: "dispatch" };
+                // else: lost a race to a concurrent identical call on this connection --
+                // loop once to re-read its freshly-created state and respond consistently.
+              }
             }
           }
         }
@@ -643,7 +697,16 @@ class GatewayProxy {
          * dispatched. Roll back both the intent and the just-added pendingCalls entry, and
          * return a normal, retryable JSON-RPC error instead. */
         try {
-          recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: walCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts });
+          /* Cluster A (generation-aware crash recovery): tags this CALL_START event with
+           * the dispatch generation active at THIS dispatch, rather than leaving
+           * recoverCrashedSessions to infer it later from whatever generation the intent
+           * file happens to be sitting at by the time recovery runs -- the intent's own
+           * `generation` field is overwritten in place on every supersede, so without an
+           * explicit per-event tag a crashed EARLIER generation's own unresolved WAL
+           * event could be (and, before this fix, silently was) matched against a LATER
+           * generation's completed cached_result. See gateway.js#recoverCrashedSessions'
+           * own generation-match check for the other half of this fix. */
+          recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: walCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts, generation: dispatchGeneration });
         } catch (walError) {
           s.pendingCalls.delete(correlationKey);
           try {
@@ -743,6 +806,30 @@ class GatewayProxy {
         try {
           if (!isError) {
             recovery.updateIntent(this.stateDir, intentKey, { state: "completed", completed_at: completedAt, cached_result: result });
+            /* Cluster A (cross-connection replay of a proven-completed call): retained
+             * independently of this per-connection intent record (which a future
+             * SUPERSEDE on this SAME connection will overwrite) so a DIFFERENT,
+             * reconnecting connectionId presenting a matching caller idempotency key can
+             * still find this exact outcome -- see recovery.js's own header on this
+             * store and why it is deliberately narrower (idempotency-key-gated, TTL-
+             * bounded) than a plain argument match. Best-effort: a failure to retain this
+             * secondary record must not undo or fail the call that already genuinely
+             * completed -- the primary intent record above is already durable, and this
+             * is only ever an ADDITIONAL convenience for a future reconnect. */
+            try {
+              recovery.recordCompletedSignature(this.stateDir, recovery.computeSignatureKey(toolName, callArgs), {
+                tool: toolName,
+                arguments: callArgs,
+                intent_key: intentKey,
+                connection_id: connectionId,
+                generation: dispatchGeneration,
+                idempotency_key: callerIdempotencyKey,
+                cached_result: result,
+                completed_at: completedAt,
+              });
+            } catch (signatureError) {
+              this.log(JSON.stringify({ event: "gateway_retained_signature_write_failed", connection_id: connectionId, tool: toolName, intent_key: intentKey, detail: signatureError.message }));
+            }
           } else {
             recovery.updateIntent(this.stateDir, intentKey, {
               state: "ambiguous",
@@ -780,7 +867,9 @@ class GatewayProxy {
            * back to if this WAL line never lands; see recoverCrashedSessions' own
            * intent-consultation comment. */
           try {
-            recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt });
+            // Cluster A: tagged with the same dispatchGeneration as this call's own
+            // CALL_START event above -- see that event's own doc comment.
+            recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt, generation: dispatchGeneration });
           } catch (walError) {
             session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
             this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: walError.message }));
