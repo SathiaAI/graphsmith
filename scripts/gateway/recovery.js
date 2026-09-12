@@ -57,7 +57,24 @@ const stateStore = require("../state-store.js");
 const RECOVERY_DIRNAME = "gateway-recovery";
 const ACTIVE_DIRNAME = "active";
 const INTENTS_DIRNAME = "intents";
+const SIGNATURES_DIRNAME = "completed-signatures";
 const INTENT_SCHEMA_VERSION = 1;
+/* Cluster A (generation-aware crash recovery / cross-connection replay -- Codex PR #29
+ * Finding 2 follow-up): a completed intent is normally keyed by (connectionId, tool,
+ * args) alone (see computeIntentKey's own header on why that scoping is deliberate for
+ * the LIVE dispatch fence), which means a reconnecting agent -- a brand-new
+ * connectionId after its old connection crashed or dropped -- computes a DIFFERENT
+ * intentKey than its own crashed predecessor's completed call, and would otherwise
+ * re-dispatch a side effect that already durably succeeded. This second, much narrower
+ * store retains just enough about the MOST RECENT completed call for a given (tool,
+ * args) SIGNATURE (no connectionId) to let that reconnect replay the real result instead
+ * of re-executing it -- but ONLY when the caller proves it is deliberately asking for a
+ * replay via the same `params._meta.idempotencyKey` mechanism the live fence already
+ * uses (see proxy.js's own dispatch-guard doc comment); never a bare argument match,
+ * which would silently collapse two deliberately-repeated independent calls into one,
+ * exactly the ambiguity the caller-idempotency-key mechanism exists to resolve. Bounded
+ * by DEFAULT_RETAINED_SIGNATURE_TTL_MS below rather than kept forever. */
+const DEFAULT_RETAINED_SIGNATURE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 function fail(message, code = "GATEWAY_RECOVERY_ERROR") {
   const error = new Error(message);
@@ -76,6 +93,9 @@ function intentsDir(stateDir) {
 }
 function quarantineDir(stateDir) {
   return path.join(recoveryDir(stateDir), "quarantine");
+}
+function signaturesDir(stateDir) {
+  return path.join(recoveryDir(stateDir), SIGNATURES_DIRNAME);
 }
 
 /* CodeRabbit PR #33 review "reject path-bearing recovery identifiers": connectionId and
@@ -97,6 +117,9 @@ function walPath(stateDir, connectionId) {
 }
 function intentPath(stateDir, intentKey) {
   return path.join(intentsDir(stateDir), `${assertSafeId(intentKey, "intentKey")}.json`);
+}
+function signaturePath(stateDir, signatureKey) {
+  return path.join(signaturesDir(stateDir), `${assertSafeId(signatureKey, "signatureKey")}.json`);
 }
 
 /* Codex PR #33 review "restrict permissions on raw recovery records": these directories
@@ -304,6 +327,61 @@ function computeIntentKey(connectionId, tool, args) {
   return "gs_" + crypto.createHash("sha256").update(material, "utf8").digest("hex").slice(0, 32);
 }
 
+/** The signature identity Cluster A's cross-connection replay needs: (tool, logical
+ * arguments) alone, deliberately WITHOUT connectionId (unlike computeIntentKey above) --
+ * see this file's own header comment on DEFAULT_RETAINED_SIGNATURE_TTL_MS for why. */
+function computeSignatureKey(tool, args) {
+  const material = `${tool}\0${canonicalJson(args === undefined ? null : args)}`;
+  return "gs_sig_" + crypto.createHash("sha256").update(material, "utf8").digest("hex").slice(0, 32);
+}
+
+/** Retains (overwriting any prior record for this exact signature) the most recent
+ * proven-successful outcome for a (tool, arguments) signature, independent of which
+ * connection produced it -- called only from the same completion point that transitions
+ * an intent to "completed" (proxy.js's handleMessage). Unconditional overwrite is
+ * correct here: only ONE "most recent completed call for this signature" can ever be
+ * replayed at a time, and a newer completion is strictly more useful to a future
+ * reconnect than an older one. */
+function recordCompletedSignature(stateDir, signatureKey, data) {
+  ensureDir(signaturesDir(stateDir));
+  const record = { schema_version: INTENT_SCHEMA_VERSION, signature_key: signatureKey, ...data };
+  stateStore.atomicOverwriteFile(signaturePath(stateDir, signatureKey), JSON.stringify(record), signaturesDir(stateDir));
+  fsyncDir(signaturesDir(stateDir));
+  restrictFileMode(signaturePath(stateDir, signatureKey));
+}
+
+/** Reads a retained completed-call signature, honoring the bounded retention window --
+ * an expired record is treated exactly as if it never existed (returns null) and is
+ * best-effort deleted so it stops taking up space, rather than kept around forever
+ * (this file's own header explains why an unbounded retention would be wrong: a stale
+ * "it once succeeded" fact should eventually stop being replayable at all). `ttlMs`
+ * defaults to DEFAULT_RETAINED_SIGNATURE_TTL_MS when not given. */
+function readCompletedSignature(stateDir, signatureKey, ttlMs) {
+  let raw;
+  try {
+    raw = fs.readFileSync(signaturePath(stateDir, signatureKey), "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw fail(`Unreadable retained completed-call signature "${signatureKey}": ${error.message}`, "GATEWAY_RECOVERY_SIGNATURE_UNREADABLE");
+  }
+  let record;
+  try {
+    record = JSON.parse(raw);
+  } catch (error) {
+    throw fail(`Corrupt retained completed-call signature "${signatureKey}": ${error.message}`, "GATEWAY_RECOVERY_SIGNATURE_CORRUPT");
+  }
+  const effectiveTtl = typeof ttlMs === "number" ? ttlMs : DEFAULT_RETAINED_SIGNATURE_TTL_MS;
+  if (typeof record.completed_at !== "number" || Date.now() - record.completed_at > effectiveTtl) {
+    try {
+      fs.unlinkSync(signaturePath(stateDir, signatureKey));
+    } catch (error) {
+      /* best effort -- see this function's own doc comment */
+    }
+    return null;
+  }
+  return record;
+}
+
 function readIntent(stateDir, intentKey) {
   let raw;
   try {
@@ -484,12 +562,15 @@ function resolveIntentNotExecuted(stateDir, intentKey) {
 
 module.exports = {
   RECOVERY_DIRNAME,
+  DEFAULT_RETAINED_SIGNATURE_TTL_MS,
   recoveryDir,
   activeDir,
   intentsDir,
   quarantineDir,
+  signaturesDir,
   walPath,
   intentPath,
+  signaturePath,
   appendWalEvent,
   deleteWal,
   quarantineWal,
@@ -497,6 +578,9 @@ module.exports = {
   listActiveConnections,
   canonicalJson,
   computeIntentKey,
+  computeSignatureKey,
+  recordCompletedSignature,
+  readCompletedSignature,
   readIntent,
   createIntentIfAbsent,
   updateIntent,
