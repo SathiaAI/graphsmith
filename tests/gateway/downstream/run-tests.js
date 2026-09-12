@@ -96,6 +96,127 @@ async function malformedToolsListMissingArrayRejected() {
   );
 }
 
+/** Codex PR #29 review "validate the downstream initialize result": a downstream
+ * returning a well-formed JSON-RPC envelope whose "result" is missing the MCP-required
+ * protocolVersion/capabilities/serverInfo must fail startup the same way a malformed
+ * tools/list result already does, instead of continuing with serverInfo: null. */
+async function malformedInitializeResultRejected() {
+  const dir = freshDir("bad-initialize-result");
+  const fixturePath = path.join(dir, "bad-initialize-fixture.js");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: {} }); return; } // missing every required field
+    });
+    `
+  );
+  const serverConfig = { name: "bad", transport: "stdio", endpoint: `node ${fixturePath}` };
+  let threw = null;
+  try {
+    await downstream.connectAllDownstreams([serverConfig]);
+  } catch (error) {
+    threw = error;
+  }
+  check(
+    "malformed-initialize-result-rejected",
+    Boolean(threw && threw.code === "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE" && /initialize result/.test(threw.message)),
+    threw && threw.message
+  );
+}
+
+/** Codex PR #29 review "keep gateway secrets out of downstream subprocess environments":
+ * buildStdioChildEnv strips exactly the named secret env vars and nothing else, and
+ * connectStdio actually spawns its child with that filtered environment rather than the
+ * gateway process's own full env. */
+async function stdioChildEnvExcludesGatewaySecrets() {
+  check(
+    "build-stdio-child-env-strips-only-named-keys",
+    (() => {
+      const saved = { A: process.env.GS_TEST_SECRET_A, B: process.env.GS_TEST_KEEP_B };
+      process.env.GS_TEST_SECRET_A = "top-secret";
+      process.env.GS_TEST_KEEP_B = "keep-me";
+      const filtered = downstream.buildStdioChildEnv(new Set(["GS_TEST_SECRET_A"]));
+      const result = filtered.GS_TEST_SECRET_A === undefined && filtered.GS_TEST_KEEP_B === "keep-me";
+      if (saved.A === undefined) delete process.env.GS_TEST_SECRET_A; else process.env.GS_TEST_SECRET_A = saved.A;
+      if (saved.B === undefined) delete process.env.GS_TEST_KEEP_B; else process.env.GS_TEST_KEEP_B = saved.B;
+      return result;
+    })()
+  );
+
+  const dir = freshDir("stdio-secret-env");
+  const fixturePath = path.join(dir, "env-echo-fixture.js");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "env-echo", version: "1.0" } } }); return; }
+      if (msg.method === "tools/list") { send({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } }); return; }
+      if (msg.method === "gs/dumpEnv") { send({ jsonrpc: "2.0", id: msg.id, result: { GS_TEST_GATEWAY_SECRET: process.env.GS_TEST_GATEWAY_SECRET === undefined ? null : process.env.GS_TEST_GATEWAY_SECRET } }); return; }
+    });
+    `
+  );
+  process.env.GS_TEST_GATEWAY_SECRET = "signing-key-material";
+  const conn = downstream.connectStdio(`node ${fixturePath}`, { secretEnvNames: new Set(["GS_TEST_GATEWAY_SECRET"]) });
+  try {
+    await conn.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1.0" } });
+    const dumped = await conn.call("gs/dumpEnv", {});
+    check("stdio-child-does-not-inherit-gateway-secret-env-var", dumped.GS_TEST_GATEWAY_SECRET === null, JSON.stringify(dumped));
+  } finally {
+    conn.close();
+    delete process.env.GS_TEST_GATEWAY_SECRET;
+  }
+}
+
+/** Codex PR #29 review "surface unmatched stdio responses to the session recorder": a
+ * stdio response whose id has no live pending call must reach options.onUnmatchedResponse
+ * instead of vanishing silently at the transport layer. */
+async function unmatchedStdioResponseSurfaced() {
+  const dir = freshDir("unmatched-response");
+  const fixturePath = path.join(dir, "unmatched-response-fixture.js");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "unmatched", version: "1.0" } } });
+        // Immediately follow with a bogus response for an id this client never sent.
+        send({ jsonrpc: "2.0", id: 999999, result: { surprise: true } });
+        return;
+      }
+    });
+    `
+  );
+  const unmatched = [];
+  const conn = downstream.connectStdio(`node ${fixturePath}`, { onUnmatchedResponse: (msg) => unmatched.push(msg) });
+  try {
+    await conn.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1.0" } });
+    await new Promise((resolve) => setTimeout(resolve, 200)); // let the bogus line be read
+    check(
+      "unmatched-stdio-response-surfaced-to-callback",
+      unmatched.length === 1 && unmatched[0].id === 999999,
+      JSON.stringify(unmatched)
+    );
+  } finally {
+    conn.close();
+  }
+}
+
 /** Codex PR #29 review round 3 "require a result or error in HTTP responses": a
  * downstream HTTP response carrying the right jsonrpc/id but neither "result" nor
  * "error" (or, symmetrically, both) must fail closed instead of resolving `undefined` as
@@ -373,6 +494,9 @@ async function onRequestReceivesOwnServerName() {
 async function main() {
   await prototypePollutingServerNameIsStoredSafely();
   await malformedToolsListMissingArrayRejected();
+  await malformedInitializeResultRejected();
+  await stdioChildEnvExcludesGatewaySecrets();
+  await unmatchedStdioResponseSurfaced();
   await httpResponseRequiresExactlyOneOfResultOrError();
   await unboundedUnterminatedLineForcesClose();
   await completeLinesBatchedInOneChunkDoNotForceClose();
