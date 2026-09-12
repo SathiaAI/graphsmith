@@ -101,20 +101,29 @@ class GatewayProxy {
      * call the gateway legitimately authorized. The (idempotent) tools/list handler below
      * simply re-records the same surface if the agent does ask. */
     session.recordToolsList(s, this.mergedTools);
-    this.sessions.set(connectionId, s);
-    this.agentInitialized.set(connectionId, false);
     /* Codex PR #29 Finding 1 (Option C, external-panel-reviewed design -- see
      * option-c-hardened-design.md): crash-recovery WAL, recorded from the very start of
      * the connection so a crash before any tool call still leaves a durable record of
      * the granted tool surface and goal. Separate, unsigned, outside the hash chain --
      * see recovery.js's own header for why this makes zero changes to session.js's own
-     * call-recording functions or to sealBoundaryBundle. */
+     * call-recording functions or to sealBoundaryBundle.
+     *
+     * Codex PR #33 review "roll back session publication when its first WAL write
+     * fails": this append used to run AFTER `this.sessions.set(...)` below, and
+     * unguarded -- if it threw (e.g. a full state volume), openConnection still threw
+     * out to its caller (who never gets a usable connectionId back), but the session had
+     * ALREADY been published into this.sessions/agentInitialized: an unreachable "ghost"
+     * session that stays counted by openSessionCount() and is later sealed at shutdown.
+     * Persist first; only publish the session into this proxy's live maps once the WAL
+     * durably has its start event. */
     recovery.appendWalEvent(this.stateDir, connectionId, {
       type: "SESSION_START",
       started_at: s.startedAt,
       goal: s.goal || null,
       tools: this.mergedTools.map((t) => ({ name: t.name, server: t.server, schema: t.schema })),
     });
+    this.sessions.set(connectionId, s);
+    this.agentInitialized.set(connectionId, false);
     return s;
   }
 
@@ -181,18 +190,33 @@ class GatewayProxy {
       const mergedServerInfo = serverNames.length === 1
         ? this.serverInfos[serverNames[0]]
         : { name: "graphsmith-standalone-gateway(" + serverNames.join("+") + ")", version: "1.0", fronted: this.serverInfos };
+      /* Codex PR #33 review "commit initialization only after its WAL event succeeds":
+       * this used to record into the in-memory session and flip agentInitialized=true
+       * BEFORE this WAL append, with the append itself unguarded. If the append then
+       * failed (e.g. a full state volume), the exception escaped handleMessage entirely
+       * (breaking its own "never throws" contract) while leaving agentInitialized already
+       * true -- a retried initialize would be rejected as a repeat, yet crash replay would
+       * never see an INITIALIZE event for this connection, sealing an inconsistent
+       * recovered session. Persist first; only commit the in-memory mutations once the WAL
+       * durably has this event, matching the existing CALL_START-failure pattern below. */
+      try {
+        recovery.appendWalEvent(this.stateDir, connectionId, {
+          type: "INITIALIZE",
+          clientInfo: params && params.clientInfo,
+          serverInfo: mergedServerInfo,
+          model: params && params.model,
+        });
+      } catch (walError) {
+        session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: "initialize", detail: walError.message });
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error: { code: -32000, message: `Failed to durably record this connection's initialize before completing it: ${walError.message}. Not initialized -- safe to retry.` } };
+      }
       session.recordInitialize(s, {
         clientInfo: params && params.clientInfo,
         serverInfo: mergedServerInfo,
         model: params && params.model,
       });
       this.agentInitialized.set(connectionId, true);
-      recovery.appendWalEvent(this.stateDir, connectionId, {
-        type: "INITIALIZE",
-        clientInfo: params && params.clientInfo,
-        serverInfo: mergedServerInfo,
-        model: params && params.model,
-      });
       if (isNotification) return null;
       /* This gateway implements exactly one protocol version (GATEWAY_PROTOCOL_VERSION);
        * echoing back whatever the agent asked for (SS3.3) would let a client believe
@@ -244,6 +268,33 @@ class GatewayProxy {
       const conn = method === "tools/call" ? this.connections.get(serverName) : this.connections.values().next().value;
       const callArgs = method === "tools/call" ? (params && params.arguments) : params;
 
+      /* Correlate by an internally-generated marker even for notification-shaped calls
+       * (SS3.3's Map-keyed-by-id requirement is about the DOWNSTREAM leg's own id, which
+       * downstream.js already manages; here we key the SESSION record by the AGENT's own
+       * JSON-RPC id when present, or a synthetic one for a fire-and-forget call).
+       * Codex PR #29 review "handle JSON-RPC null IDs before recording calls": JSON-RPC
+       * 2.0 permits an explicit `id: null` on a REQUEST (distinct from a notification,
+       * which omits the id key entirely) -- `isNotification` above only catches the
+       * latter. A null id still gets a real response below (the outer `id` variable,
+       * unchanged, is echoed back as JSON-RPC requires) -- only the internal bookkeeping
+       * key needs to never be null.
+       *
+       * Computed HERE, before the idempotency-intent dispatch guard below (Codex PR #33
+       * review "reject duplicate request IDs before creating intents"): this used to be
+       * computed only right before session.recordCallStart, well after a durable
+       * "dispatched" intent could already have been created for a brand-new intentKey.
+       * An agent reusing an in-flight JSON-RPC id for a genuinely different operation
+       * would then get that intent created, dispatch never actually reach recordCallStart
+       * (it throws DUPLICATE_JSONRPC_ID) -- an exception that, unguarded, escaped
+       * handleMessage entirely -- and be left with an orphaned "dispatched" intent
+       * permanently blocking a call that never happened. Checking id availability first
+       * means a genuine duplicate id is rejected as an ordinary JSON-RPC error before
+       * anything durable is touched. */
+      const correlationKey = isNotification || id === null ? Symbol(`${isNotification ? "notify" : "null-id"}:${toolName}`) : id;
+      if (!isNotification && id !== null && s.pendingCalls.has(correlationKey)) {
+        return { jsonrpc: "2.0", id, error: { code: -32600, message: `Duplicate in-flight JSON-RPC id ${JSON.stringify(id)} on this connection -- a response for it is still pending.` } };
+      }
+
       /* Codex PR #29 Finding 2 (Option C, external-panel-reviewed design -- see
        * option-c-hardened-design.md): a durable idempotency fence for real tools/call
        * dispatch, keyed by (connectionId, tool, canonicalized arguments) so a retry
@@ -254,6 +305,16 @@ class GatewayProxy {
        * scope for this fix; see the design doc's disclosed limitations. */
       let intentKey = null;
       let dispatchGeneration = 1;
+      /* Codex PR #33 review "restore the prior completed intent when CALL_START WAL
+       * persistence fails" / CodeRabbit PR #33 review (same finding): when a completed
+       * intent is superseded below, this snapshot is the complete pre-supersede record --
+       * consulted by the CALL_START WAL-failure rollback further down so a transient WAL
+       * failure restores the earlier generation's real cached result instead of deleting
+       * it outright (which would make a later request carrying the ORIGINAL idempotency
+       * key find no record and dispatch again). Left null for the "brand new intent"
+       * dispatch path, where deleteIntent on rollback is already correct (nothing to
+       * restore). */
+      let supersededIntentSnapshot = null;
       if (method === "tools/call") {
         intentKey = recovery.computeIntentKey(connectionId, toolName, callArgs);
         /* Frontier-panel decision (Paul, 2026-09-10, PR #33 review clusters E1/E2 -- see
@@ -284,6 +345,9 @@ class GatewayProxy {
                * in-flight/crashed retry of THIS new attempt -- rather than creating a
                * second file, keeping exactly one record per (connection, tool, args). */
               try {
+                // Snapshot BEFORE overwriting -- see supersededIntentSnapshot's own doc
+                // comment above for why this must be the complete pre-supersede record.
+                supersededIntentSnapshot = existing;
                 recovery.updateIntent(this.stateDir, intentKey, {
                   state: "dispatched",
                   dispatched_at: this.now(),
@@ -298,6 +362,7 @@ class GatewayProxy {
                 intentDecision = { kind: "dispatch" };
                 this.log(JSON.stringify({ event: "gateway_intent_signature_reused_without_key", connection_id: connectionId, tool: toolName, intent_key: intentKey, generation: dispatchGeneration, detail: "a completed call's signature was reused without a matching idempotency key -- dispatched as a new, independent call rather than replayed" }));
               } catch (updateError) {
+                supersededIntentSnapshot = null;
                 if (updateError.code !== "GATEWAY_RECOVERY_INTENT_NOT_FOUND") throw updateError;
                 // else: intent was concurrently removed -- loop again, this attempt's
                 // re-read will see no existing intent and take the fresh-dispatch path.
@@ -317,6 +382,23 @@ class GatewayProxy {
               gatewayCode: "GATEWAY_DOWNSTREAM_OUTCOME_UNKNOWN",
               message: "A prior attempt of this exact operation did not reach a confirmed successful outcome -- dispatch halted pending operator resolution (see recovery-resolve).",
             };
+          } else if (existing && existing.state === "not_executed") {
+            /* CodeRabbit PR #33 review "add a not_executed branch to the live dispatch
+             * guard": this state is only ever set by an operator's recovery-resolve
+             * --confirmed not-executed on a CRASHED connection (recovery.js#
+             * resolveIntentNotExecuted). Without this branch, this fell through to the
+             * final `else` below, whose createIntentIfAbsent returns null for the
+             * already-existing file -- after two such attempts `intentDecision` was never
+             * set, and the generic "could not establish a durable dispatch intent"
+             * AMBIGUOUS_RETRY fallback fired instead of a response that actually reflects
+             * what happened (an operator already proved this exact operation never ran).
+             * Report that fact with its own code/message rather than a generic one. */
+            intentDecision = {
+              kind: "block",
+              code: -32084,
+              gatewayCode: "GATEWAY_OPERATOR_CONFIRMED_NOT_EXECUTED",
+              message: "An operator confirmed via recovery-resolve that a prior attempt of this exact operation did NOT execute downstream -- this intent record has not yet been cleaned up; retry once the owning crashed connection finishes being sealed.",
+            };
           } else {
             /* Frontier-panel decision (Paul, 2026-09-10, cluster E2): a reconnecting
              * agent gets a brand-new connectionId, so its retry of "the same" logical
@@ -332,15 +414,30 @@ class GatewayProxy {
              * use of the same tool by unrelated, healthy live connections is normal and
              * unaffected (same O(all intents on disk) disclosed cost as
              * recovery.listAllIntents' other callers; only reached on a brand-new key). */
-            const quarantine = this.pendingOperatorReviewConnections.size > 0
-              ? recovery.listAllIntents(this.stateDir).find(
+            /* CodeRabbit PR #33 review "fail closed when the quarantine scan cannot read
+             * an intent": listAllIntents propagates GATEWAY_RECOVERY_INTENT_UNREADABLE/
+             * GATEWAY_RECOVERY_INTENT_CORRUPT for ANY intent file on disk, including one
+             * totally unrelated to this dispatch -- this scan ran unguarded, ahead of the
+             * downstream recovery try/catch block, so a single unreadable/corrupt intent
+             * anywhere rejected handleMessage with a generic -32603 instead of this
+             * quarantine check's own documented -32082 JSON-RPC error, and the tool was
+             * NOT actually blocked from dispatching. Fail closed instead: a scan that
+             * cannot be proven safe blocks this dispatch via the existing quarantine
+             * response, same as a real quarantine hit. */
+            let quarantine = null;
+            if (this.pendingOperatorReviewConnections.size > 0) {
+              try {
+                quarantine = recovery.listAllIntents(this.stateDir).find(
                   (i) =>
                     i.tool === toolName &&
                     i.intent_key !== intentKey &&
                     this.pendingOperatorReviewConnections.has(i.connection_id) &&
                     (i.state === "dispatched" || i.state === "ambiguous")
-                )
-              : null;
+                ) || null;
+              } catch (scanError) {
+                quarantine = { connection_id: `<unreadable recovery state: ${scanError.message}>` };
+              }
+            }
             if (quarantine) {
               intentDecision = {
                 kind: "block",
@@ -393,8 +490,20 @@ class GatewayProxy {
            * anomaly above is recorded in-memory only -- a crash before this connection's
            * own close would silently drop it from the recovered/sealed bundle, even
            * though the gateway genuinely prevented a duplicate dispatch. Durable WAL
-           * event + the matching structured log line (see the replay branch above). */
-          recovery.appendWalEvent(this.stateDir, connectionId, { type: "ANOMALY", kind: intentDecision.gatewayCode, tool: toolName, intent_key: intentKey, detail: intentDecision.message, ts: this.now() });
+           * event + the matching structured log line (see the replay branch above).
+           *
+           * CodeRabbit PR #33 review "guard this WAL append the same way the CALL_START
+           * append is guarded": handleMessage documents that it never throws for a
+           * well-formed envelope, but this append was unguarded -- if it failed (e.g.
+           * ENOSPC), the exception would escape handleMessage entirely instead of still
+           * returning the block response the gateway already decided on. Degraded
+           * durability for this one anomaly (already recorded in-memory above) is
+           * preferable to an escaping exception on the fence path. */
+          try {
+            recovery.appendWalEvent(this.stateDir, connectionId, { type: "ANOMALY", kind: intentDecision.gatewayCode, tool: toolName, intent_key: intentKey, detail: intentDecision.message, ts: this.now() });
+          } catch (walError) {
+            this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, type: "ANOMALY", detail: walError.message }));
+          }
           this.log(JSON.stringify({ event: "gateway_call_completed", connection_id: connectionId, step: null, tool: toolName, server: serverName, status: "blocked", duration_ms: 0 }));
           if (isNotification) return null;
           return {
@@ -407,20 +516,6 @@ class GatewayProxy {
       }
 
       const ts = this.now();
-      /* Correlate by an internally-generated marker even for notification-shaped calls
-       * (SS3.3's Map-keyed-by-id requirement is about the DOWNSTREAM leg's own id, which
-       * downstream.js already manages; here we key the SESSION record by the AGENT's own
-       * JSON-RPC id when present, or a synthetic one for a fire-and-forget call). */
-      /* Codex PR #29 review "handle JSON-RPC null IDs before recording calls": JSON-RPC
-       * 2.0 permits an explicit `id: null` on a REQUEST (distinct from a notification,
-       * which omits the id key entirely) -- `isNotification` above only catches the
-       * latter. Using `id` (null) directly as this call's correlation key made it into
-       * session.recordCallStart's Map key, which explicitly throws INVALID_ARGUMENT on a
-       * null/undefined key -- turning a legal-if-unusual request into an uncaught
-       * internal error instead of a normal response. A null id still gets a real
-       * response below (the outer `id` variable, unchanged, is echoed back as JSON-RPC
-       * requires) -- only the internal bookkeeping key needs to never be null. */
-      const correlationKey = isNotification || id === null ? Symbol(`${isNotification ? "notify" : "null-id"}:${toolName}`) : id;
       // Captured BEFORE recordCallStart consumes it -- see recovery.js's header on why
       // this already-monotonic per-session counter is exactly the stable, JSON-safe
       // replay identity Option C's WAL needs (a live correlationKey can be a Symbol,
@@ -442,7 +537,31 @@ class GatewayProxy {
           recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: walCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts });
         } catch (walError) {
           s.pendingCalls.delete(correlationKey);
-          try { recovery.deleteIntent(this.stateDir, intentKey); } catch (cleanupError) { /* best effort */ }
+          try {
+            /* CodeRabbit/Codex PR #33 review "restore the prior completed intent when
+             * CALL_START WAL persistence fails": if this dispatch SUPERSEDED an earlier
+             * completed intent (supersededIntentSnapshot set above), deleting it outright
+             * would discard that earlier generation's real cached result -- a later
+             * request carrying the ORIGINAL idempotency key would then find no record and
+             * dispatch again instead of replaying it, defeating the whole point of E1's
+             * idempotency fence for the call that was already safely completed. Restore
+             * the exact pre-supersede fields instead. Only a brand-new intent (nothing
+             * superseded) still gets a plain delete -- there is no earlier record to lose. */
+            if (supersededIntentSnapshot) {
+              recovery.updateIntent(this.stateDir, intentKey, {
+                state: supersededIntentSnapshot.state,
+                dispatched_at: undefined,
+                idempotency_key: supersededIntentSnapshot.idempotency_key,
+                generation: supersededIntentSnapshot.generation,
+                cached_result: supersededIntentSnapshot.cached_result,
+                completed_at: supersededIntentSnapshot.completed_at,
+                resolved_at: supersededIntentSnapshot.resolved_at,
+                resolution: supersededIntentSnapshot.resolution,
+              });
+            } else {
+              recovery.deleteIntent(this.stateDir, intentKey);
+            }
+          } catch (cleanupError) { /* best effort */ }
           session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
           if (isNotification) return null;
           return { jsonrpc: "2.0", id, error: { code: -32000, message: `Failed to durably record this call before dispatch: ${walError.message}. Not dispatched -- safe to retry.` } };
@@ -542,7 +661,21 @@ class GatewayProxy {
       if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result, isError, ts: completedAt });
         if (method === "tools/call") {
-          recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt });
+          /* Part of the Codex/CodeRabbit PR #33 review cluster on unguarded WAL appends
+           * (mirrors the CALL_START/INITIALIZE/ANOMALY appends elsewhere in this file):
+           * the downstream call has ALREADY completed for real by this point -- there is
+           * no "don't dispatch" option left, so a WAL write failure here must be
+           * best-effort (log it, keep going) rather than escape handleMessage and deny the
+           * agent the real response it is owed. The intent file's own cached_result
+           * (updated separately above) remains the source of truth recovery-replay falls
+           * back to if this WAL line never lands; see recoverCrashedSessions' own
+           * intent-consultation comment. */
+          try {
+            recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt });
+          } catch (walError) {
+            session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
+            this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: walError.message }));
+          }
         }
         /* Board decision 2026-09-04, PR #29 review "emit the required structured log for
          * each call": the only prior gateway log for a call was the session-finalize log
