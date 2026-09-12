@@ -59,10 +59,24 @@ function sealBoundaryBundle(session, keys) {
   });
   const outputs = calls.filter((c) => !c.isError).map((c, i) => ({ call: i + 1, result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)) }));
 
+  /* Cluster B (session-identity distinctness in the audit trail): `session.session_id`
+   * is an optional, additive field (scripts/gateway/session.js#createSession -- a
+   * permanent id minted once per session and, for the gateway's own recovery WAL,
+   * persisted and read back on replay rather than regenerated). Folded into bundle_id
+   * alongside the existing content fields so two sessions that happen to record
+   * identical {init, grantedTools, call count} are never collapsed into the same
+   * bundle_id just because this hash cannot otherwise tell them apart -- without this, a
+   * second, genuinely distinct session with byte-identical recorded content was
+   * indistinguishable from a replay of the first one. Defaults to `null` when absent
+   * (every non-gateway caller of sealBoundaryBundle, and any session recorded before
+   * this field existed) so bundle_id stays exactly as deterministic as before for those
+   * callers -- only ever the SAME session replayed twice (session_id read back from its
+   * own persisted record, not regenerated) collides with itself, which is correct. */
+  const sessionId = typeof session.session_id === "string" && session.session_id.length > 0 ? session.session_id : null;
   const BOUNDARY = "boundary-only: the MCP shim observes tool I/O, not the agent's plan. Not emitted by the agent.";
   const A = (path, body) => ({ path, body });
   const run = {
-    bundle_id: "gsa-" + sha256Hex(JSON.stringify({ init, grantedTools, n: calls.length })).slice(0, 16),
+    bundle_id: "gsa-" + sha256Hex(JSON.stringify({ init, grantedTools, n: calls.length, session_id: sessionId })).slice(0, 16),
     mode: "standard",
     profiles: ["A"],                                     // boundary tier earns A only, never full profiles
     producer: { name: "gsa-mcp-shim", version: "0.3.0" },
