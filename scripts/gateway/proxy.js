@@ -332,6 +332,25 @@ class GatewayProxy {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method: "${method}".` } };
   }
 
+  /** Codex PR #29 review round 4 "log calls finalized as disconnected": every OTHER path
+   * that finishes a call (GatewayProxy#handleMessage's own completion above) emits a
+   * structured "gateway_call_completed" log line for it; a call finalized instead via
+   * session.markPendingAsDisconnected got no such line from anywhere -- handleMessage
+   * can't log it later because the pending entry is already gone by the time its own
+   * response (if any) arrives. Shared by both call sites below so the log shape stays
+   * identical to handleMessage's own. */
+  logDisconnectedCall(connectionId, call, at) {
+    this.log(JSON.stringify({
+      event: "gateway_call_completed",
+      connection_id: connectionId,
+      step: call.seq,
+      tool: call.tool,
+      server: call.server,
+      status: "disconnected",
+      duration_ms: at - call.ts,
+    }));
+  }
+
   /** Called when a downstream connection drops mid-session (SS7): marks only the pending
    * calls actually routed to `reasonServerName` as disconnected, across every open
    * session. A pending call to a DIFFERENT, still-healthy downstream is left alone -- if
@@ -339,7 +358,13 @@ class GatewayProxy {
    * "disconnected" error borrowed from an unrelated server's failure. */
   handleDownstreamDisconnect(reasonServerName) {
     for (const s of this.sessions.values()) {
-      session.markPendingAsDisconnected(s, `downstream server "${reasonServerName}" disconnected`, this.now, reasonServerName);
+      session.markPendingAsDisconnected(
+        s,
+        `downstream server "${reasonServerName}" disconnected`,
+        this.now,
+        reasonServerName,
+        (call, at) => this.logDisconnectedCall(s.connectionId, call, at)
+      );
     }
   }
 
@@ -352,7 +377,15 @@ class GatewayProxy {
   async closeConnection(connectionId, reason) {
     const s = this.sessions.get(connectionId);
     if (!s) return null;
-    if (s.pendingCalls.size > 0) session.markPendingAsDisconnected(s, reason || "connection closed with calls still pending", this.now);
+    if (s.pendingCalls.size > 0) {
+      session.markPendingAsDisconnected(
+        s,
+        reason || "connection closed with calls still pending",
+        this.now,
+        undefined,
+        (call, at) => this.logDisconnectedCall(connectionId, call, at)
+      );
+    }
     this.sessions.delete(connectionId);
     this.agentInitialized.delete(connectionId);
     let sealed;
