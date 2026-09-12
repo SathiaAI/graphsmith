@@ -22,7 +22,7 @@ const http = require("http");
 const readline = require("readline");
 const { isAuthenticated } = require("../../mcp-server/src/auth.js");
 const { MAX_BODY_BYTES, REQUEST_TIMEOUT_MS } = require("../../mcp-server/src/httpTransport.js");
-const { DEFAULT_REQUEST_TIMEOUT_MS } = require("./downstream.js");
+const { DEFAULT_REQUEST_TIMEOUT_MS, MAX_HTTP_RESPONSE_BYTES, nextResidualLineBytes } = require("./downstream.js");
 
 /** Runs the agent-facing stdio transport against `ctx.proxy`. Returns
  * { connectionId, closed, stop, pushRequest } -- `closed` resolves once the session has
@@ -43,7 +43,38 @@ const { DEFAULT_REQUEST_TIMEOUT_MS } = require("./downstream.js");
 function runStdioAgentTransport(ctx) {
   const connectionId = "stdio-" + crypto.randomBytes(8).toString("hex");
   ctx.proxy.openConnection(connectionId);
+  /* Codex PR #29 review round 5 "handle a broken agent stdout pipe": mirrors
+   * downstream.js's connectStdio's own child.stdin "error" listener -- if the agent
+   * process on the other end of this stdio pair exits or closes its read side while a
+   * response is being written, process.stdout.write() can emit an asynchronous EPIPE (or
+   * similar) error. Node treats an unhandled "error" event on a stream as fatal and
+   * crashes the whole process; this listener exists solely to absorb the stream-level
+   * error event itself, so a vanished agent's own broken pipe cannot take down this
+   * gateway process -- the existing stdin "close" handler below already drives the real
+   * disconnect/cleanup path independently of this. */
+  process.stdout.on("error", () => { /* best effort: absorbed to prevent an unhandled 'error' event from crashing the gateway */ });
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  /* Codex PR #29 review round 5 "bound newline-delimited input from stdio agents":
+   * mirrors downstream.js's connectStdio -- readline buffers an unbounded amount of
+   * input while waiting for a newline. downstream.js's own stdio path (the OTHER
+   * direction: gateway -> real MCP server) already bounds this; the agent-facing side
+   * (agent -> gateway, right here) previously did not, so a faulty or compromised stdio
+   * agent could grow this process's memory without limit by never terminating a line.
+   * Reuses the exact same pure helper and byte cap as downstream.js's own fix so both
+   * directions stay consistent, and reports the same JSON-RPC error shape as this
+   * transport's own parse-error handler below before closing the connection. */
+  let bytesSinceLastLine = 0;
+  let stdinOverLimitHandled = false;
+  process.stdin.on("data", (chunk) => {
+    if (stdinOverLimitHandled) return;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytesSinceLastLine = nextResidualLineBytes(bytesSinceLastLine, buf);
+    if (bytesSinceLastLine > MAX_HTTP_RESPONSE_BYTES) {
+      stdinOverLimitHandled = true;
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: `Agent stdin produced an unterminated line exceeding the ${MAX_HTTP_RESPONSE_BYTES}-byte limit -- closing the connection.` } }) + "\n");
+      rl.close();
+    }
+  });
 
   const pendingPushed = new Map(); // gw-push id -> { resolve, reject, timer }
 
