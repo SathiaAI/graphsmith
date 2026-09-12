@@ -340,6 +340,11 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
       }
 
       let sessionId = sessionIdHeader;
+      /* Codex PR #29 review "validate initialize before allocating an HTTP session":
+       * tracks whether THIS request is the one that just minted `sessionId` via
+       * openSession() below, so the handleMessage outcome can decide whether that brand
+       * new session actually earned its 30-minute idle slot. */
+      let justOpened = false;
       if (!sessionId) {
         /* No session ID presented: the ONLY message this can legitimately be is
          * "initialize" (board decision 2026-09-08) -- anything else means either a
@@ -365,6 +370,7 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
          * refusal and answer it like any other "not accepting requests" case instead. */
         try {
           sessionId = openSession();
+          justOpened = true;
         } catch (error) {
           res.writeHead(503, { "content-type": "application/json" });
           res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32000, message: `Cannot start a new session: ${error.message}` } }));
@@ -379,6 +385,19 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
       }
 
       ctx.proxy.handleMessage(sessionId, msg).then((response) => {
+        /* Codex PR #29 review "validate initialize before allocating an HTTP session":
+         * `msg.method === "initialize"` above only checks the method NAME -- a request
+         * missing "jsonrpc": "2.0", carrying an invalid "id", or otherwise malformed
+         * still reached openSession() above and got a real session + 30-minute idle
+         * timer before proxy.handleMessage's own envelope validation rejected it. An
+         * authenticated client repeating that could exhaust all MAX_HTTP_SESSIONS slots
+         * with initialize attempts that were never going to succeed. Since this session
+         * was only just minted for this exact request, an error response here means its
+         * "initialize" never actually completed -- seal it immediately rather than
+         * leaving a dead session to occupy a slot until it idles out. */
+        if (justOpened && response && response.error) {
+          sealSession(sessionId, `initialize failed validation: ${response.error.message}`);
+        }
         if (response === null) {
           res.writeHead(202, { [SESSION_ID_HEADER]: sessionId });
           res.end();
@@ -387,6 +406,7 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
           res.end(JSON.stringify(response));
         }
       }).catch((error) => {
+        if (justOpened) sealSession(sessionId, `initialize threw: ${error.message}`);
         res.writeHead(500, { "content-type": "application/json", [SESSION_ID_HEADER]: sessionId });
         res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32603, message: error.message } }));
       });
