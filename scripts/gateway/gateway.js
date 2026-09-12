@@ -295,14 +295,28 @@ function buildHealthStatus(ctx) {
   let recoveryStatus;
   try {
     const allIntents = recovery.listAllIntents(stateDir);
+    /* Codex PR #33 review "report each unresolved intent key in recovery output": a
+     * "dispatched" intent is normal (a live call genuinely in flight on a healthy
+     * connection) on most gateways most of the time, BUT it is also exactly the state a
+     * crashed connection's own unresolved call is left in when startup recovery could not
+     * prove its outcome (recoverCrashedSessions' RECOVERY_AMBIGUOUS_INTENT case) -- the
+     * aggregate `in_flight` count alone cannot tell those two apart, and an operator
+     * cannot act on a plain number. Itemize the same way `pending_operator_review`
+     * already does for `ambiguous` intents, so a stuck one is directly actionable
+     * (recovery-resolve/recovery-abandon both require the exact intent key) without first
+     * having to know a crash happened and go hunting through raw recovery files. */
+    const dispatched = allIntents
+      .filter((i) => i.state === "dispatched")
+      .map((i) => ({ connection_id: i.connection_id, intent_key: i.intent_key, tool: i.tool, dispatched_since: i.dispatched_at || null }));
     recoveryStatus = {
       pending_operator_review: allIntents
         .filter((i) => i.state === "ambiguous")
         .map((i) => ({ connection_id: i.connection_id, intent_key: i.intent_key, tool: i.tool, ambiguous_since: i.ambiguous_at || null, reason: i.ambiguous_reason || null })),
-      in_flight: allIntents.filter((i) => i.state === "dispatched").length,
+      in_flight: dispatched.length,
+      dispatched,
     };
   } catch (error) {
-    recoveryStatus = { pending_operator_review: [], in_flight: 0, error: error.message };
+    recoveryStatus = { pending_operator_review: [], in_flight: 0, dispatched: [], error: error.message };
   }
 
   return {
@@ -320,6 +334,40 @@ function buildHealthStatus(ctx) {
     recovery: recoveryStatus,
     remote_anchor: { implemented: false, reason: "SG-FR-6 not implemented in this build -- see chain.js#pushChainTailToRemoteAnchor" },
   };
+}
+
+/** Shared by recoverCrashedSessions and abandonConnection's own GATEWAY_BUNDLE_ID_
+ * COLLISION handling (Codex PR #33 review "verify bundle collisions before discarding
+ * recovery state", and its follow-up "verify collisions in recovery-abandon before
+ * cleanup"): verified directly against gsa-mcp-shim.js: bundle_id = sha256({init,
+ * grantedTools, n: calls.length}) -- a coarse fingerprint with no timestamp, nonce, or
+ * actual call content. Re-running recovery/abandon for the SAME crash deterministically
+ * reproduces the same bundle_id, which is "already durably appended," not a real
+ * conflict -- but a DIFFERENT crashed session that merely happens to share {init,
+ * grantedTools, call count} would ALSO collide here, and blindly trusting the id match
+ * would then discard that other session's real WAL and completed intents, permanently.
+ * Reads back the bundle actually on disk and compares its real content (the execution
+ * trace, itself a hash of every call's real arguments/result) before treating this as
+ * the expected repeated-attempt case. Returns true only when content is read back and
+ * verified identical; any read/parse failure or mismatch returns false (an unverified
+ * collision must never be treated as "safe to clean up"). */
+function bundleCollisionIsSameContent(stateDir, sealed) {
+  try {
+    const existingRaw = fs.readFileSync(chain.bundlePath(stateDir, sealed.bundle.manifest.bundle_id), "utf8");
+    const existingBundle = JSON.parse(existingRaw);
+    // gsa-produce.js#produceBundle never stores artifact bodies on the bundle itself --
+    // manifest.artifacts.<name>.sha256 is the real per-artifact content fingerprint (the
+    // raw bodies live in bundle.contents, keyed by file path, but the hash already IS the
+    // exact equality check needed here). execution_trace alone (per-call input/result
+    // hashes, tool, granted, error/model flags) is sufficient: it is a hash of every
+    // call's real arguments and result, so two sessions cannot share it without sharing
+    // their actual call content.
+    const existingHash = existingBundle.manifest && existingBundle.manifest.artifacts && existingBundle.manifest.artifacts.execution_trace && existingBundle.manifest.artifacts.execution_trace.sha256;
+    const newHash = sealed.bundle.manifest && sealed.bundle.manifest.artifacts && sealed.bundle.manifest.artifacts.execution_trace && sealed.bundle.manifest.artifacts.execution_trace.sha256;
+    return Boolean(existingHash) && existingHash === newHash;
+  } catch (readError) {
+    return false; // could not verify -- treat as a genuine, unverified conflict
+  }
 }
 
 /** Startup crash-recovery pass (Codex PR #29 Finding 1, Option C -- external-panel-
@@ -399,6 +447,13 @@ function recoverCrashedSessions(stateDir, keys, log) {
       // Any call still pending after replaying every event was in flight at crash time.
       // Consult its real intent record for a proven outcome before deciding anything.
       let needsOperator = false;
+      // Codex PR #33 review "include the intent key in the advertised resolution
+      // command": collected as we go so the RECOVERY_AMBIGUOUS_INTENT log below can name
+      // every actual unresolved key, rather than the literal "<key>" placeholder it used
+      // to print regardless of how many calls (or which ones) were actually unresolved --
+      // recovery-resolve requires the exact key, which an operator otherwise had to
+      // discover by hand-parsing raw recovery files.
+      const unresolvedIntentKeys = [];
       for (const [key] of Array.from(s.pendingCalls.entries())) {
         const startedFrom = keyToStartEvent.get(key);
         if (!startedFrom) continue; // defensive; should not happen
@@ -432,15 +487,18 @@ function recoverCrashedSessions(stateDir, keys, log) {
           session.recordCallResult(s, key, { result: { error: "operator confirmed via recovery-resolve that this call did not execute downstream" }, isError: true, ts: Date.now() });
         } else {
           needsOperator = true;
+          unresolvedIntentKeys.push(intentKey);
         }
       }
 
       if (needsOperator) {
         pendingOperatorReview.push(connectionId);
+        const resolveCommands = unresolvedIntentKeys
+          .map((key) => `"node scripts/gateway/gateway.js recovery-resolve --connection ${connectionId} --intent ${key} --confirmed executed|not-executed"`)
+          .join(", ");
         log(
-          `RECOVERY_AMBIGUOUS_INTENT: connection "${connectionId}" crashed with a call in flight whose outcome is not proven -- ` +
-            `leaving its WAL and intent record in place rather than guessing. Resolve with ` +
-            `"node scripts/gateway/gateway.js recovery-resolve --connection ${connectionId} --intent <key> --confirmed executed|not-executed", ` +
+          `RECOVERY_AMBIGUOUS_INTENT: connection "${connectionId}" crashed with ${unresolvedIntentKeys.length} call(s) in flight whose outcome is not proven (intent key(s): ${unresolvedIntentKeys.join(", ")}) -- ` +
+            `leaving its WAL and intent record(s) in place rather than guessing. Resolve each with ${resolveCommands}, ` +
             `or "node scripts/gateway/gateway.js recovery-abandon --connection ${connectionId}" to seal only the calls that did reach a proven outcome.`
         );
         continue; // do not touch this connection's WAL/intents any further
@@ -461,36 +519,7 @@ function recoverCrashedSessions(stateDir, keys, log) {
         chain.appendSession(stateDir, sealed);
       } catch (error) {
         if (error.code === "GATEWAY_BUNDLE_ID_COLLISION") {
-          /* Verified directly against gsa-mcp-shim.js: bundle_id = sha256({init,
-           * grantedTools, n: calls.length}) -- a coarse fingerprint with no timestamp,
-           * nonce, or actual call content. Re-running recovery for the SAME crash
-           * deterministically reproduces the same bundle_id, which is "already durably
-           * appended," not a real conflict -- but a DIFFERENT crashed session that
-           * merely happens to share {init, grantedTools, call count} would ALSO collide
-           * here, and blindly trusting the id match would then discard that other
-           * session's real WAL and completed intents, permanently. Codex PR #33 review
-           * "verify bundle collisions before discarding recovery state": read back the
-           * bundle actually on disk and compare its real content (the execution trace,
-           * which is itself a hash of every call's real arguments/result) before
-           * deciding this is the expected repeated-recovery case. */
-          let sameContent = false;
-          try {
-            const existingRaw = fs.readFileSync(chain.bundlePath(stateDir, sealed.bundle.manifest.bundle_id), "utf8");
-            const existingBundle = JSON.parse(existingRaw);
-            // gsa-produce.js#produceBundle never stores artifact bodies on the bundle
-            // itself -- manifest.artifacts.<name>.sha256 is the real per-artifact content
-            // fingerprint (the raw bodies live in bundle.contents, keyed by file path, but
-            // the hash already IS the exact equality check needed here). execution_trace
-            // alone (per-call input/result hashes, tool, granted, error/model flags) is
-            // sufficient: it is a hash of every call's real arguments and result, so two
-            // sessions cannot share it without sharing their actual call content.
-            const existingHash = existingBundle.manifest && existingBundle.manifest.artifacts && existingBundle.manifest.artifacts.execution_trace && existingBundle.manifest.artifacts.execution_trace.sha256;
-            const newHash = sealed.bundle.manifest && sealed.bundle.manifest.artifacts && sealed.bundle.manifest.artifacts.execution_trace && sealed.bundle.manifest.artifacts.execution_trace.sha256;
-            sameContent = Boolean(existingHash) && existingHash === newHash;
-          } catch (readError) {
-            sameContent = false; // could not verify -- treat as a genuine, unverified conflict below
-          }
-          if (sameContent) {
+          if (bundleCollisionIsSameContent(stateDir, sealed)) {
             log(`recovery: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
           } else {
             log(
@@ -588,7 +617,21 @@ function abandonConnection(stateDir, keys, connectionId, log) {
     chain.appendSession(stateDir, sealed);
   } catch (error) {
     if (error.code !== "GATEWAY_BUNDLE_ID_COLLISION") throw error;
-    log(`recovery-abandon: connection "${connectionId}" was already durably sealed (bundle_id collision, expected on a repeated attempt).`);
+    /* Codex PR #33 review "verify collisions in recovery-abandon before cleanup": this
+     * used to treat EVERY collision here as the expected repeated-attempt case and fall
+     * straight through to deleting this connection's WAL/intents below -- unlike
+     * recoverCrashedSessions' own already-hardened handling of the identical error code,
+     * which reads back the bundle on disk and verifies its real content first. An
+     * operator running recovery-abandon on a connection that happens to collide with a
+     * genuinely DIFFERENT session's bundle_id would silently discard this connection's
+     * only remaining unrecoverable record. Apply the same content verification here. */
+    if (!bundleCollisionIsSameContent(stateDir, sealed)) {
+      throw fail(
+        `recovery-abandon: connection "${connectionId}" produced bundle_id "${sealed.bundle.manifest.bundle_id}", which already exists on disk, but its recorded content does NOT match this connection's recovered session -- a genuine conflict with a different session, not a repeated abandon attempt. Refusing to abandon: deleting this connection's WAL/intents now would discard its only remaining, unrecoverable record. Investigate the existing bundle before retrying.`,
+        "GATEWAY_RECOVERY_UNVERIFIED_BUNDLE_COLLISION"
+      );
+    }
+    log(`recovery-abandon: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
   }
   recovery.deleteWal(stateDir, connectionId);
   for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) recovery.deleteIntent(stateDir, intent.intent_key);
@@ -878,9 +921,22 @@ async function startGateway(options) {
     agentPusher.connectionId = null;
     if (stdioHandle) stdioHandle.stop();
     if (httpHandle) await new Promise((resolve) => httpHandle.server.close(resolve));
-    // Finalize any still-open sessions (drained above, or forced closed after the timeout).
+    /* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
+     * closeConnection can throw before reaching its own guarded sealing block (e.g.
+     * recovery.listIntentsForConnection hitting a corrupt/unreadable intent FILE for this
+     * connection -- a genuine fs-level problem, not the kind of failure this codebase
+     * treats as recoverable). Previously unguarded here, so one such connection's failure
+     * escaped this loop entirely, skipping every remaining connection's own close, every
+     * downstream conn.close() below, and writerClaim.release() -- leaking a stale claim
+     * that blocks the next restart. Isolate per-connection failures (mirrors
+     * recoverCrashedSessions' own per-connection try/catch) so shutdown always reaches
+     * the downstream-close and writer-claim-release steps regardless. */
     for (const connectionId of Array.from(proxy.sessions.keys())) {
-      await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
+      try {
+        await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
+      } catch (error) {
+        log(`SHUTDOWN CLOSE FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- continuing shutdown for other sessions and releasing the writer claim regardless.`);
+      }
     }
     for (const conn of downstreamHandles.connections.values()) {
       try { conn.close(); } catch (error) { /* best effort */ }
