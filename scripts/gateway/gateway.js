@@ -30,7 +30,7 @@ const modeGate = require("./mode-gate.js");
 const gatewayConfig = require("./config.js");
 const chain = require("./chain.js");
 const session = require("./session.js");
-const { GatewayProxy } = require("./proxy.js");
+const { GatewayProxy, MAX_PENDING_CALLS_PER_SESSION } = require("./proxy.js");
 const downstream = require("./downstream.js");
 const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-transport.js");
 const writerClaimModule = require("../writer-claim.js");
@@ -117,6 +117,23 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
    * this parameter (there is none in this codebase, but this keeps the function honest
    * about its own default rather than crashing on a missing argument). */
   const recordedServerName = serverName || "sampling";
+  /* Codex PR #29 review round 6 "bound downstream-pushed sampling calls": this path
+   * records and forwards every downstream-initiated sampling request unconditionally,
+   * unlike GatewayProxy#handleMessage's own agent-initiated dispatch (proxy.js), which
+   * refuses to admit another concurrent call once a session already has
+   * MAX_PENDING_CALLS_PER_SESSION genuinely pending. Without the same admission bound
+   * here, a faulty or compromised sampling-capable stdio downstream could still exhaust
+   * memory via this separate route despite that cap. Mirrors proxy.js's own error shape. */
+  if (s && s.pendingCalls.size >= MAX_PENDING_CALLS_PER_SESSION) {
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32000,
+        message: `This session already has ${MAX_PENDING_CALLS_PER_SESSION} call(s) pending -- refusing to admit another concurrent downstream-initiated sampling call until at least one resolves.`,
+      },
+    });
+  }
   if (s) {
     session.recordCallStart(s, correlationKey, {
       tool: "sampling/createMessage",

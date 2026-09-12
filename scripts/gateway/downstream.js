@@ -227,9 +227,18 @@ function connectStdio(endpoint, options = {}) {
        * guards against. Require exactly one of "result"/"error" as an own property and
        * branch on presence, matching connectHttp's own envelope check just above (and
        * agent-transport.js's own pushed-reply correlation, fixed the same way). */
-      const wellFormed = msg.jsonrpc === "2.0" && (hasResult || hasError) && !(hasResult && hasError);
+      /* Codex PR #29 review round 6 "validate the error object before dereferencing it":
+       * hasError is a presence check, not a shape check -- {"error":null} satisfies it,
+       * and the round-5 fix above only ruled out "both present" / "neither present", not
+       * an "error" value that is present but not itself a JSON-RPC error object. Without
+       * this, the hasError branch below dereferenced msg.error.message unconditionally,
+       * throwing a TypeError from this readline "line" callback (outside the call's own
+       * promise) and crashing the whole gateway process on a malformed stdio reply.
+       * Mirrors connectHttp's own errObj shape guard just below in this file. */
+      const errorIsValidObject = hasError && msg.error !== null && typeof msg.error === "object" && !Array.isArray(msg.error);
+      const wellFormed = msg.jsonrpc === "2.0" && (hasResult || hasError) && !(hasResult && hasError) && (!hasError || errorIsValidObject);
       if (!wellFormed) {
-        reject(fail(`downstream stdio response for id ${JSON.stringify(msg.id)} was not a well-formed JSON-RPC 2.0 response (missing/invalid "jsonrpc", or not exactly one of "result"/"error" present)`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
+        reject(fail(`downstream stdio response for id ${JSON.stringify(msg.id)} was not a well-formed JSON-RPC 2.0 response (missing/invalid "jsonrpc", not exactly one of "result"/"error" present, or "error" present but not a JSON-RPC error object)`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
       } else if (hasError) {
         reject(Object.assign(fail(msg.error.message || "downstream error", "GATEWAY_DOWNSTREAM_RPC_ERROR"), { rpcError: msg.error }));
       } else {
@@ -425,6 +434,21 @@ function connectHttp(endpoint, options = {}) {
         (res) => {
           const chunks = [];
           let bytesReceived = 0;
+          /* Codex PR #29 review round 6 "reject truncated HTTP responses immediately": a
+           * downstream that sends response headers and part of the body, then resets the
+           * connection, ends this response stream via "aborted"/"error" -- NOT "end" -- and
+           * the ClientRequest's own "error" handler (above/below) does not reliably fire
+           * once headers have already arrived on some Node versions/transports. Without a
+           * listener here, a mid-response disconnect previously fell through to no handler
+           * at all and the call sat pending until the absolute deadline (default 30s)
+           * instead of failing fast on a disconnect the gateway already observed. */
+          const onPrematureEnd = (error) => {
+            if (settled) return;
+            reachable = false;
+            settleReject(fail(`downstream HTTP response ended prematurely${error ? `: ${error.message}` : ""}`, "GATEWAY_DOWNSTREAM_DISCONNECTED"));
+          };
+          res.on("aborted", () => onPrematureEnd(null));
+          res.on("error", (error) => onPrematureEnd(error));
           res.on("data", (chunk) => {
             if (settled) return;
             bytesReceived += chunk.length;
