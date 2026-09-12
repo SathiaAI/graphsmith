@@ -741,6 +741,105 @@ async function toolQuarantineScopedToTheAffectedToolAndConnectionOnly() {
   await proxy2.closeConnection("conn-3", "test cleanup");
 }
 
+/* Cluster A (cross-connection replay of a proven-completed call): a reconnecting agent
+ * gets a brand-new connectionId, so its retry of "the same" logical operation computes a
+ * DIFFERENT intentKey than its own crashed/closed predecessor connection's completed
+ * call (intentKey is scoped to connectionId -- see computeIntentKey's own header).
+ * Presenting the SAME caller idempotency key the original call carried must still
+ * replay that real result rather than re-executing the downstream side effect. */
+async function reconnectWithMatchingIdempotencyKeyReplaysCrossConnectionCompletedCall() {
+  const dir = freshDir("cross-conn-replay");
+  const conn = fakeConnectionCapturing(async () => ({ value: 7 }));
+  const mergedTools = [{ name: "charge", server: "srv", schema: {} }];
+  const toolOwners = new Map([["charge", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  const params = { name: "charge", arguments: { amount: 5 }, _meta: { idempotencyKey: "customer-key-1" } };
+
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  await proxy.closeConnection("conn-1", "conn-1 done");
+
+  // A brand-new connection (e.g. the agent reconnected after a crash) presents the SAME
+  // idempotency key for the SAME logical operation.
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const resp = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  check("cross-connection-replay-returns-the-original-result", Boolean(resp && resp.result && resp.result.value === 7), JSON.stringify(resp));
+  check("cross-connection-replay-does-not-redispatch-downstream", conn.calls.length === 1, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-2", "test cleanup");
+}
+
+/* The other half of the same fix: WITHOUT a matching (or any) idempotency key, a
+ * reconnecting agent's call to the same tool+arguments is a genuinely new, independent
+ * dispatch -- never silently collapsed onto an old connection's result just because the
+ * arguments happen to match, mirroring the live same-connection rule exactly. */
+async function reconnectWithoutMatchingIdempotencyKeyDispatchesIndependently() {
+  const dir = freshDir("cross-conn-no-replay");
+  let callCount = 0;
+  const conn = fakeConnectionCapturing(async () => { callCount += 1; return { value: callCount }; });
+  const mergedTools = [{ name: "charge", server: "srv", schema: {} }];
+  const toolOwners = new Map([["charge", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  const params = { name: "charge", arguments: { amount: 5 } }; // no _meta.idempotencyKey
+
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  await proxy.closeConnection("conn-1", "conn-1 done");
+
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const resp = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  check("cross-connection-without-key-dispatches-independently", Boolean(resp && resp.result && resp.result.value === 2), JSON.stringify(resp));
+  check("cross-connection-without-key-redispatches-downstream", conn.calls.length === 2, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-2", "test cleanup");
+}
+
+/* "Extend the existing quarantine mechanism ... to also cover this retained-completed-
+ * intent case": a tool quarantined because some OTHER crashed connection left it with an
+ * unresolved outcome must stay blocked even for a reconnecting caller that also happens
+ * to present a valid, matching idempotency key for an unrelated, already-completed
+ * signature on that same tool -- the retained-signature replay path must never bypass
+ * the quarantine gate. */
+async function retainedSignatureReplayStillBlockedByQuarantine() {
+  const dir = freshDir("cross-conn-quarantine");
+  const conn = fakeConnectionCapturing(async () => ({ value: 1 }));
+  const mergedTools = [{ name: "email", server: "srv", schema: {} }];
+  const toolOwners = new Map([["email", "srv"]]);
+  const params = { name: "email", arguments: { to: "a" }, _meta: { idempotencyKey: "email-key-1" } };
+
+  // First, a real completed call on its own connection -- this is what populates the
+  // cross-connection retained-signature store the quarantine gate must still override.
+  const proxy1 = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy1.openConnection("conn-1");
+  await proxy1.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy1.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  await proxy1.closeConnection("conn-1", "conn-1 done");
+
+  // Now simulate a DIFFERENT, still-crashed connection leaving this exact tool
+  // quarantined (an unresolved intent for the SAME tool, different arguments -- the
+  // quarantine check is scoped to the tool, not the arguments; see proxy.js's own doc
+  // comment on it).
+  const staleIntentKey = recovery.computeIntentKey("crashed-conn", "email", { to: "z" });
+  recovery.createIntentIfAbsent(dir, staleIntentKey, {
+    connection_id: "crashed-conn",
+    tool: "email",
+    arguments: { to: "z" },
+    state: "dispatched",
+    dispatched_at: Date.now(),
+  });
+  const proxy2 = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    pendingOperatorReviewConnections: ["crashed-conn"],
+  });
+  proxy2.openConnection("conn-2");
+  await proxy2.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const resp = await proxy2.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  check("quarantine-blocks-even-a-matching-retained-signature-replay", Boolean(resp && resp.error && resp.error.code === -32082), JSON.stringify(resp));
+  check("quarantine-blocks-retained-signature-replay-without-redispatch", conn.calls.length === 1, JSON.stringify(conn.calls)); // only conn-1's original call
+  await proxy2.closeConnection("conn-2", "test cleanup");
+}
+
 /* Codex PR #33 review "undo the fence when CALL_START persistence fails": the intent is
  * created (dispatched) before this WAL append -- if the append itself fails (e.g. a full
  * disk), the call never actually reaches conn.call(). Without a rollback, the intent
@@ -1098,11 +1197,15 @@ async function callResultWalFailureDoesNotEscapeHandleMessage() {
 
 /* Codex PR #29 review round 3 "retain sessions when persistence fails": closeConnection
  * used to discard the fully-sealed bundle the moment chain.appendSession threw, leaving
- * only a summary log line. Two connections given identical initialize params and an
- * identical call count deterministically produce the same bundle_id (gsa-mcp-shim.js
- * hashes only {init, grantedTools, n} -- see chain.js's own "same agent reconnecting ...
- * reproduces it" comment), so the second one's real chain.appendSession call genuinely
- * throws GATEWAY_BUNDLE_ID_COLLISION here rather than a synthetic/forced failure. */
+ * only a summary log line. Two connections given identical initialize params, an
+ * identical call count, AND (Cluster B: session_id is now folded into bundle_id -- see
+ * session.js#createSession/gsa-mcp-shim.js#sealBoundaryBundle) the SAME explicit
+ * session_id deterministically produce the same bundle_id, so the second one's real
+ * chain.appendSession call genuinely throws GATEWAY_BUNDLE_ID_COLLISION here rather than
+ * a synthetic/forced failure. Forcing an identical session_id across two otherwise-
+ * independent connections is now the only way to reproduce that collision on purpose
+ * (a real, live connection always gets its own random one) -- exactly mirroring what
+ * "two connections with identical content" meant before session_id existed. */
 async function persistenceFailureQuarantinesSealedBundle() {
   const dir = freshDir("quarantine");
   const conn = fakeConnection(async () => ({ ok: true }));
@@ -1112,14 +1215,15 @@ async function persistenceFailureQuarantinesSealedBundle() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
     onSealFailure: (s, error) => sealFailures.push(error),
   });
+  const forcedSharedSessionId = "forced-shared-session-id-for-collision-test";
 
-  proxy.openConnection("conn-1");
+  proxy.openConnection("conn-1", { sessionId: forcedSharedSessionId });
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
   const entry1 = await proxy.closeConnection("conn-1", "test cleanup");
   check("quarantine-setup-first-append-succeeds", Boolean(entry1 && typeof entry1.bundle_id === "string"), JSON.stringify(entry1));
 
-  proxy.openConnection("conn-2");
+  proxy.openConnection("conn-2", { sessionId: forcedSharedSessionId });
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
   const entry2 = await proxy.closeConnection("conn-2", "test cleanup");
@@ -1226,6 +1330,9 @@ async function main() {
   await retryWithMismatchedKeyDispatchesIndependently();
   await toolQuarantinedWhileACrashedConnectionIsPendingOperatorReview();
   await toolQuarantineScopedToTheAffectedToolAndConnectionOnly();
+  await reconnectWithMatchingIdempotencyKeyReplaysCrossConnectionCompletedCall();
+  await reconnectWithoutMatchingIdempotencyKeyDispatchesIndependently();
+  await retainedSignatureReplayStillBlockedByQuarantine();
   await ambiguousOutcomeBlocksRetryUntilOperatorResolves();
   await closeConnectionFencesInFlightIntentAsAmbiguous();
   await walRecordsLifecycleEventsAndIsCleanedUpOnClose();
