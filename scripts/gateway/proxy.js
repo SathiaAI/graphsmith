@@ -76,6 +76,17 @@ const GATEWAY_PROTOCOL_VERSION = "2025-06-18";
  * configurable once a real deployment needs a different number, not before. */
 const MAX_PENDING_CALLS_PER_SESSION = 1000;
 
+/* Codex PR #29 review "bound completed call history retained by each session":
+ * MAX_PENDING_CALLS_PER_SESSION above bounds only calls genuinely IN FLIGHT at once --
+ * once a call resolves, session.recordCallResult moves it out of pendingCalls and into
+ * session.calls (SS3.3's execution_trace), which has no cap at all. A connection with no
+ * enforced lifetime (stdio) or one that keeps resetting its own idle timer (an active
+ * HTTP client issuing calls sequentially, never exceeding the pending cap) can therefore
+ * grow session.calls -- full arguments and result retained per entry -- without bound
+ * until this process exhausts memory, entirely bypassing the pending-call admission
+ * check above. Same "fixed, non-speculative default" discipline as that constant. */
+const MAX_COMPLETED_CALLS_PER_SESSION = 100000;
+
 class GatewayProxy {
   /**
    * @param {object} opts
@@ -290,6 +301,17 @@ class GatewayProxy {
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error };
       }
+      /* Codex PR #29 review "bound completed call history retained by each session": a
+       * client issuing calls one at a time (never tripping the pending-call cap above)
+       * can still grow this session's completed-call history without bound over the
+       * connection's lifetime. Refuse admission the same way the pending-call cap does --
+       * the client must end this session and start a new one -- rather than let one
+       * long-lived connection's retained history grow unbounded. */
+      if (s.calls.length >= MAX_COMPLETED_CALLS_PER_SESSION) {
+        const error = { code: -32000, message: `This session has already completed ${MAX_COMPLETED_CALLS_PER_SESSION} call(s) -- refusing to admit another call on this connection; start a new session.` };
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error };
+      }
       const conn = method === "tools/call" ? this.connections.get(serverName) : this.connections.values().next().value;
       const callArgs = method === "tools/call" ? (params && params.arguments) : params;
       const ts = this.now();
@@ -481,4 +503,4 @@ class GatewayProxy {
   }
 }
 
-module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION };
+module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION };
