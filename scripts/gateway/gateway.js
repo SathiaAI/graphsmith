@@ -77,7 +77,7 @@ function fail(message, code = "GATEWAY_ERROR") {
  * see agent-transport.js's header). Any other case (an http agent transport, or no agent
  * currently connected) gets a real JSON-RPC error naming exactly why, rather than the
  * silent drop this was before. */
-function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
+function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName) {
   if (msg.method !== "sampling/createMessage") {
     return Promise.resolve({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not forward downstream-initiated method "${msg.method}" to the agent.` } });
   }
@@ -107,10 +107,20 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
   const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
   const correlationKey = s ? Symbol("downstream-initiated-sample") : null;
   const startTs = proxy ? proxy.now() : Date.now();
+  /* Codex PR #29 review round 4 "preserve the originating server for sampling": with
+   * multiple stdio downstreams configured, every connection's onRequest callback used to
+   * be this exact same function reference, so nothing here could tell which downstream
+   * server actually emitted the request -- every sampling step was recorded and logged
+   * under the placeholder server name "sampling" regardless of which real downstream
+   * initiated it. `serverName` is now bound per-connection by connectAllDownstreams (see
+   * downstream.js), so fall back to the old placeholder only for a caller that predates
+   * this parameter (there is none in this codebase, but this keeps the function honest
+   * about its own default rather than crashing on a missing argument). */
+  const recordedServerName = serverName || "sampling";
   if (s) {
     session.recordCallStart(s, correlationKey, {
       tool: "sampling/createMessage",
-      server: "sampling",
+      server: recordedServerName,
       arguments: msg.params,
       isModelCall: true,
       ts: startTs,
@@ -133,7 +143,7 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
       connection_id: agentPusher.connectionId || null,
       step: recordedCall ? recordedCall.seq : null,
       tool: "sampling/createMessage",
-      server: "sampling",
+      server: recordedServerName,
       status: isError ? "error" : "ok",
       duration_ms: completedAt - startTs,
     }));
@@ -153,11 +163,19 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
       return { jsonrpc: "2.0", id: msg.id, result };
     },
     (error) => {
-      log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
       const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
+      /* Codex PR #29 review round 4 "emit only one log line for sampling failures":
+       * this used to unconditionally log the plain diagnostic below AND, when
+       * correlatedNow, also call logCompletion(true) -- double-logging the same failed
+       * step and violating AGENTS.md's "one log line per step" contract. The structured
+       * completion record already carries the failure (status:"error"); only fall back to
+       * the plain diagnostic when there is no session to record a structured line against
+       * in the first place, so every failure still gets exactly one log line either way. */
       if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
         logCompletion(true);
+      } else {
+        log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
       }
       return { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: error.message } };
     }
@@ -325,11 +343,27 @@ async function startGateway(options) {
    * (never, for the http transport -- see forwardDownstreamRequestToAgent's own doc). */
   const agentPusher = { current: null, connectionId: null };
 
+  /* Codex PR #29 review round 4 "advertise sampling before accepting sampling requests":
+   * forwardDownstreamRequestToAgent only relays sampling/createMessage when the agent
+   * transport is stdio (the one transport that can push a request to the agent -- see its
+   * own doc above), but every downstream initialize previously declared `capabilities: {}`
+   * regardless. A conforming MCP server never sends a request the client hasn't declared
+   * support for, so a real downstream would never exercise this relay at all -- only the
+   * test fixture worked, because it ignores capability negotiation. `config.agent_listen`
+   * is already loaded above, so this is knowable before connectAllDownstreams runs. */
+  const agentTransportSupportsSampling = (config.agent_listen || { transport: "stdio" }).transport !== "http";
+
   let downstreamHandles;
   try {
     downstreamHandles = await downstream.connectAllDownstreams(config.downstream_servers, {
       clientInfo: { name: "graphsmith-standalone-gateway", version: "1.0" },
-      onRequest: (msg) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy),
+      supportsSampling: agentTransportSupportsSampling,
+      /* Codex PR #29 review round 4 "preserve the originating server for sampling": with
+       * multiple stdio downstreams, connectAllDownstreams binds each connection's own
+       * onRequest to its configured server name (see downstream.js) -- forward it through
+       * so the recorded/logged step is attributed to the real downstream, not a single
+       * shared placeholder. */
+      onRequest: (msg, serverName) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName),
     });
   } catch (error) {
     writerClaim.release();
