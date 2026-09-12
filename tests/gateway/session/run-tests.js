@@ -83,6 +83,37 @@ function disconnectMarksPendingAsError() {
   check("disconnect-clears-pendingCalls", s.pendingCalls.size === 0, `pendingCalls.size=${s.pendingCalls.size}`);
 }
 
+/** CodeRabbit PR #29 review round 4 "contain disconnect-callback failures during
+ * session finalization": onDisconnect is the CALLER's side effect (proxy.js wires it to
+ * a JSON.stringify + this.log() call, which console.error can in principle throw for --
+ * e.g. an EPIPE on a closed stderr). Before this fix, a throwing onDisconnect would
+ * escape markPendingAsDisconnected entirely, aborting the loop for any remaining pending
+ * calls on this session and propagating up through closeConnection/
+ * handleDownstreamDisconnect -- in gateway.js's shutdown drain this would abort
+ * finalizing every OTHER open session too and skip writerClaim.release(), leaking a
+ * stale claim. Two pending calls here prove both halves: the call whose callback throws
+ * is still correctly recorded (not lost), AND the loop continues to the next one rather
+ * than stopping. */
+function disconnectCallbackFailureDoesNotAbortLoopOrPropagate() {
+  const s = session.createSession("conn-callback-failure");
+  session.recordCallStart(s, "first", { tool: "a", server: "srv", arguments: {}, ts: 1 });
+  session.recordCallStart(s, "second", { tool: "b", server: "srv", arguments: {}, ts: 2 });
+  const seen = [];
+  let threw = null;
+  try {
+    session.markPendingAsDisconnected(s, "downstream disconnected", undefined, undefined, (call) => {
+      seen.push(call.tool);
+      throw new Error("logger EPIPE (simulated)");
+    });
+  } catch (error) {
+    threw = error;
+  }
+  check("disconnect-callback-failure-does-not-propagate-out-of-markPendingAsDisconnected", threw === null, threw && threw.message);
+  check("disconnect-callback-still-invoked-for-every-pending-call-despite-throwing", seen.length === 2 && seen.includes("a") && seen.includes("b"), JSON.stringify(seen));
+  check("disconnect-callback-failure-does-not-lose-the-call-record", s.calls.length === 2, `expected 2 calls, got ${s.calls.length}`);
+  check("disconnect-callback-failure-still-clears-pendingCalls", s.pendingCalls.size === 0, `pendingCalls.size=${s.pendingCalls.size}`);
+}
+
 function modelCallFlagPreserved() {
   const s = session.createSession("conn-5");
   session.recordCallStart(s, 1, { tool: "sampling/createMessage", server: "sampling", arguments: {}, isModelCall: true, ts: 1 });
@@ -138,6 +169,7 @@ function main() {
   outOfOrderCorrelation();
   unmatchedResponseIsAnomalyNotCrash();
   disconnectMarksPendingAsError();
+  disconnectCallbackFailureDoesNotAbortLoopOrPropagate();
   modelCallFlagPreserved();
   duplicateJsonRpcIdRejected();
   finalizeRefusesWithPendingCalls();
