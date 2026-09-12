@@ -31,12 +31,13 @@ const gatewayConfig = require("./config.js");
 const chain = require("./chain.js");
 const session = require("./session.js");
 const recovery = require("./recovery.js");
-const { GatewayProxy } = require("./proxy.js");
+const { GatewayProxy, MAX_PENDING_CALLS_PER_SESSION } = require("./proxy.js");
 const downstream = require("./downstream.js");
 const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-transport.js");
 const writerClaimModule = require("../writer-claim.js");
 const { WriterClaim } = writerClaimModule;
 const registerGatewaySessions = require("../../checks/register-gateway-sessions.js");
+const stateStore = require("../state-store.js");
 
 /** SS3.7's bounded drain: waits (polling) until every open session on `proxy` has no
  * calls still in flight, or `timeoutMs` elapses, whichever first. Extracted as its own
@@ -54,6 +55,15 @@ async function drainOpenSessions(proxy, timeoutMs, pollMs = 25) {
   return !Array.from(proxy.sessions.values()).some((s) => s.pendingCalls.size > 0);
 }
 
+/* Codex PR #29 review round 3 "preserve the configured shutdown deadline for HTTP
+ * calls": Node's http.Server#close() waits for every still-active response to finish
+ * before its callback fires -- a request still awaiting a slow (up to
+ * DEFAULT_REQUEST_TIMEOUT_MS, 30s) downstream call can hold shutdown well past the
+ * nominal drainTimeoutMs (default 5s) drain cap above. This bounds how long doStop()
+ * will wait for the listener to close cleanly before force-terminating any sockets
+ * still open on it, so a slow HTTP call can no longer extend shutdown indefinitely. */
+const HTTP_LISTENER_CLOSE_TIMEOUT_MS = 2000;
+
 function fail(message, code = "GATEWAY_ERROR") {
   const error = new Error(message);
   error.code = code;
@@ -69,7 +79,7 @@ function fail(message, code = "GATEWAY_ERROR") {
  * see agent-transport.js's header). Any other case (an http agent transport, or no agent
  * currently connected) gets a real JSON-RPC error naming exactly why, rather than the
  * silent drop this was before. */
-function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
+function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName) {
   if (msg.method !== "sampling/createMessage") {
     return Promise.resolve({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not forward downstream-initiated method "${msg.method}" to the agent.` } });
   }
@@ -98,6 +108,34 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
    * a strict one-process-one-connection transport (agent-transport.js's own header). */
   const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
   const correlationKey = s ? Symbol("downstream-initiated-sample") : null;
+  const startTs = proxy ? proxy.now() : Date.now();
+  /* Codex PR #29 review round 4 "preserve the originating server for sampling": with
+   * multiple stdio downstreams configured, every connection's onRequest callback used to
+   * be this exact same function reference, so nothing here could tell which downstream
+   * server actually emitted the request -- every sampling step was recorded and logged
+   * under the placeholder server name "sampling" regardless of which real downstream
+   * initiated it. `serverName` is now bound per-connection by connectAllDownstreams (see
+   * downstream.js), so fall back to the old placeholder only for a caller that predates
+   * this parameter (there is none in this codebase, but this keeps the function honest
+   * about its own default rather than crashing on a missing argument). */
+  const recordedServerName = serverName || "sampling";
+  /* Codex PR #29 review round 6 "bound downstream-pushed sampling calls": this path
+   * records and forwards every downstream-initiated sampling request unconditionally,
+   * unlike GatewayProxy#handleMessage's own agent-initiated dispatch (proxy.js), which
+   * refuses to admit another concurrent call once a session already has
+   * MAX_PENDING_CALLS_PER_SESSION genuinely pending. Without the same admission bound
+   * here, a faulty or compromised sampling-capable stdio downstream could still exhaust
+   * memory via this separate route despite that cap. Mirrors proxy.js's own error shape. */
+  if (s && s.pendingCalls.size >= MAX_PENDING_CALLS_PER_SESSION) {
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32000,
+        message: `This session already has ${MAX_PENDING_CALLS_PER_SESSION} call(s) pending -- refusing to admit another concurrent downstream-initiated sampling call until at least one resolves.`,
+      },
+    });
+  }
   /* Codex PR #33 review "persist sampling calls in the recovery WAL": this forward is
    * recorded into the in-memory session (above) but, before this fix, NEVER into
    * recovery.js's WAL at all -- unlike proxy.js's own tools/call path. A crash after the
@@ -124,10 +162,10 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
     walCallSeq = s.nextCallSeq;
     session.recordCallStart(s, correlationKey, {
       tool: "sampling/createMessage",
-      server: "sampling",
+      server: recordedServerName,
       arguments: msg.params,
       isModelCall: true,
-      ts: proxy.now(),
+      ts: startTs,
     });
     try {
       recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, {
@@ -163,6 +201,28 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
       error: { code: -32000, message: `Failed to durably record this sampling request before forwarding it to the agent: ${walAppendFailed.message}. Not forwarded -- safe to retry.` },
     });
   }
+  /* Codex PR #29 review round 3 "log completed downstream-initiated sampling steps":
+   * proxy.js's own agent-initiated call path (GatewayProxy#handleMessage) emits a
+   * structured "gateway_call_completed" log line for every call it records -- this
+   * separate downstream-initiated sampling path records the same kind of execution-trace
+   * step (model_call:true) but previously emitted no matching completion log on success,
+   * and its failure log above lacked the connection id, step, status, and duration every
+   * other completed-call log line carries. Mirror that same structured shape here so a
+   * session containing a downstream-initiated sampling call has a complete, consistent
+   * operational log regardless of which side (agent or downstream) initiated the call. */
+  function logCompletion(isError) {
+    const completedAt = proxy ? proxy.now() : Date.now();
+    const recordedCall = s ? s.calls[s.calls.length - 1] : null;
+    log(JSON.stringify({
+      event: "gateway_call_completed",
+      connection_id: agentPusher.connectionId || null,
+      step: recordedCall ? recordedCall.seq : null,
+      tool: "sampling/createMessage",
+      server: recordedServerName,
+      status: isError ? "error" : "ok",
+      duration_ms: completedAt - startTs,
+    }));
+  }
   return agentPusher.current(msg.method, msg.params).then(
     (result) => {
       /* Mirrors proxy.js's own "correlatedNow" guard (CodeRabbit PR #29 review, round 1):
@@ -170,7 +230,8 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
        * still in flight awaiting the agent's model. Only record if it's still genuinely
        * pending, so this never throws SESSION_FINALIZED or logs a spurious anomaly for an
        * entry the gateway itself already removed. */
-      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) {
+      const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
+      if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
         if (walCallSeq !== null) {
           try {
@@ -179,12 +240,33 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
             log(`Failed to durably record a downstream-initiated sampling call's result: ${walError.message}`);
           }
         }
+        logCompletion(false);
       }
       return { jsonrpc: "2.0", id: msg.id, result };
     },
     (error) => {
-      log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
-      if (s && !s.finalized && s.pendingCalls.has(correlationKey)) {
+      const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
+      /* Codex PR #29 review round 4 "emit only one log line for sampling failures":
+       * this used to unconditionally log the plain diagnostic below AND, when
+       * correlatedNow, also call logCompletion(true) -- double-logging the same failed
+       * step and violating AGENTS.md's "one log line per step" contract. The structured
+       * completion record already carries the failure (status:"error"); only fall back to
+       * the plain diagnostic when there is no session to record a structured line against
+       * in the first place, so every failure still gets exactly one log line either way.
+       *
+       * CodeRabbit PR #29 review round 4 "use the fallback only when no session exists":
+       * `correlatedNow` also goes false once a stdio agent disconnect has already run this
+       * call through closeConnection/handleDownstreamDisconnect's own pending-call
+       * cleanup (session.markPendingAsDisconnected) -- and that cleanup already emitted
+       * this exact step's structured gateway_call_completed/status:"disconnected" log via
+       * its onDisconnect callback (see proxy.js#logDisconnectedCall). `s` is still truthy
+       * in that case (the session object itself isn't gone, just this call's pending
+       * entry), so the old unconditional `else` fired the plain diagnostic below on top of
+       * that already-emitted completion log -- two log lines for one step. Only fall back
+       * to the plain diagnostic when there was never a session to correlate against at
+       * all, so a disconnect-during-forward gets exactly the one completion log
+       * closeConnection/handleDownstreamDisconnect already recorded, not a second one. */
+      if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
         if (walCallSeq !== null) {
           try {
@@ -193,10 +275,37 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
             log(`Failed to durably record a downstream-initiated sampling call's error result: ${walError.message}`);
           }
         }
+        logCompletion(true);
+      } else if (!s) {
+        log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
       }
       return { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: error.message } };
     }
   );
+}
+
+/** Codex PR #29 review "surface unmatched stdio responses to the session recorder": a
+ * stdio downstream response whose id has no live pending call (already timed out, or a
+ * downstream fabricating/replaying an id this gateway never sent) previously vanished
+ * silently at the transport layer (downstream.js), even though that file's own doc
+ * comment already promised the session-correlation layer records it as an anomaly --
+ * nothing actually wired the two together. Mirrors forwardDownstreamRequestToAgent's own
+ * attribution rule just above: a downstream connection is shared by every currently open
+ * agent session, so this can only be honestly attributed to ONE session's sealed audit
+ * trail when this gateway's agent transport is stdio (the one transport that can only
+ * ever have a single open session -- agentPusher.connectionId names it; see that
+ * function's own header for why). Any other case (HTTP agent transport with zero or
+ * multiple concurrent sessions, or no agent currently connected) still surfaces the
+ * observed protocol violation, just as a plain operational log line naming the
+ * originating server -- recording it against an arbitrarily-chosen session's audit trail
+ * would misattribute a violation this gateway cannot actually pin on that session. */
+function recordUnmatchedDownstreamResponse(msg, agentPusher, log, proxy, serverName) {
+  const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
+  if (s && !s.finalized) {
+    session.recordCallResult(s, msg.id, { result: msg, isError: true, ts: proxy.now() });
+    return;
+  }
+  log(JSON.stringify({ event: "gateway_unmatched_downstream_response", server: serverName || null, id: msg.id }));
 }
 
 function loadSigningKeys(config) {
@@ -841,19 +950,78 @@ function runRecoveryAbandonCli(argv, log) {
   }
 }
 
+/* Cluster D: operational exposure for buildHealthStatus(ctx) above. This is a
+ * single-tenant, locally-run process (not a hosted service with a real ops network
+ * surface) -- SG-NFR-3's health/status report existed only as `.status()` on the
+ * in-process handle before this, reachable from a unit test or an embedder that already
+ * holds the handle, but from nothing an operator could actually run against a gateway
+ * they only know how to reach by its config file (a separate `status` invocation, a cron
+ * job, a shell one-liner). A separate ops HTTP port is deliberately out of scope for this
+ * fix (it would need its own auth/bind-address story, mirroring agent_listen's own,
+ * before it could ship responsibly) -- a periodically-written status FILE plus a `status`
+ * CLI subcommand that reads it is the minimal, honest version of "operationally exposed"
+ * for a process that already writes durable state to `state_dir` for other reasons. */
+const STATUS_FILE_NAME = "gateway-status.json";
+/* Fixed, non-speculative default -- same discipline as SESSION_IDLE_TIMEOUT_MS/
+ * MAX_HTTP_SESSIONS in agent-transport.js and the MAX_* constants in downstream.js/
+ * proxy.js: make it configurable once a real deployment needs a different cadence, not
+ * before. 10s keeps `gateway.js status` usefully fresh without meaningfully adding to
+ * this process's I/O -- one small JSON write, not on any request's critical path. */
+const STATUS_WRITE_INTERVAL_MS = 10000;
+
+function gatewayStatusPath(stateDir) {
+  return path.join(stateDir, STATUS_FILE_NAME);
+}
+
+/* Best-effort, non-throwing by design: a failure to write the status file (e.g. a
+ * momentarily full disk) is an operational inconvenience for whoever next runs `status`,
+ * never a reason to disrupt request handling or bring down the gateway process itself --
+ * this is purely an observability side channel, not part of SG-FR-5's persisted-session
+ * write path. Reuses state-store.js's own atomic-write primitive (temp file + fsync +
+ * rename), same as chain.js#appendSession's HEAD.json write, so a reader (the `status`
+ * subcommand, or an operator's own tool) can never observe a half-written file. */
+function writeStatusFile(ctx, log) {
+  try {
+    const stateDir = ctx.config.state_dir;
+    fs.mkdirSync(stateDir, { recursive: true });
+    const status = { ...buildHealthStatus(ctx), written_at: new Date().toISOString() };
+    stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir);
+  } catch (error) {
+    log(`failed to write status file (non-fatal): ${error.message}`);
+  }
+}
+
 /**
  * Starts the standalone gateway process. Returns { dormant: true } if attach mode is
  * active (caller should exit 0). Otherwise returns a running gateway handle with
  * `.stop()` for graceful shutdown (SIGTERM/SIGINT, SS3.7) and `.status()` (SG-NFR-3).
  */
 async function startGateway(options) {
-  const root = options.root || process.cwd();
   const log = options.log || ((...args) => console.error("[graphsmith-gateway]", ...args));
+
+  /* Cluster E (partial fix -- see PR description for what is deliberately NOT included
+   * here): the mode-gate validation root must track whichever project's config this
+   * invocation is actually loading, not this process's cwd. `gateway.js --config
+   * /path/to/project-b/gateway.json` run with cwd `/path/to/project-a/` previously
+   * validated project A's <cwd>/.graphsmith/gateway-mode.json (checkModeGate's `root`
+   * defaulted to process.cwd()) while loadConfig() below loaded project B's config
+   * entirely independently -- two different projects' state read through one mode-gate
+   * check that named neither of them. Deriving `root` from configPath's own directory
+   * instead makes "which mode-selection record gates this run" track "which config this
+   * run loads" by construction: whatever project configPath points into is the project
+   * whose .graphsmith/ this checks, for every caller (the CLI's own configPath resolution
+   * below, and any direct startGateway() caller), not only the common case where cwd and
+   * the config's directory happen to coincide. options.root remains available to
+   * override this explicitly for a caller that genuinely keeps its config file outside
+   * the project root it means to validate against -- it is no longer the default source
+   * of truth. */
+  const configPath = options.configPath || path.join(process.cwd(), "gateway-config.json");
+  const root = options.root || path.dirname(path.resolve(configPath));
 
   const modeResult = checkModeGate(root, log);
   if (modeResult.dormant) return { dormant: true };
 
-  const config = gatewayConfig.loadConfig(options.configPath);
+  const config = gatewayConfig.loadConfig(configPath);
   if (config.session_boundary === "time_window") {
     throw fail(
       "session_boundary=\"time_window\" is accepted by the config schema as a forward-compatible " +
@@ -874,7 +1042,15 @@ async function startGateway(options) {
     log(`writer-claim lost: ${error.message} -- halting: no new sessions will be accepted.`);
     if (proxy) proxy.stopAcceptingNewSessions();
     // SS7: "In-flight sessions at the moment of loss should still attempt to finalize
-    // and persist" -- already-open sessions are left alone; only new admission stops.
+    // and persist" -- already-open sessions are left alone here; only new admission
+    // stops. That is deliberately NOT the whole story: a session already open when the
+    // claim is lost is still allowed to run to completion and finalize, which is exactly
+    // where the single-writer invariant chain.appendSession depends on could be violated
+    // by a replacement writer that has since taken over this state directory (Cluster C).
+    // GatewayProxy's own isWriterClaimValid check (wired below, consulted synchronously
+    // right before chain.appendSession in closeConnection) is what actually closes that
+    // gap -- not by halting every in-flight session the instant claim loss is first
+    // detected, but by re-checking liveness at the one write that matters.
   };
   writerClaim.startHeartbeat();
 
@@ -914,11 +1090,43 @@ async function startGateway(options) {
    * (never, for the http transport -- see forwardDownstreamRequestToAgent's own doc). */
   const agentPusher = { current: null, connectionId: null };
 
+  /* Codex PR #29 review round 4 "advertise sampling before accepting sampling requests":
+   * forwardDownstreamRequestToAgent only relays sampling/createMessage when the agent
+   * transport is stdio (the one transport that can push a request to the agent -- see its
+   * own doc above), but every downstream initialize previously declared `capabilities: {}`
+   * regardless. A conforming MCP server never sends a request the client hasn't declared
+   * support for, so a real downstream would never exercise this relay at all -- only the
+   * test fixture worked, because it ignores capability negotiation. `config.agent_listen`
+   * is already loaded above, so this is knowable before connectAllDownstreams runs. */
+  const agentTransportSupportsSampling = (config.agent_listen || { transport: "stdio" }).transport !== "http";
+
+  /* Codex PR #29 review "keep gateway secrets out of downstream subprocess environments":
+   * every configured stdio downstream is spawned as a child process that, absent an
+   * explicit `env`, inherits this gateway's complete process.env -- including whichever
+   * env vars signing_key_ref / agent_listen.token_ref / a downstream's own token_ref
+   * resolve secrets from. Collect just those NAMES (never the resolved secret values,
+   * which this gateway process never needs to hand back to itself) once, here, so
+   * connectStdio (via connectAllDownstreams/connectDownstream) can strip them from every
+   * stdio child's environment regardless of which downstream is spawned. */
+  const gatewaySecretEnvNames = new Set(
+    [config.signing_key_ref, (config.agent_listen || {}).token_ref, ...(config.downstream_servers || []).map((s) => s.token_ref)].filter(
+      (name) => typeof name === "string" && name.length > 0
+    )
+  );
+
   let downstreamHandles;
   try {
     downstreamHandles = await downstream.connectAllDownstreams(config.downstream_servers, {
       clientInfo: { name: "graphsmith-standalone-gateway", version: "1.0" },
-      onRequest: (msg) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy),
+      supportsSampling: agentTransportSupportsSampling,
+      secretEnvNames: gatewaySecretEnvNames,
+      /* Codex PR #29 review round 4 "preserve the originating server for sampling": with
+       * multiple stdio downstreams, connectAllDownstreams binds each connection's own
+       * onRequest to its configured server name (see downstream.js) -- forward it through
+       * so the recorded/logged step is attributed to the real downstream, not a single
+       * shared placeholder. */
+      onRequest: (msg, serverName) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName),
+      onUnmatchedResponse: (msg, serverName) => recordUnmatchedDownstreamResponse(msg, agentPusher, log, proxy, serverName),
     });
   } catch (error) {
     writerClaim.release();
@@ -938,7 +1146,13 @@ async function startGateway(options) {
     // is sufficient here.
     pendingOperatorReviewConnections: pendingOperatorReview,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
-    onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size })),
+    onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size, quarantinedTo: error.quarantinedTo || null })),
+    // Cluster C: read fresh from disk (WriterClaim#status's own contract) rather than
+    // trust writerClaim's in-memory _claimToken -- a claim lost out-of-band (the file
+    // removed or overwritten by a replacement writer underneath this process) must be
+    // caught here even if this instance's own heartbeat hasn't yet noticed and fired
+    // onClaimLost.
+    isWriterClaimValid: () => writerClaim.status().held_by_this_instance,
   });
 
   for (const [name, conn] of downstreamHandles.connections.entries()) {
@@ -988,6 +1202,18 @@ async function startGateway(options) {
 
   const ctx = { config, writerClaim, connections: downstreamHandles.connections, proxy };
 
+  /* Cluster D: write an initial status file immediately (not just on the first
+   * interval tick, options.statusWriteIntervalMs or STATUS_WRITE_INTERVAL_MS away) so a
+   * `status` invocation right after startup already finds fresh data, then keep it
+   * refreshed on a fixed cadence for the rest of this process's life. unref'd, matching
+   * every other background timer in this file (writer-claim's own heartbeat, HTTP
+   * session idle timers) -- a status-file refresh must never be the reason this process
+   * fails to exit. */
+  writeStatusFile(ctx, log);
+  const statusWriteIntervalMs = options.statusWriteIntervalMs || STATUS_WRITE_INTERVAL_MS;
+  const statusWriteTimer = setInterval(() => writeStatusFile(ctx, log), statusWriteIntervalMs);
+  if (typeof statusWriteTimer.unref === "function") statusWriteTimer.unref();
+
   const drainTimeoutMs = options.drainTimeoutMs || 5000;
   /* CodeRabbit PR #29 review "make stop() await the in-progress shutdown instead of
    * returning early": the SIGTERM/SIGINT handler and the stdio-disconnect path
@@ -1006,6 +1232,7 @@ async function startGateway(options) {
   }
   async function doStop(reason) {
     log(`shutting down (${reason || "requested"}): draining ${proxy.openSessionCount()} open session(s)`);
+    clearInterval(statusWriteTimer); // Cluster D: stop refreshing the status file once shutdown begins
     proxy.stopAcceptingNewSessions();
     /* SS3.7: "finish in-flight sessions" means actually WAIT (bounded) for calls already
      * in flight to complete and be recorded with their real result -- not immediately
@@ -1016,7 +1243,23 @@ async function startGateway(options) {
     agentPusher.current = null; // no agent left to push a forwarded sampling request to
     agentPusher.connectionId = null;
     if (stdioHandle) stdioHandle.stop();
-    if (httpHandle) await new Promise((resolve) => httpHandle.server.close(resolve));
+    if (httpHandle) {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
+        httpHandle.server.close(finish);
+        const forceCloseTimer = setTimeout(() => {
+          // Stop accepting new connections is already implied by close() above; this
+          // forcibly ends any still-open sockets/responses so the callback above (or
+          // this fallback) fires within the bounded deadline rather than whenever the
+          // last active response happens to finish.
+          if (typeof httpHandle.server.closeAllConnections === "function") httpHandle.server.closeAllConnections();
+          finish();
+        }, HTTP_LISTENER_CLOSE_TIMEOUT_MS);
+        if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
+      });
+    }
+    // Finalize any still-open sessions (drained above, or forced closed after the timeout).
     /* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
      * closeConnection can throw before reaching its own guarded sealing block (e.g.
      * recovery.listIntentsForConnection hitting a corrupt/unreadable intent FILE for this
@@ -1038,6 +1281,10 @@ async function startGateway(options) {
       try { conn.close(); } catch (error) { /* best effort */ }
     }
     writerClaim.release();
+    // Cluster D: one last write so `gateway.js status` run after this process has
+    // exited reports an accurate "not claimed by this instance" / drained snapshot
+    // instead of silently going stale mid-run-looking data.
+    writeStatusFile(ctx, log);
     log("shutdown complete: writer-claim released.");
   }
 
@@ -1051,21 +1298,92 @@ async function startGateway(options) {
   };
 }
 
+/* Cluster D: `node gateway.js status [configPath]` -- reads the status FILE a running
+ * gateway (started against the same config) periodically writes to <state_dir>/
+ * gateway-status.json (see writeStatusFile above) and pretty-prints it. Deliberately a
+ * separate, short-lived process reading a file, not an RPC to the running gateway or a
+ * new ops HTTP port (out of scope -- see writeStatusFile's own header comment): this
+ * mirrors how `node scripts/writer-claim.js status` already reports on-disk state
+ * without needing a running process to ask. Exits non-zero with a clear, actionable
+ * message when the config can't be loaded, no status file exists yet (no gateway has
+ * run against this config, or state_dir doesn't match), or the file is unreadable/
+ * corrupt -- never a stack trace. */
+function runStatusCommand(configPathArg) {
+  const configPath = configPathArg || path.join(process.cwd(), "gateway-config.json");
+  let config;
+  try {
+    config = gatewayConfig.loadConfig(configPath);
+  } catch (error) {
+    console.error(`[graphsmith-gateway] status: could not load config at ${configPath}: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const statusPath = gatewayStatusPath(config.state_dir);
+  let raw;
+  try {
+    raw = fs.readFileSync(statusPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      console.error(
+        `[graphsmith-gateway] status: no status file at ${statusPath} -- has a gateway ever been ` +
+          `started against this config (state_dir: ${config.state_dir})?`
+      );
+    } else {
+      console.error(`[graphsmith-gateway] status: could not read ${statusPath}: ${error.message}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  let status;
+  try {
+    status = JSON.parse(raw);
+  } catch (error) {
+    console.error(`[graphsmith-gateway] status: ${statusPath} contains invalid JSON: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(JSON.stringify(status, null, 2));
+
+  // A status file this stale means the writer that produced it stopped refreshing it --
+  // either a clean shutdown (see doStop's own final write) or a crash that skipped that
+  // final write. Either way, flag it rather than let stale data read as "still running".
+  const writtenAt = Date.parse(status.written_at);
+  if (Number.isFinite(writtenAt)) {
+    const ageMs = Date.now() - writtenAt;
+    const staleAfterMs = STATUS_WRITE_INTERVAL_MS * 3;
+    if (ageMs > staleAfterMs) {
+      console.error(
+        `[graphsmith-gateway] status: WARNING -- this snapshot is ${Math.round(ageMs / 1000)}s old ` +
+          `(refreshed every ~${Math.round(STATUS_WRITE_INTERVAL_MS / 1000)}s while running); the ` +
+          "gateway that wrote it may no longer be running."
+      );
+    }
+  }
+}
+
 function main() {
   const log = (...args) => console.error("[graphsmith-gateway]", ...args);
-  const subcommand = process.argv[2];
-  if (subcommand === "recovery-resolve" || subcommand === "recovery-abandon") {
+  const argv = process.argv.slice(2);
+  if (argv[0] === "recovery-resolve" || argv[0] === "recovery-abandon") {
     try {
-      if (subcommand === "recovery-resolve") runRecoveryResolveCli(process.argv.slice(3), log);
-      else runRecoveryAbandonCli(process.argv.slice(3), log);
+      if (argv[0] === "recovery-resolve") runRecoveryResolveCli(argv.slice(1), log);
+      else runRecoveryAbandonCli(argv.slice(1), log);
     } catch (error) {
       console.error(`[graphsmith-gateway] FATAL: ${error.message}`);
       process.exitCode = 1;
     }
     return;
   }
-  const configPath = process.argv[2] || path.join(process.cwd(), "gateway-config.json");
-  startGateway({ configPath, root: process.cwd() }).then((handle) => {
+  if (argv[0] === "status") {
+    runStatusCommand(argv[1]);
+    return;
+  }
+
+  const configPath = argv[0] || path.join(process.cwd(), "gateway-config.json");
+  startGateway({ configPath }).then((handle) => {
     if (handle.dormant) {
       process.exit(0);
     }
@@ -1091,4 +1409,7 @@ module.exports = {
   abandonConnection,
   runRecoveryResolveCli,
   runRecoveryAbandonCli,
+  gatewayStatusPath,
+  STATUS_WRITE_INTERVAL_MS,
+  runStatusCommand,
 };
