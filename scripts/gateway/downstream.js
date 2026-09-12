@@ -129,8 +129,20 @@ function connectStdio(endpoint, options = {}) {
    * MAX_HTTP_RESPONSE_BYTES. Track bytes received since the last completed line and
    * force-close the connection if a single unterminated line grows past that same cap. */
   let bytesSinceLastLine = 0;
+  /* CodeRabbit PR #29 review round 4 "track only the bytes after the last newline":
+   * readline registers its own "data" listener on child.stdout before this one, so for a
+   * chunk containing one or more COMPLETE lines, readline has already emitted "line"
+   * (resetting bytesSinceLastLine to 0 below) by the time this listener runs -- which then
+   * added the chunk's FULL length on top of that reset, rather than only the bytes still
+   * unterminated after the chunk's last newline. Several complete, individually
+   * well-formed lines delivered together in one chunk (e.g. pipelined/batched downstream
+   * writes) could therefore be misreported as a single oversized unterminated line and
+   * force-close a perfectly healthy connection. Derive the residual directly from each
+   * chunk's own last newline instead of relying on ordering against readline's listener. */
   child.stdout.on("data", (chunk) => {
-    bytesSinceLastLine += chunk.length;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const lastNewline = buf.lastIndexOf(0x0a);
+    bytesSinceLastLine = lastNewline === -1 ? bytesSinceLastLine + buf.length : buf.length - lastNewline - 1;
     if (bytesSinceLastLine > MAX_HTTP_RESPONSE_BYTES) {
       bytesSinceLastLine = 0;
       if (!closed) {
@@ -148,7 +160,8 @@ function connectStdio(endpoint, options = {}) {
    * directions from being confused with each other (board decision 2026-09-04, PR #29
    * review "distinguish downstream requests before correlating responses"). */
   rl.on("line", (line) => {
-    bytesSinceLastLine = 0; // a completed line: reset the unterminated-line byte counter above
+    // bytesSinceLastLine is now derived per-chunk (from each chunk's own last newline) in
+    // the "data" listener above, so it needs no reset here.
     const trimmed = line.trim();
     if (trimmed.length === 0) return;
     let msg;
@@ -523,17 +536,37 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
     for (const serverConfig of downstreamServers) {
       let conn;
       try {
-        conn = connectDownstream(serverConfig, options);
+        /* Codex PR #29 review round 4 "preserve the originating server for sampling": the
+         * shared `options.onRequest` (when provided) previously reached every downstream
+         * connection completely unchanged, so nothing in that shared closure could tell
+         * which configured server actually emitted a given unsolicited request -- every
+         * downstream-initiated sampling call was attributed to a single placeholder
+         * instead of the real originating server. Bind this server's own name into its
+         * own connection's callback here, once, rather than have every caller of
+         * connectAllDownstreams re-derive it. */
+        const perServerOptions = typeof options.onRequest === "function"
+          ? { ...options, onRequest: (msg) => options.onRequest(msg, serverConfig.name) }
+          : options;
+        conn = connectDownstream(serverConfig, perServerOptions);
         /* Full MCP initialize params (protocolVersion + capabilities, not just
          * clientInfo) -- a downstream that actually validates the initialization
          * contract (this repo's own MCP server included) rejects a request missing
          * either. Followed by the required post-initialize "initialized" notification
          * before this client is allowed to send any other request (tools/list here) --
          * skipping it left the handshake incomplete even though the permissive test
-         * fixture tolerated it. */
+         * fixture tolerated it.
+         *
+         * Codex PR #29 review round 4 "advertise sampling before accepting sampling
+         * requests": gateway.js only ever relays a downstream's sampling/createMessage
+         * request when the agent transport is stdio (the only transport that can push a
+         * request to the agent) -- but this call previously declared `capabilities: {}`
+         * unconditionally, so a conforming downstream server would never send that
+         * request in the first place, having negotiated that this client supports no
+         * optional capabilities. Advertise the sampling client capability exactly when
+         * the caller says the agent transport can actually relay it. */
         const initResult = await conn.call("initialize", {
           protocolVersion: MCP_PROTOCOL_VERSION,
-          capabilities: {},
+          capabilities: options.supportsSampling ? { sampling: {} } : {},
           clientInfo: options.clientInfo || { name: "graphsmith-standalone-gateway", version: "1.0" },
         });
         serverInfos[serverConfig.name] = (initResult && initResult.serverInfo) || null;
