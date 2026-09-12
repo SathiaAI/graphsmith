@@ -212,6 +212,30 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
   );
 }
 
+/** Codex PR #29 review "surface unmatched stdio responses to the session recorder": a
+ * stdio downstream response whose id has no live pending call (already timed out, or a
+ * downstream fabricating/replaying an id this gateway never sent) previously vanished
+ * silently at the transport layer (downstream.js), even though that file's own doc
+ * comment already promised the session-correlation layer records it as an anomaly --
+ * nothing actually wired the two together. Mirrors forwardDownstreamRequestToAgent's own
+ * attribution rule just above: a downstream connection is shared by every currently open
+ * agent session, so this can only be honestly attributed to ONE session's sealed audit
+ * trail when this gateway's agent transport is stdio (the one transport that can only
+ * ever have a single open session -- agentPusher.connectionId names it; see that
+ * function's own header for why). Any other case (HTTP agent transport with zero or
+ * multiple concurrent sessions, or no agent currently connected) still surfaces the
+ * observed protocol violation, just as a plain operational log line naming the
+ * originating server -- recording it against an arbitrarily-chosen session's audit trail
+ * would misattribute a violation this gateway cannot actually pin on that session. */
+function recordUnmatchedDownstreamResponse(msg, agentPusher, log, proxy, serverName) {
+  const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
+  if (s && !s.finalized) {
+    session.recordCallResult(s, msg.id, { result: msg, isError: true, ts: proxy.now() });
+    return;
+  }
+  log(JSON.stringify({ event: "gateway_unmatched_downstream_response", server: serverName || null, id: msg.id }));
+}
+
 function loadSigningKeys(config) {
   const material = gatewayConfig.resolveSecretRef(config.signing_key_ref, "signing_key_ref");
   /* The signing_key_ref convention (SS4) is "a reference ... never the raw key
@@ -383,17 +407,33 @@ async function startGateway(options) {
    * is already loaded above, so this is knowable before connectAllDownstreams runs. */
   const agentTransportSupportsSampling = (config.agent_listen || { transport: "stdio" }).transport !== "http";
 
+  /* Codex PR #29 review "keep gateway secrets out of downstream subprocess environments":
+   * every configured stdio downstream is spawned as a child process that, absent an
+   * explicit `env`, inherits this gateway's complete process.env -- including whichever
+   * env vars signing_key_ref / agent_listen.token_ref / a downstream's own token_ref
+   * resolve secrets from. Collect just those NAMES (never the resolved secret values,
+   * which this gateway process never needs to hand back to itself) once, here, so
+   * connectStdio (via connectAllDownstreams/connectDownstream) can strip them from every
+   * stdio child's environment regardless of which downstream is spawned. */
+  const gatewaySecretEnvNames = new Set(
+    [config.signing_key_ref, (config.agent_listen || {}).token_ref, ...(config.downstream_servers || []).map((s) => s.token_ref)].filter(
+      (name) => typeof name === "string" && name.length > 0
+    )
+  );
+
   let downstreamHandles;
   try {
     downstreamHandles = await downstream.connectAllDownstreams(config.downstream_servers, {
       clientInfo: { name: "graphsmith-standalone-gateway", version: "1.0" },
       supportsSampling: agentTransportSupportsSampling,
+      secretEnvNames: gatewaySecretEnvNames,
       /* Codex PR #29 review round 4 "preserve the originating server for sampling": with
        * multiple stdio downstreams, connectAllDownstreams binds each connection's own
        * onRequest to its configured server name (see downstream.js) -- forward it through
        * so the recorded/logged step is attributed to the real downstream, not a single
        * shared placeholder. */
       onRequest: (msg, serverName) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName),
+      onUnmatchedResponse: (msg, serverName) => recordUnmatchedDownstreamResponse(msg, agentPusher, log, proxy, serverName),
     });
   } catch (error) {
     writerClaim.release();
