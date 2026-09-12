@@ -36,6 +36,7 @@ const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-trans
 const writerClaimModule = require("../writer-claim.js");
 const { WriterClaim } = writerClaimModule;
 const registerGatewaySessions = require("../../checks/register-gateway-sessions.js");
+const stateStore = require("../state-store.js");
 
 /** SS3.7's bounded drain: waits (polling) until every open session on `proxy` has no
  * calls still in flight, or `timeoutMs` elapses, whichever first. Extracted as its own
@@ -353,19 +354,78 @@ function buildHealthStatus(ctx) {
   };
 }
 
+/* Cluster D: operational exposure for buildHealthStatus(ctx) above. This is a
+ * single-tenant, locally-run process (not a hosted service with a real ops network
+ * surface) -- SG-NFR-3's health/status report existed only as `.status()` on the
+ * in-process handle before this, reachable from a unit test or an embedder that already
+ * holds the handle, but from nothing an operator could actually run against a gateway
+ * they only know how to reach by its config file (a separate `status` invocation, a cron
+ * job, a shell one-liner). A separate ops HTTP port is deliberately out of scope for this
+ * fix (it would need its own auth/bind-address story, mirroring agent_listen's own,
+ * before it could ship responsibly) -- a periodically-written status FILE plus a `status`
+ * CLI subcommand that reads it is the minimal, honest version of "operationally exposed"
+ * for a process that already writes durable state to `state_dir` for other reasons. */
+const STATUS_FILE_NAME = "gateway-status.json";
+/* Fixed, non-speculative default -- same discipline as SESSION_IDLE_TIMEOUT_MS/
+ * MAX_HTTP_SESSIONS in agent-transport.js and the MAX_* constants in downstream.js/
+ * proxy.js: make it configurable once a real deployment needs a different cadence, not
+ * before. 10s keeps `gateway.js status` usefully fresh without meaningfully adding to
+ * this process's I/O -- one small JSON write, not on any request's critical path. */
+const STATUS_WRITE_INTERVAL_MS = 10000;
+
+function gatewayStatusPath(stateDir) {
+  return path.join(stateDir, STATUS_FILE_NAME);
+}
+
+/* Best-effort, non-throwing by design: a failure to write the status file (e.g. a
+ * momentarily full disk) is an operational inconvenience for whoever next runs `status`,
+ * never a reason to disrupt request handling or bring down the gateway process itself --
+ * this is purely an observability side channel, not part of SG-FR-5's persisted-session
+ * write path. Reuses state-store.js's own atomic-write primitive (temp file + fsync +
+ * rename), same as chain.js#appendSession's HEAD.json write, so a reader (the `status`
+ * subcommand, or an operator's own tool) can never observe a half-written file. */
+function writeStatusFile(ctx, log) {
+  try {
+    const stateDir = ctx.config.state_dir;
+    fs.mkdirSync(stateDir, { recursive: true });
+    const status = { ...buildHealthStatus(ctx), written_at: new Date().toISOString() };
+    stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir);
+  } catch (error) {
+    log(`failed to write status file (non-fatal): ${error.message}`);
+  }
+}
+
 /**
  * Starts the standalone gateway process. Returns { dormant: true } if attach mode is
  * active (caller should exit 0). Otherwise returns a running gateway handle with
  * `.stop()` for graceful shutdown (SIGTERM/SIGINT, SS3.7) and `.status()` (SG-NFR-3).
  */
 async function startGateway(options) {
-  const root = options.root || process.cwd();
   const log = options.log || ((...args) => console.error("[graphsmith-gateway]", ...args));
+
+  /* Cluster E (partial fix -- see PR description for what is deliberately NOT included
+   * here): the mode-gate validation root must track whichever project's config this
+   * invocation is actually loading, not this process's cwd. `gateway.js --config
+   * /path/to/project-b/gateway.json` run with cwd `/path/to/project-a/` previously
+   * validated project A's <cwd>/.graphsmith/gateway-mode.json (checkModeGate's `root`
+   * defaulted to process.cwd()) while loadConfig() below loaded project B's config
+   * entirely independently -- two different projects' state read through one mode-gate
+   * check that named neither of them. Deriving `root` from configPath's own directory
+   * instead makes "which mode-selection record gates this run" track "which config this
+   * run loads" by construction: whatever project configPath points into is the project
+   * whose .graphsmith/ this checks, for every caller (the CLI's own configPath resolution
+   * below, and any direct startGateway() caller), not only the common case where cwd and
+   * the config's directory happen to coincide. options.root remains available to
+   * override this explicitly for a caller that genuinely keeps its config file outside
+   * the project root it means to validate against -- it is no longer the default source
+   * of truth. */
+  const configPath = options.configPath || path.join(process.cwd(), "gateway-config.json");
+  const root = options.root || path.dirname(path.resolve(configPath));
 
   const modeResult = checkModeGate(root, log);
   if (modeResult.dormant) return { dormant: true };
 
-  const config = gatewayConfig.loadConfig(options.configPath);
+  const config = gatewayConfig.loadConfig(configPath);
   if (config.session_boundary === "time_window") {
     throw fail(
       "session_boundary=\"time_window\" is accepted by the config schema as a forward-compatible " +
@@ -386,7 +446,15 @@ async function startGateway(options) {
     log(`writer-claim lost: ${error.message} -- halting: no new sessions will be accepted.`);
     if (proxy) proxy.stopAcceptingNewSessions();
     // SS7: "In-flight sessions at the moment of loss should still attempt to finalize
-    // and persist" -- already-open sessions are left alone; only new admission stops.
+    // and persist" -- already-open sessions are left alone here; only new admission
+    // stops. That is deliberately NOT the whole story: a session already open when the
+    // claim is lost is still allowed to run to completion and finalize, which is exactly
+    // where the single-writer invariant chain.appendSession depends on could be violated
+    // by a replacement writer that has since taken over this state directory (Cluster C).
+    // GatewayProxy's own isWriterClaimValid check (wired below, consulted synchronously
+    // right before chain.appendSession in closeConnection) is what actually closes that
+    // gap -- not by halting every in-flight session the instant claim loss is first
+    // detected, but by re-checking liveness at the one write that matters.
   };
   writerClaim.startHeartbeat();
 
@@ -450,6 +518,12 @@ async function startGateway(options) {
     log,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
     onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size, quarantinedTo: error.quarantinedTo || null })),
+    // Cluster C: read fresh from disk (WriterClaim#status's own contract) rather than
+    // trust writerClaim's in-memory _claimToken -- a claim lost out-of-band (the file
+    // removed or overwritten by a replacement writer underneath this process) must be
+    // caught here even if this instance's own heartbeat hasn't yet noticed and fired
+    // onClaimLost.
+    isWriterClaimValid: () => writerClaim.status().held_by_this_instance,
   });
 
   for (const [name, conn] of downstreamHandles.connections.entries()) {
@@ -499,6 +573,18 @@ async function startGateway(options) {
 
   const ctx = { config, writerClaim, connections: downstreamHandles.connections, proxy };
 
+  /* Cluster D: write an initial status file immediately (not just on the first
+   * interval tick, options.statusWriteIntervalMs or STATUS_WRITE_INTERVAL_MS away) so a
+   * `status` invocation right after startup already finds fresh data, then keep it
+   * refreshed on a fixed cadence for the rest of this process's life. unref'd, matching
+   * every other background timer in this file (writer-claim's own heartbeat, HTTP
+   * session idle timers) -- a status-file refresh must never be the reason this process
+   * fails to exit. */
+  writeStatusFile(ctx, log);
+  const statusWriteIntervalMs = options.statusWriteIntervalMs || STATUS_WRITE_INTERVAL_MS;
+  const statusWriteTimer = setInterval(() => writeStatusFile(ctx, log), statusWriteIntervalMs);
+  if (typeof statusWriteTimer.unref === "function") statusWriteTimer.unref();
+
   const drainTimeoutMs = options.drainTimeoutMs || 5000;
   /* CodeRabbit PR #29 review "make stop() await the in-progress shutdown instead of
    * returning early": the SIGTERM/SIGINT handler and the stdio-disconnect path
@@ -517,6 +603,7 @@ async function startGateway(options) {
   }
   async function doStop(reason) {
     log(`shutting down (${reason || "requested"}): draining ${proxy.openSessionCount()} open session(s)`);
+    clearInterval(statusWriteTimer); // Cluster D: stop refreshing the status file once shutdown begins
     proxy.stopAcceptingNewSessions();
     /* SS3.7: "finish in-flight sessions" means actually WAIT (bounded) for calls already
      * in flight to complete and be recorded with their real result -- not immediately
@@ -551,6 +638,10 @@ async function startGateway(options) {
       try { conn.close(); } catch (error) { /* best effort */ }
     }
     writerClaim.release();
+    // Cluster D: one last write so `gateway.js status` run after this process has
+    // exited reports an accurate "not claimed by this instance" / drained snapshot
+    // instead of silently going stale mid-run-looking data.
+    writeStatusFile(ctx, log);
     log("shutdown complete: writer-claim released.");
   }
 
@@ -564,9 +655,81 @@ async function startGateway(options) {
   };
 }
 
+/* Cluster D: `node gateway.js status [configPath]` -- reads the status FILE a running
+ * gateway (started against the same config) periodically writes to <state_dir>/
+ * gateway-status.json (see writeStatusFile above) and pretty-prints it. Deliberately a
+ * separate, short-lived process reading a file, not an RPC to the running gateway or a
+ * new ops HTTP port (out of scope -- see writeStatusFile's own header comment): this
+ * mirrors how `node scripts/writer-claim.js status` already reports on-disk state
+ * without needing a running process to ask. Exits non-zero with a clear, actionable
+ * message when the config can't be loaded, no status file exists yet (no gateway has
+ * run against this config, or state_dir doesn't match), or the file is unreadable/
+ * corrupt -- never a stack trace. */
+function runStatusCommand(configPathArg) {
+  const configPath = configPathArg || path.join(process.cwd(), "gateway-config.json");
+  let config;
+  try {
+    config = gatewayConfig.loadConfig(configPath);
+  } catch (error) {
+    console.error(`[graphsmith-gateway] status: could not load config at ${configPath}: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const statusPath = gatewayStatusPath(config.state_dir);
+  let raw;
+  try {
+    raw = fs.readFileSync(statusPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      console.error(
+        `[graphsmith-gateway] status: no status file at ${statusPath} -- has a gateway ever been ` +
+          `started against this config (state_dir: ${config.state_dir})?`
+      );
+    } else {
+      console.error(`[graphsmith-gateway] status: could not read ${statusPath}: ${error.message}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  let status;
+  try {
+    status = JSON.parse(raw);
+  } catch (error) {
+    console.error(`[graphsmith-gateway] status: ${statusPath} contains invalid JSON: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(JSON.stringify(status, null, 2));
+
+  // A status file this stale means the writer that produced it stopped refreshing it --
+  // either a clean shutdown (see doStop's own final write) or a crash that skipped that
+  // final write. Either way, flag it rather than let stale data read as "still running".
+  const writtenAt = Date.parse(status.written_at);
+  if (Number.isFinite(writtenAt)) {
+    const ageMs = Date.now() - writtenAt;
+    const staleAfterMs = STATUS_WRITE_INTERVAL_MS * 3;
+    if (ageMs > staleAfterMs) {
+      console.error(
+        `[graphsmith-gateway] status: WARNING -- this snapshot is ${Math.round(ageMs / 1000)}s old ` +
+          `(refreshed every ~${Math.round(STATUS_WRITE_INTERVAL_MS / 1000)}s while running); the ` +
+          "gateway that wrote it may no longer be running."
+      );
+    }
+  }
+}
+
 function main() {
-  const configPath = process.argv[2] || path.join(process.cwd(), "gateway-config.json");
-  startGateway({ configPath, root: process.cwd() }).then((handle) => {
+  const argv = process.argv.slice(2);
+  if (argv[0] === "status") {
+    runStatusCommand(argv[1]);
+    return;
+  }
+
+  const configPath = argv[0] || path.join(process.cwd(), "gateway-config.json");
+  startGateway({ configPath }).then((handle) => {
     if (handle.dormant) {
       process.exit(0);
     }
@@ -581,4 +744,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { startGateway, checkModeGate, buildHealthStatus, loadSigningKeys, drainOpenSessions };
+module.exports = { startGateway, checkModeGate, buildHealthStatus, loadSigningKeys, drainOpenSessions, gatewayStatusPath, STATUS_WRITE_INTERVAL_MS, runStatusCommand };
