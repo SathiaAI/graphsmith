@@ -95,6 +95,19 @@ const MAX_HTTP_RESPONSE_BYTES = 10 * 1024 * 1024;
  * unbounded number of pages. */
 const MAX_TOOLS_LIST_PAGES = 1000;
 
+/* Bounds the CUMULATIVE size of a downstream's entire tools/list surface, summed across
+ * every page -- Codex PR #29 review round 5 "bound aggregate tool discovery data":
+ * MAX_HTTP_RESPONSE_BYTES already bounds any single page's response body, and
+ * MAX_TOOLS_LIST_PAGES bounds how many pages are followed, but neither bounds the
+ * cumulative bytes actually RETAINED in `tools` across those pages -- a downstream
+ * returning close to MAX_HTTP_RESPONSE_BYTES on every one of MAX_TOOLS_LIST_PAGES pages
+ * could still make this client buffer roughly 10 GiB before startup fails. A generous,
+ * fixed multiple of the per-page cap (not yet a config field -- same "fixed,
+ * non-speculative default" discipline as MAX_TOOLS_LIST_PAGES above and MAX_HTTP_SESSIONS
+ * in agent-transport.js; make it configurable once a real deployment needs a different
+ * number, not before). */
+const MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES = 50 * 1024 * 1024;
+
 /** Pure helper for connectStdio's unterminated-line byte cap (CodeRabbit PR #29 review
  * round 4 "make this regression test deterministic"): given the residual unterminated
  * byte count carried over from the previous chunk and the newly-received chunk, returns
@@ -203,10 +216,21 @@ function connectStdio(endpoint, options = {}) {
        * below), a downstream that omits "jsonrpc": "2.0" or sends neither "result" nor
        * "error" would still be resolved/rejected as if it were well-formed, sealing a
        * malformed exchange as a normal successful (or normally-failed) tool result. */
-      const wellFormed = msg.jsonrpc === "2.0" && (Object.prototype.hasOwnProperty.call(msg, "result") || Object.prototype.hasOwnProperty.call(msg, "error"));
+      const hasResult = Object.prototype.hasOwnProperty.call(msg, "result");
+      const hasError = Object.prototype.hasOwnProperty.call(msg, "error");
+      /* Codex PR #29 review round 5 "require exactly one result or error in stdio
+       * replies": the prior check accepted a message carrying BOTH fields, or an
+       * "error" key present but falsy (e.g. {"error":null}) -- branching on msg.error's
+       * truthiness rather than the hasError presence flag let that second shape fall
+       * through to the success branch and resolve(msg.result) with an undefined result,
+       * the same false-success outcome the "neither present" half of this check already
+       * guards against. Require exactly one of "result"/"error" as an own property and
+       * branch on presence, matching connectHttp's own envelope check just above (and
+       * agent-transport.js's own pushed-reply correlation, fixed the same way). */
+      const wellFormed = msg.jsonrpc === "2.0" && (hasResult || hasError) && !(hasResult && hasError);
       if (!wellFormed) {
-        reject(fail(`downstream stdio response for id ${JSON.stringify(msg.id)} was not a well-formed JSON-RPC 2.0 response (missing/invalid "jsonrpc", or neither "result" nor "error" present)`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
-      } else if (msg.error) {
+        reject(fail(`downstream stdio response for id ${JSON.stringify(msg.id)} was not a well-formed JSON-RPC 2.0 response (missing/invalid "jsonrpc", or not exactly one of "result"/"error" present)`, "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"));
+      } else if (hasError) {
         reject(Object.assign(fail(msg.error.message || "downstream error", "GATEWAY_DOWNSTREAM_RPC_ERROR"), { rpcError: msg.error }));
       } else {
         resolve(msg.result);
@@ -471,10 +495,23 @@ function connectHttp(endpoint, options = {}) {
      * sent through it into a request instead -- a real protocol violation (JSON-RPC 2.0 /
      * MCP both define a notification as exactly "no id member"), and a conforming
      * downstream is free to reject it. Post the notification directly, with no id, rather
-     * than delegating to call(). Best-effort, fire-and-forget: the response (if any) is
-     * ignored, and a downstream that is unreachable is not this caller's problem (matches
-     * call()'s own "closed" short-circuit). */
-    if (closed) return;
+     * than delegating to call().
+     *
+     * Codex PR #29 review round 5 "await HTTP initialized delivery before listing
+     * tools": this used to fire-and-forget with no way for a caller to know the request
+     * had actually been sent, so connectAllDownstreams's own initialize -> notify
+     * ("notifications/initialized") -> tools/list sequence issued tools/list on a
+     * separate, unordered HTTP request/socket without waiting for the notification to
+     * even leave this process -- a strict, stateful downstream enforcing MCP's own
+     * "initialized before further requests" ordering could receive or process tools/list
+     * first and reject the handshake. Returns a Promise that resolves once this request
+     * SETTLES (success or failure) rather than a raw fire-and-forget void -- this stays
+     * best-effort in that a network failure here is never surfaced to the caller as a
+     * rejection (a downstream that is unreachable is not this caller's problem, matching
+     * call()'s own "closed" short-circuit); only the TIMING is now observable, bounded by
+     * the same DEFAULT_REQUEST_TIMEOUT_MS every other request in this file uses, so an
+     * unresponsive downstream cannot hang a caller that awaits this indefinitely. */
+    if (closed) return Promise.resolve();
     const isStatelessMetaMethod = STATELESS_META_METHODS.has(method);
     const effectiveParams = isStatelessMetaMethod
       ? { ...(params || {}), _meta: { ...buildStatelessMeta(options), ...((params && params._meta) || {}) } }
@@ -483,22 +520,28 @@ function connectHttp(endpoint, options = {}) {
     // No "id" field: this must stay a real JSON-RPC/MCP notification (see comment above),
     // unlike call()'s request body which always assigns one.
     const body = JSON.stringify({ jsonrpc: "2.0", method, params: effectiveParams });
-    const req = client.request(url, {
-      method: "POST",
-      // Mirrors call()'s own header construction above (kept in sync manually --
-      // notify() has no id/response to correlate, so it cannot share call()'s promise body).
-      headers: {
-        "content-type": "application/json",
-        "content-length": Buffer.byteLength(body),
-        "mcp-protocol-version": declaredProtocolVersion,
-        "mcp-method": method,
-        ...(method === "tools/call" && params && typeof params.name === "string" ? { "mcp-name": params.name } : {}),
-        ...(options.headers || {}),
-      },
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
+      const timer = setTimeout(settle, DEFAULT_REQUEST_TIMEOUT_MS);
+      if (typeof timer.unref === "function") timer.unref();
+      const req = client.request(url, {
+        method: "POST",
+        // Mirrors call()'s own header construction above (kept in sync manually --
+        // notify() has no id/response to correlate, so it cannot share call()'s promise body).
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "mcp-protocol-version": declaredProtocolVersion,
+          "mcp-method": method,
+          ...(method === "tools/call" && params && typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+          ...(options.headers || {}),
+        },
+      });
+      req.on("error", () => { reachable = false; settle(); }); // best-effort: nothing to reject, no caller treats this as a failure
+      req.on("response", (res) => { res.resume(); res.on("end", settle); res.on("error", settle); }); // drain and discard; notify() never reads a result
+      req.end(body);
     });
-    req.on("error", () => { reachable = false; }); // best-effort: nothing to reject, no caller is awaiting this
-    req.on("response", (res) => { res.resume(); }); // drain and discard; notify() never reads a result
-    req.end(body);
   }
 
   function close() {
@@ -593,17 +636,27 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
           clientInfo: options.clientInfo || { name: "graphsmith-standalone-gateway", version: "1.0" },
         });
         serverInfos[serverConfig.name] = (initResult && initResult.serverInfo) || null;
-        conn.notify("notifications/initialized", {});
+        /* Codex PR #29 review round 5 "await HTTP initialized delivery before listing
+         * tools": notify() now returns a Promise that resolves once this notification
+         * has actually settled (see its own header comment in connectHttp) -- awaited
+         * here so tools/list below is never issued before "notifications/initialized"
+         * has been sent, closing the ordering gap a strict, stateful HTTP downstream
+         * could otherwise observe. connectStdio's own notify() returns no Promise; await
+         * on a non-thenable resolves on the next microtask, so this line is a no-op wait
+         * for stdio downstreams, not a behavior change for them. */
+        await conn.notify("notifications/initialized", {});
 
         /* Follows tools/list's nextCursor until the downstream reports none, so a
          * paginated surface is fully advertised rather than silently truncated to its
-         * first page. Bounded (page cap + cursor-cycle detection) so a downstream that
-         * never terminates pagination fails this server's startup instead of hanging it
-         * forever. */
+         * first page. Bounded (page cap + cursor-cycle detection, AND cumulative byte
+         * size -- see MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES above) so a downstream that never
+         * terminates pagination, or returns unboundedly large pages, fails this server's
+         * startup instead of hanging or exhausting memory. */
         const tools = [];
         const seenCursors = new Set();
         let cursor;
         let pages = 0;
+        let totalToolsBytes = 0;
         do {
           const toolsResult = await conn.call("tools/list", cursor !== undefined ? { cursor } : {});
           /* Codex PR #29 review "reject malformed tools/list payloads": a well-formed
@@ -633,8 +686,31 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
                 "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"
               );
             }
+            /* Codex PR #29 review round 5 "reject tool descriptors without a valid input
+             * schema": the check above validates only "name" -- a descriptor such as
+             * {"name":"x"} (no inputSchema at all) previously passed, was normalized to
+             * `schema: null` a few lines below, and was forwarded to agents as a tool
+             * with no input contract. The MCP Tool schema requires inputSchema on every
+             * tool; a client that validates the advertised contract can reject this
+             * gateway's otherwise successful tools/list over a single misbehaving
+             * downstream tool descriptor. */
+            if (!tool.inputSchema || typeof tool.inputSchema !== "object" || Array.isArray(tool.inputSchema)) {
+              throw fail(
+                `downstream server "${serverConfig.name}" returned a malformed tool descriptor for ` +
+                  `"${tool.name}" in tools/list (missing or invalid "inputSchema": must be an object).`,
+                "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"
+              );
+            }
           }
           tools.push(...pageTools);
+          totalToolsBytes += Buffer.byteLength(JSON.stringify(pageTools));
+          if (totalToolsBytes > MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES) {
+            throw fail(
+              `downstream server "${serverConfig.name}" tools/list surface exceeded the cumulative ` +
+                `${MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES}-byte cap across its paginated pages`,
+              "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"
+            );
+          }
           pages++;
           const nextCursor = toolsResult && toolsResult.nextCursor;
           if (nextCursor === undefined || nextCursor === null) {
@@ -695,5 +771,6 @@ module.exports = {
   connectAllDownstreams,
   DEFAULT_REQUEST_TIMEOUT_MS,
   MAX_HTTP_RESPONSE_BYTES,
+  MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES,
   nextResidualLineBytes,
 }
