@@ -745,6 +745,290 @@ async function postDispatchUpdateSkippedWhenIntentConcurrentlyRemoved() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* CodeRabbit PR #33 review "guard this WAL append the same way the CALL_START append is
+ * guarded": the ANOMALY append on a blocked-retry path (GATEWAY_AMBIGUOUS_RETRY etc.) was
+ * unguarded, unlike CALL_START's own established pattern -- a WAL failure here used to
+ * escape handleMessage entirely instead of still returning the block response. */
+async function anomalyWalAppendFailureDoesNotEscapeHandleMessage() {
+  const dir = freshDir("anomaly-wal-failure");
+  let resolveCall;
+  const conn = fakeConnectionCapturing(() => new Promise((resolve) => { resolveCall = resolve; }));
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { a: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type === "ANOMALY") throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+    return realAppendWalEvent(...args);
+  };
+  let resp, threw = null;
+  try {
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "slow", arguments: { a: 1 } } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("anomaly-wal-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("anomaly-wal-failure-still-returns-the-block-response", Boolean(resp && resp.error && resp.error.code === -32080), JSON.stringify(resp));
+  resolveCall({ ok: true });
+  await firstPromise;
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* CodeRabbit PR #33 review "add a not_executed branch to the live dispatch guard": an
+ * intent an operator confirmed via recovery-resolve --confirmed not-executed used to fall
+ * through to the generic "could not establish a durable dispatch intent" AMBIGUOUS_RETRY
+ * after two wasted attempts, instead of a response that reflects what actually happened. */
+async function notExecutedIntentReturnsDedicatedBlockCode() {
+  const dir = freshDir("not-executed-branch");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "email", server: "srv", schema: {} }];
+  const toolOwners = new Map([["email", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const intentKey = recovery.computeIntentKey("conn-1", "email", { to: "x" });
+  recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-1", tool: "email", arguments: { to: "x" }, state: "dispatched", dispatched_at: Date.now() });
+  recovery.resolveIntentNotExecuted(dir, intentKey);
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "email", arguments: { to: "x" } } });
+  check("not-executed-intent-returns-dedicated-code", Boolean(resp && resp.error && resp.error.code === -32084), JSON.stringify(resp));
+  check("not-executed-intent-did-not-dispatch-downstream", conn.calls.length === 0, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "reject duplicate request IDs before creating intents": an agent
+ * reusing an in-flight JSON-RPC id for a genuinely different operation used to get a
+ * durable "dispatched" intent created BEFORE session.recordCallStart's own duplicate-id
+ * check ran (and threw, uncaught) -- orphaning that intent forever for a call that never
+ * actually dispatched. */
+async function duplicateJsonRpcIdRejectedBeforeIntentCreated() {
+  const dir = freshDir("duplicate-id");
+  let resolveFirst;
+  const conn = fakeConnectionCapturing((method, params) => {
+    if (params && params.name === "slow") return new Promise((resolve) => { resolveFirst = resolve; });
+    return Promise.resolve({ ok: true });
+  });
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }, { name: "other", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"], ["other", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let resp, threw = null;
+  try {
+    // Same id (1) reused for a DIFFERENT tool while the first is still pending.
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "other", arguments: {} } });
+  } catch (error) {
+    threw = error;
+  }
+  check("duplicate-id-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("duplicate-id-rejected-with-a-jsonrpc-error", Boolean(resp && resp.error), JSON.stringify(resp));
+  check("duplicate-id-did-not-dispatch-the-second-call", conn.calls.length === 1, JSON.stringify(conn.calls));
+  const otherIntentKey = recovery.computeIntentKey("conn-1", "other", {});
+  check("duplicate-id-did-not-create-an-orphaned-intent", recovery.readIntent(dir, otherIntentKey) === null, "intent unexpectedly present");
+  resolveFirst({ ok: true });
+  await firstPromise;
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* CodeRabbit/Codex PR #33 review "restore the prior completed intent when CALL_START WAL
+ * persistence fails": when a completed intent is superseded by a new, independent dispatch
+ * (no matching idempotency key) and THAT dispatch's own CALL_START WAL append then fails,
+ * the rollback used to unconditionally delete the intent -- discarding the earlier
+ * generation's real cached result. A later request carrying the ORIGINAL idempotency key
+ * would then find no record and dispatch again instead of replaying it. */
+async function supersedeCallStartWalFailureRestoresPriorCompletedIntent() {
+  const dir = freshDir("supersede-wal-failure");
+  const conn = fakeConnectionCapturing(async () => ({ value: 1 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const originalParams = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "first-attempt" } };
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: originalParams });
+  const intentKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
+  const beforeSupersede = recovery.readIntent(dir, intentKey);
+  check("supersede-setup-first-call-completed", Boolean(beforeSupersede) && beforeSupersede.state === "completed" && beforeSupersede.idempotency_key === "first-attempt", JSON.stringify(beforeSupersede));
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type === "CALL_START") throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+    return realAppendWalEvent(...args);
+  };
+  let resp, threw = null;
+  try {
+    // No idempotencyKey -> this is treated as a new, independent dispatch that supersedes
+    // the completed record above, generation 2 -- whose own CALL_START append then fails.
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("supersede-wal-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("supersede-wal-failure-returns-a-retryable-jsonrpc-error", Boolean(resp && resp.error && resp.error.code === -32000), JSON.stringify(resp));
+  check("supersede-wal-failure-did-not-redispatch-downstream", conn.calls.length === 1, JSON.stringify(conn.calls));
+  const restored = recovery.readIntent(dir, intentKey);
+  check(
+    "supersede-wal-failure-restored-the-original-completed-record",
+    Boolean(restored) && restored.state === "completed" && restored.idempotency_key === "first-attempt" && restored.generation === 1 && restored.cached_result && restored.cached_result.value === 1,
+    JSON.stringify(restored)
+  );
+  // The original idempotency key must still replay the FIRST call's cached result, not
+  // dispatch a third time.
+  const replay = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 3, method: "tools/call", params: originalParams });
+  check("supersede-wal-failure-original-key-still-replays-not-redispatches", conn.calls.length === 1 && Boolean(replay && replay.result && replay.result.value === 1), JSON.stringify({ calls: conn.calls, replay }));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* CodeRabbit PR #33 review "fail closed when the quarantine scan cannot read an intent":
+ * listAllIntents propagating a read failure for ANY intent file on disk (not just the one
+ * relevant to this dispatch) used to reject handleMessage with a generic -32603 instead of
+ * this quarantine check's own documented -32082, and the tool was not actually blocked. */
+async function quarantineScanFailureFailsClosed() {
+  const dir = freshDir("quarantine-scan-failure");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "email", server: "srv", schema: {} }];
+  const toolOwners = new Map([["email", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    pendingOperatorReviewConnections: ["crashed-conn"],
+  });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+
+  const realListAllIntents = recovery.listAllIntents;
+  recovery.listAllIntents = () => { throw Object.assign(new Error("simulated corrupt intent"), { code: "GATEWAY_RECOVERY_INTENT_CORRUPT" }); };
+  let resp, threw = null;
+  try {
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "email", arguments: { to: "x" } } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.listAllIntents = realListAllIntents;
+  }
+  check("quarantine-scan-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("quarantine-scan-failure-fails-closed-with-quarantine-code", Boolean(resp && resp.error && resp.error.code === -32082), JSON.stringify(resp));
+  check("quarantine-scan-failure-did-not-dispatch-downstream", conn.calls.length === 0, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "commit initialization only after its WAL event succeeds": a WAL
+ * failure on the INITIALIZE append used to be unguarded (escaping handleMessage) AND ran
+ * after agentInitialized was already flipped true, so a retry would be rejected as a
+ * repeat initialize even though it was never durably recorded. */
+async function initializeWalFailureDoesNotEscapeAndRollsBack() {
+  const dir = freshDir("initialize-wal-failure");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  let failNext = true;
+  recovery.appendWalEvent = (...args) => {
+    if (failNext && args[2] && args[2].type === "INITIALIZE") {
+      failNext = false;
+      throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+    }
+    return realAppendWalEvent(...args);
+  };
+  let resp, threw = null;
+  try {
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("initialize-wal-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("initialize-wal-failure-returns-a-retryable-jsonrpc-error", Boolean(resp && resp.error && resp.error.code === -32000), JSON.stringify(resp));
+  check("initialize-wal-failure-did-not-flip-agentInitialized", proxy.agentInitialized.get("conn-1") === false, "agentInitialized was already true");
+
+  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  check("initialize-retry-succeeds-normally-afterward", Boolean(retry && retry.result && retry.result.protocolVersion), JSON.stringify(retry));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "roll back session publication when its first WAL write fails": a
+ * SESSION_START WAL failure in openConnection used to be unguarded and ran AFTER the
+ * session was already published into this.sessions/agentInitialized -- leaving an
+ * unreachable "ghost" session counted by openSessionCount() even though the caller (who
+ * never gets a usable connectionId back) saw openConnection throw. */
+async function openConnectionWalFailureDoesNotPublishGhostSession() {
+  const dir = freshDir("open-connection-wal-failure");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type === "SESSION_START") throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+    return realAppendWalEvent(...args);
+  };
+  let threw = null;
+  try {
+    proxy.openConnection("conn-1");
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("open-connection-wal-failure-still-throws-to-its-caller", threw !== null, "openConnection did not throw");
+  check("open-connection-wal-failure-did-not-publish-a-ghost-session", proxy.openSessionCount() === 0, `openSessionCount()=${proxy.openSessionCount()}`);
+  check("open-connection-wal-failure-did-not-set-agentInitialized", proxy.agentInitialized.has("conn-1") === false, "agentInitialized unexpectedly set");
+
+  // A subsequent real openConnection for the SAME connectionId must work normally --
+  // proof there is no leftover half-published state blocking it.
+  proxy.openConnection("conn-1");
+  check("open-connection-retry-succeeds-normally-afterward", proxy.openSessionCount() === 1, `openSessionCount()=${proxy.openSessionCount()}`);
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Part of the same WAL-append-guarding cluster as CALL_START/INITIALIZE/ANOMALY above: the
+ * CALL_RESULT append (after a call has ALREADY completed downstream, with no "don't
+ * dispatch" option left) must be best-effort and never escape handleMessage -- the agent
+ * is still owed its real result even if this durability write fails. */
+async function callResultWalFailureDoesNotEscapeHandleMessage() {
+  const dir = freshDir("call-result-wal-failure");
+  const conn = fakeConnectionCapturing(async () => ({ value: 99 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type === "CALL_RESULT") throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+    return realAppendWalEvent(...args);
+  };
+  let resp, threw = null;
+  try {
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("call-result-wal-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("call-result-wal-failure-still-returns-the-real-result", Boolean(resp && resp.result && resp.result.value === 99), JSON.stringify(resp));
+  const intentKey = recovery.computeIntentKey("conn-1", "echo", {});
+  const intent = recovery.readIntent(dir, intentKey);
+  check("call-result-wal-failure-intent-still-marked-completed", Boolean(intent) && intent.state === "completed", JSON.stringify(intent));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -774,6 +1058,16 @@ async function main() {
   await replayedCallGetsAStructuredCompletionLogToo();
   await callStartWalAppendFailureRollsBackAndStaysRetryable();
   await postDispatchUpdateSkippedWhenIntentConcurrentlyRemoved();
+
+  // PR #33 review round 5 (post E1/E2) fixes:
+  await anomalyWalAppendFailureDoesNotEscapeHandleMessage();
+  await notExecutedIntentReturnsDedicatedBlockCode();
+  await duplicateJsonRpcIdRejectedBeforeIntentCreated();
+  await supersedeCallStartWalFailureRestoresPriorCompletedIntent();
+  await quarantineScanFailureFailsClosed();
+  await initializeWalFailureDoesNotEscapeAndRollsBack();
+  await openConnectionWalFailureDoesNotPublishGhostSession();
+  await callResultWalFailureDoesNotEscapeHandleMessage();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
