@@ -154,7 +154,14 @@ function resolveSecretRef(ref, label) {
     }
     return contents;
   }
-  const value = process.env[ref];
+  /* CodeRabbit PR #29 review round 4 "trim and reject whitespace-only environment
+   * variables": an unresolved (empty) reference throws below, but a *whitespace-only*
+   * value previously passed through unmodified -- a whitespace signing_key_ref then fails
+   * much later and less clearly inside crypto.createPrivateKey(), and a whitespace bearer
+   * token can pass this check yet never authenticate. Trim before the emptiness check,
+   * same as the file-secret branch above already does. */
+  const rawValue = process.env[ref];
+  const value = typeof rawValue === "string" ? rawValue.trim() : rawValue;
   if (typeof value !== "string" || value.length === 0) {
     throw fail(`${label} ("${ref}") does not name an existing file, and no environment variable "${ref}" is set.`, "GATEWAY_SECRET_REF_UNRESOLVED");
   }
