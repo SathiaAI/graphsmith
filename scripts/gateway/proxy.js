@@ -143,6 +143,17 @@ class GatewayProxy {
     if (!msg || typeof msg !== "object" || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
       return { jsonrpc: "2.0", id: msg && typeof msg === "object" && !Array.isArray(msg) ? msg.id : null, error: { code: -32600, message: "Malformed JSON-RPC 2.0 request envelope." } };
     }
+    /* Codex PR #29 review round 6 "reject invalid JSON-RPC identifier types": JSON-RPC
+     * 2.0 restricts "id" to a string, a number, or null (a request with no "id" at all is
+     * a notification, handled via isNotification below) -- this check previously accepted
+     * any other type (boolean, object, array) since it only ever compared id to
+     * `undefined`. For "tools/call" that let a malformed id reach dispatch, execute a real
+     * downstream side effect, and come back in a response/correlation record no
+     * spec-conforming caller could use. Reject before computing isNotification/dispatch;
+     * the offending id is never echoed back since its type is exactly what is invalid. */
+    if (msg.id !== undefined && msg.id !== null && typeof msg.id !== "string" && typeof msg.id !== "number") {
+      return { jsonrpc: "2.0", id: null, error: { code: -32600, message: `Invalid JSON-RPC "id": must be a string, a number, or null (or omitted for a notification).` } };
+    }
     const { method, params, id } = msg;
     const isNotification = id === undefined;
 
@@ -461,4 +472,4 @@ class GatewayProxy {
   }
 }
 
-module.exports = { GatewayProxy, isModelCallMethod };
+module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION };
