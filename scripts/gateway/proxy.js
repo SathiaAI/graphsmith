@@ -65,6 +65,17 @@ function isModelCallMethod(method) {
  * apart independently. */
 const GATEWAY_PROTOCOL_VERSION = "2025-06-18";
 
+/* Codex PR #29 review round 5 "cap in-flight calls per agent session": without a bound,
+ * one authenticated client (stdio, or one HTTP session) could open arbitrarily many
+ * concurrent tools/call or sampling requests -- each retaining session state, a
+ * downstream pending entry, and a timer -- without ever waiting for a response. The
+ * active-session cap (MAX_HTTP_SESSIONS in agent-transport.js) bounds how many SESSIONS
+ * exist; it does nothing to bound growth WITHIN one session. Same "fixed,
+ * non-speculative default" discipline as that constant and MAX_TOOLS_LIST_PAGES/
+ * MAX_HTTP_RESPONSE_BYTES/MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES in downstream.js -- make it
+ * configurable once a real deployment needs a different number, not before. */
+const MAX_PENDING_CALLS_PER_SESSION = 1000;
+
 class GatewayProxy {
   /**
    * @param {object} opts
@@ -135,21 +146,17 @@ class GatewayProxy {
     const { method, params, id } = msg;
     const isNotification = id === undefined;
 
-    /* SS3.7/SS7: once the writer-claim is lost, stop admitting NEW work on every
-     * connection, not just new connections (openConnection already refuses those) --
-     * otherwise an already-open agent connection could keep issuing calls indefinitely
-     * after a replacement writer has acquired the state directory, risking concurrent
-     * chain-append corruption. A call already in flight (already past this point in an
-     * earlier handleMessage invocation, already awaiting its downstream response) is
-     * unaffected and is allowed to drain normally -- only messages that arrive AFTER the
-     * flag flips are refused. */
-    if (!this.acceptingNewSessions) {
-      if (isNotification) return null;
-      return { jsonrpc: "2.0", id, error: { code: -32000, message: "Gateway is draining (writer-claim lost or shutting down): not accepting new requests on this connection." } };
-    }
-
     if (method === "notifications/cancelled") {
-      /* SS3.3: downstream calls run under a gateway-internal id, not the agent's own
+      /* Codex PR #29 review round 5 "continue processing cancellations while draining":
+       * this must run BEFORE the acceptingNewSessions gate below, not after -- a
+       * cancellation notification for an already-in-flight call is not "new work" the
+       * drain is refusing to admit, it is how an agent asks the gateway to stop existing
+       * work SOONER. Gating it behind acceptingNewSessions silently dropped every
+       * cancellation once shutdown began, so an agent's cancel request during drain could
+       * never reach conn.cancel() and the gateway would wait out the full drain deadline
+       * even though the agent had already asked to stop the call.
+       *
+       * SS3.3: downstream calls run under a gateway-internal id, not the agent's own
        * JSON-RPC id, so a bare pass-through of the cancellation payload would target the
        * wrong id on the downstream leg (or no id at all, for a downstream that happens to
        * reuse numbering). Translate via the mapping recorded when the call started. */
@@ -163,6 +170,20 @@ class GatewayProxy {
         }
       }
       return null;
+    }
+
+    /* SS3.7/SS7: once the writer-claim is lost, stop admitting NEW work on every
+     * connection, not just new connections (openConnection already refuses those) --
+     * otherwise an already-open agent connection could keep issuing calls indefinitely
+     * after a replacement writer has acquired the state directory, risking concurrent
+     * chain-append corruption. A call already in flight (already past this point in an
+     * earlier handleMessage invocation, already awaiting its downstream response) is
+     * unaffected and is allowed to drain normally -- only messages that arrive AFTER the
+     * flag flips are refused. notifications/cancelled is exempted above: it never admits
+     * new work, only stops existing work sooner. */
+    if (!this.acceptingNewSessions) {
+      if (isNotification) return null;
+      return { jsonrpc: "2.0", id, error: { code: -32000, message: "Gateway is draining (writer-claim lost or shutting down): not accepting new requests on this connection." } };
     }
 
     if (method === "initialize") {
@@ -236,6 +257,16 @@ class GatewayProxy {
       const serverName = method === "tools/call" ? this.toolOwners.get(toolName) : (params && params.server);
       if (method === "tools/call" && !serverName) {
         const error = { code: -32602, message: `Unknown tool "${String(toolName)}" -- not present in this gateway's granted tool surface.` };
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error };
+      }
+      /* Codex PR #29 review round 5 "cap in-flight calls per agent session": refuse
+       * admitting another concurrent call once this session already has
+       * MAX_PENDING_CALLS_PER_SESSION genuinely pending, rather than let one session's
+       * own pending-call bookkeeping (and the downstream timers/sockets each entry
+       * retains) grow without bound. */
+      if (s.pendingCalls.size >= MAX_PENDING_CALLS_PER_SESSION) {
+        const error = { code: -32000, message: `This session already has ${MAX_PENDING_CALLS_PER_SESSION} call(s) pending -- refusing to admit another concurrent call until at least one resolves.` };
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error };
       }
