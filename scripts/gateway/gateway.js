@@ -119,6 +119,7 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
    * deliberately scoped to tools/call only, unchanged) -- only Finding 1's WAL/attestation
    * coverage is extended to this path. */
   let walCallSeq = null;
+  let walAppendFailed = null;
   if (s) {
     walCallSeq = s.nextCallSeq;
     session.recordCallStart(s, correlationKey, {
@@ -139,13 +140,28 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy) {
         ts: proxy.now(),
       });
     } catch (walError) {
-      // Best-effort: this forward is already in flight and cannot be rolled back the way
-      // proxy.js's own pre-dispatch WAL append can (there is no "don't dispatch" option
-      // once the downstream server is already waiting on this reply) -- a WAL write
-      // failure here degrades recovery coverage for this one call but must not break the
-      // actual sampling forward the downstream server is waiting on.
-      log(`Failed to durably record a downstream-initiated sampling call before forwarding it to the agent: ${walError.message}`);
+      walAppendFailed = walError;
     }
+  }
+  if (walAppendFailed) {
+    /* Codex PR #33 review "refuse sampling when its CALL_START cannot be saved": unlike
+     * the CALL_RESULT append further below (where the downstream call has ALREADY
+     * completed and there is no "don't forward" option left), this append happens
+     * strictly BEFORE agentPusher.current() is ever invoked -- nothing has been sent to
+     * the agent yet at this point, so forwarding anyway is not "already in flight," it is
+     * choosing to forward work this gateway just proved it cannot durably attest. A crash
+     * before this connection's own close would then replay with no CALL_START for this
+     * call at all, recreating exactly the attestation gap Finding 1 exists to close. Roll
+     * back the in-memory pending-call entry (there is nothing durable to undo) and return
+     * a real JSON-RPC error to the downstream server instead, matching proxy.js's own
+     * "not dispatched -- safe to retry" contract for the identical failure mode. */
+    if (s) s.pendingCalls.delete(correlationKey);
+    log(`Refusing to forward a downstream-initiated sampling/createMessage request to the agent: its CALL_START could not be durably recorded (${walAppendFailed.message}).`);
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: { code: -32000, message: `Failed to durably record this sampling request before forwarding it to the agent: ${walAppendFailed.message}. Not forwarded -- safe to retry.` },
+    });
   }
   return agentPusher.current(msg.method, msg.params).then(
     (result) => {
@@ -370,6 +386,35 @@ function bundleCollisionIsSameContent(stateDir, sealed) {
   }
 }
 
+/** Codex PR #33 review "verify the chain entry before cleaning a colliding WAL": content
+ * verification alone (bundleCollisionIsSameContent above) proves the bundle FILE on disk
+ * (chain.appendSession's own step 1) really is this connection's own durable record -- it
+ * does NOT prove step 2 (the chain.jsonl append) ever happened. If chain.appendSession
+ * crashed after writing the bundle file but before appending chain.jsonl, a recovery pass
+ * that stops at content verification would still delete this connection's WAL/intents as
+ * "already durably sealed," permanently omitting it from the attestation chain even though
+ * it was never actually chain-appended. Shared by recoverCrashedSessions and
+ * abandonConnection (same two callers bundleCollisionIsSameContent already serves) so both
+ * paths get the identical repair, not just content verification. Returns true (safe to
+ * clean up this connection's WAL/intents now -- durably sealed, chain entry confirmed
+ * present, repairing it first if it was merely missing) or false (unverified conflict with
+ * a genuinely different session; caller must not clean up). May throw if content is
+ * verified but the repair write itself fails -- callers must not clean up in that case
+ * either, since the chain still does not durably reference this bundle. */
+function verifyAndRepairBundleCollision(stateDir, sealed, log) {
+  if (!bundleCollisionIsSameContent(stateDir, sealed)) return false;
+  const bundleId = sealed.bundle.manifest.bundle_id;
+  if (!chain.chainHasEntryForBundle(stateDir, bundleId)) {
+    chain.repairMissingChainEntry(stateDir, bundleId);
+    log(
+      `recovery: bundle "${bundleId}" was durably written but never chain-appended (crash between ` +
+        `chain.appendSession's own bundle-write and chain.jsonl-append steps) -- completed the missing ` +
+        `chain.jsonl/HEAD.json append now.`
+    );
+  }
+  return true;
+}
+
 /** Startup crash-recovery pass (Codex PR #29 Finding 1, Option C -- external-panel-
  * reviewed design, see option-c-hardened-design.md). Runs once, after the writer-claim
  * is acquired (so this process is the sole owner of state_dir) and BEFORE any downstream
@@ -384,9 +429,25 @@ function bundleCollisionIsSameContent(stateDir, sealed) {
  * IN FLIGHT at crash time, so its real intent record (recovery.js's idempotency store,
  * Finding 2) is consulted for a proven outcome; only a session with every call proven
  * terminal is auto-sealed. Anything else is left alone and reported -- never guessed. */
-function recoverCrashedSessions(stateDir, keys, log) {
+function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
   const pendingOperatorReview = [];
   for (const connectionId of recovery.listActiveConnections(stateDir)) {
+    /* Codex PR #33 review "renew ownership during synchronous recovery": this whole
+     * per-connection body below is synchronous fs work (WAL replay, session.finalizeSession,
+     * chain.appendSession) -- with enough or large enough crash-left WALs it can run past
+     * writer-claim.js's own staleAfterMs before ever yielding to the event loop, which is
+     * the only place the heartbeat startHeartbeat() already started can actually fire.
+     * writer-claim.js's own startHeartbeat() doc comment discloses exactly this gap and
+     * prescribes a synchronous renew() call at the boundary of any long synchronous phase
+     * this claim is held across (mirroring state-store.js's own _assertStillOwned fix) --
+     * done here once PER CONNECTION, not once for the whole loop, so many small WALs are
+     * covered the same as one huge one. `writerClaim` is optional (existing direct callers/
+     * tests that construct no real claim keep working, renewal simply skipped) but
+     * startGateway's own real call site below always passes its live claim. A failed renew
+     * means another process may already hold this state_dir -- propagate immediately
+     * (uncaught by this loop's own per-connection try/catch further down) rather than keep
+     * mutating shared chain/WAL state under a claim that might no longer be exclusive. */
+    if (writerClaim) writerClaim.renew();
     /* CodeRabbit PR #33 review "continue recovery after an unreadable connection state":
      * readWalEvents/readIntent below can throw (GATEWAY_RECOVERY_WAL_UNREADABLE,
      * GATEWAY_RECOVERY_INTENT_UNREADABLE, GATEWAY_RECOVERY_INTENT_CORRUPT) on a genuine
@@ -519,7 +580,15 @@ function recoverCrashedSessions(stateDir, keys, log) {
         chain.appendSession(stateDir, sealed);
       } catch (error) {
         if (error.code === "GATEWAY_BUNDLE_ID_COLLISION") {
-          if (bundleCollisionIsSameContent(stateDir, sealed)) {
+          let verified;
+          try {
+            verified = verifyAndRepairBundleCollision(stateDir, sealed, log);
+          } catch (repairError) {
+            log(`RECOVERY CHAIN-REPAIR FAILURE for connection "${connectionId}": ${repairError.message} -- leaving its WAL in place for investigation.`);
+            pendingOperatorReview.push(connectionId);
+            continue;
+          }
+          if (verified) {
             log(`recovery: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
           } else {
             log(
@@ -561,7 +630,12 @@ function recoverCrashedSessions(stateDir, keys, log) {
  * operation actually executed, a future identical call is no longer fenced against
  * re-running it. This tradeoff (and that it is scoped per-connection, never global) is
  * documented in KNOWN-LIMITATIONS.md. */
-function abandonConnection(stateDir, keys, connectionId, log) {
+function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null) {
+  /* Codex PR #33 review "renew ownership during synchronous recovery": same rationale as
+   * recoverCrashedSessions' own per-connection renew() above, applied to this CLI's own
+   * synchronous WAL replay/finalize/chain-append for its one connection -- "sufficiently
+   * large" applies just as well to a single big WAL as to many small ones. */
+  if (writerClaim) writerClaim.renew();
   /* Codex PR #33 review "continue recovery after an unreadable connection state": this
    * command is recoverCrashedSessions' own documented remediation path for a connection
    * it could not process -- including one whose WAL could not even be READ (permissions/
@@ -625,7 +699,16 @@ function abandonConnection(stateDir, keys, connectionId, log) {
      * operator running recovery-abandon on a connection that happens to collide with a
      * genuinely DIFFERENT session's bundle_id would silently discard this connection's
      * only remaining unrecoverable record. Apply the same content verification here. */
-    if (!bundleCollisionIsSameContent(stateDir, sealed)) {
+    let verified;
+    try {
+      verified = verifyAndRepairBundleCollision(stateDir, sealed, log);
+    } catch (repairError) {
+      throw fail(
+        `recovery-abandon: connection "${connectionId}" bundle "${sealed.bundle.manifest.bundle_id}" was content-verified as this connection's own record, but completing its missing chain.jsonl append failed: ${repairError.message}. Refusing to abandon: this connection's WAL/intents are NOT cleaned up (the chain still does not durably reference this bundle) -- investigate and retry.`,
+        "GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED"
+      );
+    }
+    if (!verified) {
       throw fail(
         `recovery-abandon: connection "${connectionId}" produced bundle_id "${sealed.bundle.manifest.bundle_id}", which already exists on disk, but its recorded content does NOT match this connection's recovered session -- a genuine conflict with a different session, not a repeated abandon attempt. Refusing to abandon: deleting this connection's WAL/intents now would discard its only remaining, unrecoverable record. Investigate the existing bundle before retrying.`,
         "GATEWAY_RECOVERY_UNVERIFIED_BUNDLE_COLLISION"
@@ -705,10 +788,23 @@ function runRecoveryResolveCli(argv, log) {
        * operator confirmed only that the external effect occurred, not what it
        * returned. Reject instead of guessing a shape for evidence that doesn't exist. */
       if (!flags["result-file"]) {
+        /* Codex PR #33 review "stop advising a false not-executed resolution": this
+         * message used to suggest "use --confirmed not-executed instead" as the fallback
+         * when the operator lacks a result file -- but an operator who chose --confirmed
+         * executed in the first place is telling this CLI they KNOW the side effect ran;
+         * following that suggestion would record the opposite of what they know happened,
+         * seal it as a failed/non-executed call, and release the fence so a retry repeats
+         * the side effect. The only truthful options when the exact result is unrecoverable
+         * are to leave the intent unresolved for now, or to explicitly give up the fence
+         * via recovery-abandon -- never to assert non-execution that isn't true. */
         throw fail(
           "recovery-resolve --confirmed executed requires --result-file <path>: a null result would be " +
-            "replayed as an unverified clean success in the sealed bundle. If the real result is truly " +
-            "unknown, use --confirmed not-executed instead (or recovery-abandon to give up on this connection).",
+            "replayed as an unverified clean success in the sealed bundle. If you know this call executed " +
+            "but cannot recover its exact result, do NOT use --confirmed not-executed -- that records the " +
+            "opposite of what you know happened and lets a future retry repeat the side effect. Instead, " +
+            "either supply the real result via --result-file once you can recover it, leave this intent " +
+            "unresolved for now (this connection will keep being flagged for operator review on every " +
+            "restart, harmlessly), or use recovery-abandon to explicitly give up the fence on this connection.",
           "GATEWAY_RECOVERY_CLI_USAGE"
         );
       }
@@ -739,7 +835,7 @@ function runRecoveryAbandonCli(argv, log) {
   const writerClaim = new WriterClaim(config.state_dir, { hostId: config.host_id });
   writerClaim.acquire();
   try {
-    abandonConnection(config.state_dir, keys, connectionId, log);
+    abandonConnection(config.state_dir, keys, connectionId, log, writerClaim);
   } finally {
     writerClaim.release();
   }
@@ -798,7 +894,7 @@ async function startGateway(options) {
    * indefinitely (writerClaim.release() already stops the heartbeat itself). */
   let pendingOperatorReview;
   try {
-    ({ pendingOperatorReview } = recoverCrashedSessions(config.state_dir, keys, log));
+    ({ pendingOperatorReview } = recoverCrashedSessions(config.state_dir, keys, log, writerClaim));
   } catch (error) {
     writerClaim.release();
     throw error;
