@@ -91,7 +91,7 @@ function sanitize(src, isPy) {
       const e = src.indexOf(c3, i + 3); const end = e === -1 ? n : e + 3;
       blank(bare, i + 3, end - 3); i = end; continue;
     }
-    if (c === "'" || c === '"' || (!isPy && c === "\u0060")) {
+    if (c === "'" || c === '"' || (!isPy && c === "`")) {
       const isTemplate = !isPy && c === "`"; // backticks span multiple lines
       let j = i + 1;
       while (j < n) {
@@ -264,10 +264,18 @@ function lintProject(root) {
       // R5 — eval/exec/new-require ban (bare view: comments/strings blanked).
       // Scoped to evolvable targets only (§104): machine-evaluated candidates,
       // scaffold-generated adapters/, workflow/worker code. Constitutional engine
-      // scripts (files in graphlint.js's OWN __dirname, the hash-pinned scripts/)
-      // are exempt — their child_process use is legitimate supervisor infrastructure.
-      // Resolving the dir guards against spoofing by any nested dir named "scripts".
-      if (path.resolve(path.dirname(f)) !== __dirname) {
+      // scripts (files anywhere under graphlint.js's OWN __dirname subtree —
+      // scripts/ itself and its subdirectories, e.g. scripts/gateway/) are exempt —
+      // their child_process use is legitimate supervisor infrastructure.
+      // This is a subtree check (path.relative against the real __dirname), not a
+      // string match on the literal name "scripts", so it still guards against
+      // spoofing by any nested directory elsewhere in the tree that happens to be
+      // named "scripts" (or a subdirectory of one) without actually being under
+      // graphlint.js's own real __dirname.
+      const dirRelToScripts = path.relative(__dirname, path.resolve(path.dirname(f)));
+      const underScriptsDir = dirRelToScripts === "" ||
+        (!dirRelToScripts.startsWith("..") && !path.isAbsolute(dirRelToScripts));
+      if (!underScriptsDir) {
       if (EVAL_RE.test(ln))
         add(f, i + 1, "R5: eval() call — generated/evolvable code must never gain new execution surface", "HIGH",
             "Replace eval() with a static dispatch table or JSON.parse.");

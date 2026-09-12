@@ -58,9 +58,18 @@
     "full local run of scripts/ci-run-suites.js on this release candidate,",
     "96/96 gating suites green); listing them only removes the 4 discovery",
     "warnings and makes the classification reviewable, it does not change",
-    "which suites gate."
+    "which suites gate.",
+    "",
+    "2026-08-28 (Track 1.2, standalone gateway): tests/gateway/ is a new per-component",
+    "regression suite for the new scripts/gateway/*.js + checks/register-gateway-",
+    "sessions.js (Standalone Gateway TRD, SG-FR-1 through SG-FR-5 and SG-FR-7). It is a",
+    "real GraphSmith component per the RULE above, so it is listed as GATING explicitly",
+    "rather than relying on the fail-safe. Covers mode-selection gating, config schema",
+    "validation, session capture/correlation, hash-chain persistence + SG-FR-7's",
+    "verifier, proxy dispatch, and a real end-to-end child-process integration test."
   ],
   "gating_suites": [
+    "tests/gateway/",
     "tests/manifest/",
     "tests/audit-replay/",
     "tests/report-integrity/",

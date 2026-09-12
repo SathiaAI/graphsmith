@@ -21,15 +21,27 @@ function sha256Hex(s) { return crypto.createHash("sha256").update(Buffer.from(St
 /* session = {
  *   initialize: { clientInfo:{name,version}, serverInfo:{name,version}, model?:string },
  *   tools:      [{ name, server, schema }],            // from tools/list — the GRANTED surface
- *   calls:      [{ tool, arguments, result, isError?, model_call?, ts? }],  // tools/call sequence
- *   goal?:      string
+ *   calls:      [{ tool, arguments, result, isError?, model_call?, ts?,
+ *                  disconnected?, disconnect_reason?, jsonRpcId? }],  // tools/call sequence
+ *   goal?:      string,
+ *   anomalies?: [{ kind, jsonRpcId, detail, ts }]  // e.g. UNMATCHED_RESPONSE (session.js)
  * }
- * keys = { privateKey, signer, algo } */
+ * keys = { privateKey, signer, algo }
+ *
+ * `disconnected`/`disconnect_reason`/`jsonRpcId` on a call and the session-level
+ * `anomalies` array are additive, optional fields (gateway callers only -- see
+ * scripts/gateway/session.js#toSealableSession): when present they are folded into the
+ * persisted record below so an operator can tell a downstream disconnect or unmatched
+ * response apart from an ordinary tool error from the sealed bundle alone, not only from
+ * the gateway's own in-memory state. Never required, and never changes the bundle's own
+ * schema (schemas/attestation-bundle.schema.json) -- both land inside existing free-form
+ * artifact bodies (execution_trace.jsonl lines, decision_record.md text). */
 function sealBoundaryBundle(session, keys) {
   if (!session || typeof session !== "object") throw new Error("sealBoundaryBundle: session required");
   const init = session.initialize || {};
   const tools = Array.isArray(session.tools) ? session.tools : [];
   const calls = Array.isArray(session.calls) ? session.calls : [];
+  const anomalies = Array.isArray(session.anomalies) ? session.anomalies : [];
 
   const grantedTools = tools.map((t) => (t.server ? t.server + ":" : "") + t.name);
   // execution_trace: one entry per tool call; a call to a tool NOT in the granted surface is flagged.
@@ -42,6 +54,7 @@ function sealBoundaryBundle(session, keys) {
       result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)),
       is_error: !!c.isError,
       model_call: !!c.model_call,                        // sampling/createMessage → non-deterministic
+      ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason || null } : {}),
     });
   });
   const outputs = calls.filter((c) => !c.isError).map((c, i) => ({ call: i + 1, result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)) }));
@@ -62,7 +75,7 @@ function sealBoundaryBundle(session, keys) {
       validation_report: A("validation_report.json", JSON.stringify({ boundary: BOUNDARY })),
       execution_trace: A("execution_trace.jsonl", traceLines.join("\n")),
       output_manifest: A("output_manifest.json", JSON.stringify({ outputs })),
-      decision_record: A("decision_record.md", "# MCP boundary attestation\n\nTool I/O at the MCP boundary only. The agent's plan/compiled graph was not observed (no agent changes were made). Non-MCP side effects are NOT captured. This bundle asserts profile A (boundary), never the full plan profiles."),
+      decision_record: A("decision_record.md", "# MCP boundary attestation\n\nTool I/O at the MCP boundary only. The agent's plan/compiled graph was not observed (no agent changes were made). Non-MCP side effects are NOT captured. This bundle asserts profile A (boundary), never the full plan profiles." + (anomalies.length > 0 ? "\n\n## Anomalies\n\n" + anomalies.map((a) => `- ${a.kind || "unknown"}: ${a.detail || ""} (jsonRpcId=${JSON.stringify(a.jsonRpcId)}, ts=${a.ts})`).join("\n") : "")),
     },
     // Each MCP tool becomes a skill entry with provenance = hash of its declared schema. MCP tools are
     // observed, not GraphSmith-approved — so all_skills_signed_and_approved honestly recomputes false.
