@@ -339,7 +339,7 @@ async function pushedReplyWithPresentButFalsyErrorIsRejected() {
   const toolResp = await gw.nextMessage();
   check(
     "e2e-falsy-error-reply-surfaces-as-tool-call-error-not-fake-success",
-    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/\"sampled\"/.test(JSON.stringify(toolResp))),
+    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/"sampled"/.test(JSON.stringify(toolResp))),
     JSON.stringify(toolResp)
   );
 
