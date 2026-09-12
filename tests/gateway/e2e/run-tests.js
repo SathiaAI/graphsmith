@@ -339,7 +339,7 @@ async function pushedReplyWithPresentButFalsyErrorIsRejected() {
   const toolResp = await gw.nextMessage();
   check(
     "e2e-falsy-error-reply-surfaces-as-tool-call-error-not-fake-success",
-    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/"sampled"/.test(JSON.stringify(toolResp))),
+    Boolean(toolResp && toolResp.id === 2 && toolResp.error && typeof toolResp.error.message === "string" && !/\"sampled\"/.test(JSON.stringify(toolResp))),
     JSON.stringify(toolResp)
   );
 
@@ -555,6 +555,48 @@ async function httpAgentSessionsAreIdBasedNotSocketBased() {
   await gw.exitCode();
 }
 
+/** Codex PR #29 review "validate initialize before allocating an HTTP session": a
+ * headerless request whose method is "initialize" but whose envelope is otherwise
+ * malformed (missing "jsonrpc": "2.0" here) previously still got a real session with a
+ * 30-minute idle timer before proxy.handleMessage's own envelope check rejected it. The
+ * session must instead be sealed immediately, so a later call against that same session
+ * id sees it as unknown, not merely inert until the idle timeout. */
+async function httpFailedInitializeDoesNotLeakSession() {
+  const root = freshRoot("agent-http-failed-init");
+  writeConfirmedMode(root, "standalone");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const gw = spawnGateway(root, configPath);
+  const port = await waitForHttpPort(gw);
+  const token = fs.readFileSync(tokenPath, "utf8").trim();
+  const agent = new http.Agent({ keepAlive: true });
+  try {
+    // No "jsonrpc": "2.0" -- fails proxy.js's own envelope check, but agent-transport.js's
+    // pre-session gate only looks at msg.method, so this still reaches openSession().
+    const badInit = await httpPost(port, token, { id: 1, method: "initialize", params: {} }, agent);
+    const leakedSessionId = badInit.headers["mcp-session-id"];
+    check(
+      "e2e-agent-http-failed-initialize-returns-error",
+      Boolean(badInit.body && badInit.body.error),
+      JSON.stringify(badInit.body)
+    );
+    check("e2e-agent-http-failed-initialize-still-names-a-session-id", typeof leakedSessionId === "string", JSON.stringify(badInit.headers));
+    if (typeof leakedSessionId === "string") {
+      const followUp = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, agent, leakedSessionId);
+      check(
+        "e2e-agent-http-session-from-failed-initialize-is-sealed-not-leaked",
+        followUp.body && followUp.body.error && /unknown or expired/i.test(followUp.body.error.message),
+        JSON.stringify(followUp.body)
+      );
+    }
+  } finally {
+    agent.destroy();
+  }
+  gw.child.kill();
+  await gw.exitCode();
+}
+
 async function modeDormantExitsZero() {
   const root = freshRoot("dormant");
   writeConfirmedMode(root, "attach");
@@ -637,6 +679,7 @@ async function main() {
   await agentHttpListenerRejectsNonPostMethod();
   await agentHttpListenerBindFailureRejectedCleanly();
   await httpAgentSessionsAreIdBasedNotSocketBased();
+  await httpFailedInitializeDoesNotLeakSession();
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
