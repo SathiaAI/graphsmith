@@ -162,7 +162,27 @@ function markPendingAsDisconnected(session, reason, now, serverFilter, onDisconn
     };
     session.calls.push(call);
     session.pendingCalls.delete(jsonRpcId);
-    if (typeof onDisconnect === "function") onDisconnect(call, at);
+    /* CodeRabbit PR #29 review round 4 "contain disconnect-callback failures during
+     * session finalization": onDisconnect is the caller's own side effect (proxy.js
+     * wires it to a JSON.stringify + this.log() call) and this module deliberately has
+     * no logger of its own (see header) to report a failure in it -- but letting such a
+     * failure escape uncaught is far worse than losing that one log line: it would abort
+     * this loop (leaving any REMAINING pending calls on this session never marked
+     * disconnected), and propagate up through closeConnection/handleDownstreamDisconnect,
+     * skipping session removal, finalizeSession, and chain.appendSession entirely. Inside
+     * gateway.js's shutdown drain loop that uncaught throw would also abort finalizing
+     * every OTHER open session and skip writerClaim.release(), leaking a stale
+     * writer-claim that blocks the next gateway start. A failed logging side effect must
+     * never take down session bookkeeping or shutdown with it. */
+    if (typeof onDisconnect === "function") {
+      try {
+        onDisconnect(call, at);
+      } catch (error) {
+        // Swallowed deliberately -- see the comment above. This module has no logger to
+        // report it to, and the call itself is already correctly recorded in
+        // session.calls above regardless of whether the caller's side effect succeeded.
+      }
+    }
   }
 }
 
