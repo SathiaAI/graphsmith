@@ -79,8 +79,16 @@ function runStdioAgentTransport(ctx) {
       const wellFormed = msg.jsonrpc === "2.0" && (hasResult || hasError) && !(hasResult && hasError);
       if (!wellFormed) {
         reject(new Error(`agent's reply to pushed request (id ${JSON.stringify(msg.id)}) was not a well-formed JSON-RPC 2.0 response (missing/invalid "jsonrpc", or not exactly one of "result"/"error" present)`));
-      } else if (msg.error) {
-        reject(Object.assign(new Error(msg.error.message || "agent returned an error"), { rpcError: msg.error }));
+      } else if (hasError) {
+        /* CodeRabbit PR #29 review round 4 "a reply with a present but falsy error
+         * resolves as a successful undefined result": branching on msg.error's truthiness
+         * (rather than the hasError presence flag already computed above) let a reply
+         * shaped like {"jsonrpc":"2.0","id":"gw-push-...","error":null} pass the
+         * exactly-one-of-result-or-error check above and then fall through to resolve()
+         * with an undefined result -- the exact false-success outcome that check exists to
+         * prevent. Same class of bug already fixed in downstream.js's own response
+         * correlation. */
+        reject(Object.assign(new Error((msg.error && msg.error.message) || "agent returned an error"), { rpcError: msg.error }));
       } else {
         resolve(msg.result);
       }
