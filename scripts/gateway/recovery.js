@@ -99,8 +99,37 @@ function intentPath(stateDir, intentKey) {
   return path.join(intentsDir(stateDir), `${assertSafeId(intentKey, "intentKey")}.json`);
 }
 
+/* Codex PR #33 review "restrict permissions on raw recovery records": these directories
+ * (and, below, the WAL/intent files inside them) hold raw goals, tool arguments, and
+ * cached results -- data the signed execution trace otherwise only ever stores as
+ * hashes. Under the common `022` umask, mkdirSync's default mode is `0755`, letting any
+ * other local user on the host read them. `0700` scopes the whole recovery tree to this
+ * process's own owner, matching the "OS process boundary is the trust boundary"
+ * convention this codebase already uses elsewhere. An explicit chmod (not just the mode
+ * passed to mkdirSync) also re-tightens a directory that was created by an older build
+ * of this file before this fix, since `recursive: true` does not revisit dirs that
+ * already existed. Best-effort: a chmod that fails (e.g. a filesystem that does not
+ * support POSIX modes) must not mask the real error from the write that follows. */
 function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch (error) {
+    /* best effort -- see doc comment above */
+  }
+}
+
+/* Same rationale as ensureDir's own doc comment above, for the individual WAL/intent
+ * files themselves: `fs.openSync(path, "a")`/atomicCreateExclusive/atomicOverwriteFile
+ * all default to `0666 & ~umask` (typically `0644`), which is world/group-readable under
+ * a `022` umask. Called after every write (mirroring fsyncDir's own "not just on first
+ * creation" convention above) so a file that predates this fix is re-tightened too. */
+function restrictFileMode(filePath) {
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch (error) {
+    /* best effort -- see doc comment above */
+  }
 }
 
 /* CodeRabbit PR #33 review "fsync the recovery directory after creating WAL files": a
@@ -137,6 +166,7 @@ function appendDurableLine(filePath, line) {
   } finally {
     fs.closeSync(fd);
   }
+  restrictFileMode(filePath);
 }
 
 /** Appends one WAL event for `connectionId`. Synchronous end-to-end (open/write/fsync/
@@ -216,7 +246,14 @@ function listActiveConnections(stateDir) {
     if (error.code === "ENOENT") return [];
     throw error;
   }
-  return entries.filter((f) => f.endsWith(".jsonl")).map((f) => f.slice(0, -".jsonl".length));
+  /* Codex PR #33 review "sort active connections before recovery": readdirSync gives no
+   * portable ordering guarantee across platforms/filesystems -- gateway.js#
+   * recoverCrashedSessions consumes this array directly, in order, to decide chain-append
+   * sequence numbers and tail hashes for each recovered connection. An unsorted, platform-
+   * dependent order made re-running recovery on the same crash-left files potentially
+   * produce a different resulting chain across restarts/hosts. Sorting here (once, at the
+   * source) keeps every consumer's replay/append order deterministic. */
+  return entries.filter((f) => f.endsWith(".jsonl")).map((f) => f.slice(0, -".jsonl".length)).sort();
 }
 
 /** Stable-key JSON stringify -- {a:1,b:2} and {b:2,a:1} must canonicalize identically so
@@ -282,6 +319,11 @@ function createIntentIfAbsent(stateDir, intentKey, data) {
   // entry that makes this new intent file discoverable after a crash -- done here,
   // locally, rather than changing that shared helper's behavior for every other caller.
   fsyncDir(intentsDir(stateDir));
+  // Same "restrict permissions on raw recovery records" rationale as ensureDir/
+  // appendDurableLine above -- state-store.js's shared atomicCreateExclusive is not
+  // itself changed (other callers outside this module rely on its current mode), so this
+  // module re-tightens its own files locally after the fact instead.
+  restrictFileMode(intentPath(stateDir, intentKey));
   return record;
 }
 
@@ -290,6 +332,7 @@ function updateIntent(stateDir, intentKey, patch) {
   if (!current) throw fail(`Cannot update unknown intent "${intentKey}"`, "GATEWAY_RECOVERY_INTENT_NOT_FOUND");
   const updated = { ...current, ...patch };
   stateStore.atomicOverwriteFile(intentPath(stateDir, intentKey), JSON.stringify(updated), intentsDir(stateDir));
+  restrictFileMode(intentPath(stateDir, intentKey));
   return updated;
 }
 
