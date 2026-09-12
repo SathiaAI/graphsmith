@@ -89,6 +89,56 @@ function walTornTailLineToleratedRestKept() {
   check("wal-torn-tail-keeps-every-complete-line-before-it", events.length === 2 && events[0].type === "SESSION_START" && events[1].type === "CALL_START", JSON.stringify(events));
 }
 
+/* Codex PR #33 review "complete WAL writes before treating them as durable": fs.writeSync
+ * may write fewer bytes than the caller asked for in a single call. Before this fix, a
+ * short write here was fsync'd (and reported durable) exactly as if it had written the
+ * whole line -- readWalEvents' own "stop at the first malformed line" tolerance (its own
+ * header comment) would then treat that torn interior line as a crash tail and silently
+ * discard it AND every real, complete event appended after it. */
+function appendWalEventRetriesOnAShortWrite() {
+  const dir = freshDir("wal-short-write");
+  const originalWriteSync = fs.writeSync;
+  let calls = 0;
+  fs.writeSync = function (fd, buffer, offset, length, position) {
+    calls++;
+    if (calls === 1) {
+      // Simulate a short write: only the first half of the requested bytes land.
+      const partial = Math.max(1, Math.floor(length / 2));
+      return originalWriteSync(fd, buffer, offset, partial, position);
+    }
+    return originalWriteSync.apply(fs, arguments);
+  };
+  try {
+    recovery.appendWalEvent(dir, "conn-1", { type: "SESSION_START", goal: "g" });
+  } finally {
+    fs.writeSync = originalWriteSync;
+  }
+  check("wal-short-write-took-more-than-one-writeSync-call", calls > 1, String(calls));
+  const events = recovery.readWalEvents(dir, "conn-1");
+  check("wal-short-write-still-produces-one-complete-parseable-event", events.length === 1 && events[0].type === "SESSION_START" && events[0].goal === "g", JSON.stringify(events));
+  // A second, real event appended afterward must not be lost the way a genuinely torn
+  // line would discard it -- confirms the whole first line landed intact on disk, not
+  // just that JSON.parse happened to tolerate a truncated tail by coincidence.
+  recovery.appendWalEvent(dir, "conn-1", { type: "INITIALIZE", model: "m" });
+  const eventsAfter = recovery.readWalEvents(dir, "conn-1");
+  check("wal-short-write-does-not-corrupt-subsequent-events", eventsAfter.length === 2 && eventsAfter[1].type === "INITIALIZE", JSON.stringify(eventsAfter));
+}
+
+function appendWalEventFailsClosedWhenWriteSyncMakesNoProgress() {
+  const dir = freshDir("wal-no-progress-write");
+  const originalWriteSync = fs.writeSync;
+  fs.writeSync = function () { return 0; };
+  let threw = null;
+  try {
+    recovery.appendWalEvent(dir, "conn-1", { type: "SESSION_START", goal: "g" });
+  } catch (error) {
+    threw = error;
+  } finally {
+    fs.writeSync = originalWriteSync;
+  }
+  check("wal-no-progress-write-throws-rather-than-fsync-nothing", threw && threw.code === "GATEWAY_RECOVERY_SHORT_WRITE", threw && threw.code);
+}
+
 /* Codex PR #33 review "restrict permissions on raw recovery records": these files/dirs
  * hold raw goals, tool arguments, and cached results -- data the signed execution trace
  * otherwise only ever stores as hashes. Under a common 022 umask, the previous default
@@ -223,6 +273,26 @@ function deleteIntentIsIdempotent() {
   check("delete-intent-of-already-deleted-is-a-no-op", threw === null, threw && threw.message);
 }
 
+/* Codex PR #33 review "fsync the intent directory after rollback deletion": proxy.js's own
+ * CALL_START-failure rollback calls deleteIntent to remove a just-created "dispatched"
+ * intent it now knows never actually dispatched, then tells the caller a retry is safe --
+ * but the unlink's own directory-entry removal was never fsynced, so a crash shortly after
+ * could resurrect the stale record on the next mount. */
+function deleteIntentFsyncsTheIntentsDirectoryAfterRemoval() {
+  const dir = freshDir("intent-delete-fsync");
+  const key = recovery.computeIntentKey("conn-1", "tool", {});
+  recovery.createIntentIfAbsent(dir, key, { connection_id: "conn-1", tool: "tool", arguments: {}, state: "dispatched", dispatched_at: 1 });
+  const originalFsyncSync = fs.fsyncSync;
+  let fsyncCount = 0;
+  fs.fsyncSync = (fd) => { fsyncCount++; return originalFsyncSync(fd); };
+  try {
+    recovery.deleteIntent(dir, key);
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+  check("delete-intent-fsyncs-the-intents-directory", fsyncCount >= 1, `expected at least 1 fsyncSync call, got ${fsyncCount}`);
+}
+
 function listIntentsForConnectionFiltersCorrectly() {
   const dir = freshDir("intent-list-conn");
   const keyA1 = recovery.computeIntentKey("conn-a", "tool1", {});
@@ -263,6 +333,42 @@ function operatorResolutionExecutedAndNotExecuted() {
   const resolvedNotExecuted = recovery.resolveIntentNotExecuted(dir, keyNotExecuted);
   check("resolve-intent-not-executed-persists-a-terminal-state", resolvedNotExecuted.state === "not_executed", JSON.stringify(resolvedNotExecuted));
   check("resolve-intent-not-executed-is-not-immediately-deleted", recovery.readIntent(dir, keyNotExecuted) !== null, "was deleted immediately");
+}
+
+/* Codex PR #33 review "reject resolutions that overwrite terminal intents": both resolve*
+ * functions used to patch unconditionally regardless of the intent's current state -- a
+ * stale or repeated operator command could silently rewrite an already-`completed`
+ * intent's own observed result, or flip a `not_executed` intent the other way, discarding
+ * real evidence. Only dispatched/ambiguous may transition; a repeat of the SAME terminal
+ * resolution is a no-op; any OTHER terminal state is refused outright. */
+function resolveIntentGuardsAgainstOverwritingATerminalState() {
+  const dir = freshDir("intent-resolve-terminal-guard");
+  const keyCompleted = recovery.computeIntentKey("conn-1", "toolA", {});
+  recovery.createIntentIfAbsent(dir, keyCompleted, { connection_id: "conn-1", tool: "toolA", arguments: {}, state: "dispatched", dispatched_at: 1 });
+  recovery.resolveIntentExecuted(dir, keyCompleted, { charged: true });
+
+  let threwOnRepeat = null;
+  let repeatResult = null;
+  try { repeatResult = recovery.resolveIntentExecuted(dir, keyCompleted, { charged: true }); } catch (error) { threwOnRepeat = error; }
+  check("resolve-executed-repeat-is-a-no-op-not-a-throw", threwOnRepeat === null, threwOnRepeat && threwOnRepeat.message);
+  check("resolve-executed-repeat-does-not-change-the-record", repeatResult && repeatResult.cached_result.charged === true, JSON.stringify(repeatResult));
+
+  let threwOnConflict = null;
+  try { recovery.resolveIntentNotExecuted(dir, keyCompleted); } catch (error) { threwOnConflict = error; }
+  check("resolve-not-executed-refuses-to-overwrite-a-completed-intent", threwOnConflict && threwOnConflict.code === "GATEWAY_RECOVERY_INTENT_TERMINAL", threwOnConflict && threwOnConflict.code);
+  check("resolve-not-executed-refusal-did-not-mutate-the-record", recovery.readIntent(dir, keyCompleted).state === "completed", JSON.stringify(recovery.readIntent(dir, keyCompleted)));
+
+  const keyNotExecuted = recovery.computeIntentKey("conn-1", "toolB", {});
+  recovery.createIntentIfAbsent(dir, keyNotExecuted, { connection_id: "conn-1", tool: "toolB", arguments: {}, state: "ambiguous" });
+  recovery.resolveIntentNotExecuted(dir, keyNotExecuted);
+  let threwOnReverseConflict = null;
+  try { recovery.resolveIntentExecuted(dir, keyNotExecuted, { forced: true }); } catch (error) { threwOnReverseConflict = error; }
+  check("resolve-executed-refuses-to-overwrite-a-not-executed-intent", threwOnReverseConflict && threwOnReverseConflict.code === "GATEWAY_RECOVERY_INTENT_TERMINAL", threwOnReverseConflict && threwOnReverseConflict.code);
+  check("resolve-executed-refusal-did-not-mutate-the-record", recovery.readIntent(dir, keyNotExecuted).state === "not_executed", JSON.stringify(recovery.readIntent(dir, keyNotExecuted)));
+
+  let threwOnRepeatNotExecuted = null;
+  try { recovery.resolveIntentNotExecuted(dir, keyNotExecuted); } catch (error) { threwOnRepeatNotExecuted = error; }
+  check("resolve-not-executed-repeat-is-a-no-op-not-a-throw", threwOnRepeatNotExecuted === null, threwOnRepeatNotExecuted && threwOnRepeatNotExecuted.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +514,106 @@ function bundleCollisionWithDifferentContentIsFlaggedNotDiscarded() {
   check("bundle-collision-genuine-conflict-intent-not-discarded", recovery.readIntent(dir, intentKeyY) !== null, "intent was deleted despite unverified collision");
   const headAfter = chain.readHead(dir);
   check("bundle-collision-genuine-conflict-no-second-chain-entry-appended", headAfter && headAfter.seq === firstHead.seq, JSON.stringify(headAfter));
+}
+
+/* Codex PR #33 review "verify the chain entry before cleaning a colliding WAL": content
+ * verification alone proves the BUNDLE FILE on disk really is this connection's own
+ * durable record -- it does not prove chain.appendSession's own chain.jsonl append (step
+ * 2 of its own documented write order) ever actually happened. Simulates exactly that
+ * partial-append crash (bundle file present and content-verified, chain.jsonl/HEAD.json
+ * still reflecting "no chain yet") by sealing normally once, then stripping only the
+ * chain.jsonl/HEAD.json side of that append and re-seeding the identical WAL as a second
+ * crash-left copy would look. Recovery must complete the missing append, not just discard
+ * the WAL believing nothing more was needed. */
+function recoverRepairsAPartialAppendMissingItsChainEntry() {
+  const dir = freshDir("recover-partial-append");
+  const keys = makeKeys();
+  const connectionId = "conn-partial";
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const firstHead = chain.readHead(dir);
+  check("partial-append-fixture-first-pass-sealed", firstHead && firstHead.seq === 1, JSON.stringify(firstHead));
+
+  // Simulate the crash landing between chain.appendSession's own bundle-file write and its
+  // chain.jsonl append: the bundle file stays exactly as written; chain.jsonl/HEAD.json are
+  // rolled back to "nothing appended yet".
+  fs.unlinkSync(chain.chainPath(dir));
+  fs.unlinkSync(chain.headPath(dir));
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("partial-append-repair-does-not-need-operator-review", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+  check("partial-append-repair-completes-the-missing-chain-entry", chain.chainHasEntryForBundle(dir, firstHead.bundle_id), "chain.jsonl still has no entry for the content-verified bundle");
+  const headAfter = chain.readHead(dir);
+  check("partial-append-repair-head-points-at-the-repaired-entry", headAfter && headAfter.seq === 1 && headAfter.bundle_id === firstHead.bundle_id, JSON.stringify(headAfter));
+  check("partial-append-repair-cleans-up-the-wal", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present");
+}
+
+/* Codex PR #33 review "renew ownership during synchronous recovery": recoverCrashedSessions'
+ * own per-connection loop is entirely synchronous fs work that can, with enough or large
+ * enough crash-left WALs, run long enough to starve the writer-claim's async heartbeat past
+ * its own staleAfterMs -- writer-claim.js's own startHeartbeat() doc comment discloses
+ * exactly this gap and prescribes a synchronous renew() call at the boundary of any long
+ * synchronous phase the claim is held across. */
+function recoverCrashedSessionsRenewsTheWriterClaimPerConnection() {
+  const dir = freshDir("recover-renew");
+  const keys = makeKeys();
+  seedCleanCallWal(dir, "conn-1");
+  recovery.appendWalEvent(dir, "conn-1", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  seedCleanCallWal(dir, "conn-2");
+  recovery.appendWalEvent(dir, "conn-2", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  let renewCalls = 0;
+  const fakeWriterClaim = { renew: () => { renewCalls++; } };
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog, fakeWriterClaim);
+  check("recover-renews-the-claim-once-per-connection", renewCalls === 2, String(renewCalls));
+  check("recover-with-a-fake-claim-still-seals-normally", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+}
+
+function recoverCrashedSessionsWithoutAWriterClaimStillWorks() {
+  // Every existing direct caller of recoverCrashedSessions (this whole test file) omits
+  // the writerClaim argument -- confirms it stays fully optional/backward-compatible.
+  const dir = freshDir("recover-no-claim-arg");
+  const keys = makeKeys();
+  seedCleanCallWal(dir, "conn-1");
+  recovery.appendWalEvent(dir, "conn-1", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  let threw = null;
+  try { recoverCrashedSessions(dir, keys, silentLog); } catch (error) { threw = error; }
+  check("recover-without-a-writer-claim-argument-does-not-throw", threw === null, threw && threw.message);
+}
+
+function recoverCrashedSessionsAbortsImmediatelyIfTheClaimIsLost() {
+  const dir = freshDir("recover-renew-lost");
+  const keys = makeKeys();
+  seedCleanCallWal(dir, "conn-a");
+  recovery.appendWalEvent(dir, "conn-a", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  seedCleanCallWal(dir, "conn-b");
+  recovery.appendWalEvent(dir, "conn-b", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  let renewCalls = 0;
+  const fakeWriterClaim = {
+    renew: () => {
+      renewCalls++;
+      const error = new Error("Lost the writer-claim: another writer has taken over.");
+      error.code = "WRITER_CLAIM_LOST";
+      throw error;
+    },
+  };
+  let threw = null;
+  try {
+    recoverCrashedSessions(dir, keys, silentLog, fakeWriterClaim);
+  } catch (error) {
+    threw = error;
+  }
+  check("recover-aborts-when-the-claim-is-lost-mid-pass", threw && threw.code === "WRITER_CLAIM_LOST", threw && threw.code);
+  check("recover-stops-at-the-very-first-renew-failure", renewCalls === 1, String(renewCalls));
+  // The claim was lost before EITHER connection's own body ran -- neither WAL may be
+  // touched, since this process can no longer prove it is still the sole writer.
+  const remaining = recovery.listActiveConnections(dir);
+  check("recover-leaves-every-connections-wal-untouched-once-the-claim-is-lost", remaining.length === 2 && remaining.includes("conn-a") && remaining.includes("conn-b"), JSON.stringify(remaining));
+  check("recover-appended-no-chain-entry-once-the-claim-is-lost", chain.readHead(dir) === null, JSON.stringify(chain.readHead(dir)));
 }
 
 function unreadableWalForOneConnectionDoesNotBlockAnother() {
@@ -568,6 +774,33 @@ function samplingForwardErrorIsPersistedAsFailedResult() {
     const result = events.find((e) => e.type === "CALL_RESULT");
     check("sampling-forward-error-wal-records-call-result-as-an-error", Boolean(result) && result.isError === true, JSON.stringify(events));
     check("sampling-forward-error-session-records-it-as-an-error", s.calls.length === 1 && s.calls[0].isError === true, JSON.stringify(s.calls));
+  });
+}
+
+/* Codex PR #33 review "refuse sampling when its CALL_START cannot be saved": this WAL
+ * append happens strictly BEFORE agentPusher.current() is ever invoked -- nothing has been
+ * sent to the agent yet at the point it fails, so this must refuse to forward (a real,
+ * retryable JSON-RPC error) rather than dispatch work a subsequent crash could never
+ * replay (no CALL_START in the WAL at all). */
+function samplingForwardRefusesWhenCallStartCannotBeSaved() {
+  const dir = freshDir("sampling-wal-failure");
+  const connectionId = "conn-sample-wal-fail";
+  // Force recovery.appendWalEvent's own ensureDir(activeDir(...)) to fail: pre-create
+  // "gateway-recovery/active" as a plain FILE so mkdirSync(..., {recursive:true}) throws
+  // EEXIST instead of creating the directory appendWalEvent needs.
+  fs.mkdirSync(path.join(dir, "gateway-recovery"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "gateway-recovery", "active"), "not a directory");
+
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  let agentWasCalled = false;
+  const agentPusher = { current: () => { agentWasCalled = true; return Promise.resolve({ content: [] }); }, connectionId };
+  const msg = { method: "sampling/createMessage", id: 7, params: { prompt: "hi" } };
+  return forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy).then((resp) => {
+    check("sampling-wal-failure-does-not-forward-to-the-agent", agentWasCalled === false, "agentPusher.current was called despite the WAL append failing");
+    check("sampling-wal-failure-returns-a-jsonrpc-error", Boolean(resp.error), JSON.stringify(resp));
+    check("sampling-wal-failure-rolls-back-the-pending-call-entry", s.pendingCalls.size === 0, String(s.pendingCalls.size));
   });
 }
 
@@ -820,6 +1053,8 @@ function main() {
   walListActiveConnectionsReturnsSortedOrder();
   recoveryFilesAndDirsAreOwnerOnlyPermissions();
   walOnEmptyRecoveryDirReturnsNoActiveConnections();
+  appendWalEventRetriesOnAShortWrite();
+  appendWalEventFailsClosedWhenWriteSyncMakesNoProgress();
 
   intentKeyStableRegardlessOfArgumentKeyOrder();
   intentKeyDiffersOnConnectionToolOrArgs();
@@ -828,9 +1063,11 @@ function main() {
   readIntentOfMissingKeyReturnsNull();
   updateIntentMergesAndRejectsUnknown();
   deleteIntentIsIdempotent();
+  deleteIntentFsyncsTheIntentsDirectoryAfterRemoval();
   listIntentsForConnectionFiltersCorrectly();
   listAllIntentsSpansEveryConnection();
   operatorResolutionExecutedAndNotExecuted();
+  resolveIntentGuardsAgainstOverwritingATerminalState();
 
   recoverAutoSealsASessionThatCrashedAfterCleanDisconnect();
   recoverClosesFinding1GapUsingCompletedIntentAsProofOfOutcome();
@@ -843,6 +1080,10 @@ function main() {
 
   pathBearingIdentifiersAreRejected();
   bundleCollisionWithDifferentContentIsFlaggedNotDiscarded();
+  recoverRepairsAPartialAppendMissingItsChainEntry();
+  recoverCrashedSessionsRenewsTheWriterClaimPerConnection();
+  recoverCrashedSessionsWithoutAWriterClaimStillWorks();
+  recoverCrashedSessionsAbortsImmediatelyIfTheClaimIsLost();
   unreadableWalForOneConnectionDoesNotBlockAnother();
   abandonConnectionQuarantinesAnUnreadableWal();
   abandonConnectionRefusesOnUnverifiedBundleCollision();
@@ -856,6 +1097,7 @@ function main() {
 
   return samplingForwardSuccessIsPersistedToWalWithModelCallFlag()
     .then(() => samplingForwardErrorIsPersistedAsFailedResult())
+    .then(() => samplingForwardRefusesWhenCallStartCannotBeSaved())
     .then(() => {
       recoverPreservesModelCallFlagOnSamplingReplay();
       recoverDoesNotBlockAutoSealOnAnUnresolvedSamplingCall();
