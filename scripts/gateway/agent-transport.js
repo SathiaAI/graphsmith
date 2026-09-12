@@ -22,7 +22,7 @@ const http = require("http");
 const readline = require("readline");
 const { isAuthenticated } = require("../../mcp-server/src/auth.js");
 const { MAX_BODY_BYTES, REQUEST_TIMEOUT_MS } = require("../../mcp-server/src/httpTransport.js");
-const { DEFAULT_REQUEST_TIMEOUT_MS } = require("./downstream.js");
+const { DEFAULT_REQUEST_TIMEOUT_MS, MAX_HTTP_RESPONSE_BYTES, nextResidualLineBytes } = require("./downstream.js");
 
 /** Runs the agent-facing stdio transport against `ctx.proxy`. Returns
  * { connectionId, closed, stop, pushRequest } -- `closed` resolves once the session has
@@ -43,7 +43,38 @@ const { DEFAULT_REQUEST_TIMEOUT_MS } = require("./downstream.js");
 function runStdioAgentTransport(ctx) {
   const connectionId = "stdio-" + crypto.randomBytes(8).toString("hex");
   ctx.proxy.openConnection(connectionId);
+  /* Codex PR #29 review round 5 "handle a broken agent stdout pipe": mirrors
+   * downstream.js's connectStdio's own child.stdin "error" listener -- if the agent
+   * process on the other end of this stdio pair exits or closes its read side while a
+   * response is being written, process.stdout.write() can emit an asynchronous EPIPE (or
+   * similar) error. Node treats an unhandled "error" event on a stream as fatal and
+   * crashes the whole process; this listener exists solely to absorb the stream-level
+   * error event itself, so a vanished agent's own broken pipe cannot take down this
+   * gateway process -- the existing stdin "close" handler below already drives the real
+   * disconnect/cleanup path independently of this. */
+  process.stdout.on("error", () => { /* best effort: absorbed to prevent an unhandled 'error' event from crashing the gateway */ });
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  /* Codex PR #29 review round 5 "bound newline-delimited input from stdio agents":
+   * mirrors downstream.js's connectStdio -- readline buffers an unbounded amount of
+   * input while waiting for a newline. downstream.js's own stdio path (the OTHER
+   * direction: gateway -> real MCP server) already bounds this; the agent-facing side
+   * (agent -> gateway, right here) previously did not, so a faulty or compromised stdio
+   * agent could grow this process's memory without limit by never terminating a line.
+   * Reuses the exact same pure helper and byte cap as downstream.js's own fix so both
+   * directions stay consistent, and reports the same JSON-RPC error shape as this
+   * transport's own parse-error handler below before closing the connection. */
+  let bytesSinceLastLine = 0;
+  let stdinOverLimitHandled = false;
+  process.stdin.on("data", (chunk) => {
+    if (stdinOverLimitHandled) return;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytesSinceLastLine = nextResidualLineBytes(bytesSinceLastLine, buf);
+    if (bytesSinceLastLine > MAX_HTTP_RESPONSE_BYTES) {
+      stdinOverLimitHandled = true;
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: `Agent stdin produced an unterminated line exceeding the ${MAX_HTTP_RESPONSE_BYTES}-byte limit -- closing the connection.` } }) + "\n");
+      rl.close();
+    }
+  });
 
   const pendingPushed = new Map(); // gw-push id -> { resolve, reject, timer }
 
@@ -66,8 +97,32 @@ function runStdioAgentTransport(ctx) {
       const { resolve, reject, timer } = pendingPushed.get(msg.id);
       clearTimeout(timer);
       pendingPushed.delete(msg.id);
-      if (msg.error) reject(Object.assign(new Error(msg.error.message || "agent returned an error"), { rpcError: msg.error }));
-      else resolve(msg.result);
+      /* Codex PR #29 review round 3 "validate agent replies to pushed sampling
+       * requests": this previously accepted any id-matching, method-less message as a
+       * valid reply, without requiring "jsonrpc": "2.0" or exactly one of "result"/
+       * "error" -- mirroring the same gap downstream.js's connectStdio had (and already
+       * fixed) on its own response-correlation path. A malformed reply such as
+       * `{"id":"gw-push-..."}` would resolve as a successful `undefined` sampling result
+       * and be forwarded to the downstream, and be attested, as though it had genuinely
+       * succeeded. */
+      const hasResult = Object.prototype.hasOwnProperty.call(msg, "result");
+      const hasError = Object.prototype.hasOwnProperty.call(msg, "error");
+      const wellFormed = msg.jsonrpc === "2.0" && (hasResult || hasError) && !(hasResult && hasError);
+      if (!wellFormed) {
+        reject(new Error(`agent's reply to pushed request (id ${JSON.stringify(msg.id)}) was not a well-formed JSON-RPC 2.0 response (missing/invalid "jsonrpc", or not exactly one of "result"/"error" present)`));
+      } else if (hasError) {
+        /* CodeRabbit PR #29 review round 4 "a reply with a present but falsy error
+         * resolves as a successful undefined result": branching on msg.error's truthiness
+         * (rather than the hasError presence flag already computed above) let a reply
+         * shaped like {"jsonrpc":"2.0","id":"gw-push-...","error":null} pass the
+         * exactly-one-of-result-or-error check above and then fall through to resolve()
+         * with an undefined result -- the exact false-success outcome that check exists to
+         * prevent. Same class of bug already fixed in downstream.js's own response
+         * correlation. */
+        reject(Object.assign(new Error((msg.error && msg.error.message) || "agent returned an error"), { rpcError: msg.error }));
+      } else {
+        resolve(msg.result);
+      }
       return;
     }
     ctx.proxy.handleMessage(connectionId, msg).then((response) => {
@@ -285,6 +340,11 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
       }
 
       let sessionId = sessionIdHeader;
+      /* Codex PR #29 review "validate initialize before allocating an HTTP session":
+       * tracks whether THIS request is the one that just minted `sessionId` via
+       * openSession() below, so the handleMessage outcome can decide whether that brand
+       * new session actually earned its 30-minute idle slot. */
+      let justOpened = false;
       if (!sessionId) {
         /* No session ID presented: the ONLY message this can legitimately be is
          * "initialize" (board decision 2026-09-08) -- anything else means either a
@@ -310,6 +370,7 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
          * refusal and answer it like any other "not accepting requests" case instead. */
         try {
           sessionId = openSession();
+          justOpened = true;
         } catch (error) {
           res.writeHead(503, { "content-type": "application/json" });
           res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32000, message: `Cannot start a new session: ${error.message}` } }));
@@ -324,6 +385,19 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
       }
 
       ctx.proxy.handleMessage(sessionId, msg).then((response) => {
+        /* Codex PR #29 review "validate initialize before allocating an HTTP session":
+         * `msg.method === "initialize"` above only checks the method NAME -- a request
+         * missing "jsonrpc": "2.0", carrying an invalid "id", or otherwise malformed
+         * still reached openSession() above and got a real session + 30-minute idle
+         * timer before proxy.handleMessage's own envelope validation rejected it. An
+         * authenticated client repeating that could exhaust all MAX_HTTP_SESSIONS slots
+         * with initialize attempts that were never going to succeed. Since this session
+         * was only just minted for this exact request, an error response here means its
+         * "initialize" never actually completed -- seal it immediately rather than
+         * leaving a dead session to occupy a slot until it idles out. */
+        if (justOpened && response && response.error) {
+          sealSession(sessionId, `initialize failed validation: ${response.error.message}`);
+        }
         if (response === null) {
           res.writeHead(202, { [SESSION_ID_HEADER]: sessionId });
           res.end();
@@ -332,6 +406,7 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
           res.end(JSON.stringify(response));
         }
       }).catch((error) => {
+        if (justOpened) sealSession(sessionId, `initialize threw: ${error.message}`);
         res.writeHead(500, { "content-type": "application/json", [SESSION_ID_HEADER]: sessionId });
         res.end(JSON.stringify({ jsonrpc: "2.0", id: msg && msg.id, error: { code: -32603, message: error.message } }));
       });
