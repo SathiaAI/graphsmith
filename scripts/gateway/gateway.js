@@ -170,11 +170,24 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
        * step and violating AGENTS.md's "one log line per step" contract. The structured
        * completion record already carries the failure (status:"error"); only fall back to
        * the plain diagnostic when there is no session to record a structured line against
-       * in the first place, so every failure still gets exactly one log line either way. */
+       * in the first place, so every failure still gets exactly one log line either way.
+       *
+       * CodeRabbit PR #29 review round 4 "use the fallback only when no session exists":
+       * `correlatedNow` also goes false once a stdio agent disconnect has already run this
+       * call through closeConnection/handleDownstreamDisconnect's own pending-call
+       * cleanup (session.markPendingAsDisconnected) -- and that cleanup already emitted
+       * this exact step's structured gateway_call_completed/status:"disconnected" log via
+       * its onDisconnect callback (see proxy.js#logDisconnectedCall). `s` is still truthy
+       * in that case (the session object itself isn't gone, just this call's pending
+       * entry), so the old unconditional `else` fired the plain diagnostic below on top of
+       * that already-emitted completion log -- two log lines for one step. Only fall back
+       * to the plain diagnostic when there was never a session to correlate against at
+       * all, so a disconnect-during-forward gets exactly the one completion log
+       * closeConnection/handleDownstreamDisconnect already recorded, not a second one. */
       if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
         logCompletion(true);
-      } else {
+      } else if (!s) {
         log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
       }
       return { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: error.message } };
