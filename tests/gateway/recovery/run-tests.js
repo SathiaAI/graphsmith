@@ -35,7 +35,7 @@ const ROOT = path.resolve(__dirname, "../../..");
 const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
 const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
-const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli, forwardDownstreamRequestToAgent } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli, forwardDownstreamRequestToAgent, buildHealthStatus } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
 const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 
 let failures = 0;
@@ -89,6 +89,35 @@ function walTornTailLineToleratedRestKept() {
   check("wal-torn-tail-keeps-every-complete-line-before-it", events.length === 2 && events[0].type === "SESSION_START" && events[1].type === "CALL_START", JSON.stringify(events));
 }
 
+/* Codex PR #33 review "restrict permissions on raw recovery records": these files/dirs
+ * hold raw goals, tool arguments, and cached results -- data the signed execution trace
+ * otherwise only ever stores as hashes. Under a common 022 umask, the previous default
+ * modes (0755 dirs, 0644 files) let any other local user on the host read them. POSIX-only
+ * (Windows has no equivalent permission bits to assert against). */
+function recoveryFilesAndDirsAreOwnerOnlyPermissions() {
+  if (process.platform === "win32") {
+    record("recovery-permissions-owner-only", "SKIP", "POSIX file mode bits do not apply on win32");
+    return;
+  }
+  const dir = freshDir("permissions");
+  recovery.appendWalEvent(dir, "conn-1", { type: "SESSION_START", goal: null });
+  const walMode = fs.statSync(recovery.walPath(dir, "conn-1")).mode & 0o777;
+  check("recovery-wal-file-is-0600", walMode === 0o600, walMode.toString(8));
+  const activeDirMode = fs.statSync(recovery.activeDir(dir)).mode & 0o777;
+  check("recovery-active-dir-is-0700", activeDirMode === 0o700, activeDirMode.toString(8));
+
+  const intentKey = recovery.computeIntentKey("conn-1", "toolA", {});
+  recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-1", tool: "toolA", arguments: {}, state: "dispatched", dispatched_at: 1 });
+  const intentModeAfterCreate = fs.statSync(recovery.intentPath(dir, intentKey)).mode & 0o777;
+  check("recovery-intent-file-is-0600-after-create", intentModeAfterCreate === 0o600, intentModeAfterCreate.toString(8));
+  const intentsDirMode = fs.statSync(recovery.intentsDir(dir)).mode & 0o777;
+  check("recovery-intents-dir-is-0700", intentsDirMode === 0o700, intentsDirMode.toString(8));
+
+  recovery.updateIntent(dir, intentKey, { state: "ambiguous", ambiguous_at: 2 });
+  const intentModeAfterUpdate = fs.statSync(recovery.intentPath(dir, intentKey)).mode & 0o777;
+  check("recovery-intent-file-is-0600-after-update", intentModeAfterUpdate === 0o600, intentModeAfterUpdate.toString(8));
+}
+
 function walListActiveConnectionsAndDelete() {
   const dir = freshDir("wal-list-delete");
   recovery.appendWalEvent(dir, "conn-a", { type: "SESSION_START" });
@@ -103,6 +132,23 @@ function walListActiveConnectionsAndDelete() {
   let threw = null;
   try { recovery.deleteWal(dir, "conn-a"); } catch (error) { threw = error; }
   check("wal-delete-of-already-deleted-is-a-no-op", threw === null, threw && threw.message);
+}
+
+/* Codex PR #33 review "sort active connections before recovery": readdirSync gives no
+ * portable ordering guarantee -- recoverCrashedSessions consumes listActiveConnections'
+ * result directly, in order, to decide chain-append sequence/tail-hash assignment, so an
+ * unsorted order made replay order (and therefore the resulting chain) platform/fs
+ * dependent. Deliberately does NOT sort the expectation itself, unlike
+ * walListActiveConnectionsAndDelete above, to actually exercise the function's own
+ * ordering guarantee rather than the test's. */
+function walListActiveConnectionsReturnsSortedOrder() {
+  const dir = freshDir("wal-list-sorted");
+  // Appended out of lexical order on purpose.
+  recovery.appendWalEvent(dir, "conn-c", { type: "SESSION_START" });
+  recovery.appendWalEvent(dir, "conn-a", { type: "SESSION_START" });
+  recovery.appendWalEvent(dir, "conn-b", { type: "SESSION_START" });
+  const active = recovery.listActiveConnections(dir);
+  check("wal-list-active-connections-is-sorted", JSON.stringify(active) === JSON.stringify(["conn-a", "conn-b", "conn-c"]), JSON.stringify(active));
 }
 
 function walOnEmptyRecoveryDirReturnsNoActiveConnections() {
@@ -383,6 +429,67 @@ function unreadableWalForOneConnectionDoesNotBlockAnother() {
   check("isolation-good-connections-chain-entry-appended-despite-sibling-failure", headEntry && headEntry.seq === 1, JSON.stringify(headEntry));
 }
 
+/* Codex PR #33 review "verify collisions in recovery-abandon before cleanup": unlike
+ * recoverCrashedSessions' own already-hardened GATEWAY_BUNDLE_ID_COLLISION handling
+ * (bundleCollisionWithDifferentContentIsFlaggedNotDiscarded above), abandonConnection used
+ * to treat EVERY collision on that error code as the expected repeated-attempt case and
+ * fall straight through to deleting the connection's WAL/intents -- discarding a genuinely
+ * DIFFERENT session's only remaining, unrecoverable record. */
+function abandonConnectionRefusesOnUnverifiedBundleCollision() {
+  const dir = freshDir("abandon-collision");
+  const keys = makeKeys();
+  // First connection: seals normally via recoverCrashedSessions, occupying a bundle_id
+  // derived only from {init, grantedTools, n: calls.length} -- not the actual content.
+  seedCleanCallWal(dir, "conn-x");
+  recovery.appendWalEvent(dir, "conn-x", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const firstHead = chain.readHead(dir);
+
+  // Second, DIFFERENT connection an operator now runs recovery-abandon on: same tool,
+  // same init shape, same call count (1) -- deliberately different arguments/result, so
+  // it collides on bundle_id despite being a genuinely different session's content.
+  const connectionId = "conn-y";
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [{ name: "echo", server: "srv", schema: {} }] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "echo", server: "srv", arguments: { a: 999 }, ts: 10 });
+  const intentKeyY = recovery.computeIntentKey(connectionId, "echo", { a: 999 });
+  recovery.createIntentIfAbsent(dir, intentKeyY, { connection_id: connectionId, tool: "echo", arguments: { a: 999 }, state: "dispatched", dispatched_at: 9 });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: false, different: true }, isError: false, ts: 11 });
+
+  let threw = null;
+  try { abandonConnection(dir, keys, connectionId, silentLog); } catch (error) { threw = error; }
+  check("abandon-collision-refuses-rather-than-silently-cleaning-up", threw !== null, "abandonConnection did not throw on an unverified collision");
+  check("abandon-collision-wal-not-discarded", recovery.readWalEvents(dir, connectionId).length > 0, "WAL was deleted despite unverified collision");
+  check("abandon-collision-intent-not-discarded", recovery.readIntent(dir, intentKeyY) !== null, "intent was deleted despite unverified collision");
+  const headAfter = chain.readHead(dir);
+  check("abandon-collision-no-second-chain-entry-appended", headAfter && headAfter.seq === firstHead.seq, JSON.stringify(headAfter));
+}
+
+/* Same GATEWAY_BUNDLE_ID_COLLISION content-verification path, but for the ordinary case
+ * where recovery-abandon really is re-run on the SAME already-sealed connection (matching
+ * content) -- must still succeed and clean up normally, not regress into refusing every
+ * collision unconditionally. */
+function abandonConnectionStillSucceedsOnAGenuineRepeatedAttempt() {
+  const dir = freshDir("abandon-collision-repeat");
+  const keys = makeKeys();
+  const connectionId = "conn-repeat";
+  const intentKey = seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  // First abandon: seals it for real.
+  abandonConnection(dir, keys, connectionId, silentLog);
+  const firstHead = chain.readHead(dir);
+  // Re-seed the IDENTICAL WAL/intent (as a crash-left copy of the same connection's state
+  // would look on disk) and abandon it again -- same content, same bundle_id, expected.
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  let threw = null;
+  try { abandonConnection(dir, keys, connectionId, silentLog); } catch (error) { threw = error; }
+  check("abandon-repeated-genuine-attempt-does-not-throw", threw === null, threw && threw.message);
+  check("abandon-repeated-genuine-attempt-cleans-up-the-wal", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present");
+  const headAfter = chain.readHead(dir);
+  check("abandon-repeated-genuine-attempt-no-duplicate-chain-entry", headAfter && headAfter.seq === firstHead.seq, JSON.stringify(headAfter));
+}
+
 function abandonConnectionQuarantinesAnUnreadableWal() {
   const dir = freshDir("abandon-quarantine");
   const keys = makeKeys();
@@ -573,6 +680,62 @@ function writerClaimIsReleasedWhenStartupRecoveryThrows() {
   });
 }
 
+/* Codex PR #33 review "report each unresolved intent key in recovery output": a bare
+ * `in_flight` COUNT cannot distinguish an ordinary live in-progress call from a crashed
+ * connection's own unresolved one left in the same "dispatched" state -- an operator needs
+ * the actual keys (recovery-resolve/recovery-abandon both require the exact key) to act. */
+function healthStatusItemizesDispatchedIntentsAlongsideTheCount() {
+  const dir = freshDir("health-dispatched");
+  const intentKeyA = recovery.computeIntentKey("conn-a", "toolA", { x: 1 });
+  recovery.createIntentIfAbsent(dir, intentKeyA, { connection_id: "conn-a", tool: "toolA", arguments: { x: 1 }, state: "dispatched", dispatched_at: 123 });
+  const intentKeyB = recovery.computeIntentKey("conn-b", "toolB", {});
+  recovery.createIntentIfAbsent(dir, intentKeyB, { connection_id: "conn-b", tool: "toolB", arguments: {}, state: "ambiguous", ambiguous_at: 456, ambiguous_reason: "test" });
+
+  const ctx = {
+    config: { state_dir: dir },
+    writerClaim: { status: () => ({}) },
+    connections: new Map(),
+    proxy: { openSessionCount: () => 0 },
+  };
+  const status = buildHealthStatus(ctx);
+  check("health-in-flight-count-still-reported", status.recovery.in_flight === 1, JSON.stringify(status.recovery));
+  check(
+    "health-dispatched-list-itemizes-the-actual-intent",
+    Array.isArray(status.recovery.dispatched) && status.recovery.dispatched.length === 1 && status.recovery.dispatched[0].intent_key === intentKeyA && status.recovery.dispatched[0].connection_id === "conn-a" && status.recovery.dispatched[0].tool === "toolA",
+    JSON.stringify(status.recovery)
+  );
+  check(
+    "health-pending-operator-review-unaffected-by-this-change",
+    status.recovery.pending_operator_review.length === 1 && status.recovery.pending_operator_review[0].intent_key === intentKeyB,
+    JSON.stringify(status.recovery)
+  );
+}
+
+/* Codex PR #33 review "include the intent key in the advertised resolution command": the
+ * RECOVERY_AMBIGUOUS_INTENT log used to print a literal "<key>" placeholder in its example
+ * remediation command regardless of which (or how many) calls were actually unresolved --
+ * unusable without first hand-parsing raw recovery files to find the real key. */
+function recoverAmbiguousIntentLogNamesTheRealKeyNotAPlaceholder() {
+  const dir = freshDir("recover-log-real-key");
+  const keys = makeKeys();
+  const connectionId = "conn-unresolved";
+  // A crashed call with NO intent record at all (never even reached createIntentIfAbsent,
+  // or its file was lost) -- recoverCrashedSessions must still flag it for operator review
+  // (the existing "needsOperator" fallback) and now names its real, computable key.
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [{ name: "echo", server: "srv", schema: {} }] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "echo", server: "srv", arguments: { a: 1 }, ts: 10 });
+  const expectedIntentKey = recovery.computeIntentKey(connectionId, "echo", { a: 1 });
+
+  const logLines = [];
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, (line) => logLines.push(line));
+  check("recover-log-real-key-flags-for-operator-review", pendingOperatorReview.includes(connectionId), JSON.stringify(pendingOperatorReview));
+  const ambiguousLog = logLines.find((l) => l.includes("RECOVERY_AMBIGUOUS_INTENT"));
+  check("recover-log-real-key-line-exists", Boolean(ambiguousLog), JSON.stringify(logLines));
+  check("recover-log-real-key-names-the-actual-computed-key", Boolean(ambiguousLog) && ambiguousLog.includes(expectedIntentKey), ambiguousLog || "no log line");
+  check("recover-log-real-key-does-not-print-the-old-placeholder", Boolean(ambiguousLog) && !ambiguousLog.includes("--intent <key>"), ambiguousLog || "no log line");
+}
+
 function recoveryResolveRequiresResultFileForExecuted() {
   const dir = freshDir("cli-result-file");
   const root = freshDir("cli-result-file-root");
@@ -654,6 +817,8 @@ function main() {
   walReadOfMissingConnectionReturnsEmpty();
   walTornTailLineToleratedRestKept();
   walListActiveConnectionsAndDelete();
+  walListActiveConnectionsReturnsSortedOrder();
+  recoveryFilesAndDirsAreOwnerOnlyPermissions();
   walOnEmptyRecoveryDirReturnsNoActiveConnections();
 
   intentKeyStableRegardlessOfArgumentKeyOrder();
@@ -680,7 +845,11 @@ function main() {
   bundleCollisionWithDifferentContentIsFlaggedNotDiscarded();
   unreadableWalForOneConnectionDoesNotBlockAnother();
   abandonConnectionQuarantinesAnUnreadableWal();
+  abandonConnectionRefusesOnUnverifiedBundleCollision();
+  abandonConnectionStillSucceedsOnAGenuineRepeatedAttempt();
   notExecutedIntentReplaysAsAFailedCallAndIsThenCleanedUp();
+  healthStatusItemizesDispatchedIntentsAlongsideTheCount();
+  recoverAmbiguousIntentLogNamesTheRealKeyNotAPlaceholder();
 
   recoveryResolveRequiresResultFileForExecuted();
   recoveryResolveRefusesWhileAnotherWriterHoldsTheClaim();
