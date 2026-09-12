@@ -95,6 +95,20 @@ const MAX_HTTP_RESPONSE_BYTES = 10 * 1024 * 1024;
  * unbounded number of pages. */
 const MAX_TOOLS_LIST_PAGES = 1000;
 
+/** Pure helper for connectStdio's unterminated-line byte cap (CodeRabbit PR #29 review
+ * round 4 "make this regression test deterministic"): given the residual unterminated
+ * byte count carried over from the previous chunk and the newly-received chunk, returns
+ * the new residual -- the number of trailing bytes not yet followed by a newline. A
+ * chunk containing no newline extends the residual by its full length; a chunk
+ * containing one or more newlines resets the residual to just the bytes after its LAST
+ * newline. Exported separately from the "data" listener that calls it so a test can
+ * drive it directly with an explicit in-memory Buffer, independent of how an OS pipe
+ * happens to chunk a real child process's stdout. */
+function nextResidualLineBytes(prevResidualBytes, buf) {
+  const lastNewline = buf.lastIndexOf(0x0a);
+  return lastNewline === -1 ? prevResidualBytes + buf.length : buf.length - lastNewline - 1;
+}
+
 /** A downstream connection over stdio: spawns `endpoint` (a shell command line, split on
  * whitespace -- simplest form; a downstream needing shell quoting can wrap itself in a
  * small launcher script) and speaks newline-delimited JSON-RPC over its stdio, matching
@@ -138,11 +152,20 @@ function connectStdio(endpoint, options = {}) {
    * well-formed lines delivered together in one chunk (e.g. pipelined/batched downstream
    * writes) could therefore be misreported as a single oversized unterminated line and
    * force-close a perfectly healthy connection. Derive the residual directly from each
-   * chunk's own last newline instead of relying on ordering against readline's listener. */
+   * chunk's own last newline instead of relying on ordering against readline's listener.
+   *
+   * CodeRabbit PR #29 review round 4 "make this regression test deterministic": the
+   * regression test for the bug above drove this indirectly through a real child
+   * process's stdout, relying on a single process.stdout.write() call arriving as one
+   * "data" chunk on this side -- which the OS pipe is free to split into many smaller
+   * chunks regardless (and typically does, e.g. Linux's default ~64KB pipe buffer), so
+   * the test could pass against the OLD buggy logic too without ever exercising the
+   * multiple-complete-lines-in-one-chunk case it claims to cover. Extracted into this
+   * pure, exported helper so a test can drive it directly with an explicit in-memory
+   * Buffer -- deterministic, no child process or OS pipe chunking involved. */
   child.stdout.on("data", (chunk) => {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    const lastNewline = buf.lastIndexOf(0x0a);
-    bytesSinceLastLine = lastNewline === -1 ? bytesSinceLastLine + buf.length : buf.length - lastNewline - 1;
+    bytesSinceLastLine = nextResidualLineBytes(bytesSinceLastLine, buf);
     if (bytesSinceLastLine > MAX_HTTP_RESPONSE_BYTES) {
       bytesSinceLastLine = 0;
       if (!closed) {
@@ -671,4 +694,6 @@ module.exports = {
   connectDownstream,
   connectAllDownstreams,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  MAX_HTTP_RESPONSE_BYTES,
+  nextResidualLineBytes,
 }
