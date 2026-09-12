@@ -133,12 +133,21 @@ function recordCallResult(session, jsonRpcId, result) {
  * `server` matches it -- a downstream disconnect must not corrupt the attestation of a
  * call pending against a different, still-healthy downstream. Omitted entirely (the
  * connection-close / full-finalize callers) means "every pending call on this session",
- * as before. */
-function markPendingAsDisconnected(session, reason, now, serverFilter) {
+ * as before.
+ *
+ * `onDisconnect(call, at)`, when given, is invoked once per call actually moved into
+ * `session.calls` here (Codex PR #29 review round 4 "log calls finalized as
+ * disconnected": a call finalized this way previously got no matching
+ * "gateway_call_completed" log line at all -- neither here nor later, since
+ * handleMessage() only logs a call it itself still finds pending -- leaving disconnected
+ * steps with no run ID, status, or duration in the operational log even though they are
+ * fully recorded in the persisted trace). This module has no logger of its own by design
+ * (see its header); the caller decides what, if anything, to log. */
+function markPendingAsDisconnected(session, reason, now, serverFilter, onDisconnect) {
   const at = typeof now === "function" ? now() : Date.now();
   for (const [jsonRpcId, pending] of session.pendingCalls.entries()) {
     if (serverFilter !== undefined && pending.server !== serverFilter) continue;
-    session.calls.push({
+    const call = {
       tool: pending.tool,
       server: pending.server,
       arguments: pending.arguments,
@@ -150,8 +159,10 @@ function markPendingAsDisconnected(session, reason, now, serverFilter) {
       disconnected: true,
       disconnect_reason: reason || "downstream disconnected",
       jsonRpcId,
-    });
+    };
+    session.calls.push(call);
     session.pendingCalls.delete(jsonRpcId);
+    if (typeof onDisconnect === "function") onDisconnect(call, at);
   }
 }
 
