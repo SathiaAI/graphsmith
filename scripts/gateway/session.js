@@ -146,12 +146,21 @@ function recordAnomaly(session, anomaly) {
  * `server` matches it -- a downstream disconnect must not corrupt the attestation of a
  * call pending against a different, still-healthy downstream. Omitted entirely (the
  * connection-close / full-finalize callers) means "every pending call on this session",
- * as before. */
-function markPendingAsDisconnected(session, reason, now, serverFilter) {
+ * as before.
+ *
+ * `onDisconnect(call, at)`, when given, is invoked once per call actually moved into
+ * `session.calls` here (Codex PR #29 review round 4 "log calls finalized as
+ * disconnected": a call finalized this way previously got no matching
+ * "gateway_call_completed" log line at all -- neither here nor later, since
+ * handleMessage() only logs a call it itself still finds pending -- leaving disconnected
+ * steps with no run ID, status, or duration in the operational log even though they are
+ * fully recorded in the persisted trace). This module has no logger of its own by design
+ * (see its header); the caller decides what, if anything, to log. */
+function markPendingAsDisconnected(session, reason, now, serverFilter, onDisconnect) {
   const at = typeof now === "function" ? now() : Date.now();
   for (const [jsonRpcId, pending] of session.pendingCalls.entries()) {
     if (serverFilter !== undefined && pending.server !== serverFilter) continue;
-    session.calls.push({
+    const call = {
       tool: pending.tool,
       server: pending.server,
       arguments: pending.arguments,
@@ -163,8 +172,30 @@ function markPendingAsDisconnected(session, reason, now, serverFilter) {
       disconnected: true,
       disconnect_reason: reason || "downstream disconnected",
       jsonRpcId,
-    });
+    };
+    session.calls.push(call);
     session.pendingCalls.delete(jsonRpcId);
+    /* CodeRabbit PR #29 review round 4 "contain disconnect-callback failures during
+     * session finalization": onDisconnect is the caller's own side effect (proxy.js
+     * wires it to a JSON.stringify + this.log() call) and this module deliberately has
+     * no logger of its own (see header) to report a failure in it -- but letting such a
+     * failure escape uncaught is far worse than losing that one log line: it would abort
+     * this loop (leaving any REMAINING pending calls on this session never marked
+     * disconnected), and propagate up through closeConnection/handleDownstreamDisconnect,
+     * skipping session removal, finalizeSession, and chain.appendSession entirely. Inside
+     * gateway.js's shutdown drain loop that uncaught throw would also abort finalizing
+     * every OTHER open session and skip writerClaim.release(), leaking a stale
+     * writer-claim that blocks the next gateway start. A failed logging side effect must
+     * never take down session bookkeeping or shutdown with it. */
+    if (typeof onDisconnect === "function") {
+      try {
+        onDisconnect(call, at);
+      } catch (error) {
+        // Swallowed deliberately -- see the comment above. This module has no logger to
+        // report it to, and the call itself is already correctly recorded in
+        // session.calls above regardless of whether the caller's side effect succeeded.
+      }
+    }
   }
 }
 
