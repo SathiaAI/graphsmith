@@ -38,6 +38,19 @@ const { renderMarkdown } = require("./postmortem-render.js");
 
 const HARNESSES = ["claude-code", "codex"];
 
+/* reliability-2 (adversarial review run-20260807-222752): buildPostmortem
+ * used to call fs.readFileSync on an arbitrary session-log path with no
+ * size check at all, and the raw text is then further multiplied in memory
+ * (split into a line array, then a parsed-event array) before rendering.
+ * An independent rebuttal reproduction reported a 512 MiB input pushing
+ * process RSS past 2.2 GiB and OOM-killing a 4 GiB CI runner. 200 MiB is
+ * generous for a legitimate single session transcript (JSONL text; even a
+ * multi-day continuous session is normally well under this) while keeping
+ * peak memory for the read+split+parse chain bounded to a level that fits
+ * inside a constrained CI runner rather than an unbounded multiple of
+ * whatever the file happens to be. */
+const MAX_SESSION_FILE_BYTES = 200 * 1024 * 1024; // 200 MiB
+
 function parseWithHarness(harness, text, opts) {
   if (harness === "claude-code") return parseClaudeCodeSession(text, opts);
   if (harness === "codex") return parseCodexSession(text, opts);
@@ -62,11 +75,59 @@ function buildPostmortem(sessionPath, opts) {
   // internally without needing an explicit path.resolve() at this layer,
   // so sourcePath now records exactly the string the caller passed in --
   // deterministic with respect to the input, not the invocation directory.
-  let text;
+  // CodeRabbit/Codex review (PR #27): the previous version called fs.statSync(sessionPath)
+  // and fs.readFileSync(sessionPath, "utf8") as two SEPARATE operations, each re-resolving
+  // the path. Another process could replace sessionPath between them, or sessionPath could
+  // be a FIFO/device whose reported size does not bound what a subsequent read actually
+  // consumes -- either way the size check above could pass while the read below still
+  // pulls in an unbounded stream, defeating the MAX_SESSION_FILE_BYTES guard entirely.
+  // Fixed: open the path ONCE, fstatSync the resulting descriptor (not the path), reject
+  // anything that is not a regular file, and read exactly the checked byte count from
+  // that same descriptor -- closed on every exit path via finally.
+  let fd;
   try {
-    text = fs.readFileSync(sessionPath, "utf8");
+    fd = fs.openSync(sessionPath, "r");
   } catch (e) {
     throw new Error(`postmortem: cannot read '${sessionPath}': ${e.message}`);
+  }
+  let text;
+  try {
+    let stat;
+    try {
+      stat = fs.fstatSync(fd);
+    } catch (e) {
+      throw new Error(`postmortem: cannot read '${sessionPath}': ${e.message}`);
+    }
+    if (!stat.isFile()) {
+      throw new Error(
+        `postmortem: '${sessionPath}' is not a regular file. Refusing to read a FIFO, ` +
+          `device, or other special file, whose reported size cannot be trusted to bound ` +
+          `how much a read actually consumes.`
+      );
+    }
+    // FAIL-CLOSED: reject oversized input before it is ever read into memory
+    // (see MAX_SESSION_FILE_BYTES above) rather than attempting the read and
+    // relying on the process to survive it.
+    if (stat.size > MAX_SESSION_FILE_BYTES) {
+      throw new Error(
+        `postmortem: '${sessionPath}' is ${stat.size} bytes, which exceeds the ` +
+          `${MAX_SESSION_FILE_BYTES}-byte (${Math.round(MAX_SESSION_FILE_BYTES / (1024 * 1024))} MiB) limit on ` +
+          `session-log input. This limit exists to avoid an out-of-memory crash on large ` +
+          `files (readFileSync + line-split + event-parse each hold a further copy in memory). ` +
+          `If this is a legitimate session that has genuinely grown this large, split it before ` +
+          `running postmortem on it.`
+      );
+    }
+    const buffer = Buffer.alloc(stat.size);
+    let readTotal = 0;
+    while (readTotal < stat.size) {
+      const bytesRead = fs.readSync(fd, buffer, readTotal, stat.size - readTotal, readTotal);
+      if (bytesRead === 0) break;   // fewer bytes available than fstatSync reported; stop, don't spin
+      readTotal += bytesRead;
+    }
+    text = buffer.toString("utf8", 0, readTotal);
+  } finally {
+    fs.closeSync(fd);
   }
 
   const parseOpts = { sourcePath: sessionPath };
@@ -126,4 +187,4 @@ function runPostmortem(sessionPath, opts) {
   return { markdown, trace, diagnostics, harness };
 }
 
-module.exports = { buildPostmortem, runPostmortem, HARNESSES };
+module.exports = { buildPostmortem, runPostmortem, HARNESSES, MAX_SESSION_FILE_BYTES };

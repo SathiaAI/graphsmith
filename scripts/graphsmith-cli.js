@@ -17,11 +17,14 @@
  */
 "use strict";
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const readline = require("readline/promises");
 const { verifyBundle } = require("./gsa-verify.js");
 const { runPostmortem } = require("./postmortem.js");
 const { writeReport } = require("./write-report.js");
 const { composeReport, validateVerifyResultShape } = require("./gsa-audit-replay.js");
+const modeSelection = require("./mode-selection.js");
 
 function readJson(p, label) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); }
@@ -296,13 +299,174 @@ function cmdAudit(args) {
   process.exit(sub ? 1 : 2);
 }
 
+/* `graphsmith gateway mode set|status` -- Track 1.1's mode-selection
+ * contract CLI (TRD S4/MS-FR-2..MS-FR-4). All logic lives in
+ * scripts/mode-selection.js; this is thin argv parsing + the interactive
+ * prompt only. `--root <dir>` is a test/automation seam (defaults to
+ * process.cwd()), not part of the TRD's own operator-facing surface. */
+const GATEWAY_MODE_SET_USAGE =
+  "usage: graphsmith gateway mode set <standalone|attach> [options]\n" +
+  "  (interactive, default)          shows current -> target mode, requires typing\n" +
+  "                                   the target mode name back on a live TTY\n" +
+  "  --pre-authorize [--expires-in-hours N] [--out <file>]\n" +
+  "                                   interactive; ALSO writes a reusable,\n" +
+  "                                   time-boxed pre-authorization artifact\n" +
+  "                                   (default 24h, default path\n" +
+  "                                   .graphsmith/state/gateway-mode.pre-auth.json)\n" +
+  "  --use-pre-authorization <file>   non-interactive (GitOps/IaC): consumes an\n" +
+  "                                   artifact produced by an earlier --pre-authorize\n" +
+  "                                   run; refuses on any HMAC/expiry/mode mismatch\n" +
+  "  --confirmed-by <identity>        override the operator identity string recorded\n" +
+  "                                   in the confirmation (default: OS user@host)\n" +
+  "  --root <dir>                     deployment root (default: cwd)\n";
+
+function defaultConfirmedBy() {
+  try { return `${os.userInfo().username}@${os.hostname()}`; }
+  catch { return os.hostname() || "unknown-operator"; }
+}
+
+function usageError(usage, message) {
+  if (message) console.error(`graphsmith: ${message}`);
+  console.error(usage);
+  process.exit(2);
+}
+
+async function cmdGatewayModeSet(args) {
+  const positional = [];
+  const opts = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--pre-authorize") { opts.preAuthorize = true; continue; }
+    if (a === "--use-pre-authorization" || a === "--expires-in-hours" || a === "--out" || a === "--confirmed-by" || a === "--root") {
+      const value = args[i + 1];
+      if (value === undefined) return usageError(GATEWAY_MODE_SET_USAGE, `${a} requires a value`);
+      if (a === "--use-pre-authorization") opts.usePreAuthorization = value;
+      if (a === "--expires-in-hours") opts.expiresInHours = value;
+      if (a === "--out") opts.out = value;
+      if (a === "--confirmed-by") opts.confirmedBy = value;
+      if (a === "--root") opts.root = value;
+      i++;
+      continue;
+    }
+    if (a.startsWith("--")) return usageError(GATEWAY_MODE_SET_USAGE, `unknown option '${a}'`);
+    positional.push(a);
+  }
+
+  const mode = positional[0];
+  if (!modeSelection.MODES.includes(mode)) return usageError(GATEWAY_MODE_SET_USAGE);
+  if (opts.preAuthorize && opts.usePreAuthorization) return usageError(GATEWAY_MODE_SET_USAGE, "--pre-authorize and --use-pre-authorization are mutually exclusive");
+
+  const rootDir = path.resolve(opts.root || process.cwd());
+  const confirmedBy = opts.confirmedBy || defaultConfirmedBy();
+
+  if (opts.usePreAuthorization) {
+    let artifact;
+    try { artifact = JSON.parse(fs.readFileSync(path.resolve(opts.usePreAuthorization), "utf8")); }
+    catch (e) { console.error(`graphsmith: cannot read pre-authorization artifact: ${e.message}`); return process.exit(2); }
+
+    let verified;
+    try { verified = modeSelection.verifyPreAuthorizationArtifact(rootDir, artifact, { mode, now: Date.now() }); }
+    catch (e) { console.error(`graphsmith: ${e.message}`); return process.exit(1); }
+
+    const record = modeSelection.writeGatewayMode(rootDir, {
+      mode,
+      confirmedBy: verified.authorized_by,
+      confirmedAt: Date.now(),
+      preAuthorized: true,
+    });
+    console.log(`graphsmith: mode confirmed via pre-authorization -> ${record.mode} (confirmed_by=${record.confirmation.confirmed_by})`);
+    return process.exit(0);
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error(
+      "graphsmith: gateway mode set requires an interactive terminal -- no file written. " +
+      "For automation, use --use-pre-authorization <file> with an artifact produced by an " +
+      "earlier, interactive --pre-authorize run."
+    );
+    return process.exit(2);
+  }
+
+  console.log(`Current mode: ${modeSelection.describeCurrentMode(rootDir)}`);
+  console.log(`Target mode:  ${mode}`);
+  console.log("");
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const typed = await rl.question(`Type "${mode}" to confirm this change: `);
+    if (typed.trim() !== mode) {
+      console.error("graphsmith: confirmation did not match -- aborting, no file written.");
+      return process.exit(2);
+    }
+
+    const confirmedAt = Date.now();
+
+    if (opts.preAuthorize) {
+      const hours = opts.expiresInHours !== undefined ? Number(opts.expiresInHours) : null;
+      if (opts.expiresInHours !== undefined && (!Number.isFinite(hours) || hours <= 0)) {
+        return usageError(GATEWAY_MODE_SET_USAGE, "--expires-in-hours must be a positive number");
+      }
+      const ttlMs = hours !== null ? Math.round(hours * 3600 * 1000) : undefined;
+      const artifact = modeSelection.createPreAuthorizationArtifact(rootDir, {
+        mode,
+        authorizedBy: confirmedBy,
+        authorizedAt: confirmedAt,
+        ...(ttlMs !== undefined ? { ttlMs } : {}),
+      });
+      const outPath = path.resolve(opts.out || path.join(modeSelection.gatewayStateDir(rootDir), "gateway-mode.pre-auth.json"));
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+      console.log(`graphsmith: pre-authorization artifact written to ${outPath} (expires ${new Date(artifact.expires_at).toISOString()})`);
+    }
+
+    const record = modeSelection.writeGatewayMode(rootDir, { mode, confirmedBy, confirmedAt });
+    console.log(`graphsmith: mode confirmed -> ${record.mode}`);
+    return process.exit(0);
+  } finally {
+    rl.close();
+  }
+}
+
+function cmdGatewayModeStatus(args) {
+  const rootAt = args.indexOf("--root");
+  const rootDir = path.resolve(rootAt !== -1 && args[rootAt + 1] ? args[rootAt + 1] : process.cwd());
+  const status = modeSelection.statusReport(rootDir);
+  console.log(JSON.stringify(status, null, 2));
+  process.exit(status.ok ? 0 : 1);
+}
+
+function cmdGatewayMode(args) {
+  const [sub, ...rest] = args;
+  if (sub === "set") return cmdGatewayModeSet(rest);
+  if (sub === "status") return cmdGatewayModeStatus(rest);
+  console.error(GATEWAY_MODE_SET_USAGE);
+  process.exit(sub ? 1 : 2);
+}
+
+function cmdGateway(args) {
+  const [sub, ...rest] = args;
+  if (sub === "mode") return cmdGatewayMode(rest);
+  console.error("usage: graphsmith gateway mode set|status ...");
+  process.exit(sub ? 1 : 2);
+}
+
 function main(argv) {
   const [cmd, ...rest] = argv;
   if (cmd === "verify") return cmdVerify(rest);
   if (cmd === "postmortem") return cmdPostmortem(rest);
   if (cmd === "audit") return cmdAudit(rest);
+  if (cmd === "gateway") {
+    const result = cmdGateway(rest);
+    if (result && typeof result.catch === "function") {
+      result.catch((error) => {
+        console.error(error && error.stack ? error.stack : String(error));
+        process.exit(1);
+      });
+    }
+    return result;
+  }
   if (cmd === "--version" || cmd === "-v") { console.log(require("../package.json").version); return process.exit(0); }
-  console.error("graphsmith <command>\n\n  verify <bundle.json>             verify a GSA attestation bundle (fail-closed)\n  postmortem <session.jsonl>       mechanical plain-English post-mortem of a raw\n                                    Claude Code / Codex coding-session log\n  audit replay <bundle.json>       narrate an already-produced GSA bundle (verify +\n                                    replay + drift), never re-derives trust\n  --version                        print the package version\n");
+  console.error("graphsmith <command>\n\n  verify <bundle.json>             verify a GSA attestation bundle (fail-closed)\n  postmortem <session.jsonl>       mechanical plain-English post-mortem of a raw\n                                    Claude Code / Codex coding-session log\n  audit replay <bundle.json>       narrate an already-produced GSA bundle (verify +\n                                    replay + drift), never re-derives trust\n  gateway mode set|status          declare/confirm/inspect standalone vs. attach\n                                    mode (Track 1.1 mode-selection contract)\n  --version                        print the package version\n");
   process.exit(cmd ? 1 : 1);
 }
 

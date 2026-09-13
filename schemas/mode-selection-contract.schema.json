@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graphsmith.dev/schemas/mode-selection-contract.schema.json",
+  "title": "GraphSmith gateway mode-selection contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mode", "confirmation"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "mode": { "enum": ["standalone", "attach"] },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["confirmed_by", "confirmed_at", "nonce", "confirmation_token"],
+      "properties": {
+        "confirmed_by": { "type": "string", "minLength": 1, "description": "Operator identity string, freeform (a name+email, or an SSO identity in an enterprise attach deployment)." },
+        "confirmed_at": { "type": "integer", "minimum": 0, "description": "Epoch ms when this mode was confirmed." },
+        "nonce": { "type": "string", "pattern": "^[a-f0-9]{32}$", "description": "Random per-confirmation value, generated fresh by the confirmation CLI." },
+        "confirmation_token": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "HMAC-SHA256(secret, schema_version|mode|confirmed_by|confirmed_at|nonce), hex, keyed by the per-deployment secret at .graphsmith/state/gateway-mode.key. Recomputed and compared at every startup and by `graphsmith gateway mode status`."
+        },
+        "pre_authorized": {
+          "type": "boolean",
+          "description": "True if this confirmation was written via --use-pre-authorization rather than a live interactive session. Purely informational for audit/status purposes -- validation treats both paths identically once written."
+        }
+      }
+    }
+  }
+}

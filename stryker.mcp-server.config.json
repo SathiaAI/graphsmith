@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation-testing scope: mcp-server/src (reliability-1 fix, adversarial review run-20260807-222752). Scoped to this module (not the full v0.5.0 diff) because it has its own fast, comprehensive, dedicated test suite -- see .adversarial-review/run-20260807-222752/gates/mutation.json for why the full 49-file diff scope is infeasible on this sandbox's 2 CPU cores (a single full gating-suite pass takes ~9-10 min; the full diff is ~32k LOC, an estimated 2000-4000+ mutants).",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "sh -c \"cd mcp-server && node --test\""
+  },
+  "mutate": [
+    "mcp-server/src/**/*.js"
+  ],
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": {
+    "fileName": "mutation-reports/mcp-server/mutation.html"
+  },
+  "jsonReporter": {
+    "fileName": "mutation-reports/mcp-server/mutation.json"
+  },
+  "concurrency": 2,
+  "timeoutMS": 30000,
+  "timeoutFactor": 3,
+  "coverageAnalysis": "off"
+}

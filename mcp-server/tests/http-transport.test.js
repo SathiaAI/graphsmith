@@ -14,7 +14,14 @@ const assert = require("node:assert/strict");
 const http = require("http");
 const net = require("net");
 
-const { createHttpServer, MAX_BODY_BYTES } = require("../src/httpTransport.js");
+const {
+  createHttpServer,
+  MAX_BODY_BYTES,
+  SERVER_TIMEOUT_MS,
+  KEEP_ALIVE_TIMEOUT_MS,
+  HEADERS_TIMEOUT_MS,
+  MAX_HEADERS_COUNT,
+} = require("../src/httpTransport.js");
 const { STATELESS_PROTOCOL_VERSION, TOOL_NAME } = require("../src/protocol.js");
 
 const TEST_TOKEN = "test-only-token-not-a-secret-1234567890";
@@ -144,6 +151,31 @@ test("a call WITH the correct bearer token succeeds and returns the guidance", a
     assert.equal(res.body.error, undefined);
     assert.equal(res.body.result.isError, false);
     assert.ok(res.body.result.content[0].text.length > 0);
+  } finally {
+    server.close();
+  }
+});
+
+/* --- reliability-1 regression (adversarial review run-20260807-222752):
+ * the real http.Server this transport creates used to leave every
+ * connection/header timeout at Node's unbounded defaults
+ * (server.timeout=0, headersTimeout=60000, keepAliveTimeout=5000,
+ * maxHeadersCount=2000), letting a client hold sockets open indefinitely
+ * or send excessive headers. Asserts the bounded values are actually set
+ * on the real server instance createHttpServer() returns -- not just
+ * defined as constants somewhere in the module. --- */
+test("createHttpServer() sets bounded server.timeout/keepAliveTimeout/headersTimeout/maxHeadersCount, not Node's unbounded defaults", async () => {
+  const server = await startServer(TEST_TOKEN);
+  try {
+    assert.equal(server.timeout, SERVER_TIMEOUT_MS);
+    assert.ok(server.timeout > 0, "server.timeout must not be Node's default of 0 (disabled)");
+    assert.equal(server.keepAliveTimeout, KEEP_ALIVE_TIMEOUT_MS);
+    assert.equal(server.headersTimeout, HEADERS_TIMEOUT_MS);
+    assert.ok(
+      server.headersTimeout > server.keepAliveTimeout,
+      "headersTimeout must exceed keepAliveTimeout or Node's own header-parsing deadline can fire first"
+    );
+    assert.equal(server.maxHeadersCount, MAX_HEADERS_COUNT);
   } finally {
     server.close();
   }

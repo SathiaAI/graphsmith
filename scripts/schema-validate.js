@@ -36,8 +36,18 @@
  * allOf (each entry either a plain schema, or an {if, then} pair where `if`
  * is restricted to `{properties: {<key>: {const: <value>}}}`).
  * UNSUPPORTED (any use throws loudly rather than being silently ignored):
- * anyOf, oneOf, not, $ref, if/else, minimum/maximum, minItems/maxItems,
- * uniqueItems, const outside of an allOf-if, propertyNames, dependentSchemas.
+ * anyOf, oneOf, not, $ref, if/else, maximum/maxItems, uniqueItems, const
+ * outside of an allOf-if, propertyNames, dependentSchemas.
+ *
+ * Extended 2026-08-29 (Track 1.1, mode-selection contract, schemas/mode-
+ * selection-contract.schema.json) to add `minLength` and `minimum` --
+ * exactly the two additional keywords that schema needs
+ * (`confirmed_by.minLength`, `confirmed_at.minimum`), following this file's
+ * own stated policy above: a future schema needing an unimplemented keyword
+ * is meant to grow this validator's supported set, not fork a second one or
+ * silently under-validate. No existing consumer (host-adapter.schema.json)
+ * uses either keyword, so this is additive and does not change any existing
+ * validation result.
  */
 "use strict";
 
@@ -45,6 +55,7 @@ const SUPPORTED_KEYWORDS = new Set([
   "$schema", "$id", "title", "description", "$comment", // metadata, ignored
   "type", "enum", "pattern", "required", "properties",
   "additionalProperties", "items", "allOf", "const",
+  "minLength", "minimum",
 ]);
 
 function typeOf(instance) {
@@ -161,6 +172,14 @@ function validate(instance, schema, ctxPath) {
   if (Object.prototype.hasOwnProperty.call(schema, "pattern") && typeof instance === "string") {
     const re = new RegExp(schema.pattern);
     if (!re.test(instance)) errors.push(`${ctxPath}: value ${JSON.stringify(instance)} does not match pattern ${schema.pattern}`);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(schema, "minLength") && typeof instance === "string") {
+    if (instance.length < schema.minLength) errors.push(`${ctxPath}: string is shorter than minLength ${schema.minLength}`);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(schema, "minimum") && typeof instance === "number") {
+    if (instance < schema.minimum) errors.push(`${ctxPath}: value ${instance} is below minimum ${schema.minimum}`);
   }
 
   if (Array.isArray(schema.required) && typeOf(instance) === "object") {

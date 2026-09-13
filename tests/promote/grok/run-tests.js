@@ -13,6 +13,17 @@ const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
+
+/* Stryker always runs the command test runner from a copied .stryker-tmp/sandbox-*
+   working directory, even during its pre-mutation dry run. A static source-text
+   check below reads scripts/promote.js back and regex-matches an exact unmutated
+   line; Stryker's instrumentation rewrites that literal text (mutant-switch
+   scaffolding), so the check cannot pass under instrumentation regardless of
+   correctness. Only that one sub-check is skipped; the runtime HALT assertions
+   around it still fully exercise the code under test. */
+const UNDER_STRYKER = REPO_ROOT.includes(".stryker-tmp") || __dirname.includes(".stryker-tmp");
+
+const PROMOTE_PATH = path.join(REPO_ROOT, "scripts", "promote.js");
 const promoteMod = require(path.join(REPO_ROOT, "scripts", "promote.js"));
 const { generate, verifyTree } = require(path.join(REPO_ROOT, "scripts", "manifest.js"));
 const { createStore } = require(path.join(REPO_ROOT, "scripts", "state-store.js"));
@@ -680,11 +691,16 @@ function tHostilePostBegin() {
       return;
     }
     const hasEv = res.evidence !== undefined;
-    const cliSrc = fs.readFileSync(path.join(REPO_ROOT, "scripts", "promote.js"), "utf8");
-    const mapsHalt = /exitCode\s*=\s*error\.code\s*===\s*"HALT"\s*\?\s*3/.test(cliSrc);
-    if (!mapsHalt) {
-      fail(name, "CLI does not map HALT to exit 3");
-      return;
+    let mapsHaltNote = "";
+    if (UNDER_STRYKER) {
+      mapsHaltNote = " cliMapCheck=skipped-under-stryker";
+    } else {
+      const cliSrc = fs.readFileSync(path.join(REPO_ROOT, "scripts", "promote.js"), "utf8");
+      const mapsHalt = /exitCode\s*=\s*error\.code\s*===\s*"HALT"\s*\?\s*3/.test(cliSrc);
+      if (!mapsHalt) {
+        fail(name, "CLI does not map HALT to exit 3");
+        return;
+      }
     }
     const jr = parseJsonl(fx.paths.journal);
     if (jr.some((r) => r.record_type === "TX_DONE")) {
@@ -694,7 +710,7 @@ function tHostilePostBegin() {
     const snap = activeSnap(fx.paths);
     const pure = assertExactlyOneTree(fx.paths, [snap.pointer.tree], name);
     if (pure) { fail(name, pure); return; }
-    pass(name, `HALT evidence=${hasEv} mutated=${mutated} begin=${beginSeen} ACTIVE=${snap.pointer.tree}`);
+    pass(name, `HALT evidence=${hasEv} mutated=${mutated} begin=${beginSeen} ACTIVE=${snap.pointer.tree}${mapsHaltNote}`);
   } catch (e) {
     fs.readFileSync = realRead;
     fs.writeSync = realWrite;
@@ -1339,6 +1355,41 @@ function tSpawnSigkillIfUnix() {
   } catch (e) { fail(name, e.stack || e.message); }
 }
 
+/* promote.js has its own internal --selftest mode (10 named checks: happy path,
+   crash-and-recover matrix, torn-tail rollforward, abandoned-staging handling,
+   GC, abort, rollback) that no external suite previously invoked at all -- a
+   deleted/hollowed internal check would silently drop `tests.length` with no
+   external test noticing (promote.js's `check()` throws on a genuine failure,
+   but a REMOVED check call never throws -- it just quietly stops running). */
+function tSelftestCliFloor() {
+  const name = "13-cli-selftest-exit0-and-count";
+  try {
+    const r = spawnSync(process.execPath, [PROMOTE_PATH, "--selftest"], {
+      encoding: "utf8",
+    });
+    const errs = [];
+    if (r.status !== 0) errs.push(`exit want 0 got ${r.status}`);
+    let result;
+    try {
+      result = JSON.parse(r.stdout);
+    } catch (e) {
+      errs.push(`stdout not JSON: ${e.message}`);
+    }
+    if (result) {
+      if (result.status !== "pass") errs.push(`status=${result.status}`);
+      if (!Array.isArray(result.tests)) errs.push("tests must be an array");
+      else if (result.tests.length < 10) {
+        /* Baseline observed on release/v0.5.0-candidate: 10 checks. Floor, not
+           exact match, so legitimately adding new checks later doesn't break
+           this -- only a check silently disappearing does. */
+        errs.push(`selftest tests.length regressed: got ${result.tests.length}, want >= 10`);
+      }
+    }
+    if (errs.length) fail(name, errs.join("; "));
+    else pass(name, `exit=${r.status} status=${result.status} tests=${result.tests.length}`);
+  } catch (e) { fail(name, e.stack || e.message); }
+}
+
 /* ============================================================================
  * Run all
  * ============================================================================ */
@@ -1365,6 +1416,7 @@ function main() {
   tProjectManifestDoesNotRecordTree();
   tChainBreakHalt();
   tSpawnSigkillIfUnix();
+  tSelftestCliFloor();
 
   const counts = { PASS: 0, FAIL: 0, SKIPPED: 0 };
   for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1;

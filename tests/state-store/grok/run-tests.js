@@ -307,47 +307,6 @@ function attackLockStealAndTokenMismatch() {
       assert(stolen && stolen.ownerToken && stolen.ownerToken !== staleToken,
         "a lock left by a DEAD owner was not stolen -- crash recovery depends on this");
 
-      /* THE GUARANTEE THAT MATTERS, and the one the original defect broke: an owner that is
-       * MAKING PROGRESS is never stolen from, however long it holds the lock.
-       *
-       * Before the fix, `age > leaseMs || !pidAlive` stole a lock purely because its mtime
-       * was old, and the renewal timer that was supposed to keep it fresh could never fire
-       * (setInterval, fully synchronous critical section). So "old mtime" meant "a
-       * transaction longer than leaseMs". Reproduced: 300ms lease, 800ms of synchronous
-       * work, second store acquired the lock, owner's release failed LOCK_OWNER_MISMATCH,
-       * recovery reached AMBIGUOUS_RECOVERY. promote.js holds this lock across an entire
-       * fsync-heavy adoption.
-       *
-       * _commit now renews at every durable step, so a stale mtime means "this owner has
-       * made no progress" rather than "this owner started a while ago". This case holds a
-       * lock for several times its lease while doing real store work and requires a
-       * concurrent acquirer to be refused. */
-      const busyRoot = tempRoot("busy");
-      const busy = createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 });
-      busy.status();
-      const busyHeld = busy._testing.acquireLock();
-      const busyStart = Date.now();
-      let commits = 0;
-      while (Date.now() - busyStart < 1000) {
-        busy._commit([{ file: "run-registry.jsonl", make: (raw, rev) => raw + JSON.stringify({
-          schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "REGISTERED",
-          run_id: "busy-" + (commits++), tree_id: "tree-busy",
-          lease_expires_at: Date.now() + 600000,
-        }) + "\n" }]);
-      }
-      const heldFor = Date.now() - busyStart;
-      let busyRefused = false;
-      let busyError = "";
-      try {
-        createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 })._testing.acquireLock();
-      } catch (e) { busyError = e.code; busyRefused = e.code === "LOCKED"; }
-      assert(busyRefused,
-        `a lock held for ${heldFor}ms of CONTINUOUS store work (${commits} commits, 300ms lease) ` +
-        `was stolen from its live owner: ${busyError || "no error"}`);
-      assert(heldFor > 300 * 3, `the busy hold only lasted ${heldFor}ms; it must outlast the lease severalfold`);
-      busy._testing.releaseLock(busyHeld.ownerToken);
-      rmrf(busyRoot);
-
       let freshRefused = false;
       try {
         store._testing.acquireLock();
@@ -395,6 +354,64 @@ function attackLockStealAndTokenMismatch() {
           fs.unlinkSync(store.lockPath);
         } catch {}
       }
+
+      /* THE GUARANTEE THAT MATTERS, and the one the original defect broke: an owner that is
+       * MAKING PROGRESS is never stolen from, however long it holds the lock.
+       *
+       * Before the fix, `age > leaseMs || !pidAlive` stole a lock purely because its mtime
+       * was old, and the renewal timer that was supposed to keep it fresh could never fire
+       * (setInterval, fully synchronous critical section). So "old mtime" meant "a
+       * transaction longer than leaseMs". Reproduced: 300ms lease, 800ms of synchronous
+       * work, second store acquired the lock, owner's release failed LOCK_OWNER_MISMATCH,
+       * recovery reached AMBIGUOUS_RECOVERY. promote.js holds this lock across an entire
+       * fsync-heavy adoption.
+       *
+       * _commit now renews at every durable step, so a stale mtime means "this owner has
+       * made no progress" rather than "this owner started a while ago". This case holds a
+       * lock for several times its lease while doing real store work and requires a
+       * concurrent acquirer to be refused.
+       *
+       * Uses its own store/root (busyRoot), entirely independent of `store`/`root` above,
+       * and runs LAST in this test specifically so its own multi-second wall-clock budget
+       * never eats into `store`'s own lease-freshness window earlier in this function.
+       *
+       * BUSY_LEASE_MS was 300 until 2026-09-13, when it tripped on a slow Windows CI runner:
+       * one single _commit() write+fsync took ~1.4s, well past a 300ms lease. Renewal only
+       * happens at _assertStillOwned checkpoints (before/after each effect) -- not
+       * continuously during the write itself -- so a single slow write between checkpoints
+       * CAN outlast a too-tight lease and get legitimately stolen from, exactly like the
+       * "comfortable lease" case above needs headroom past a write+fsync+read+stat round
+       * trip on a loaded or slow-fs runner. That is a real, separately-tracked renewal-
+       * granularity gap (see the writer-claim hardening TRD addendum, 2026-09-13), not
+       * something this test can fix -- so it gets the same wider lease as its neighbor
+       * instead of a tighter one, to stop asserting a timing margin the CI hardware can't
+       * reliably meet. */
+      const BUSY_LEASE_MS = 2000;
+      const busyRoot = tempRoot("busy");
+      const busy = createStore(busyRoot, { leaseMs: BUSY_LEASE_MS, heartbeatMs: 200 });
+      busy.status();
+      const busyHeld = busy._testing.acquireLock();
+      const busyStart = Date.now();
+      let commits = 0;
+      while (Date.now() - busyStart < BUSY_LEASE_MS * 3.5) {
+        busy._commit([{ file: "run-registry.jsonl", make: (raw, rev) => raw + JSON.stringify({
+          schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "REGISTERED",
+          run_id: "busy-" + (commits++), tree_id: "tree-busy",
+          lease_expires_at: Date.now() + 600000,
+        }) + "\n" }]);
+      }
+      const heldFor = Date.now() - busyStart;
+      let busyRefused = false;
+      let busyError = "";
+      try {
+        createStore(busyRoot, { leaseMs: BUSY_LEASE_MS, heartbeatMs: 200 })._testing.acquireLock();
+      } catch (e) { busyError = e.code; busyRefused = e.code === "LOCKED"; }
+      assert(busyRefused,
+        `a lock held for ${heldFor}ms of CONTINUOUS store work (${commits} commits, ${BUSY_LEASE_MS}ms lease) ` +
+        `was stolen from its live owner: ${busyError || "no error"}`);
+      assert(heldFor > BUSY_LEASE_MS * 3, `the busy hold only lasted ${heldFor}ms; it must outlast the lease severalfold`);
+      busy._testing.releaseLock(busyHeld.ownerToken);
+      rmrf(busyRoot);
     });
     report(name, "PASS");
   } catch (e) {
@@ -1320,6 +1337,67 @@ function attackSoftWobbleFlagAndHardRollback() {
   }
 }
 
+/* state-store.js has its own internal --selftest mode (6 named checks: lock
+   steal/token refusal, unreadable-lock retry, journal roll-forward, alpha
+   reservation crash persistence, run-registry lease sweep, hostile-key
+   rejection) that no external suite previously invoked at all -- the same
+   blind spot already found and fixed in verify.js, gate.js, manifest.js, and
+   promote.js. A deleted/hollowed internal check would silently drop
+   `tests.length` with no external test noticing. */
+function attackSelftestCliFloor() {
+  const name = "XTRA/state-store-selftest-cli-floor";
+  try {
+    const r = spawnSync(process.execPath, [STATE_STORE, "--selftest"], {
+      encoding: "utf8",
+    });
+    const errs = [];
+    if (r.status !== 0) errs.push(`exit want 0 got ${r.status}`);
+    let result;
+    try {
+      result = JSON.parse(r.stdout);
+    } catch (e) {
+      errs.push(`stdout not JSON: ${e.message}`);
+    }
+    if (result) {
+      if (result.status !== "pass") errs.push(`status=${result.status}`);
+      if (!Array.isArray(result.tests)) errs.push("tests must be an array");
+      else if (result.tests.length < 6) {
+        /* Baseline observed on release/v0.5.0-candidate: 6 checks. Floor, not
+           exact match, so legitimately adding new checks later doesn't break
+           this -- only a check silently disappearing does. */
+        errs.push(`selftest tests.length regressed: got ${result.tests.length}, want >= 6`);
+      } else {
+        /* Round 9 (2026-08-29): the floor above only ever checked the ARRAY LENGTH, so a
+         * `tests.push({})` (dropping name/status entirely) or a `status: ""` mutant inside
+         * any individual selftest() check still passed this test -- the array got longer or
+         * stayed the same length either way. Pin each entry's shape and name/status content
+         * directly: every check selftest() KNOWS it ran must say so by name, not just add to
+         * a count. Presence-only (`.every(name => ...)`), not exact-set, so a later selftest()
+         * addition still doesn't break this -- only one of these six going missing, or
+         * reporting anything other than "pass", does. */
+        const EXPECTED_NAMES = [
+          "expired-lock-steal-and-token-refusal",
+          "lock-created-atomically-unreadable-lock-retried-then-condemned",
+          "journal-inspect-and-roll-forward",
+          "alpha-reservation-crash-persistence",
+          "registry-lease-sweep",
+          "schema-rejects-hostile-keys-on-read",
+        ];
+        const byName = new Map(result.tests.map((t) => [t && t.name, t]));
+        for (const expected of EXPECTED_NAMES) {
+          const entry = byName.get(expected);
+          if (!entry) errs.push(`selftest is missing the "${expected}" check entirely`);
+          else if (entry.status !== "pass") errs.push(`selftest check "${expected}" reported status=${JSON.stringify(entry.status)}, want "pass"`);
+        }
+      }
+    }
+    if (errs.length) throw new Error(errs.join("; "));
+    report(name, "PASS", `exit=${r.status} status=${result.status} tests=${result.tests.length}`);
+  } catch (e) {
+    report(name, "FAIL", e.message);
+  }
+}
+
 function main() {
   attackLockStealAndTokenMismatch();
   attackPidReuseAndEnvOverride();
@@ -1331,6 +1409,7 @@ function main() {
   attackSoftWobbleFlagAndHardRollback();
   attackConcurrencySync();
   attackSchema();
+  attackSelftestCliFloor();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;

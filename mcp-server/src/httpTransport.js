@@ -7,6 +7,25 @@ const { ERROR_CODES } = require("./protocol.js");
 
 const MAX_BODY_BYTES = 1024 * 1024; // 1 MiB -- this server's only real payload is a no-arg tool call.
 
+/* Bounded server-level limits (reliability-1, adversarial review
+ * run-20260807-222752): Node's http.Server defaults leave these
+ * unbounded/near-unbounded (server.timeout=0, keepAliveTimeout=5000 is the
+ * only non-zero default, headersTimeout=60000, maxHeadersCount=2000),
+ * which lets a client hold sockets open indefinitely or send excessive
+ * headers to exhaust connection/memory capacity. Values chosen to be
+ * generous for legitimate MCP tool calls (single small JSON request/
+ * response) while bounding worst-case resource hold time. */
+const SERVER_TIMEOUT_MS = 60_000; // overall socket inactivity timeout
+const KEEP_ALIVE_TIMEOUT_MS = 65_000; // idle keep-alive socket timeout
+const HEADERS_TIMEOUT_MS = 66_000; // must exceed KEEP_ALIVE_TIMEOUT_MS
+const MAX_HEADERS_COUNT = 100; // this server never expects more than a handful
+/* server.timeout only trips on socket INACTIVITY, so a client that trickles
+ * bytes slowly enough to stay "active" (a classic Slowloris body attack)
+ * would never hit it. REQUEST_TIMEOUT_MS is a separate, absolute per-request
+ * deadline from "auth passed, body accumulation started" to "request
+ * settled" that catches exactly that case. */
+const REQUEST_TIMEOUT_MS = 30_000;
+
 /* Maps a JSON-RPC error code to the HTTP status this transport reports it
  * under, so HTTP-level tooling (proxies, health checks, monitoring, a
  * generic `curl -f`) can tell success from failure without parsing the
@@ -183,6 +202,19 @@ function createHttpServer(options) {
       return;
     }
 
+    /* Absolute per-request deadline (see REQUEST_TIMEOUT_MS above): guards
+     * against a slow-body attack that server.timeout's inactivity check
+     * would miss. Cleared on the request's "close" event, which Node fires
+     * once the request has completed OR its connection was terminated
+     * prematurely -- so this covers every exit path (success, parse error,
+     * header mismatch, oversized body, client disconnect) without needing
+     * to thread a clear() call through each one individually. */
+    const requestDeadline = setTimeout(() => {
+      req.destroy();
+    }, REQUEST_TIMEOUT_MS);
+    requestDeadline.unref();
+    req.on("close", () => clearTimeout(requestDeadline));
+
     /* Accumulate as raw Buffer chunks and count actual bytes received --
      * NOT `body += chunk`, which implicitly decodes each chunk as UTF-8
      * and measures `.length` in UTF-16 code units. For multi-byte UTF-8
@@ -268,7 +300,20 @@ function createHttpServer(options) {
     });
   });
 
+  server.timeout = SERVER_TIMEOUT_MS;
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.maxHeadersCount = MAX_HEADERS_COUNT;
+
   return server;
 }
 
-module.exports = { createHttpServer, MAX_BODY_BYTES };
+module.exports = {
+  createHttpServer,
+  MAX_BODY_BYTES,
+  SERVER_TIMEOUT_MS,
+  KEEP_ALIVE_TIMEOUT_MS,
+  HEADERS_TIMEOUT_MS,
+  MAX_HEADERS_COUNT,
+  REQUEST_TIMEOUT_MS,
+};
