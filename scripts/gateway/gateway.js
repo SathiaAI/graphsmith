@@ -30,7 +30,7 @@ const modeGate = require("./mode-gate.js");
 const gatewayConfig = require("./config.js");
 const chain = require("./chain.js");
 const session = require("./session.js");
-const { GatewayProxy, MAX_PENDING_CALLS_PER_SESSION } = require("./proxy.js");
+const { GatewayProxy, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION } = require("./proxy.js");
 const downstream = require("./downstream.js");
 const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-transport.js");
 const writerClaimModule = require("../writer-claim.js");
@@ -63,10 +63,65 @@ async function drainOpenSessions(proxy, timeoutMs, pollMs = 25) {
  * still open on it, so a slow HTTP call can no longer extend shutdown indefinitely. */
 const HTTP_LISTENER_CLOSE_TIMEOUT_MS = 2000;
 
+/* Codex PR #29 review round 8 "install shutdown handlers before gateway startup
+ * completes": before this, main() only registers SIGTERM/SIGINT handlers AFTER
+ * startGateway() resolves -- a termination signal received while a slow downstream
+ * handshake is still in progress fell through to Node's default immediate-exit behavior,
+ * skipping cleanup of an already-acquired writer-claim and any already-spawned stdio
+ * downstream children (leaking both: a stale claim blocking the next start, and orphaned
+ * child processes). The 5-model external panel's majority position (Paul-approved) was
+ * explicitly AGAINST building a signal handler that tries to safely tear down
+ * partially-initialized startup state -- that is a real correctness risk on the
+ * WriterClaim lock-safety path, worse than the status quo. This bounds the slow step
+ * itself instead: if the downstream-connection phase (connectAllDownstreams below --
+ * empirically the one startup step with no bound of its own, unlike every downstream RPC
+ * inside it, which already times out via DEFAULT_REQUEST_TIMEOUT_MS) hasn't completed
+ * within this deadline, it is routed through the SAME startup-failure path an outright
+ * connection failure already uses (writerClaim.release() + rethrow) rather than left to
+ * hang indefinitely waiting for a signal handler that isn't installed yet. Comfortably
+ * exceeds DEFAULT_REQUEST_TIMEOUT_MS (downstream.js, 30s) -- a downstream pagination
+ * handshake can legitimately need more than one such round trip -- while still being a
+ * fixed, non-speculative bound (same discipline as every other *_TIMEOUT_MS constant in
+ * this codebase), not an unbounded wait. Overridable via options for tests that need a
+ * short deadline to run fast (mirrors drainTimeoutMs/statusWriteIntervalMs's own
+ * options-override pattern below). */
+const STARTUP_DOWNSTREAM_CONNECT_TIMEOUT_MS = 60000;
+
 function fail(message, code = "GATEWAY_ERROR") {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+/** Races `promise` against a bounded timeout, rejecting with `makeError()` if the timeout
+ * elapses first. `promise` itself is NOT cancelled on timeout (there is no cancellation
+ * primitive for an in-flight downstream handshake) -- see startGateway's own call site for
+ * how it best-effort cleans up a connect that finishes late, after this has already given
+ * up on it. */
+function withTimeout(promise, timeoutMs, makeError) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(makeError());
+    }, timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 /** Answers a downstream server's own unsolicited request (board decision 2026-09-04, PR
@@ -132,6 +187,28 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
       error: {
         code: -32000,
         message: `This session already has ${MAX_PENDING_CALLS_PER_SESSION} call(s) pending -- refusing to admit another concurrent downstream-initiated sampling call until at least one resolves.`,
+      },
+    });
+  }
+  /* Codex PR #29 review round 8 "cap completed downstream sampling history": proxy.js's
+   * own agent-initiated dispatch (GatewayProxy#handleMessage) additionally enforces
+   * MAX_COMPLETED_CALLS_PER_SESSION -- bounding session.calls itself, not just calls
+   * genuinely in flight -- but this separate downstream-initiated sampling path never
+   * consulted it. A sampling-capable stdio downstream that issues requests SEQUENTIALLY
+   * (each response removing the prior request from pendingCalls before the next starts)
+   * never trips the pending-call check above, so this path could append to session.calls
+   * without bound over an indefinitely-connected downstream's lifetime, exhausting memory.
+   * Mirrors proxy.js's own admission-refusal shape exactly (same code, same message
+   * template, same s.calls.length + s.pendingCalls.size admission math as that file's own
+   * post-round-8 fix) so both paths present one consistent contract to whatever is on the
+   * other end of a session. */
+  if (s && s.calls.length + s.pendingCalls.size >= MAX_COMPLETED_CALLS_PER_SESSION) {
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32000,
+        message: `This session has already completed ${MAX_COMPLETED_CALLS_PER_SESSION} call(s) -- refusing to admit another call on this connection; start a new session.`,
       },
     });
   }
@@ -231,7 +308,24 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
 function recordUnmatchedDownstreamResponse(msg, agentPusher, log, proxy, serverName) {
   const s = proxy && agentPusher.connectionId ? proxy.sessions.get(agentPusher.connectionId) : null;
   if (s && !s.finalized) {
-    session.recordCallResult(s, msg.id, { result: msg, isError: true, ts: proxy.now() });
+    /* CodeRabbit PR #29 review round 8 "record unmatched downstream responses without
+     * agent-call correlation" / Codex PR #29 review round 8 "keep unmatched downstream IDs
+     * out of agent correlation": msg.id here is the DOWNSTREAM leg's own internal id
+     * (downstream.js's own numbering), not an agent-facing JSON-RPC id -- session.
+     * pendingCalls (which recordCallResult looks up by id) is keyed by the latter. Calling
+     * recordCallResult(s, msg.id, ...) risked colliding with an unrelated LIVE agent call
+     * that happens to share the same id value: a late response for a timed-out downstream
+     * id "1" arriving while a different live agent request also has id "1" would be
+     * (mis)treated as correlated, deleting that still-live pending call from pendingCalls
+     * and sealing this stale/foreign response as its result -- corrupting the session trace
+     * and losing the UNMATCHED_RESPONSE anomaly entirely. Use the dedicated helper, which
+     * only ever appends the anomaly and never touches pendingCalls. */
+    session.recordUnmatchedResponseAnomaly(
+      s,
+      msg.id,
+      "response arrived on a downstream connection with an id that does not correlate to any agent-facing pending call",
+      proxy.now()
+    );
     return;
   }
   log(JSON.stringify({ event: "gateway_unmatched_downstream_response", server: serverName || null, id: msg.id }));
@@ -490,22 +584,51 @@ async function startGateway(options) {
   );
 
   let downstreamHandles;
+  const startupDownstreamConnectTimeoutMs = options.startupDownstreamConnectTimeoutMs || STARTUP_DOWNSTREAM_CONNECT_TIMEOUT_MS;
+  /* Codex PR #29 review round 8 "install shutdown handlers before gateway startup
+   * completes": kept as its own variable (not inlined into the try below) so the
+   * watchdog-timeout catch path can still reach the real connect promise to best-effort
+   * close whatever it eventually produces -- see that catch block's own comment. */
+  const connectAllDownstreamsPromise = downstream.connectAllDownstreams(config.downstream_servers, {
+    clientInfo: { name: "graphsmith-standalone-gateway", version: "1.0" },
+    supportsSampling: agentTransportSupportsSampling,
+    secretEnvNames: gatewaySecretEnvNames,
+    /* Codex PR #29 review round 4 "preserve the originating server for sampling": with
+     * multiple stdio downstreams, connectAllDownstreams binds each connection's own
+     * onRequest to its configured server name (see downstream.js) -- forward it through
+     * so the recorded/logged step is attributed to the real downstream, not a single
+     * shared placeholder. */
+    onRequest: (msg, serverName) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName),
+    onUnmatchedResponse: (msg, serverName) => recordUnmatchedDownstreamResponse(msg, agentPusher, log, proxy, serverName),
+  });
   try {
-    downstreamHandles = await downstream.connectAllDownstreams(config.downstream_servers, {
-      clientInfo: { name: "graphsmith-standalone-gateway", version: "1.0" },
-      supportsSampling: agentTransportSupportsSampling,
-      secretEnvNames: gatewaySecretEnvNames,
-      /* Codex PR #29 review round 4 "preserve the originating server for sampling": with
-       * multiple stdio downstreams, connectAllDownstreams binds each connection's own
-       * onRequest to its configured server name (see downstream.js) -- forward it through
-       * so the recorded/logged step is attributed to the real downstream, not a single
-       * shared placeholder. */
-      onRequest: (msg, serverName) => forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName),
-      onUnmatchedResponse: (msg, serverName) => recordUnmatchedDownstreamResponse(msg, agentPusher, log, proxy, serverName),
-    });
+    downstreamHandles = await withTimeout(
+      connectAllDownstreamsPromise,
+      startupDownstreamConnectTimeoutMs,
+      () =>
+        fail(
+          `downstream connection phase did not complete within ${startupDownstreamConnectTimeoutMs}ms -- ` +
+            "treating startup as failed (a downstream handshake that hangs this long, ignoring " +
+            "DEFAULT_REQUEST_TIMEOUT_MS on every individual RPC inside it, is not making progress).",
+          "GATEWAY_STARTUP_TIMEOUT"
+        )
+    );
   } catch (error) {
     writerClaim.release();
-    throw error; // SS7: downstream unreachable at startup -> refuse to start (hard-refuse resolution)
+    /* If connectAllDownstreams eventually settles AFTER this watchdog has already given up
+     * (and already released the writer-claim above), don't leak whatever downstream child
+     * processes/sockets it produced -- best-effort close them once they show up. This is
+     * deliberately NOT an attempt to safely tear down partially-initialized startup state
+     * in general (the panel's own explicitly-rejected approach, see this constant's own
+     * header comment) -- it only cleans up the one promise this function itself started. */
+    connectAllDownstreamsPromise
+      .then((handles) => {
+        for (const conn of handles.connections.values()) {
+          try { conn.close(); } catch (closeError) { /* best effort */ }
+        }
+      })
+      .catch(() => {});
+    throw error; // SS7: downstream unreachable (or timed out) at startup -> refuse to start (hard-refuse resolution)
   }
 
   proxy = new GatewayProxy({
@@ -564,8 +687,14 @@ async function startGateway(options) {
      * process could remain running after setting a non-zero exitCode, block a future
      * restart's claim acquisition, and need manual termination. */
     proxy.stopAcceptingNewSessions();
+    /* Codex PR #29 review round 8 "bound termination of stdio downstream children":
+     * conn.close() now returns a promise that resolves only once the child has actually
+     * exited (bounded SIGTERM wait, then SIGKILL) rather than firing SIGTERM and returning
+     * immediately -- await it here so this cleanup path genuinely finishes terminating
+     * every downstream child before releasing the writer-claim, instead of leaving a child
+     * that traps/ignores SIGTERM running past this point. */
     for (const conn of downstreamHandles.connections.values()) {
-      try { conn.close(); } catch (closeError) { /* best effort */ }
+      try { await conn.close(); } catch (closeError) { /* best effort */ }
     }
     writerClaim.release();
     throw error;
@@ -634,8 +763,12 @@ async function startGateway(options) {
     for (const connectionId of Array.from(proxy.sessions.keys())) {
       await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
     }
+    /* Codex PR #29 review round 8 "bound termination of stdio downstream children": same
+     * reasoning as the startup-failure cleanup above -- await close() so a downstream that
+     * traps/ignores SIGTERM is actually confirmed gone (or forcibly SIGKILLed) before this
+     * releases the writer-claim, rather than left running past shutdown. */
     for (const conn of downstreamHandles.connections.values()) {
-      try { conn.close(); } catch (error) { /* best effort */ }
+      try { await conn.close(); } catch (error) { /* best effort */ }
     }
     writerClaim.release();
     // Cluster D: one last write so `gateway.js status` run after this process has
@@ -744,4 +877,19 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { startGateway, checkModeGate, buildHealthStatus, loadSigningKeys, drainOpenSessions, gatewayStatusPath, STATUS_WRITE_INTERVAL_MS, runStatusCommand };
+module.exports = {
+  startGateway,
+  checkModeGate,
+  buildHealthStatus,
+  loadSigningKeys,
+  drainOpenSessions,
+  gatewayStatusPath,
+  STATUS_WRITE_INTERVAL_MS,
+  runStatusCommand,
+  // Exported for direct unit testing against fake sessions/connections (mirrors
+  // drainOpenSessions' own existing testability rationale above) -- not part of this
+  // module's own CLI/programmatic surface otherwise.
+  forwardDownstreamRequestToAgent,
+  recordUnmatchedDownstreamResponse,
+  STARTUP_DOWNSTREAM_CONNECT_TIMEOUT_MS,
+};
