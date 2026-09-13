@@ -73,6 +73,53 @@ function unmatchedResponseIsAnomalyNotCrash() {
   check("unmatched-response-not-in-calls", s.calls.length === 0, `expected 0 calls, got ${s.calls.length}`);
 }
 
+/** CodeRabbit/Codex PR #29 review round 8 "record unmatched downstream responses without
+ * agent-call correlation" / "keep unmatched downstream IDs out of agent correlation": a
+ * downstream response whose id has no matching pending call must be recorded as an
+ * anomaly WITHOUT ever touching pendingCalls -- proven directly here by picking a
+ * jsonRpcId that collides with a LIVE pending call and asserting that call survives
+ * untouched. recordCallResult (the pre-fix call site) would have deleted it. */
+function unmatchedResponseAnomalyDoesNotTouchPendingCalls() {
+  const s = session.createSession("conn-collision");
+  session.recordCallStart(s, 1, { tool: "live-agent-call", server: "srv", arguments: {}, ts: 1 });
+  const correlated = session.recordUnmatchedResponseAnomaly(s, 1, "downstream-internal id collided with an agent-facing pending call", 2);
+  check("unmatched-anomaly-helper-reports-recorded", correlated === true, String(correlated));
+  check(
+    "unmatched-anomaly-does-not-delete-the-colliding-live-pending-call",
+    s.pendingCalls.has(1) && s.pendingCalls.get(1).tool === "live-agent-call",
+    JSON.stringify(Array.from(s.pendingCalls.entries()))
+  );
+  check("unmatched-anomaly-recorded-once", s.anomalies.length === 1 && s.anomalies[0].kind === "UNMATCHED_RESPONSE" && s.anomalies[0].jsonRpcId === 1, JSON.stringify(s.anomalies));
+  check("unmatched-anomaly-does-not-add-a-spurious-completed-call", s.calls.length === 0, JSON.stringify(s.calls));
+
+  // The live call, still genuinely pending, resolves normally afterward -- proving it was
+  // never corrupted or removed by the colliding anomaly recorded against the same id.
+  session.recordCallResult(s, 1, { result: { ok: true }, ts: 3 });
+  check("colliding-live-call-still-resolves-normally-afterward", s.calls.length === 1 && s.calls[0].tool === "live-agent-call" && s.calls[0].isError === false, JSON.stringify(s.calls));
+}
+
+/** Codex PR #29 review round 8 "cap unmatched-response anomalies per session": without a
+ * bound, a stream of unmatched responses (a faulty/compromised downstream sending ids this
+ * gateway never issued) would grow session.anomalies without limit. */
+function anomaliesCappedWithTerminalMarker() {
+  const { MAX_ANOMALIES_PER_SESSION } = session;
+  const s = session.createSession("conn-anomaly-cap");
+  for (let i = 0; i < MAX_ANOMALIES_PER_SESSION + 5; i++) {
+    session.recordUnmatchedResponseAnomaly(s, `unknown-${i}`, "test anomaly", i);
+  }
+  check(
+    "anomalies-stop-growing-past-the-cap-plus-one-terminal-marker",
+    s.anomalies.length === MAX_ANOMALIES_PER_SESSION + 1,
+    `expected ${MAX_ANOMALIES_PER_SESSION + 1}, got ${s.anomalies.length}`
+  );
+  check("anomaly-cap-hit-is-itself-recorded-once", s.anomalies[s.anomalies.length - 1].kind === "ANOMALY_CAP_REACHED", JSON.stringify(s.anomalies[s.anomalies.length - 1]));
+  check(
+    "anomalies-before-the-cap-are-all-genuine-unmatched-responses",
+    s.anomalies.slice(0, MAX_ANOMALIES_PER_SESSION).every((a) => a.kind === "UNMATCHED_RESPONSE"),
+    "a non-UNMATCHED_RESPONSE entry appeared before the cap"
+  );
+}
+
 function disconnectMarksPendingAsError() {
   const s = session.createSession("conn-4");
   session.recordCallStart(s, 1, { tool: "hangs", server: "srv", arguments: {}, ts: 1 });
@@ -168,6 +215,8 @@ function main() {
   toolServerAttribution();
   outOfOrderCorrelation();
   unmatchedResponseIsAnomalyNotCrash();
+  unmatchedResponseAnomalyDoesNotTouchPendingCalls();
+  anomaliesCappedWithTerminalMarker();
   disconnectMarksPendingAsError();
   disconnectCallbackFailureDoesNotAbortLoopOrPropagate();
   modelCallFlagPreserved();
