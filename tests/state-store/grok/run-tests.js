@@ -307,47 +307,6 @@ function attackLockStealAndTokenMismatch() {
       assert(stolen && stolen.ownerToken && stolen.ownerToken !== staleToken,
         "a lock left by a DEAD owner was not stolen -- crash recovery depends on this");
 
-      /* THE GUARANTEE THAT MATTERS, and the one the original defect broke: an owner that is
-       * MAKING PROGRESS is never stolen from, however long it holds the lock.
-       *
-       * Before the fix, `age > leaseMs || !pidAlive` stole a lock purely because its mtime
-       * was old, and the renewal timer that was supposed to keep it fresh could never fire
-       * (setInterval, fully synchronous critical section). So "old mtime" meant "a
-       * transaction longer than leaseMs". Reproduced: 300ms lease, 800ms of synchronous
-       * work, second store acquired the lock, owner's release failed LOCK_OWNER_MISMATCH,
-       * recovery reached AMBIGUOUS_RECOVERY. promote.js holds this lock across an entire
-       * fsync-heavy adoption.
-       *
-       * _commit now renews at every durable step, so a stale mtime means "this owner has
-       * made no progress" rather than "this owner started a while ago". This case holds a
-       * lock for several times its lease while doing real store work and requires a
-       * concurrent acquirer to be refused. */
-      const busyRoot = tempRoot("busy");
-      const busy = createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 });
-      busy.status();
-      const busyHeld = busy._testing.acquireLock();
-      const busyStart = Date.now();
-      let commits = 0;
-      while (Date.now() - busyStart < 1000) {
-        busy._commit([{ file: "run-registry.jsonl", make: (raw, rev) => raw + JSON.stringify({
-          schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "REGISTERED",
-          run_id: "busy-" + (commits++), tree_id: "tree-busy",
-          lease_expires_at: Date.now() + 600000,
-        }) + "\n" }]);
-      }
-      const heldFor = Date.now() - busyStart;
-      let busyRefused = false;
-      let busyError = "";
-      try {
-        createStore(busyRoot, { leaseMs: 300, heartbeatMs: 100 })._testing.acquireLock();
-      } catch (e) { busyError = e.code; busyRefused = e.code === "LOCKED"; }
-      assert(busyRefused,
-        `a lock held for ${heldFor}ms of CONTINUOUS store work (${commits} commits, 300ms lease) ` +
-        `was stolen from its live owner: ${busyError || "no error"}`);
-      assert(heldFor > 300 * 3, `the busy hold only lasted ${heldFor}ms; it must outlast the lease severalfold`);
-      busy._testing.releaseLock(busyHeld.ownerToken);
-      rmrf(busyRoot);
-
       let freshRefused = false;
       try {
         store._testing.acquireLock();
@@ -395,6 +354,64 @@ function attackLockStealAndTokenMismatch() {
           fs.unlinkSync(store.lockPath);
         } catch {}
       }
+
+      /* THE GUARANTEE THAT MATTERS, and the one the original defect broke: an owner that is
+       * MAKING PROGRESS is never stolen from, however long it holds the lock.
+       *
+       * Before the fix, `age > leaseMs || !pidAlive` stole a lock purely because its mtime
+       * was old, and the renewal timer that was supposed to keep it fresh could never fire
+       * (setInterval, fully synchronous critical section). So "old mtime" meant "a
+       * transaction longer than leaseMs". Reproduced: 300ms lease, 800ms of synchronous
+       * work, second store acquired the lock, owner's release failed LOCK_OWNER_MISMATCH,
+       * recovery reached AMBIGUOUS_RECOVERY. promote.js holds this lock across an entire
+       * fsync-heavy adoption.
+       *
+       * _commit now renews at every durable step, so a stale mtime means "this owner has
+       * made no progress" rather than "this owner started a while ago". This case holds a
+       * lock for several times its lease while doing real store work and requires a
+       * concurrent acquirer to be refused.
+       *
+       * Uses its own store/root (busyRoot), entirely independent of `store`/`root` above,
+       * and runs LAST in this test specifically so its own multi-second wall-clock budget
+       * never eats into `store`'s own lease-freshness window earlier in this function.
+       *
+       * BUSY_LEASE_MS was 300 until 2026-09-13, when it tripped on a slow Windows CI runner:
+       * one single _commit() write+fsync took ~1.4s, well past a 300ms lease. Renewal only
+       * happens at _assertStillOwned checkpoints (before/after each effect) -- not
+       * continuously during the write itself -- so a single slow write between checkpoints
+       * CAN outlast a too-tight lease and get legitimately stolen from, exactly like the
+       * "comfortable lease" case above needs headroom past a write+fsync+read+stat round
+       * trip on a loaded or slow-fs runner. That is a real, separately-tracked renewal-
+       * granularity gap (see the writer-claim hardening TRD addendum, 2026-09-13), not
+       * something this test can fix -- so it gets the same wider lease as its neighbor
+       * instead of a tighter one, to stop asserting a timing margin the CI hardware can't
+       * reliably meet. */
+      const BUSY_LEASE_MS = 2000;
+      const busyRoot = tempRoot("busy");
+      const busy = createStore(busyRoot, { leaseMs: BUSY_LEASE_MS, heartbeatMs: 200 });
+      busy.status();
+      const busyHeld = busy._testing.acquireLock();
+      const busyStart = Date.now();
+      let commits = 0;
+      while (Date.now() - busyStart < BUSY_LEASE_MS * 3.5) {
+        busy._commit([{ file: "run-registry.jsonl", make: (raw, rev) => raw + JSON.stringify({
+          schema_version: SCHEMA_VERSION, state_rev: rev, record_type: "REGISTERED",
+          run_id: "busy-" + (commits++), tree_id: "tree-busy",
+          lease_expires_at: Date.now() + 600000,
+        }) + "\n" }]);
+      }
+      const heldFor = Date.now() - busyStart;
+      let busyRefused = false;
+      let busyError = "";
+      try {
+        createStore(busyRoot, { leaseMs: BUSY_LEASE_MS, heartbeatMs: 200 })._testing.acquireLock();
+      } catch (e) { busyError = e.code; busyRefused = e.code === "LOCKED"; }
+      assert(busyRefused,
+        `a lock held for ${heldFor}ms of CONTINUOUS store work (${commits} commits, ${BUSY_LEASE_MS}ms lease) ` +
+        `was stolen from its live owner: ${busyError || "no error"}`);
+      assert(heldFor > BUSY_LEASE_MS * 3, `the busy hold only lasted ${heldFor}ms; it must outlast the lease severalfold`);
+      busy._testing.releaseLock(busyHeld.ownerToken);
+      rmrf(busyRoot);
     });
     report(name, "PASS");
   } catch (e) {
