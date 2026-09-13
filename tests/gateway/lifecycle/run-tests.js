@@ -18,8 +18,10 @@ const os = require("os");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "../../..");
-const { drainOpenSessions } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+const { drainOpenSessions, startGateway } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
 const { GatewayProxy } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
+const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
+const { writeConfirmedMode } = require("../_fixtures/mode-file.js");
 
 let failures = 0;
 const results = [];
@@ -64,6 +66,7 @@ async function drainWaitsForInFlightCallToComplete() {
   });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", method: "notifications/initialized" });
   const callPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } });
 
   const drained = await drainOpenSessions(proxy, 2000, 10);
@@ -92,6 +95,7 @@ async function drainTimesOutAndReportsIncomplete() {
   });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", method: "notifications/initialized" });
   proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "veryslow", arguments: {} } }); // fire and forget
 
   const drained = await drainOpenSessions(proxy, 100, 10); // budget far shorter than the call
@@ -113,10 +117,156 @@ async function drainWithNoOpenSessionsReturnsImmediately() {
   check("drain-with-no-sessions-returns-fast", elapsed < 500, `took ${elapsed}ms`);
 }
 
+/* Codex PR #29 review round 8 "install shutdown handlers before gateway startup
+ * completes": main() only registers SIGTERM/SIGINT AFTER startGateway() resolves, so a
+ * termination received while a slow downstream handshake is still in progress previously
+ * fell through to Node's default immediate-exit behavior, skipping cleanup of an
+ * already-acquired writer-claim. Rather than move handler registration earlier (the
+ * panel-rejected approach -- see STARTUP_DOWNSTREAM_CONNECT_TIMEOUT_MS's own header
+ * comment in gateway.js), startGateway() now bounds the slow step itself: a downstream
+ * that spawns but never completes its handshake makes startup fail cleanly instead of
+ * hanging forever, through the SAME failure path (writerClaim.release() + reject) an
+ * outright connection refusal already uses. Uses a real hung child process (a `node -e`
+ * one-liner that spawns and idles forever, never speaking JSON-RPC), not a fake, since
+ * this exercises connectAllDownstreams' real spawn/handshake path -- but calls
+ * startGateway() directly (not the CLI) with a short startupDownstreamConnectTimeoutMs
+ * override so the test runs in well under a second rather than waiting out the real
+ * production default (mirrors drainTimeoutMs/statusWriteIntervalMs's own existing
+ * options-override pattern in this same function). */
+async function startupWatchdogTimesOutOnHungDownstreamConnect() {
+  const root = freshDir("startup-watchdog");
+  writeConfirmedMode(root, "standalone");
+  const kp = crypto.generateKeyPairSync("ed25519");
+  const keyPath = path.join(root, "signing-key.pem");
+  fs.writeFileSync(keyPath, kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  const stateDir = path.join(root, "state");
+  // connectStdio splits its endpoint on whitespace with no shell (see its own header
+  // comment) -- an inline `node -e "..."` one-liner containing spaces/parens would be
+  // split apart wrong, so this spawns a tiny real script file instead, matching the
+  // existing fixture-server convention (`node <path> [args]`, no embedded shell syntax).
+  const hangScriptPath = path.join(root, "hangs-forever.js");
+  const hangPidPath = path.join(root, "hangs-forever.pid");
+  // Writes its own pid before idling so this test can reap it afterward (see the
+  // try/finally below) -- this scenario is EXACTLY "a downstream that never completes its
+  // handshake" (the panel deliberately did not ask this fix to safely tear down
+  // partially-initialized startup state -- see this test's own header comment), so nothing
+  // inside startGateway()/connectAllDownstreams itself kills this child; only this test's
+  // own cleanup does, so it doesn't leave an orphan idling on the machine after the test.
+  fs.writeFileSync(hangScriptPath, `require("fs").writeFileSync(${JSON.stringify(hangPidPath)}, String(process.pid)); setInterval(() => {}, 1 << 30);\n`);
+  const config = {
+    schema_version: "1.0",
+    state_dir: stateDir,
+    // Spawns successfully (so connectAllDownstreams gets a live child) but never speaks a
+    // word of JSON-RPC -- its "initialize" call hangs forever, exactly the "slow
+    // downstream handshake in progress" scenario this watchdog exists to bound.
+    downstream_servers: [{ name: "hangs", transport: "stdio", endpoint: `${process.execPath} ${hangScriptPath}` }],
+    signing_key_ref: keyPath,
+  };
+  const configPath = path.join(root, "gateway-config.json");
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+  const start = Date.now();
+  let thrown = null;
+  try {
+    await startGateway({ configPath, startupDownstreamConnectTimeoutMs: 200 });
+  } catch (error) {
+    thrown = error;
+  }
+  const elapsed = Date.now() - start;
+
+  check("startup-watchdog-fails-closed-rather-than-hanging-forever", thrown !== null, "startGateway resolved instead of rejecting");
+  check("startup-watchdog-error-names-the-timeout", Boolean(thrown && thrown.code === "GATEWAY_STARTUP_TIMEOUT"), thrown && thrown.message);
+  check("startup-watchdog-fires-within-a-bounded-window-not-indefinitely", elapsed < 5000, `took ${elapsed}ms`);
+
+  // The SAME startup-failure cleanup path a genuine connect failure already uses must
+  // still have released the writer-claim -- otherwise a timed-out startup would leave a
+  // stale claim blocking the next start attempt, exactly the failure mode this fix exists
+  // to avoid. status().claimed reads fresh from disk and is instance-independent (unlike
+  // held_by_this_instance, which only ever answers for the SAME WriterClaim instance that
+  // acquired it), so a fresh WriterClaim here can honestly observe whether the on-disk
+  // claim file was actually removed.
+  const claimStatus = new WriterClaim(stateDir).status();
+  check("startup-watchdog-failure-releases-the-writer-claim", claimStatus.claimed === false, JSON.stringify(claimStatus));
+
+  // Reap the hung child this test itself spawned (see hangScriptPath's own comment) --
+  // best effort, polling briefly since the pidfile write races this test's own assertions.
+  for (let i = 0; i < 20 && !fs.existsSync(hangPidPath); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  try {
+    const pid = parseInt(fs.readFileSync(hangPidPath, "utf8"), 10);
+    if (Number.isInteger(pid)) process.kill(pid, "SIGKILL");
+  } catch (error) {
+    // best effort only -- an already-dead or never-spawned process is not this test's
+    // own assertion to make.
+  }
+}
+
+/* Codex PR #29 review round 8 "cap completed downstream sampling history": proxy.js's own
+ * agent-initiated dispatch enforces MAX_COMPLETED_CALLS_PER_SESSION, but this SEPARATE
+ * downstream-initiated sampling path (forwardDownstreamRequestToAgent, exercised
+ * end-to-end via a real downstream in tests/gateway/e2e's own sampling tests) never
+ * consulted it -- a sampling-capable stdio downstream issuing requests sequentially could
+ * grow session.calls without bound. Exercised here at the unit level, against a fake
+ * session/proxy/agentPusher, specifically to prove the ADMISSION REFUSAL at the cap --
+ * driving session.calls up to the real cap via genuine round trips would be far too slow
+ * for a unit suite (same rationale proxy/run-tests.js's own completedCallHistoryCapped
+ * test already documents for the agent-initiated case). */
+async function samplingForwardRefusesOnceCompletedCallCapReached() {
+  const { forwardDownstreamRequestToAgent } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+  const { MAX_COMPLETED_CALLS_PER_SESSION } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
+  const sessionModule = require(path.join(ROOT, "scripts", "gateway", "session.js"));
+  const s = sessionModule.createSession("agent-conn-1");
+  s.calls.length = MAX_COMPLETED_CALLS_PER_SESSION; // cheap stand-in for that many genuinely-completed calls
+  const proxy = { sessions: new Map([["agent-conn-1", s]]), now: () => Date.now() };
+  let agentWasAsked = false;
+  const agentPusher = { current: () => { agentWasAsked = true; return Promise.resolve({}); }, connectionId: "agent-conn-1" };
+
+  const resp = await forwardDownstreamRequestToAgent(
+    { jsonrpc: "2.0", id: 7, method: "sampling/createMessage", params: {} },
+    agentPusher,
+    () => {},
+    proxy,
+    "srv"
+  );
+  check(
+    "sampling-forward-refuses-once-completed-call-cap-reached",
+    Boolean(resp.error && resp.error.code === -32000 && /already completed/.test(resp.error.message)),
+    JSON.stringify(resp)
+  );
+  check("sampling-forward-does-not-reach-the-agent-once-refused", agentWasAsked === false, String(agentWasAsked));
+  check("sampling-forward-cap-refusal-does-not-grow-session-calls", s.calls.length === MAX_COMPLETED_CALLS_PER_SESSION, String(s.calls.length));
+}
+
+/* Same cap, exercised well BELOW it: a session with room left must still have its
+ * downstream-initiated sampling request forwarded to the agent as normal -- proving the
+ * new check in samplingForwardRefusesOnceCompletedCallCapReached's own fix is a genuine
+ * admission gate, not an accidental blanket refusal. */
+async function samplingForwardStillWorksBelowTheCap() {
+  const { forwardDownstreamRequestToAgent } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+  const sessionModule = require(path.join(ROOT, "scripts", "gateway", "session.js"));
+  const s = sessionModule.createSession("agent-conn-2");
+  const proxy = { sessions: new Map([["agent-conn-2", s]]), now: () => Date.now() };
+  const agentPusher = { current: () => Promise.resolve({ role: "assistant", content: { type: "text", text: "ok" } }), connectionId: "agent-conn-2" };
+
+  const resp = await forwardDownstreamRequestToAgent(
+    { jsonrpc: "2.0", id: 8, method: "sampling/createMessage", params: {} },
+    agentPusher,
+    () => {},
+    proxy,
+    "srv"
+  );
+  check("sampling-forward-succeeds-below-the-cap", Boolean(resp.result && resp.result.content && resp.result.content.text === "ok"), JSON.stringify(resp));
+  check("sampling-forward-records-the-completed-call-below-the-cap", s.calls.length === 1 && s.calls[0].model_call === true, JSON.stringify(s.calls));
+}
+
 async function main() {
   await drainWaitsForInFlightCallToComplete();
   await drainTimesOutAndReportsIncomplete();
   await drainWithNoOpenSessionsReturnsImmediately();
+  await samplingForwardRefusesOnceCompletedCallCapReached();
+  await samplingForwardStillWorksBelowTheCap();
+  await startupWatchdogTimesOutOnHungDownstreamConnect();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
