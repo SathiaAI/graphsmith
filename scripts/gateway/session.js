@@ -125,6 +125,50 @@ function recordCallResult(session, jsonRpcId, result) {
   return true;
 }
 
+/* CodeRabbit/Codex PR #29 review round 8 "keep unmatched downstream IDs out of agent
+ * correlation": a fixed, non-speculative cap on session.anomalies, matching the same
+ * discipline as MAX_PENDING_CALLS_PER_SESSION/MAX_COMPLETED_CALLS_PER_SESSION (proxy.js).
+ * Without one, a misbehaving or compromised downstream emitting a stream of responses
+ * with unknown ids could grow this array (and the eventual sealed bundle) without bound,
+ * independently of both call-history caps -- neither of which this ever went through. */
+const MAX_ANOMALIES_PER_SESSION = 1000;
+
+/** Records a downstream response that could not be correlated to any pending call,
+ * WITHOUT going through recordCallResult's agent-facing pendingCalls lookup (CodeRabbit
+ * PR #29 review round 8 "record unmatched downstream responses without agent-call
+ * correlation" / Codex PR #29 review round 8 "keep unmatched downstream IDs out of agent
+ * correlation"). The id on an unmatched DOWNSTREAM response is the downstream leg's own
+ * internal id (assigned by scripts/gateway/downstream.js), not an agent-facing JSON-RPC
+ * id -- recordCallResult's pendingCalls Map is keyed by the latter. Feeding a
+ * downstream-internal id into recordCallResult risked colliding with an unrelated LIVE
+ * agent call that happens to share the same id value: recordCallResult would delete that
+ * live pending call and record this stale/foreign response as its result, corrupting the
+ * session trace and losing the UNMATCHED_RESPONSE anomaly entirely. This function only
+ * ever appends the anomaly -- it never touches pendingCalls.
+ *
+ * Capped at MAX_ANOMALIES_PER_SESSION (Codex PR #29 review round 8 "cap unmatched-response
+ * anomalies per session"): once reached, further anomalies are dropped rather than grow
+ * session.anomalies without bound, but the cap being hit is itself recorded once (a single
+ * terminal marker entry) so it leaves a trace rather than silently truncating. */
+function recordUnmatchedResponseAnomaly(session, jsonRpcId, detail, ts) {
+  if (session.finalized) throw fail("Cannot record into a finalized session", "SESSION_FINALIZED");
+  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) return false;
+  session.anomalies.push({
+    kind: "UNMATCHED_RESPONSE",
+    jsonRpcId,
+    detail: detail || "response arrived for a JSON-RPC id with no matching pending call",
+    ts: ts !== undefined ? ts : Date.now(),
+  });
+  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) {
+    session.anomalies.push({
+      kind: "ANOMALY_CAP_REACHED",
+      detail: `This session reached the ${MAX_ANOMALIES_PER_SESSION}-anomaly cap -- further anomalies are dropped, not recorded.`,
+      ts: ts !== undefined ? ts : Date.now(),
+    });
+  }
+  return true;
+}
+
 /** Called when the downstream side of a connection disconnects (or the whole session is
  * finalized) with calls still pending: each is recorded with an explicit disconnect
  * marker, never silently dropped (SS7 failure mode / test plan item 10).
@@ -255,6 +299,8 @@ module.exports = {
   recordToolsList,
   recordCallStart,
   recordCallResult,
+  recordUnmatchedResponseAnomaly,
+  MAX_ANOMALIES_PER_SESSION,
   markPendingAsDisconnected,
   toSealableSession,
   finalizeSession,
