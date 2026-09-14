@@ -24,12 +24,15 @@ const FIXTURE_SERVER = path.join(__dirname, "..", "_fixtures", "fixture-mcp-serv
 let failures = 0;
 const results = [];
 function record(name, status, reason) {
-  console.log(status === "PASS" ? `PASS ${name}` : `FAIL ${name}+${reason || "unknown"}`);
+  console.log(status === "PASS" ? `PASS ${name}` : status === "SKIP" ? `SKIP ${name}${reason ? " (" + reason + ")" : ""}` : `FAIL ${name}+${reason || "unknown"}`);
   results.push({ name, status, reason: reason || "" });
   if (status === "FAIL") failures++;
 }
 function check(name, cond, reason) {
   record(name, cond ? "PASS" : "FAIL", reason);
+}
+function skip(name, reason) {
+  record(name, "SKIP", reason);
 }
 
 function freshDir(prefix) {
@@ -177,7 +180,24 @@ async function unsupportedProtocolVersionRejected() {
  * a promise that resolves only once the child has actually exited. Passes a short
  * `terminateTimeoutMs` via connectStdio's own options (mirrors this file's existing
  * per-connection options-override convention) instead of waiting out the real production
- * default, so this test runs fast rather than for STDIO_CHILD_TERMINATE_TIMEOUT_MS. */
+ * default, so this test runs fast rather than for STDIO_CHILD_TERMINATE_TIMEOUT_MS.
+ *
+ * FR-12 (2026-09-14): the timing half of this test (asserting close() takes at least
+ * terminateTimeoutMs, proving the SIGKILL-escalation branch actually ran rather than the
+ * child exiting on its own) is skipped on win32. Windows has no true POSIX signal
+ * delivery -- child.kill() (Node's SIGTERM stand-in) unconditionally force-terminates the
+ * child regardless of any process.on("SIGTERM", ...) handler it registered, so this
+ * fixture's trap never actually traps anything and the child exits in a few ms instead of
+ * surviving to the timeout floor. Confirmed via real GitHub Actions CI: reproducible on
+ * both windows-latest/node18 and windows-latest/node22, both workflow-run triggers
+ * (took 3-4ms against a >=150ms floor), root-caused by reading downstream.js's close()
+ * directly (a correct, platform-agnostic bounded-wait-then-SIGKILL design -- no production
+ * defect). Mirrors this repo's existing precedent (tests/gateway/e2e's
+ * e2e-sigterm-clean-drain-and-release) of skipping a platform-unreproducible signal
+ * assertion rather than writing one that cannot mean what it claims on win32. The other
+ * half of this same test (close-resolves-once-sigterm-trapping-child-is-actually-gone,
+ * which only checks the connection ends up closed and does not depend on trap timing)
+ * still runs and is expected to pass on every platform, including win32. */
 async function stdioChildTerminationEscalatesToSigkillAfterTimeout() {
   const dir = freshDir("sigterm-trap");
   const fixturePath = path.join(dir, "sigterm-trap-fixture.js");
@@ -203,11 +223,18 @@ async function stdioChildTerminationEscalatesToSigkillAfterTimeout() {
   await conn.close();
   const elapsed = Date.now() - start;
   check("close-resolves-once-sigterm-trapping-child-is-actually-gone", conn.isClosed() === true, String(conn.isClosed()));
-  check(
-    "close-escalated-to-sigkill-rather-than-hanging-on-a-trapped-sigterm",
-    elapsed >= 150 && elapsed < 5000,
-    `took ${elapsed}ms`
-  );
+  if (process.platform === "win32") {
+    skip(
+      "close-escalated-to-sigkill-rather-than-hanging-on-a-trapped-sigterm",
+      "Windows cannot deliver a real SIGTERM for graceful in-process handling (child.kill('SIGTERM') force-terminates on win32), so this fixture's SIGTERM trap never actually traps anything and the child exits in a few ms instead of surviving to the escalation-timeout floor -- mirrors this repo's existing precedent (tests/gateway/e2e's e2e-sigterm-clean-drain-and-release) of skipping a platform-unreproducible signal assertion rather than writing one that cannot mean what it claims."
+    );
+  } else {
+    check(
+      "close-escalated-to-sigkill-rather-than-hanging-on-a-trapped-sigterm",
+      elapsed >= 150 && elapsed < 5000,
+      `took ${elapsed}ms`
+    );
+  }
 }
 
 /** Codex PR #29 review round 8 "bound termination of stdio downstream children": a
@@ -530,7 +557,7 @@ async function samplingCapabilityAdvertisedOnlyWhenSupported() {
     rl.on("line", (line) => {
       let msg; try { msg = JSON.parse(line); } catch (e) { return; }
       if (msg.method === "initialize") {
-        fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(msg.params));
+        fs.writeFileSync(${JSON.stringify("__CAPTURE_PATH__")}, JSON.stringify(msg.params));
         send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "cap", version: "1.0" } } });
         return;
       }
@@ -577,7 +604,7 @@ async function onRequestReceivesOwnServerName() {
       rl.on("line", (line) => {
         let msg; try { msg = JSON.parse(line); } catch (e) { return; }
         if (typeof msg.method !== "string" && msg.id === "upstream-1") { return; } // reply to our own request, ignored here
-        if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: ${JSON.stringify(name)}, version: "1.0" } } }); return; }
+        if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: ${JSON.stringify("__NAME__")}, version: "1.0" } } }); return; }
         if (msg.method === "tools/list") {
           send({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
           // Immediately after the handshake, fire our own unsolicited request upstream.
@@ -632,7 +659,8 @@ async function main() {
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
-  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
+  const skipped = results.filter((r) => r.status === "SKIP").length;
+  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=${skipped}`);
   process.exit(failures ? 1 : 0);
 }
 
