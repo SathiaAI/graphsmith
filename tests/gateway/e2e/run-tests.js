@@ -124,6 +124,7 @@ async function singleSessionEndToEndVerifies() {
   gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
   const initResp = await gw.nextMessage();
   check("e2e-initialize-responds", initResp && initResp.result && initResp.result.serverInfo, JSON.stringify(initResp));
+  gw.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   gw.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   const toolsResp = await gw.nextMessage();
@@ -213,6 +214,25 @@ function httpPost(port, token, body, agent, sessionId) {
   });
 }
 
+/** Codex PR #29 review round 8 "wait for notifications/initialized before admitting
+ * tools": a plain JSON-RPC notification (no "id") over the agent HTTP transport gets an
+ * empty 202 body back (agent-transport.js's own handling of a null handleMessage()
+ * response), unlike httpPost's request/response pairs above, which always expect a JSON
+ * body -- this variant tolerates that empty body instead of treating it as a parse error. */
+function httpNotify(port, token, body, agent, sessionId) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const headers = { "content-type": "application/json", "content-length": Buffer.byteLength(payload), authorization: `Bearer ${token}` };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+    const req = http.request({ host: "127.0.0.1", port, method: "POST", agent, headers }, (res) => {
+      res.resume();
+      res.on("end", resolve);
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
 /** Board decision 2026-09-04 (PR #29 review, Decision 1, Option B): a downstream
  * server's own unsolicited "sampling/createMessage" request is forwarded to the agent
  * ONLY when the agent transport is stdio (the only one that can push a request rather
@@ -226,6 +246,7 @@ async function samplingForwardedToStdioAgent() {
 
   gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
   await gw.nextMessage();
+  gw.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
 
@@ -285,6 +306,7 @@ async function malformedPushedReplyIsRejectedNotSilentlyAccepted() {
 
   gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
   await gw.nextMessage();
+  gw.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
 
@@ -324,6 +346,7 @@ async function pushedReplyWithPresentButFalsyErrorIsRejected() {
 
   gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
   await gw.nextMessage();
+  gw.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   gw.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hello from downstream" } } });
 
@@ -377,6 +400,7 @@ async function samplingOverHttpAgentGetsExplicitError() {
   check("e2e-sampling-http-initialize-responds", initResp.body && initResp.body.result, JSON.stringify(initResp.body));
   const sessionId = initResp.headers["mcp-session-id"];
   check("e2e-sampling-http-initialize-returns-session-id", typeof sessionId === "string" && sessionId.length > 0, JSON.stringify(initResp.headers));
+  await httpNotify(port, token, { jsonrpc: "2.0", method: "notifications/initialized" }, undefined, sessionId);
 
   const callResp = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_sample", arguments: { prompt: "hi" } } }, undefined, sessionId);
   check(
@@ -416,6 +440,7 @@ async function httpDownstreamAgainstRealMcpServerSucceeds() {
   gw.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "test-agent", version: "1.0" } } });
   const initResp = await gw.nextMessage();
   check("e2e-http-downstream-initialize-responds", initResp && initResp.result, JSON.stringify(initResp));
+  gw.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   gw.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   const toolsResp = await gw.nextMessage();
@@ -527,6 +552,8 @@ async function httpAgentSessionsAreIdBasedNotSocketBased() {
     const initB = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-B", version: "1.0" } } }, sharedSocketAgent);
     const sessionB = initB.headers["mcp-session-id"];
     check("e2e-agent-http-two-sessions-on-one-socket-get-distinct-ids", typeof sessionA === "string" && typeof sessionB === "string" && sessionA !== sessionB, JSON.stringify({ sessionA, sessionB }));
+    await httpNotify(port, token, { jsonrpc: "2.0", method: "notifications/initialized" }, sharedSocketAgent, sessionA);
+    await httpNotify(port, token, { jsonrpc: "2.0", method: "notifications/initialized" }, sharedSocketAgent, sessionB);
 
     const callA = await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: { prompt: "from A" } } }, sharedSocketAgent, sessionA);
     check("e2e-agent-http-session-a-tools-call-succeeds", callA.body && callA.body.id === 2 && callA.body.result, JSON.stringify(callA.body));
@@ -568,7 +595,7 @@ async function httpFailedInitializeDoesNotLeakSession() {
   writeConfirmedMode(root, "standalone");
   const tokenPath = path.join(root, "agent-token.txt");
   fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
-  const { configPath } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const { configPath, stateDir } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
   const gw = spawnGateway(root, configPath);
   const port = await waitForHttpPort(gw);
   const token = fs.readFileSync(tokenPath, "utf8").trim();
@@ -591,6 +618,23 @@ async function httpFailedInitializeDoesNotLeakSession() {
         followUp.body && followUp.body.error && /unknown or expired/i.test(followUp.body.error.message),
         JSON.stringify(followUp.body)
       );
+      /* CodeRabbit PR #29 review round 8 "verify that the failed session was persisted":
+       * the assertion above only proves session REMOVAL (the follow-up sees an unknown
+       * session) -- it does not prove session SEALING. An implementation that deletes the
+       * session without ever writing its bundle would pass it just the same. This session
+       * is the only one this test ever opens, so the chain's head (mirrors
+       * singleSessionEndToEndVerifies' own "e2e-exactly-one-bundle-written" pattern
+       * elsewhere in this file) must name exactly it, and that bundle must actually exist
+       * on disk, not merely be referenced. */
+      const head = chain.readHead(stateDir);
+      check("e2e-failed-initialize-session-is-recorded-in-the-chain", Boolean(head && head.seq === 1 && typeof head.bundle_id === "string"), JSON.stringify(head));
+      if (head && typeof head.bundle_id === "string") {
+        check(
+          "e2e-failed-initialize-session-bundle-actually-exists-on-disk",
+          fs.existsSync(chain.bundlePath(stateDir, head.bundle_id)),
+          chain.bundlePath(stateDir, head.bundle_id)
+        );
+      }
     }
   } finally {
     agent.destroy();
@@ -648,6 +692,7 @@ async function cleanSigtermDrainsAndExitsZero() {
   gw.send({ jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
   const initResp = await gw.nextMessage();
   check("e2e-sigterm-preinitialize-succeeded", initResp && initResp.id === 0 && initResp.result, JSON.stringify(initResp));
+  gw.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   gw.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "fixture_echo", arguments: { delayMs: 200 } } });
   /* Explicit call-start signal, not a fixed sleep: tools/list needs no downstream round-

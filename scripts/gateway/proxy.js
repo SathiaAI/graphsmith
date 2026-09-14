@@ -88,6 +88,13 @@ const MAX_PENDING_CALLS_PER_SESSION = 1000;
  * check above. Same "fixed, non-speculative default" discipline as that constant. */
 const MAX_COMPLETED_CALLS_PER_SESSION = 100000;
 
+/* Per-connection agent-initialization lifecycle states (Codex PR #29 review round 8
+ * "wait for notifications/initialized before admitting tools") -- see the
+ * GatewayProxy#agentInitialized field comment in the constructor for the full rationale. */
+const INIT_NONE = "none";
+const INIT_AWAITING_NOTIFICATION = "awaiting_notification";
+const INIT_READY = "ready";
+
 class GatewayProxy {
   /**
    * @param {object} opts
@@ -128,7 +135,16 @@ class GatewayProxy {
      * review "enforce the agent initialization lifecycle"): tracked here rather than on
      * the session.js record itself, since it is purely a dispatch-gating concern of this
      * proxy, not part of the sealed session's own attested shape. */
-    this.agentInitialized = new Map(); // connectionId -> boolean
+    /* Codex PR #29 review round 8 "wait for notifications/initialized before admitting
+     * tools": three states, not a boolean -- INIT_NONE (no "initialize" yet),
+     * INIT_AWAITING_NOTIFICATION ("initialize" response computed/sent, but the client's
+     * required "notifications/initialized" has not yet arrived), and INIT_READY (that
+     * notification has been received). Tools are admitted only in INIT_READY: an
+     * "initialize" response alone does not prove the client ever received it (it may have
+     * been sent as a bare notification with no id at all), so admitting tools immediately
+     * after computing that response could unlock tools/list and tools/call before the
+     * client has actually completed the MCP-required handshake. */
+    this.agentInitialized = new Map(); // connectionId -> "none" | "awaiting_notification" | "ready"
     /* Frontier-panel decision (Paul, 2026-09-10, cluster E2): connectionIds this
      * gateway's own startup recovery (gateway.js#recoverCrashedSessions) flagged as
      * pendingOperatorReview -- consulted at dispatch time to quarantine a TOOL (not just
@@ -144,6 +160,23 @@ class GatewayProxy {
      * stay silent, mirroring onSessionFinalized/onSealFailure's own default-no-op
      * contract above. */
     this.log = typeof opts.log === "function" ? opts.log : (() => {});
+  }
+
+  /** Codex PR #29 review round 8 "contain logger failures after downstream effects": a
+   * configured `log` callback (opts.log above) is caller-supplied operational plumbing,
+   * not part of this proxy's own call-completion contract -- if it throws, the exception
+   * would otherwise escape handleMessage AFTER a downstream tool has already succeeded and
+   * had its result recorded, turning a real success into a JSON-RPC internal error sent to
+   * the agent and inviting a retry that repeats the (possibly non-idempotent) external
+   * effect. Every call site that logs after a downstream effect has already landed must go
+   * through this non-throwing wrapper instead of calling this.log directly. */
+  safeLog(payload) {
+    try {
+      this.log(payload);
+    } catch (error) {
+      // Deliberately swallowed: a failing logger must never alter call-completion
+      // semantics or the response already being returned to the agent.
+    }
   }
 
   openConnection(connectionId, options = {}) {
@@ -194,7 +227,7 @@ class GatewayProxy {
       tools: this.mergedTools.map((t) => ({ name: t.name, server: t.server, schema: t.schema })),
     });
     this.sessions.set(connectionId, s);
-    this.agentInitialized.set(connectionId, false);
+    this.agentInitialized.set(connectionId, INIT_NONE);
     return s;
   }
 
@@ -278,7 +311,7 @@ class GatewayProxy {
        * one (session.recordInitialize below just replaces the recorded clientInfo/
        * serverInfo/model), producing a sealed trace whose initialize record no longer
        * matches what was actually true when those earlier calls ran. Reject it instead. */
-      if (this.agentInitialized.get(connectionId)) {
+      if (this.agentInitialized.get(connectionId) !== INIT_NONE) {
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error: { code: -32600, message: "This connection has already completed \"initialize\" -- a repeated initialize is not permitted." } };
       }
@@ -317,7 +350,13 @@ class GatewayProxy {
         serverInfo: mergedServerInfo,
         model: params && params.model,
       });
-      this.agentInitialized.set(connectionId, true);
+      /* Codex PR #29 review round 8 "wait for notifications/initialized before admitting
+       * tools": this used to flip straight to "tools admitted" here -- before the agent
+       * has necessarily received this very response (an id-less "initialize" sent as a
+       * notification reaches this same assignment) and before the client has sent the
+       * MCP-required "notifications/initialized" completion. Move to the intermediate
+       * state instead; only that notification (handled below) advances to INIT_READY. */
+      this.agentInitialized.set(connectionId, INIT_AWAITING_NOTIFICATION);
       if (isNotification) return null;
       /* This gateway implements exactly one protocol version (GATEWAY_PROTOCOL_VERSION);
        * echoing back whatever the agent asked for (SS3.3) would let a client believe
@@ -325,6 +364,17 @@ class GatewayProxy {
        * causing later requests to be misinterpreted per the client's own (wrong)
        * assumption. Always return the version actually selected, never the request. */
       return { jsonrpc: "2.0", id, result: { protocolVersion: GATEWAY_PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: mergedServerInfo } };
+    }
+
+    if (method === "notifications/initialized") {
+      /* Codex PR #29 review round 8: only advance out of the intermediate state -- a
+       * stray "notifications/initialized" with no preceding "initialize" (state INIT_NONE)
+       * or a repeat of it (state already INIT_READY) is harmless to ignore, not something
+       * to newly admit tools for. */
+      if (this.agentInitialized.get(connectionId) === INIT_AWAITING_NOTIFICATION) {
+        this.agentInitialized.set(connectionId, INIT_READY);
+      }
+      return null;
     }
 
     if (method.startsWith("notifications/")) return null;
@@ -335,9 +385,9 @@ class GatewayProxy {
      * which sealBoundaryBundle would then attest as if it were a normal, complete
      * session. Gates only the two AGENT-initiated methods this applies to -- a
      * downstream-pushed sampling/createMessage is not agent-initiated and is unaffected. */
-    if ((method === "tools/list" || method === "tools/call") && !this.agentInitialized.get(connectionId)) {
+    if ((method === "tools/list" || method === "tools/call") && this.agentInitialized.get(connectionId) !== INIT_READY) {
       if (isNotification) return null;
-      return { jsonrpc: "2.0", id, error: { code: -32600, message: `Cannot call "${method}" before this connection has completed "initialize".` } };
+      return { jsonrpc: "2.0", id, error: { code: -32600, message: `Cannot call "${method}" before this connection has completed "initialize" and sent "notifications/initialized".` } };
     }
 
     if (method === "tools/list") {
@@ -382,7 +432,15 @@ class GatewayProxy {
        * connection's lifetime. Refuse admission the same way the pending-call cap does --
        * the client must end this session and start a new one -- rather than let one
        * long-lived connection's retained history grow unbounded. */
-      if (s.calls.length >= MAX_COMPLETED_CALLS_PER_SESSION) {
+      /* CodeRabbit PR #29 review round 8 "reserve capacity for pending calls": this check
+       * previously counted only s.calls.length (already-COMPLETED calls), ignoring calls
+       * already admitted and genuinely in flight (s.pendingCalls). With, say, 99,999
+       * completed calls and several concurrent in-flight requests all passing this check
+       * before any of them resolves into s.calls, s.calls.length could grow past
+       * MAX_COMPLETED_CALLS_PER_SESSION once they all completed. Count pending calls
+       * against the same budget so the cap bounds total retained-call growth, not just
+       * calls that happen to have already resolved at check time. */
+      if (s.calls.length + s.pendingCalls.size >= MAX_COMPLETED_CALLS_PER_SESSION) {
         const error = { code: -32000, message: `This session has already completed ${MAX_COMPLETED_CALLS_PER_SESSION} call(s) -- refusing to admit another call on this connection; start a new session.` };
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error };
@@ -880,7 +938,7 @@ class GatewayProxy {
          * emitted much later (or never, if the process crashes first) -- this gives every
          * completed call its own operational line, regardless of how the session ends. */
         const recordedCall = s.calls[s.calls.length - 1];
-        this.log(JSON.stringify({
+        this.safeLog(JSON.stringify({
           event: "gateway_call_completed",
           connection_id: connectionId,
           step: recordedCall ? recordedCall.seq : null,
@@ -916,7 +974,7 @@ class GatewayProxy {
    * response (if any) arrives. Shared by both call sites below so the log shape stays
    * identical to handleMessage's own. */
   logDisconnectedCall(connectionId, call, at) {
-    this.log(JSON.stringify({
+    this.safeLog(JSON.stringify({
       event: "gateway_call_completed",
       connection_id: connectionId,
       step: call.seq,

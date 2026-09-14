@@ -24,12 +24,15 @@ const FIXTURE_SERVER = path.join(__dirname, "..", "_fixtures", "fixture-mcp-serv
 let failures = 0;
 const results = [];
 function record(name, status, reason) {
-  console.log(status === "PASS" ? `PASS ${name}` : `FAIL ${name}+${reason || "unknown"}`);
+  console.log(status === "PASS" ? `PASS ${name}` : status === "SKIP" ? `SKIP ${name}${reason ? " (" + reason + ")" : ""}` : `FAIL ${name}+${reason || "unknown"}`);
   results.push({ name, status, reason: reason || "" });
   if (status === "FAIL") failures++;
 }
 function check(name, cond, reason) {
   record(name, cond ? "PASS" : "FAIL", reason);
+}
+function skip(name, reason) {
+  record(name, "SKIP", reason);
 }
 
 function freshDir(prefix) {
@@ -130,6 +133,138 @@ async function malformedInitializeResultRejected() {
   );
 }
 
+/** Codex PR #29 review round 8 "reject unsupported downstream protocol selections": a
+ * downstream returning a WELL-FORMED initialize result (passes every check
+ * malformedInitializeResultRejected above exercises) whose protocolVersion is not in
+ * SUPPORTED_DOWNSTREAM_PROTOCOL_VERSIONS must still be rejected at startup -- distinctly
+ * from a malformed/missing field, since this response is shaped correctly, just naming an
+ * incompatible version this client never negotiated. */
+async function unsupportedProtocolVersionRejected() {
+  const dir = freshDir("unsupported-protocol-version");
+  const fixturePath = path.join(dir, "unsupported-protocol-fixture.js");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") {
+        // Well-formed per every existing shape check, but a version this gateway never
+        // negotiated (it only ever sends "2025-06-18" as its own declared protocolVersion).
+        send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "1999-01-01", capabilities: {}, serverInfo: { name: "old-server", version: "1.0" } } });
+        return;
+      }
+    });
+    `
+  );
+  const serverConfig = { name: "old", transport: "stdio", endpoint: `node ${fixturePath}` };
+  let threw = null;
+  try {
+    await downstream.connectAllDownstreams([serverConfig]);
+  } catch (error) {
+    threw = error;
+  }
+  check(
+    "unsupported-protocol-version-rejected-at-startup",
+    Boolean(threw && threw.code === "GATEWAY_DOWNSTREAM_UNSUPPORTED_PROTOCOL_VERSION" && /1999-01-01/.test(threw.message)),
+    threw && threw.message
+  );
+}
+
+/** Codex PR #29 review round 8 "bound termination of stdio downstream children": a
+ * downstream that traps SIGTERM and keeps running must still be terminated -- close() now
+ * escalates to SIGKILL (which cannot be trapped) after its terminate-timeout, and returns
+ * a promise that resolves only once the child has actually exited. Passes a short
+ * `terminateTimeoutMs` via connectStdio's own options (mirrors this file's existing
+ * per-connection options-override convention) instead of waiting out the real production
+ * default, so this test runs fast rather than for STDIO_CHILD_TERMINATE_TIMEOUT_MS.
+ *
+ * FR-12 (2026-09-14): the timing half of this test (asserting close() takes at least
+ * terminateTimeoutMs, proving the SIGKILL-escalation branch actually ran rather than the
+ * child exiting on its own) is skipped on win32. Windows has no true POSIX signal
+ * delivery -- child.kill() (Node's SIGTERM stand-in) unconditionally force-terminates the
+ * child regardless of any process.on("SIGTERM", ...) handler it registered, so this
+ * fixture's trap never actually traps anything and the child exits in a few ms instead of
+ * surviving to the timeout floor. Confirmed via real GitHub Actions CI: reproducible on
+ * both windows-latest/node18 and windows-latest/node22, both workflow-run triggers
+ * (took 3-4ms against a >=150ms floor), root-caused by reading downstream.js's close()
+ * directly (a correct, platform-agnostic bounded-wait-then-SIGKILL design -- no production
+ * defect). Mirrors this repo's existing precedent (tests/gateway/e2e's
+ * e2e-sigterm-clean-drain-and-release) of skipping a platform-unreproducible signal
+ * assertion rather than writing one that cannot mean what it claims on win32. The other
+ * half of this same test (close-resolves-once-sigterm-trapping-child-is-actually-gone,
+ * which only checks the connection ends up closed and does not depend on trap timing)
+ * still runs and is expected to pass on every platform, including win32. */
+async function stdioChildTerminationEscalatesToSigkillAfterTimeout() {
+  const dir = freshDir("sigterm-trap");
+  const fixturePath = path.join(dir, "sigterm-trap-fixture.js");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    process.on("SIGTERM", () => {}); // trap and ignore -- never exits on SIGTERM alone
+    setInterval(() => {}, 1000); // keep the event loop alive independent of stdin closing
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "trap", version: "1.0" } } }); }
+    });
+    `
+  );
+  const conn = downstream.connectStdio(`node ${fixturePath}`, { terminateTimeoutMs: 150 });
+  await conn.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1.0" } });
+
+  const start = Date.now();
+  await conn.close();
+  const elapsed = Date.now() - start;
+  check("close-resolves-once-sigterm-trapping-child-is-actually-gone", conn.isClosed() === true, String(conn.isClosed()));
+  if (process.platform === "win32") {
+    skip(
+      "close-escalated-to-sigkill-rather-than-hanging-on-a-trapped-sigterm",
+      "Windows cannot deliver a real SIGTERM for graceful in-process handling (child.kill('SIGTERM') force-terminates on win32), so this fixture's SIGTERM trap never actually traps anything and the child exits in a few ms instead of surviving to the escalation-timeout floor -- mirrors this repo's existing precedent (tests/gateway/e2e's e2e-sigterm-clean-drain-and-release) of skipping a platform-unreproducible signal assertion rather than writing one that cannot mean what it claims."
+    );
+  } else {
+    check(
+      "close-escalated-to-sigkill-rather-than-hanging-on-a-trapped-sigterm",
+      elapsed >= 150 && elapsed < 5000,
+      `took ${elapsed}ms`
+    );
+  }
+}
+
+/** Codex PR #29 review round 8 "bound termination of stdio downstream children": a
+ * well-behaved child that exits promptly on SIGTERM must not be made to wait out the
+ * escalation timeout -- close() should resolve as soon as the child's own "close" event
+ * fires, not only once STDIO_CHILD_TERMINATE_TIMEOUT_MS elapses. */
+async function stdioChildTerminationResolvesPromptlyOnCleanExit() {
+  const dir = freshDir("clean-sigterm");
+  const fixturePath = path.join(dir, "clean-exit-fixture.js");
+  fs.writeFileSync(
+    fixturePath,
+    `
+    "use strict";
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+    rl.on("line", (line) => {
+      let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+      if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "clean", version: "1.0" } } }); }
+    });
+    `
+  );
+  const conn = downstream.connectStdio(`node ${fixturePath}`);
+  await conn.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1.0" } });
+  const start = Date.now();
+  await conn.close();
+  const elapsed = Date.now() - start;
+  check("close-on-a-well-behaved-child-resolves-well-under-the-escalation-timeout", elapsed < downstream.STDIO_CHILD_TERMINATE_TIMEOUT_MS, `took ${elapsed}ms`);
+}
+
 /** Codex PR #29 review "keep gateway secrets out of downstream subprocess environments":
  * buildStdioChildEnv strips exactly the named secret env vars and nothing else, and
  * connectStdio actually spawns its child with that filtered environment rather than the
@@ -203,10 +338,25 @@ async function unmatchedStdioResponseSurfaced() {
     `
   );
   const unmatched = [];
-  const conn = downstream.connectStdio(`node ${fixturePath}`, { onUnmatchedResponse: (msg) => unmatched.push(msg) });
+  /* CodeRabbit PR #29 review round 8 "wait for the callback instead of waiting 200 ms": a
+   * fixed delay is flaky under a slow CI worker, which can deliver the bogus line after
+   * this test already moved on to its assertion. Resolve a promise from the callback
+   * itself and use a bounded timeout only as the FAILURE limit, not as the expected
+   * delivery time. */
+  let resolveUnmatched;
+  const unmatchedReceived = new Promise((resolve) => { resolveUnmatched = resolve; });
+  const conn = downstream.connectStdio(`node ${fixturePath}`, {
+    onUnmatchedResponse: (msg) => {
+      unmatched.push(msg);
+      resolveUnmatched();
+    },
+  });
   try {
     await conn.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1.0" } });
-    await new Promise((resolve) => setTimeout(resolve, 200)); // let the bogus line be read
+    await Promise.race([
+      unmatchedReceived,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("unmatched response not received")), 2000)),
+    ]);
     check(
       "unmatched-stdio-response-surfaced-to-callback",
       unmatched.length === 1 && unmatched[0].id === 999999,
@@ -495,6 +645,9 @@ async function main() {
   await prototypePollutingServerNameIsStoredSafely();
   await malformedToolsListMissingArrayRejected();
   await malformedInitializeResultRejected();
+  await unsupportedProtocolVersionRejected();
+  await stdioChildTerminationEscalatesToSigkillAfterTimeout();
+  await stdioChildTerminationResolvesPromptlyOnCleanExit();
   await stdioChildEnvExcludesGatewaySecrets();
   await unmatchedStdioResponseSurfaced();
   await httpResponseRequiresExactlyOneOfResultOrError();
@@ -506,7 +659,8 @@ async function main() {
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
-  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
+  const skipped = results.filter((r) => r.status === "SKIP").length;
+  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=${skipped}`);
   process.exit(failures ? 1 : 0);
 }
 

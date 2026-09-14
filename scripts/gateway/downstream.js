@@ -41,10 +41,30 @@ function fail(message, code = "GATEWAY_DOWNSTREAM_ERROR") {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 
+/* Codex PR #29 review round 8 "bound termination of stdio downstream children": how long
+ * connectStdio's close() waits for a SIGTERM'd child to actually exit before escalating to
+ * SIGKILL. Same "fixed, non-speculative default" discipline as every other *_TIMEOUT_MS
+ * constant in this file/gateway.js -- long enough for a well-behaved child to flush and
+ * exit cleanly, short enough that a child which traps/ignores SIGTERM cannot stall
+ * shutdown or startup-failure cleanup for long. */
+const STDIO_CHILD_TERMINATE_TIMEOUT_MS = 5000;
+
 /* The MCP protocol version this client negotiates on the downstream leg's own
  * initialize handshake -- matches the literal version scripts/gateway/proxy.js selects
  * on the agent-facing leg (both legs of this gateway speak the same one version). */
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+
+/* Codex PR #29 review round 8 "reject unsupported downstream protocol selections": an
+ * ALLOWLIST of protocol versions this client is actually verified compatible with --
+ * deliberately not a bare `=== MCP_PROTOCOL_VERSION` equality-only check (a Set makes
+ * adding a second verified-compatible version later a matter of extending this list, not
+ * changing the check's own logic) and deliberately not the prior fully-permissive
+ * "any non-empty string" validation (5-model external panel, Paul-approved 2026-09-12).
+ * Seeded with just this client's own declared version for now: this codebase speaks
+ * exactly one protocol version end to end (see this constant's own header above and
+ * proxy.js's GATEWAY_PROTOCOL_VERSION), so nothing else is actually exercised or verified
+ * yet. */
+const SUPPORTED_DOWNSTREAM_PROTOCOL_VERSIONS = new Set([MCP_PROTOCOL_VERSION]);
 
 /* Mirrors mcp-server/src/protocol.js's own _meta key names and validateMeta()
  * contract -- literal duplication rather than a cross-package require, matching this
@@ -168,6 +188,12 @@ function connectStdio(endpoint, options = {}) {
     stdio: ["pipe", "pipe", options.inheritStderr ? "inherit" : "ignore"],
     env: buildStdioChildEnv(options.secretEnvNames),
   });
+  /* Codex PR #29 review round 8 "bound termination of stdio downstream children":
+   * overridable the same way every other per-connection option here is (a caller-supplied
+   * options field, not a bare module constant) so a test can exercise the SIGTERM ->
+   * SIGKILL escalation on a short, fast deadline instead of waiting out the real
+   * production default -- see close()'s own use of this below. */
+  const terminateTimeoutMs = options.terminateTimeoutMs || STDIO_CHILD_TERMINATE_TIMEOUT_MS;
 
   const pending = new Map();
   let nextId = 1;
@@ -404,7 +430,28 @@ function connectStdio(endpoint, options = {}) {
     closed = true;
     if (!closeError) closeError = fail("downstream connection is closed", "GATEWAY_DOWNSTREAM_DISCONNECTED");
     try { child.stdin.end(); } catch (error) { /* best effort */ }
-    try { child.kill(); } catch (error) { /* best effort */ }
+    try { child.kill(); } catch (error) { /* best effort: SIGTERM */ }
+    /* Codex PR #29 review round 8 "bound termination of stdio downstream children": this
+     * used to send SIGTERM once above and return synchronously without ever confirming the
+     * child actually exited. A configured stdio downstream that traps or ignores SIGTERM
+     * would then keep running (and keep its pipes open) indefinitely -- on a later startup
+     * failure, gateway.js's own cleanup only sets process.exitCode, so a still-open child
+     * can keep the whole gateway process alive well past that point. Wait (bounded by
+     * STDIO_CHILD_TERMINATE_TIMEOUT_MS) for the child's own "close" event (closedPromise,
+     * set up above); escalate to SIGKILL -- which a process cannot trap or ignore -- if it
+     * hasn't exited by the deadline. Returns a promise so a caller (gateway.js's shutdown
+     * and startup-failure cleanup) can actually await termination instead of treating it as
+     * fire-and-forget. */
+    return Promise.race([
+      closedPromise,
+      new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          try { child.kill("SIGKILL"); } catch (error) { /* best effort */ }
+          resolve();
+        }, terminateTimeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]).then(() => undefined);
   }
 
   return {
@@ -790,6 +837,25 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
             "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE"
           );
         }
+        /* Codex PR #29 review round 8 "reject unsupported downstream protocol selections":
+         * the shape check above only proves protocolVersion is A non-empty string -- not
+         * that it names a version this client is actually verified compatible with. This
+         * client declares (in the initialize call just above) that it implements exactly
+         * MCP_PROTOCOL_VERSION; a downstream selecting a DIFFERENT version previously let
+         * startup proceed straight to "notifications/initialized" and "tools/list" using
+         * this gateway's hard-coded protocol semantics against a negotiation the downstream
+         * never actually agreed to. Distinct error code from the shape check above: this
+         * result is well-formed, just naming a version outside SUPPORTED_DOWNSTREAM_
+         * PROTOCOL_VERSIONS, which is a different failure than a malformed/missing field. */
+        if (!SUPPORTED_DOWNSTREAM_PROTOCOL_VERSIONS.has(initResult.protocolVersion)) {
+          throw fail(
+            `downstream server "${serverConfig.name}" selected protocol version ` +
+              `"${initResult.protocolVersion}", which this gateway does not support (supported: ` +
+              `${Array.from(SUPPORTED_DOWNSTREAM_PROTOCOL_VERSIONS).join(", ")}). Refusing to proceed with ` +
+              "an incompatible protocol negotiation.",
+            "GATEWAY_DOWNSTREAM_UNSUPPORTED_PROTOCOL_VERSION"
+          );
+        }
         serverInfos[serverConfig.name] = initResult.serverInfo;
         /* Codex PR #29 review round 5 "await HTTP initialized delivery before listing
          * tools": notify() now returns a Promise that resolves once this notification
@@ -900,8 +966,15 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
           toolOwners.set(tool.name, serverConfig.name);
         }
       } catch (error) {
-        if (conn) { try { conn.close(); } catch (closeError) { /* best effort */ } }
-        if (error.code === "GATEWAY_TOOL_NAME_COLLISION" || error.code === "GATEWAY_DOWNSTREAM_PAGINATION_LOOP" || error.code === "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE") throw error;
+        if (conn) { try { await conn.close(); } catch (closeError) { /* best effort */ } }
+        if (
+          error.code === "GATEWAY_TOOL_NAME_COLLISION" ||
+          error.code === "GATEWAY_DOWNSTREAM_PAGINATION_LOOP" ||
+          error.code === "GATEWAY_DOWNSTREAM_MALFORMED_RESPONSE" ||
+          error.code === "GATEWAY_DOWNSTREAM_UNSUPPORTED_PROTOCOL_VERSION"
+        ) {
+          throw error;
+        }
         throw fail(
           `Refusing to start: downstream server "${serverConfig.name}" (${serverConfig.transport} ${serverConfig.endpoint}) ` +
             `is unreachable or failed its handshake: ${error.message}`,
@@ -912,7 +985,7 @@ async function connectAllDownstreams(downstreamServers, options = {}) {
     }
   } catch (error) {
     for (const conn of connections.values()) {
-      try { conn.close(); } catch (closeError) { /* best effort */ }
+      try { await conn.close(); } catch (closeError) { /* best effort */ }
     }
     throw error;
   }
@@ -925,6 +998,8 @@ module.exports = {
   connectDownstream,
   connectAllDownstreams,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  STDIO_CHILD_TERMINATE_TIMEOUT_MS,
+  SUPPORTED_DOWNSTREAM_PROTOCOL_VERSIONS,
   MAX_HTTP_RESPONSE_BYTES,
   MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES,
   nextResidualLineBytes,

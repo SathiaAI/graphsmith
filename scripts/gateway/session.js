@@ -157,17 +157,89 @@ function recordCallResult(session, jsonRpcId, result) {
   return true;
 }
 
+/* CodeRabbit/Codex PR #29 review round 8 "keep unmatched downstream IDs out of agent
+ * correlation": a fixed, non-speculative cap on session.anomalies, matching the same
+ * discipline as MAX_PENDING_CALLS_PER_SESSION/MAX_COMPLETED_CALLS_PER_SESSION (proxy.js).
+ * Without one, a misbehaving or compromised downstream emitting a stream of responses
+ * with unknown ids could grow this array (and the eventual sealed bundle) without bound,
+ * independently of both call-history caps -- neither of which this ever went through.
+ *
+ * Cluster I (frontier-panel review, 2026-09-14, 5/5 unanimous): Option C's own
+ * recordAnomaly (below) originally bypassed this cap entirely on the theory that an
+ * internally-detected event (an ambiguous-retry-blocked attestation) is trusted where an
+ * externally-supplied one is not. The panel's unanimous view: internal detection doesn't
+ * make the FREQUENCY trusted -- an agent that can repeatedly trigger the internal
+ * condition (e.g. by retrying ambiguously) can still drive unbounded growth through an
+ * uncapped path, reopening the exact resource-exhaustion class this cap was added to
+ * close. Both anomaly-recording entry points below now share one capped, internal
+ * implementation so there is a single bound on session.anomalies regardless of which
+ * one records the event. */
+const MAX_ANOMALIES_PER_SESSION = 1000;
+
+/** Shared internal implementation for every anomaly-recording entry point in this file.
+ * Appends `anomaly` (stamped with ts unless the caller already supplied one) once
+ * session.anomalies is below MAX_ANOMALIES_PER_SESSION; once the cap is reached, further
+ * anomalies are dropped rather than grow session.anomalies without bound, but the cap
+ * being hit is itself recorded once (a single terminal marker entry) so it leaves a
+ * trace rather than silently truncating. Returns true if the anomaly was recorded
+ * (or the cap-reached marker was just appended), false if it was dropped. Not exported --
+ * recordAnomaly and recordUnmatchedResponseAnomaly are the only external entry points,
+ * so no existing call site anywhere in this codebase needs to change. */
+function pushCappedAnomaly(session, anomaly) {
+  if (session.finalized) throw fail("Cannot record into a finalized session", "SESSION_FINALIZED");
+  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) return false;
+  const entry = { ts: Date.now(), ...anomaly };
+  session.anomalies.push(entry);
+  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) {
+    // Reuses entry.ts (an explicit historical ts if the caller supplied one, e.g.
+    // recordUnmatchedResponseAnomaly's ts param) rather than a fresh Date.now(), matching
+    // recordUnmatchedResponseAnomaly's original pre-merge behavior exactly.
+    session.anomalies.push({
+      kind: "ANOMALY_CAP_REACHED",
+      detail: `This session reached the ${MAX_ANOMALIES_PER_SESSION}-anomaly cap -- further anomalies are dropped, not recorded.`,
+      ts: entry.ts,
+    });
+  }
+  return true;
+}
+
 /** Records a protocol-level irregularity that is not itself a call outcome -- generic
  * and additive, mirroring recordCallResult's own UNMATCHED_RESPONSE anomaly shape so
  * sealBoundaryBundle's existing anomaly handling needs no changes. Added for Option C
  * (Codex PR #29 Finding 2, external-panel-reviewed design -- see
  * option-c-hardened-design.md): records an ambiguous-retry-blocked event so the sealed
  * bundle attests that a duplicate dispatch was prevented, not just that one happened to
- * not occur. This is the one addition Option C makes to this file; every other function
- * here is unchanged. */
+ * not occur. Routed through the shared, capped pushCappedAnomaly (Cluster I,
+ * frontier-panel review 2026-09-14) rather than appending directly -- see that helper's
+ * comment for why an internally-detected event still needs the same cap as an
+ * externally-supplied one. */
 function recordAnomaly(session, anomaly) {
-  if (session.finalized) throw fail("Cannot record into a finalized session", "SESSION_FINALIZED");
-  session.anomalies.push({ ts: Date.now(), ...anomaly });
+  return pushCappedAnomaly(session, anomaly);
+}
+
+/** Records a downstream response that could not be correlated to any pending call,
+ * WITHOUT going through recordCallResult's agent-facing pendingCalls lookup (CodeRabbit
+ * PR #29 review round 8 "record unmatched downstream responses without agent-call
+ * correlation" / Codex PR #29 review round 8 "keep unmatched downstream IDs out of agent
+ * correlation"). The id on an unmatched DOWNSTREAM response is the downstream leg's own
+ * internal id (assigned by scripts/gateway/downstream.js), not an agent-facing JSON-RPC
+ * id -- recordCallResult's pendingCalls Map is keyed by the latter. Feeding a
+ * downstream-internal id into recordCallResult risked colliding with an unrelated LIVE
+ * agent call that happens to share the same id value: recordCallResult would delete that
+ * live pending call and record this stale/foreign response as its result, corrupting the
+ * session trace and losing the UNMATCHED_RESPONSE anomaly entirely. This function only
+ * ever appends the anomaly -- it never touches pendingCalls.
+ *
+ * Capped at MAX_ANOMALIES_PER_SESSION via the shared pushCappedAnomaly helper (Codex
+ * PR #29 review round 8 "cap unmatched-response anomalies per session", generalized by
+ * Cluster I, frontier-panel review 2026-09-14). */
+function recordUnmatchedResponseAnomaly(session, jsonRpcId, detail, ts) {
+  return pushCappedAnomaly(session, {
+    kind: "UNMATCHED_RESPONSE",
+    jsonRpcId,
+    detail: detail || "response arrived for a JSON-RPC id with no matching pending call",
+    ts: ts !== undefined ? ts : Date.now(),
+  });
 }
 
 /** Called when the downstream side of a connection disconnects (or the whole session is
@@ -302,6 +374,8 @@ module.exports = {
   recordCallStart,
   recordCallResult,
   recordAnomaly,
+  recordUnmatchedResponseAnomaly,
+  MAX_ANOMALIES_PER_SESSION,
   markPendingAsDisconnected,
   toSealableSession,
   finalizeSession,

@@ -44,6 +44,14 @@ async function checkAsync(name, fn) {
   }
 }
 
+/* Codex PR #29 review round 8 "wait for notifications/initialized before admitting
+ * tools": GatewayProxy now only admits tools/list and tools/call after this
+ * notification has actually been received, not merely after "initialize" completes --
+ * every existing test below that exercises tools/list or tools/call must send it too. */
+async function sendInitializedNotification(proxy, connectionId) {
+  await proxy.handleMessage(connectionId, { jsonrpc: "2.0", method: "notifications/initialized" });
+}
+
 function freshDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `gs-gateway-proxy-${prefix}-`));
 }
@@ -110,6 +118,7 @@ async function multipleDownstreamAttribution() {
 
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   const respA = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "toolB", arguments: {} } });
   check("call-to-toolB-routed-to-server-B-not-A", respA.result.from === "B", JSON.stringify(respA));
@@ -122,6 +131,7 @@ async function unknownToolRejected() {
   const proxy = makeProxy(dir, new Map([["A", conn]]), [], new Map());
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "nonexistent", arguments: {} } });
   check("unknown-tool-returns-jsonrpc-error", resp.error && /Unknown tool/.test(resp.error.message), JSON.stringify(resp));
   await proxy.closeConnection("conn-1", "test cleanup");
@@ -142,6 +152,8 @@ async function concurrentAgentsIndependentSessions() {
    * in this test). */
   await proxy.handleMessage("agent-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: { clientInfo: { name: "agent-one", version: "1" } } });
   await proxy.handleMessage("agent-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: { clientInfo: { name: "agent-two", version: "1" } } });
+  await sendInitializedNotification(proxy, "agent-1");
+  await sendInitializedNotification(proxy, "agent-2");
   await proxy.handleMessage("agent-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { who: "one" } } });
   await proxy.handleMessage("agent-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { who: "two" } } });
 
@@ -171,6 +183,7 @@ async function downstreamDisconnectMarksErrorNotCrash() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const callPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "hangs", arguments: {} } });
   // Simulate the downstream dying while the call is in flight.
   rejectCall(Object.assign(new Error("downstream process exited"), { code: "GATEWAY_DOWNSTREAM_DISCONNECTED" }));
@@ -190,6 +203,7 @@ async function malformedDownstreamResponseFailsClosedPerCall() {
   const proxy = makeProxy(dir, new Map([["bad-srv", conn], ["good-srv", goodConn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const badResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "bad", arguments: {} } });
   check("malformed-response-fails-closed-as-jsonrpc-error", badResp.error !== undefined, JSON.stringify(badResp));
   const goodResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "good", arguments: {} } });
@@ -206,6 +220,7 @@ async function connectionCloseWithPendingCallsMarksDisconnected() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "neverresponds", arguments: {} } }); // fire and forget, never resolves
   const entry = await proxy.closeConnection("conn-1", "agent hung up mid-call");
   check("closing-connection-with-pending-call-still-produces-a-chain-entry", entry !== null, "no entry appended");
@@ -239,6 +254,7 @@ async function downstreamDisconnectEmitsCompletionLog() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "hangs", arguments: {} } }); // fire and forget, never resolves
   proxy.handleDownstreamDisconnect("srv");
   const s = proxy.sessions.get("conn-1");
@@ -268,6 +284,7 @@ async function completedCallHistoryCapped() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const s = proxy.sessions.get("conn-1");
   s.calls.length = MAX_COMPLETED_CALLS_PER_SESSION; // cheap stand-in for MAX_COMPLETED_CALLS_PER_SESSION genuinely-completed calls
   const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tool", arguments: {} } });
@@ -306,6 +323,7 @@ async function toolLevelErrorRecordedButNotProtocolError() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "flaky", arguments: {} } });
   check("tool-level-isError-still-returns-a-normal-result-not-a-protocol-error", resp.result && resp.result.isError === true && resp.error === undefined, JSON.stringify(resp));
   const s = proxy.sessions.get("conn-1");
@@ -330,6 +348,7 @@ async function preservesDownstreamJsonRpcErrorEnvelope() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "picky", arguments: {} } });
   check(
     "downstream-rpc-error-code-and-data-preserved-not-flattened-to--32000",
@@ -357,11 +376,47 @@ async function initializationLifecycleEnforced() {
   const initResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 3, method: "initialize", params: {} });
   check("first-initialize-succeeds", initResp.result !== undefined, JSON.stringify(initResp));
 
+  /* Codex PR #29 review round 8 "wait for notifications/initialized before admitting
+   * tools": the "initialize" response alone must NOT be enough to unlock tools/list or
+   * tools/call -- a conforming client's own subsequent "notifications/initialized" is
+   * required first, matching the same rejection shape as a pre-initialize call. */
+  const preNotifCall = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "echo", arguments: {} } });
+  check("tools-call-after-initialize-but-before-notifications-initialized-rejected", preNotifCall.error !== undefined, JSON.stringify(preNotifCall));
+  const preNotifList = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 7, method: "tools/list", params: {} });
+  check("tools-list-after-initialize-but-before-notifications-initialized-rejected", preNotifList.error !== undefined, JSON.stringify(preNotifList));
+
+  await sendInitializedNotification(proxy, "conn-1");
+
   const postInitCall = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "echo", arguments: {} } });
-  check("tools-call-after-initialize-succeeds", postInitCall.result && postInitCall.result.ok === true, JSON.stringify(postInitCall));
+  check("tools-call-after-notifications-initialized-succeeds", postInitCall.result && postInitCall.result.ok === true, JSON.stringify(postInitCall));
 
   const repeatInit = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 5, method: "initialize", params: {} });
   check("repeated-initialize-rejected", repeatInit.error !== undefined, JSON.stringify(repeatInit));
+
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #29 review round 8 "wait for notifications/initialized before admitting
+ * tools": an initialize sent AS A NOTIFICATION (no "id") must not unlock tools either --
+ * the client never received the selected protocol/capabilities in that case, so admitting
+ * tools afterward would let it invoke a contract it was never shown. */
+async function noIdInitializeDoesNotUnlockToolsWithoutNotification() {
+  const dir = freshDir("init-notify-noid");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+
+  const initResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", method: "initialize", params: {} });
+  check("id-less-initialize-notification-produces-no-response", initResp === null, JSON.stringify(initResp));
+
+  const callBeforeNotification = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
+  check("tools-call-after-id-less-initialize-but-before-notifications-initialized-rejected", callBeforeNotification.error !== undefined, JSON.stringify(callBeforeNotification));
+
+  await sendInitializedNotification(proxy, "conn-1");
+  const callAfterNotification = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
+  check("tools-call-after-notifications-initialized-following-id-less-initialize-succeeds", callAfterNotification.result && callAfterNotification.result.ok === true, JSON.stringify(callAfterNotification));
 
   await proxy.closeConnection("conn-1", "test cleanup");
 }
@@ -379,6 +434,7 @@ async function structuredLogEmittedPerCompletedCall() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
   const callLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed");
   check(
@@ -413,6 +469,7 @@ async function toolsListForwardsFullDescriptor() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const listResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
   const tool = listResp.result && listResp.result.tools && listResp.result.tools[0];
   check(
@@ -444,6 +501,7 @@ async function nullJsonRpcIdDoesNotCrash() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: null, method: "tools/call", params: { name: "echo", arguments: {} } });
   check(
     "null-jsonrpc-id-tools-call-does-not-throw-and-echoes-null-id",
@@ -1219,12 +1277,14 @@ async function persistenceFailureQuarantinesSealedBundle() {
 
   proxy.openConnection("conn-1", { sessionId: forcedSharedSessionId });
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
   const entry1 = await proxy.closeConnection("conn-1", "test cleanup");
   check("quarantine-setup-first-append-succeeds", Boolean(entry1 && typeof entry1.bundle_id === "string"), JSON.stringify(entry1));
 
   proxy.openConnection("conn-2", { sessionId: forcedSharedSessionId });
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await sendInitializedNotification(proxy, "conn-2");
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
   const entry2 = await proxy.closeConnection("conn-2", "test cleanup");
   check("persistence-failure-returns-null", entry2 === null, JSON.stringify(entry2));
@@ -1266,6 +1326,7 @@ async function writerClaimRevalidatedImmediatelyBeforeAppend() {
 
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "x", version: "1" } } });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } });
   // Simulate the claim being lost/stolen by a replacement writer AFTER this session
   // opened (and even after it ran its call) but before it happens to finalize --
@@ -1320,6 +1381,7 @@ async function main() {
   await toolLevelErrorRecordedButNotProtocolError();
   await preservesDownstreamJsonRpcErrorEnvelope();
   await initializationLifecycleEnforced();
+  await noIdInitializeDoesNotUnlockToolsWithoutNotification();
   await structuredLogEmittedPerCompletedCall();
   await toolsListForwardsFullDescriptor();
   await nullJsonRpcIdDoesNotCrash();
