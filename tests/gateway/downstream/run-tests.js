@@ -557,7 +557,7 @@ async function samplingCapabilityAdvertisedOnlyWhenSupported() {
     rl.on("line", (line) => {
       let msg; try { msg = JSON.parse(line); } catch (e) { return; }
       if (msg.method === "initialize") {
-        fs.writeFileSync(${JSON.stringify("__CAPTURE_PATH__")}, JSON.stringify(msg.params));
+        fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(msg.params));
         send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "cap", version: "1.0" } } });
         return;
       }
@@ -604,7 +604,7 @@ async function onRequestReceivesOwnServerName() {
       rl.on("line", (line) => {
         let msg; try { msg = JSON.parse(line); } catch (e) { return; }
         if (typeof msg.method !== "string" && msg.id === "upstream-1") { return; } // reply to our own request, ignored here
-        if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: ${JSON.stringify("__NAME__")}, version: "1.0" } } }); return; }
+        if (msg.method === "initialize") { send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: ${JSON.stringify(name)}, version: "1.0" } } }); return; }
         if (msg.method === "tools/list") {
           send({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
           // Immediately after the handshake, fire our own unsolicited request upstream.
