@@ -525,6 +525,7 @@ async function idempotencyKeyPropagatedToRealToolCallOnly() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
   const expectedKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
   check(
@@ -544,6 +545,7 @@ async function inFlightRetryBlockedAsAmbiguousRetry() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   // Deliberately not awaited: an async function body runs synchronously up to its first
   // `await` (here, `conn.call(...)`), so by the time control returns to this line the
   // intent has already been durably created as "dispatched" -- no extra tick needed.
@@ -568,6 +570,7 @@ async function completedCallReplaysCachedResultOnRetryWithMatchingKey() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const params = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "caller-key-1" } };
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params });
@@ -590,6 +593,7 @@ async function retryOfCompletedCallWithoutKeyDispatchesIndependently() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const params = { name: "echo", arguments: { a: 1 } }; // no _meta.idempotencyKey
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params });
@@ -616,6 +620,7 @@ async function retryWithMismatchedKeyDispatchesIndependently() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "key-A" } } });
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "key-B" } } });
   check("retry-with-mismatched-key-redispatched-downstream", conn.calls.length === 2, JSON.stringify(conn.calls));
@@ -630,6 +635,7 @@ async function ambiguousOutcomeBlocksRetryUntilOperatorResolves() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const first = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "flaky", arguments: {} } });
   check("first-attempt-surfaces-the-real-transport-error", Boolean(first && first.error), JSON.stringify(first));
   const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "flaky", arguments: {} } });
@@ -647,6 +653,7 @@ async function closeConnectionFencesInFlightIntentAsAmbiguous() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const inFlight = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } });
   const intentKey = recovery.computeIntentKey("conn-1", "slow", {});
   await proxy.closeConnection("conn-1", "agent hung up mid-call");
@@ -664,6 +671,7 @@ async function walRecordsLifecycleEventsAndIsCleanedUpOnClose() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
   const eventsBeforeClose = recovery.readWalEvents(dir, "conn-1").map((e) => e.type);
   check(
@@ -694,6 +702,7 @@ async function blockedRetryAnomalyIsDurablyRecorded() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
   const walEvents = recovery.readWalEvents(dir, "conn-1");
@@ -720,6 +729,7 @@ async function replayedCallGetsAStructuredCompletionLogToo() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const params = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "structured-log-key" } };
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   logLines.length = 0; // only care about the retry's own logging below
@@ -756,6 +766,7 @@ async function toolQuarantinedWhileACrashedConnectionIsPendingOperatorReview() {
   });
   proxy.openConnection("conn-2"); // a brand-new (e.g. reconnecting) connection
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-2");
   const resp = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "email", arguments: { to: "y" } } });
   check("tool-quarantined-for-different-connection-and-arguments", Boolean(resp && resp.error && resp.error.code === -32082), JSON.stringify(resp));
   check("tool-quarantined-did-not-redispatch-downstream", conn.calls.length === 0, JSON.stringify(conn.calls));
@@ -783,6 +794,7 @@ async function toolQuarantineScopedToTheAffectedToolAndConnectionOnly() {
   });
   proxy.openConnection("conn-2");
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-2");
   const otherTool = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "increment", arguments: {} } });
   check("unrelated-tool-not-quarantined", Boolean(otherTool && otherTool.result && otherTool.result.ok === true), JSON.stringify(otherTool));
   // Simulate the operator resolving the crashed connection (recovery-abandon deletes the
@@ -793,6 +805,7 @@ async function toolQuarantineScopedToTheAffectedToolAndConnectionOnly() {
   const proxy2 = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { pendingOperatorReviewConnections: [] });
   proxy2.openConnection("conn-3");
   await proxy2.handleMessage("conn-3", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy2, "conn-3");
   const afterResolve = await proxy2.handleMessage("conn-3", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "email", arguments: { to: "y" } } });
   check("tool-dispatches-normally-once-crashed-connection-resolved", Boolean(afterResolve && afterResolve.result && afterResolve.result.ok === true), JSON.stringify(afterResolve));
   await proxy.closeConnection("conn-2", "test cleanup");
@@ -815,6 +828,7 @@ async function reconnectWithMatchingIdempotencyKeyReplaysCrossConnectionComplete
 
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   await proxy.closeConnection("conn-1", "conn-1 done");
 
@@ -822,6 +836,7 @@ async function reconnectWithMatchingIdempotencyKeyReplaysCrossConnectionComplete
   // idempotency key for the SAME logical operation.
   proxy.openConnection("conn-2");
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-2");
   const resp = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   check("cross-connection-replay-returns-the-original-result", Boolean(resp && resp.result && resp.result.value === 7), JSON.stringify(resp));
   check("cross-connection-replay-does-not-redispatch-downstream", conn.calls.length === 1, JSON.stringify(conn.calls));
@@ -843,11 +858,13 @@ async function reconnectWithoutMatchingIdempotencyKeyDispatchesIndependently() {
 
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   await proxy.closeConnection("conn-1", "conn-1 done");
 
   proxy.openConnection("conn-2");
   await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-2");
   const resp = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   check("cross-connection-without-key-dispatches-independently", Boolean(resp && resp.result && resp.result.value === 2), JSON.stringify(resp));
   check("cross-connection-without-key-redispatches-downstream", conn.calls.length === 2, JSON.stringify(conn.calls));
@@ -872,6 +889,7 @@ async function retainedSignatureReplayStillBlockedByQuarantine() {
   const proxy1 = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy1.openConnection("conn-1");
   await proxy1.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy1, "conn-1");
   await proxy1.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   await proxy1.closeConnection("conn-1", "conn-1 done");
 
@@ -892,6 +910,7 @@ async function retainedSignatureReplayStillBlockedByQuarantine() {
   });
   proxy2.openConnection("conn-2");
   await proxy2.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy2, "conn-2");
   const resp = await proxy2.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
   check("quarantine-blocks-even-a-matching-retained-signature-replay", Boolean(resp && resp.error && resp.error.code === -32082), JSON.stringify(resp));
   check("quarantine-blocks-retained-signature-replay-without-redispatch", conn.calls.length === 1, JSON.stringify(conn.calls)); // only conn-1's original call
@@ -911,6 +930,7 @@ async function callStartWalAppendFailureRollsBackAndStaysRetryable() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
 
   const realAppendWalEvent = recovery.appendWalEvent;
   let failNextCallStart = true;
@@ -954,6 +974,7 @@ async function postDispatchUpdateSkippedWhenIntentConcurrentlyRemoved() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const callPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { a: 1 } } });
   const intentKey = recovery.computeIntentKey("conn-1", "slow", { a: 1 });
   recovery.deleteIntent(dir, intentKey); // simulate the concurrent removal
@@ -982,6 +1003,7 @@ async function anomalyWalAppendFailureDoesNotEscapeHandleMessage() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { a: 1 } } });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -1017,6 +1039,7 @@ async function notExecutedIntentReturnsDedicatedBlockCode() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const intentKey = recovery.computeIntentKey("conn-1", "email", { to: "x" });
   recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-1", tool: "email", arguments: { to: "x" }, state: "dispatched", dispatched_at: Date.now() });
   recovery.resolveIntentNotExecuted(dir, intentKey);
@@ -1043,6 +1066,7 @@ async function duplicateJsonRpcIdRejectedBeforeIntentCreated() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -1077,6 +1101,7 @@ async function supersedeCallStartWalFailureRestoresPriorCompletedIntent() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const originalParams = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "first-attempt" } };
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: originalParams });
   const intentKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
@@ -1128,6 +1153,7 @@ async function quarantineScanFailureFailsClosed() {
   });
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
 
   const realListAllIntents = recovery.listAllIntents;
   recovery.listAllIntents = () => { throw Object.assign(new Error("simulated corrupt intent"), { code: "GATEWAY_RECOVERY_INTENT_CORRUPT" }); };
@@ -1176,7 +1202,7 @@ async function initializeWalFailureDoesNotEscapeAndRollsBack() {
   }
   check("initialize-wal-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
   check("initialize-wal-failure-returns-a-retryable-jsonrpc-error", Boolean(resp && resp.error && resp.error.code === -32000), JSON.stringify(resp));
-  check("initialize-wal-failure-did-not-flip-agentInitialized", proxy.agentInitialized.get("conn-1") === false, "agentInitialized was already true");
+  check("initialize-wal-failure-did-not-flip-agentInitialized", proxy.agentInitialized.get("conn-1") === "none", `agentInitialized unexpectedly advanced: ${proxy.agentInitialized.get("conn-1")}`);
 
   const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
   check("initialize-retry-succeeds-normally-afterward", Boolean(retry && retry.result && retry.result.protocolVersion), JSON.stringify(retry));
@@ -1231,6 +1257,7 @@ async function callResultWalFailureDoesNotEscapeHandleMessage() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
 
   const realAppendWalEvent = recovery.appendWalEvent;
   recovery.appendWalEvent = (...args) => {
@@ -1364,6 +1391,7 @@ async function writerClaimCheckDefaultsToValidWhenNotProvided() {
   const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners); // no isWriterClaimValid
   proxy.openConnection("conn-1");
   await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
   const entry = await proxy.closeConnection("conn-1", "test cleanup");
   check("append-not-refused-when-no-writer-claim-check-configured", Boolean(entry && typeof entry.bundle_id === "string"), JSON.stringify(entry));
 }

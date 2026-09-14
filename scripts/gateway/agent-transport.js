@@ -155,7 +155,31 @@ function runStdioAgentTransport(ctx) {
         reject(new Error("agent stdio disconnected before responding to a pushed request"));
       }
       pendingPushed.clear();
-      await ctx.proxy.closeConnection(connectionId, "agent stdio disconnected");
+      /* Pre-existing gap surfaced by merging PR #29's gateway.js doStop() fix ("await
+       * close() so a downstream ... is actually confirmed gone" -- Codex PR #29 review
+       * round 8): this listener runs as an async callback on the readline "close" EVENT,
+       * which nothing awaits or catches -- a rejection here (e.g. closeConnection's own
+       * intent-fencing loop hitting an unreadable/corrupt recovery intent, see
+       * proxy.js#closeConnection) becomes an unhandled promise rejection that crashes the
+       * WHOLE gateway process. This is not specific to shutdown: any ordinary stdio
+       * disconnect that races an unreadable intent for this connection hits the same
+       * path. gateway.js's own doStop() loop already guards its own (redundant, in the
+       * shutdown case) call to closeConnection for exactly this failure mode -- mirror
+       * that guard here so a single connection's fs-level intent corruption can never take
+       * the process down. Note this failure throws before closeConnection reaches its own
+       * onSealFailure/recordAnomaly reporting (both live further down, past the
+       * intent-fencing loop that threw), so outside of a shutdown that also runs
+       * gateway.js's own logged loop for this same connectionId, this catch currently has
+       * no logging surface of its own -- silently swallowing is a deliberate "never let
+       * one connection's fs corruption take the whole process down" choice, not a claim
+       * that the failure is reported elsewhere; wiring a log callback through here is a
+       * reasonable follow-up but out of scope for this merge. */
+      try {
+        await ctx.proxy.closeConnection(connectionId, "agent stdio disconnected");
+      } catch (error) {
+        // best effort only -- matches this file's own process.stdout "error" listener
+        // above, which absorbs a comparable stream-level failure for the same reason.
+      }
       resolve();
     });
   });
