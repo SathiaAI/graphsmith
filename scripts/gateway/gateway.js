@@ -30,6 +30,7 @@ const modeGate = require("./mode-gate.js");
 const gatewayConfig = require("./config.js");
 const chain = require("./chain.js");
 const session = require("./session.js");
+const recovery = require("./recovery.js");
 const { GatewayProxy, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION } = require("./proxy.js");
 const downstream = require("./downstream.js");
 const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-transport.js");
@@ -212,13 +213,78 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
       },
     });
   }
+  /* Codex PR #33 review "persist sampling calls in the recovery WAL": this forward is
+   * recorded into the in-memory session (above) but, before this fix, NEVER into
+   * recovery.js's WAL at all -- unlike proxy.js's own tools/call path. A crash after the
+   * agent answers this sampling request but before the connection's own close would
+   * silently omit that model invocation from a recovered/sealed bundle: recoverCrashedSessions
+   * replays this connection's WAL from scratch and previously had no event type for it,
+   * and even hard-coded isModelCall:false on every CALL_START it did replay. This is
+   * deliberately NOT the same gap as the disclosed one in KNOWN-LIMITATIONS.md item 11
+   * ("an agent-initiated sampling/createMessage forwarded through proxy.js's own dispatch
+   * branch is out of scope for the fence") -- that disclosure is scoped to the opposite
+   * direction (an AGENT sending sampling/createMessage INTO this gateway) and says so
+   * explicitly ("rather than a downstream server"); this is a downstream SERVER's own
+   * request being forwarded UP to the agent, a different code path (this function, not
+   * proxy.js's handleMessage) with no matching disclosure. Reuses the same CALL_START/
+   * CALL_RESULT WAL event shape proxy.js's tools/call path uses (same recoverCrashedSessions/
+   * abandonConnection replay code handles both), with isModelCall:true now carried through
+   * so replay can tell the two apart instead of assuming every replayed call is a plain
+   * tool call. No idempotency-intent fencing is added here (Finding 2's fence is
+   * deliberately scoped to tools/call only, unchanged) -- only Finding 1's WAL/attestation
+   * coverage is extended to this path.
+   *
+   * Ordering note (Cluster H, frontier-panel review 2026-09-14, 5/5 unanimous): the
+   * MAX_COMPLETED_CALLS_PER_SESSION refusal above runs FIRST and returns early, so a
+   * refused call is never admitted, recorded in session.calls, or forwarded to the agent
+   * -- it correctly never reaches the WAL either. The admission gate and the durability
+   * write share one boundary, not two: there is no "evicted call still needs a WAL
+   * entry" case on this path, since eviction here means outright refusal, not eviction
+   * of an already-recorded call from memory. The WAL append below remains unconditional
+   * on whatever this admission check decided; it is never itself capped or tombstoned. */
+  let walCallSeq = null;
+  let walAppendFailed = null;
   if (s) {
+    walCallSeq = s.nextCallSeq;
     session.recordCallStart(s, correlationKey, {
       tool: "sampling/createMessage",
       server: recordedServerName,
       arguments: msg.params,
       isModelCall: true,
       ts: startTs,
+    });
+    try {
+      recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, {
+        type: "CALL_START",
+        call_seq: walCallSeq,
+        tool: "sampling/createMessage",
+        server: "sampling",
+        arguments: msg.params,
+        isModelCall: true,
+        ts: proxy.now(),
+      });
+    } catch (walError) {
+      walAppendFailed = walError;
+    }
+  }
+  if (walAppendFailed) {
+    /* Codex PR #33 review "refuse sampling when its CALL_START cannot be saved": unlike
+     * the CALL_RESULT append further below (where the downstream call has ALREADY
+     * completed and there is no "don't forward" option left), this append happens
+     * strictly BEFORE agentPusher.current() is ever invoked -- nothing has been sent to
+     * the agent yet at this point, so forwarding anyway is not "already in flight," it is
+     * choosing to forward work this gateway just proved it cannot durably attest. A crash
+     * before this connection's own close would then replay with no CALL_START for this
+     * call at all, recreating exactly the attestation gap Finding 1 exists to close. Roll
+     * back the in-memory pending-call entry (there is nothing durable to undo) and return
+     * a real JSON-RPC error to the downstream server instead, matching proxy.js's own
+     * "not dispatched -- safe to retry" contract for the identical failure mode. */
+    if (s) s.pendingCalls.delete(correlationKey);
+    log(`Refusing to forward a downstream-initiated sampling/createMessage request to the agent: its CALL_START could not be durably recorded (${walAppendFailed.message}).`);
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: { code: -32000, message: `Failed to durably record this sampling request before forwarding it to the agent: ${walAppendFailed.message}. Not forwarded -- safe to retry.` },
     });
   }
   /* Codex PR #29 review round 3 "log completed downstream-initiated sampling steps":
@@ -253,6 +319,13 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
       const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
       if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
+        if (walCallSeq !== null) {
+          try {
+            recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError: false, ts: proxy.now() });
+          } catch (walError) {
+            log(`Failed to durably record a downstream-initiated sampling call's result: ${walError.message}`);
+          }
+        }
         logCompletion(false);
       }
       return { jsonrpc: "2.0", id: msg.id, result };
@@ -281,6 +354,13 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
        * closeConnection/handleDownstreamDisconnect already recorded, not a second one. */
       if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
+        if (walCallSeq !== null) {
+          try {
+            recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result: { error: error.message }, isError: true, ts: proxy.now() });
+          } catch (walError) {
+            log(`Failed to durably record a downstream-initiated sampling call's error result: ${walError.message}`);
+          }
+        }
         logCompletion(true);
       } else if (!s) {
         log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
@@ -432,6 +512,41 @@ function buildHealthStatus(ctx) {
     }
   }
 
+  /* Option C: surface every intent an operator still needs to act on (or that is merely
+   * "dispatched" and not yet stale enough to worry about) so this is discoverable without
+   * an operator having to already know a crash happened -- the whole point of a durable,
+   * un-auto-expired fence (recovery.js's own header) is defeated if nothing ever points an
+   * operator at it. Read directly from disk rather than cached from the one-time startup
+   * recoverCrashedSessions() pass, since a NEW ambiguous intent can appear at any time
+   * during normal operation (proxy.js's closeConnection fences a "dispatched" intent
+   * ambiguous the moment its owning connection closes mid-call, not just at startup). */
+  let recoveryStatus;
+  try {
+    const allIntents = recovery.listAllIntents(stateDir);
+    /* Codex PR #33 review "report each unresolved intent key in recovery output": a
+     * "dispatched" intent is normal (a live call genuinely in flight on a healthy
+     * connection) on most gateways most of the time, BUT it is also exactly the state a
+     * crashed connection's own unresolved call is left in when startup recovery could not
+     * prove its outcome (recoverCrashedSessions' RECOVERY_AMBIGUOUS_INTENT case) -- the
+     * aggregate `in_flight` count alone cannot tell those two apart, and an operator
+     * cannot act on a plain number. Itemize the same way `pending_operator_review`
+     * already does for `ambiguous` intents, so a stuck one is directly actionable
+     * (recovery-resolve/recovery-abandon both require the exact intent key) without first
+     * having to know a crash happened and go hunting through raw recovery files. */
+    const dispatched = allIntents
+      .filter((i) => i.state === "dispatched")
+      .map((i) => ({ connection_id: i.connection_id, intent_key: i.intent_key, tool: i.tool, dispatched_since: i.dispatched_at || null }));
+    recoveryStatus = {
+      pending_operator_review: allIntents
+        .filter((i) => i.state === "ambiguous")
+        .map((i) => ({ connection_id: i.connection_id, intent_key: i.intent_key, tool: i.tool, ambiguous_since: i.ambiguous_at || null, reason: i.ambiguous_reason || null })),
+      in_flight: dispatched.length,
+      dispatched,
+    };
+  } catch (error) {
+    recoveryStatus = { pending_operator_review: [], in_flight: 0, dispatched: [], error: error.message };
+  }
+
   return {
     schema_version: "1.0",
     writer_claim: ctx.writerClaim.status(),
@@ -444,8 +559,530 @@ function buildHealthStatus(ctx) {
       ? { seq: head.seq, entry_sha256: head.entry_sha256, last_persisted_at: lastPersistedAt }
       : { seq: 0, entry_sha256: null, last_persisted_at: lastPersistedAt, ...(headError ? { error: headError } : {}) },
     session_chain_integrity: sessionChainIntegrity,
+    recovery: recoveryStatus,
     remote_anchor: { implemented: false, reason: "SG-FR-6 not implemented in this build -- see chain.js#pushChainTailToRemoteAnchor" },
   };
+}
+
+/** Shared by recoverCrashedSessions and abandonConnection's own GATEWAY_BUNDLE_ID_
+ * COLLISION handling (Codex PR #33 review "verify bundle collisions before discarding
+ * recovery state", and its follow-up "verify collisions in recovery-abandon before
+ * cleanup"): verified directly against gsa-mcp-shim.js: bundle_id = sha256({init,
+ * grantedTools, n: calls.length}) -- a coarse fingerprint with no timestamp, nonce, or
+ * actual call content. Re-running recovery/abandon for the SAME crash deterministically
+ * reproduces the same bundle_id, which is "already durably appended," not a real
+ * conflict -- but a DIFFERENT crashed session that merely happens to share {init,
+ * grantedTools, call count} would ALSO collide here, and blindly trusting the id match
+ * would then discard that other session's real WAL and completed intents, permanently.
+ * Reads back the bundle actually on disk and compares its real content (the execution
+ * trace, itself a hash of every call's real arguments/result) before treating this as
+ * the expected repeated-attempt case. Returns true only when content is read back and
+ * verified identical; any read/parse failure or mismatch returns false (an unverified
+ * collision must never be treated as "safe to clean up"). */
+function bundleCollisionIsSameContent(stateDir, sealed) {
+  try {
+    const existingRaw = fs.readFileSync(chain.bundlePath(stateDir, sealed.bundle.manifest.bundle_id), "utf8");
+    const existingBundle = JSON.parse(existingRaw);
+    // gsa-produce.js#produceBundle never stores artifact bodies on the bundle itself --
+    // manifest.artifacts.<name>.sha256 is the real per-artifact content fingerprint (the
+    // raw bodies live in bundle.contents, keyed by file path, but the hash already IS the
+    // exact equality check needed here). execution_trace alone (per-call input/result
+    // hashes, tool, granted, error/model flags) is sufficient: it is a hash of every
+    // call's real arguments and result, so two sessions cannot share it without sharing
+    // their actual call content.
+    const existingHash = existingBundle.manifest && existingBundle.manifest.artifacts && existingBundle.manifest.artifacts.execution_trace && existingBundle.manifest.artifacts.execution_trace.sha256;
+    const newHash = sealed.bundle.manifest && sealed.bundle.manifest.artifacts && sealed.bundle.manifest.artifacts.execution_trace && sealed.bundle.manifest.artifacts.execution_trace.sha256;
+    return Boolean(existingHash) && existingHash === newHash;
+  } catch (readError) {
+    return false; // could not verify -- treat as a genuine, unverified conflict
+  }
+}
+
+/** Codex PR #33 review "verify the chain entry before cleaning a colliding WAL": content
+ * verification alone (bundleCollisionIsSameContent above) proves the bundle FILE on disk
+ * (chain.appendSession's own step 1) really is this connection's own durable record -- it
+ * does NOT prove step 2 (the chain.jsonl append) ever happened. If chain.appendSession
+ * crashed after writing the bundle file but before appending chain.jsonl, a recovery pass
+ * that stops at content verification would still delete this connection's WAL/intents as
+ * "already durably sealed," permanently omitting it from the attestation chain even though
+ * it was never actually chain-appended. Shared by recoverCrashedSessions and
+ * abandonConnection (same two callers bundleCollisionIsSameContent already serves) so both
+ * paths get the identical repair, not just content verification. Returns true (safe to
+ * clean up this connection's WAL/intents now -- durably sealed, chain entry confirmed
+ * present, repairing it first if it was merely missing) or false (unverified conflict with
+ * a genuinely different session; caller must not clean up). May throw if content is
+ * verified but the repair write itself fails -- callers must not clean up in that case
+ * either, since the chain still does not durably reference this bundle. */
+function verifyAndRepairBundleCollision(stateDir, sealed, log) {
+  if (!bundleCollisionIsSameContent(stateDir, sealed)) return false;
+  const bundleId = sealed.bundle.manifest.bundle_id;
+  if (!chain.chainHasEntryForBundle(stateDir, bundleId)) {
+    chain.repairMissingChainEntry(stateDir, bundleId);
+    log(
+      `recovery: bundle "${bundleId}" was durably written but never chain-appended (crash between ` +
+        `chain.appendSession's own bundle-write and chain.jsonl-append steps) -- completed the missing ` +
+        `chain.jsonl/HEAD.json append now.`
+    );
+  }
+  return true;
+}
+
+/** Startup crash-recovery pass (Codex PR #29 Finding 1, Option C -- external-panel-
+ * reviewed design, see option-c-hardened-design.md). Runs once, after the writer-claim
+ * is acquired (so this process is the sole owner of state_dir) and BEFORE any downstream
+ * connection or agent-facing listener starts, replaying any WAL a prior crashed instance
+ * left behind under recovery.js's `gateway-recovery/active/` directory.
+ *
+ * Replay reconstructs a session using session.js's real, UNMODIFIED recorder functions
+ * (recordInitialize/recordToolsList/recordCallStart/recordCallResult/
+ * markPendingAsDisconnected) -- there is no second, parallel session shape to keep in
+ * sync with the live one. A call with no matching CALL_RESULT event is exactly Finding
+ * 1's "crash after a completed call but before disconnect" gap turned inside out: it was
+ * IN FLIGHT at crash time, so its real intent record (recovery.js's idempotency store,
+ * Finding 2) is consulted for a proven outcome; only a session with every call proven
+ * terminal is auto-sealed. Anything else is left alone and reported -- never guessed. */
+function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
+  const pendingOperatorReview = [];
+  for (const connectionId of recovery.listActiveConnections(stateDir)) {
+    /* Codex PR #33 review "renew ownership during synchronous recovery": this whole
+     * per-connection body below is synchronous fs work (WAL replay, session.finalizeSession,
+     * chain.appendSession) -- with enough or large enough crash-left WALs it can run past
+     * writer-claim.js's own staleAfterMs before ever yielding to the event loop, which is
+     * the only place the heartbeat startHeartbeat() already started can actually fire.
+     * writer-claim.js's own startHeartbeat() doc comment discloses exactly this gap and
+     * prescribes a synchronous renew() call at the boundary of any long synchronous phase
+     * this claim is held across (mirroring state-store.js's own _assertStillOwned fix) --
+     * done here once PER CONNECTION, not once for the whole loop, so many small WALs are
+     * covered the same as one huge one. `writerClaim` is optional (existing direct callers/
+     * tests that construct no real claim keep working, renewal simply skipped) but
+     * startGateway's own real call site below always passes its live claim. A failed renew
+     * means another process may already hold this state_dir -- propagate immediately
+     * (uncaught by this loop's own per-connection try/catch further down) rather than keep
+     * mutating shared chain/WAL state under a claim that might no longer be exclusive. */
+    if (writerClaim) writerClaim.renew();
+    /* CodeRabbit PR #33 review "continue recovery after an unreadable connection state":
+     * readWalEvents/readIntent below can throw (GATEWAY_RECOVERY_WAL_UNREADABLE,
+     * GATEWAY_RECOVERY_INTENT_UNREADABLE, GATEWAY_RECOVERY_INTENT_CORRUPT) on a genuine
+     * fs-level read failure for THIS connection's own state -- a permissions or I/O
+     * problem, not a content/JSON one (which readWalEvents already handles by stopping
+     * at the first bad line, not throwing). Previously unguarded, so one such connection
+     * aborted recovery for every other connection still waiting in this same loop. Wrap
+     * the whole per-connection body so a failure here is isolated to this connection --
+     * flagged for the operator (whose recovery-abandon can now quarantine an unreadable
+     * WAL without needing to re-read it -- see abandonConnection below) and otherwise
+     * left alone, exactly like this function's other own failure branches already do. */
+    try {
+      const events = recovery.readWalEvents(stateDir, connectionId);
+      if (events.length === 0) {
+        // Every line was torn (crash mid-write of the very first event) or the file was
+        // empty -- nothing durable was ever recorded for this connection.
+        recovery.deleteWal(stateDir, connectionId);
+        continue;
+      }
+
+      const startEvent = events.find((e) => e.type === "SESSION_START");
+      // Cluster B: reuse the exact session_id this session's own SESSION_START event
+      // persisted (proxy.js#openConnection) rather than letting session.createSession
+      // mint a fresh one -- replaying the SAME crash-left WAL twice (e.g. this recovery
+      // pass itself crashing before cleanup, see recoverIsIdempotentAcrossACrashDuring
+      // RecoveryItself in tests/gateway/recovery/run-tests.js) must produce the SAME
+      // bundle_id both times. An older WAL written before this field existed has no
+      // session_id on its SESSION_START event; passed through as `null` explicitly
+      // (never generated here) for the same reason -- see session.js#createSession's own
+      // doc comment on the three-way distinction this argument makes.
+      const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
+      const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
+      // Maps this replay's own stable Symbol.for() keys back to the CALL_START event that
+      // produced them, needed only to look up that call's real intent record below.
+      const keyToStartEvent = new Map();
+
+      for (const event of events) {
+        if (event.type === "SESSION_START") {
+          session.recordToolsList(s, event.tools || []);
+        } else if (event.type === "INITIALIZE") {
+          session.recordInitialize(s, { clientInfo: event.clientInfo, serverInfo: event.serverInfo, model: event.model });
+        } else if (event.type === "CALL_START") {
+          // Symbol.for (the global registry), not Symbol(): this replay's own CALL_START
+          // and CALL_RESULT events for the same call_seq must resolve to the SAME symbol
+          // reference for session.js's Map-keyed pendingCalls to correlate them -- a live
+          // correlationKey may have been a non-reproducible Symbol() or a real JSON-RPC id,
+          // but replay only needs internal consistency within itself, not to match what
+          // the crashed process originally used.
+          const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+          keyToStartEvent.set(key, event);
+          session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
+        } else if (event.type === "CALL_RESULT") {
+          const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+          if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts });
+        } else if (event.type === "ANOMALY") {
+          // Codex PR #33 review "append blocked-retry anomalies to the WAL": replays a
+          // dispatch-guard block (GATEWAY_AMBIGUOUS_RETRY/GATEWAY_DOWNSTREAM_OUTCOME_UNKNOWN)
+          // that was recorded in-memory only via session.recordAnomaly in the live proxy --
+          // without this, a crash before the connection's own close would silently drop
+          // that attestation from the recovered/sealed bundle.
+          session.recordAnomaly(s, { kind: event.kind, tool: event.tool, intent_key: event.intent_key, detail: event.detail, ts: event.ts });
+        }
+        // CLOSING is informational only for replay -- if present, the crash happened
+        // between "closeConnection began" and "chain.appendSession completed", which the
+        // GATEWAY_BUNDLE_ID_COLLISION handling below already covers.
+      }
+
+      // Any call still pending after replaying every event was in flight at crash time.
+      // Consult its real intent record for a proven outcome before deciding anything.
+      let needsOperator = false;
+      // Codex PR #33 review "include the intent key in the advertised resolution
+      // command": collected as we go so the RECOVERY_AMBIGUOUS_INTENT log below can name
+      // every actual unresolved key, rather than the literal "<key>" placeholder it used
+      // to print regardless of how many calls (or which ones) were actually unresolved --
+      // recovery-resolve requires the exact key, which an operator otherwise had to
+      // discover by hand-parsing raw recovery files.
+      const unresolvedIntentKeys = [];
+      for (const [key] of Array.from(s.pendingCalls.entries())) {
+        const startedFrom = keyToStartEvent.get(key);
+        if (!startedFrom) continue; // defensive; should not happen
+        if (startedFrom.isModelCall) {
+          /* A downstream-initiated sampling/createMessage forward (see
+           * forwardDownstreamRequestToAgent's own WAL comment above) has no
+           * idempotency-intent fence at all -- Finding 2's fence is deliberately scoped to
+           * real tools/call dispatch only, so there is no intent record to consult here and
+           * never will be. Unlike a fenced tool call, there is also no external side effect
+           * this gateway must avoid duplicating: the only real risk of an unresolved
+           * sampling call is an incomplete attestation of what the agent was asked, which
+           * this WAL replay has already captured (the CALL_START event, recorded above).
+           * Record it as a real, disconnected/unproven result and move on rather than
+           * blocking this whole connection's auto-seal on operator review for a call that
+           * has nothing an operator could actually resolve (there is no --result-file or
+           * --confirmed answer that applies to "did the agent's model happen to finish
+           * replying before the crash"). */
+          session.recordCallResult(s, key, { result: { error: "gateway restarted after a crash while this downstream-initiated sampling/createMessage forward was still awaiting the agent's response" }, isError: true, ts: Date.now() });
+          continue;
+        }
+        const intentKey = recovery.computeIntentKey(connectionId, startedFrom.tool, startedFrom.arguments);
+        const intent = recovery.readIntent(stateDir, intentKey);
+        /* Cluster A (generation-aware crash recovery): the intent file's own `generation`
+         * field is overwritten IN PLACE on every supersede (proxy.js's dispatch guard),
+         * so by the time recovery runs it always reflects the MOST RECENT generation --
+         * which is not necessarily the generation THIS specific crashed CALL_START event
+         * belongs to. Concretely: generation 1 completes, but its own CALL_RESULT WAL
+         * write fails (best-effort, logged, not fatal -- see proxy.js's own comment on
+         * that append); the SAME connection later dispatches generation 2 of the exact
+         * same (tool, arguments), which also completes and DOES get its CALL_RESULT
+         * durably written. A later crash then leaves generation 1's CALL_START forever
+         * unresolved in the WAL while the intent file now sits at generation 2. Without
+         * this check, the loop below would bind generation 2's cached_result (a
+         * DIFFERENT call's real outcome) to generation 1's own pending call -- a false
+         * attestation. Comparing against the generation THIS CALL_START event itself
+         * recorded (defaulting to 1 for a WAL line written before this field existed)
+         * ensures a proven outcome is only ever applied to the generation it actually
+         * belongs to; any other generation's crashed call is left for operator review,
+         * exactly like a call with no intent record at all. */
+        const expectedGeneration = typeof startedFrom.generation === "number" ? startedFrom.generation : 1;
+        const intentGeneration = intent && typeof intent.generation === "number" ? intent.generation : 1;
+        if (intent && intent.state === "completed" && intentGeneration === expectedGeneration) {
+          session.recordCallResult(s, key, { result: intent.cached_result, isError: false, ts: Date.now() });
+        } else if (intent && intent.state === "not_executed" && intentGeneration === expectedGeneration) {
+          /* Codex PR #33 review "persist a terminal not-executed resolution": an operator
+           * already answered "did it execute?" (no) via recovery-resolve while this
+           * connection was crashed -- record that as a real (failed) terminal result now,
+           * rather than re-flagging the same connection for operator review forever
+           * because no "completed" intent will ever appear for a call that never ran. */
+          session.recordCallResult(s, key, { result: { error: "operator confirmed via recovery-resolve that this call did not execute downstream" }, isError: true, ts: Date.now() });
+        } else {
+          needsOperator = true;
+          unresolvedIntentKeys.push(intentKey);
+        }
+      }
+
+      if (needsOperator) {
+        pendingOperatorReview.push(connectionId);
+        const resolveCommands = unresolvedIntentKeys
+          .map((key) => `"node scripts/gateway/gateway.js recovery-resolve --connection ${connectionId} --intent ${key} --confirmed executed|not-executed"`)
+          .join(", ");
+        log(
+          `RECOVERY_AMBIGUOUS_INTENT: connection "${connectionId}" crashed with ${unresolvedIntentKeys.length} call(s) in flight whose outcome is not proven (intent key(s): ${unresolvedIntentKeys.join(", ")}) -- ` +
+            `leaving its WAL and intent record(s) in place rather than guessing. Resolve each with ${resolveCommands}, ` +
+            `or "node scripts/gateway/gateway.js recovery-abandon --connection ${connectionId}" to seal only the calls that did reach a proven outcome.`
+        );
+        continue; // do not touch this connection's WAL/intents any further
+      }
+
+      if (s.pendingCalls.size > 0) {
+        session.markPendingAsDisconnected(s, "gateway restarted after a crash; connection never received a clean close", () => Date.now());
+      }
+      let sealed;
+      try {
+        sealed = session.finalizeSession(s, keys);
+      } catch (error) {
+        log(`RECOVERY SEAL FAILURE for connection "${connectionId}": ${error.message} -- leaving its WAL in place for investigation.`);
+        pendingOperatorReview.push(connectionId);
+        continue;
+      }
+      try {
+        chain.appendSession(stateDir, sealed);
+      } catch (error) {
+        if (error.code === "GATEWAY_BUNDLE_ID_COLLISION") {
+          let verified;
+          try {
+            verified = verifyAndRepairBundleCollision(stateDir, sealed, log);
+          } catch (repairError) {
+            log(`RECOVERY CHAIN-REPAIR FAILURE for connection "${connectionId}": ${repairError.message} -- leaving its WAL in place for investigation.`);
+            pendingOperatorReview.push(connectionId);
+            continue;
+          }
+          if (verified) {
+            log(`recovery: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
+          } else {
+            log(
+              `RECOVERY BUNDLE COLLISION for connection "${connectionId}": bundle_id "${sealed.bundle.manifest.bundle_id}" ` +
+                `already exists on disk but its recorded content does not match this connection's recovered session -- ` +
+                `a genuine conflict between two different sessions, not a repeated recovery attempt of the same one. ` +
+                `Leaving this connection's WAL and intents in place for investigation rather than discarding them.`
+            );
+            pendingOperatorReview.push(connectionId);
+            continue;
+          }
+        } else {
+          log(`RECOVERY CHAIN-APPEND FAILURE for connection "${connectionId}": ${error.message} -- leaving its WAL in place for investigation.`);
+          pendingOperatorReview.push(connectionId);
+          continue;
+        }
+      }
+      recovery.deleteWal(stateDir, connectionId);
+      for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) {
+        if (intent.state === "completed" || intent.state === "not_executed") recovery.deleteIntent(stateDir, intent.intent_key);
+      }
+      log(`recovery: connection "${connectionId}" recovered and sealed from a crash-left WAL (${s.calls.length} call(s)).`);
+    } catch (error) {
+      log(`RECOVERY FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- leaving its state in place for investigation. Use "recovery-abandon --connection ${connectionId}" to quarantine it without needing to re-read that state.`);
+      pendingOperatorReview.push(connectionId);
+    }
+  }
+  return { pendingOperatorReview };
+}
+
+/** Operator override for a connection stuck in `pendingOperatorReview` (recovery-abandon
+ * CLI, see main() below): unlike recoverCrashedSessions' own auto-seal path, this treats
+ * EVERY call still pending after WAL replay as terminal regardless of whether its intent
+ * ever reached a proven "completed" outcome -- an explicit "I am giving up on finding out
+ * whether this executed, seal what I have" decision, not a guess made on the operator's
+ * behalf. Any intent still `dispatched`/`ambiguous` for this connection is deleted
+ * afterward: the durable fence Finding 2 provides is deliberately given up on for THIS
+ * specific connection, by explicit operator action, not silently -- if the downstream
+ * operation actually executed, a future identical call is no longer fenced against
+ * re-running it. This tradeoff (and that it is scoped per-connection, never global) is
+ * documented in KNOWN-LIMITATIONS.md. */
+function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null) {
+  /* Codex PR #33 review "renew ownership during synchronous recovery": same rationale as
+   * recoverCrashedSessions' own per-connection renew() above, applied to this CLI's own
+   * synchronous WAL replay/finalize/chain-append for its one connection -- "sufficiently
+   * large" applies just as well to a single big WAL as to many small ones. */
+  if (writerClaim) writerClaim.renew();
+  /* Codex PR #33 review "continue recovery after an unreadable connection state": this
+   * command is recoverCrashedSessions' own documented remediation path for a connection
+   * it could not process -- including one whose WAL could not even be READ (permissions/
+   * I/O error, not a content problem). Before this, that same unreadable-WAL error would
+   * simply be thrown again here, leaving the operator with no way to actually resolve
+   * it. Quarantine (rename, not delete -- see recovery.quarantineWal's own doc comment)
+   * instead: an operator who explicitly asked to abandon this connection does not need
+   * this command to succeed at reading state it already knows is unreadable, only to stop
+   * this connection from blocking every future startup. */
+  let events;
+  try {
+    events = recovery.readWalEvents(stateDir, connectionId);
+  } catch (error) {
+    const quarantined = recovery.quarantineWal(stateDir, connectionId);
+    for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) recovery.deleteIntent(stateDir, intent.intent_key);
+    log(
+      `recovery-abandon: connection "${connectionId}"'s WAL could not be read (${error.message}) -- ` +
+        (quarantined ? `moved it to "${quarantined}" for manual inspection` : "no WAL file was found to quarantine") +
+        `, and released any of its idempotency fence(s). This connection was NOT sealed into the chain ` +
+        `(there is nothing readable to seal from) -- if it made any real downstream calls, that record is now unrecoverable through this gateway.`
+    );
+    return;
+  }
+  if (events.length === 0) {
+    recovery.deleteWal(stateDir, connectionId);
+    for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) recovery.deleteIntent(stateDir, intent.intent_key);
+    log(`recovery-abandon: connection "${connectionId}" had no WAL to replay -- nothing to seal, cleaned up any leftover intents.`);
+    return;
+  }
+  const startEvent = events.find((e) => e.type === "SESSION_START");
+  // Cluster B: same reuse-not-regenerate rule as recoverCrashedSessions' own replay
+  // above -- see that call site's doc comment and session.js#createSession's.
+  const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
+  const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
+  for (const event of events) {
+    if (event.type === "SESSION_START") {
+      session.recordToolsList(s, event.tools || []);
+    } else if (event.type === "INITIALIZE") {
+      session.recordInitialize(s, { clientInfo: event.clientInfo, serverInfo: event.serverInfo, model: event.model });
+    } else if (event.type === "CALL_START") {
+      const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+      session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
+    } else if (event.type === "CALL_RESULT") {
+      const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+      if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts });
+    } else if (event.type === "ANOMALY") {
+      session.recordAnomaly(s, { kind: event.kind, tool: event.tool, intent_key: event.intent_key, detail: event.detail, ts: event.ts });
+    }
+  }
+  if (s.pendingCalls.size > 0) {
+    session.recordAnomaly(s, { kind: "OPERATOR_ABANDONED_RECOVERY", detail: `operator explicitly abandoned recovery for connection "${connectionId}" with ${s.pendingCalls.size} call(s) of unproven outcome` });
+    session.markPendingAsDisconnected(s, "operator ran recovery-abandon: outcome could not be confirmed and was not waited on further", () => Date.now());
+  }
+  const sealed = session.finalizeSession(s, keys);
+  try {
+    chain.appendSession(stateDir, sealed);
+  } catch (error) {
+    if (error.code !== "GATEWAY_BUNDLE_ID_COLLISION") throw error;
+    /* Codex PR #33 review "verify collisions in recovery-abandon before cleanup": this
+     * used to treat EVERY collision here as the expected repeated-attempt case and fall
+     * straight through to deleting this connection's WAL/intents below -- unlike
+     * recoverCrashedSessions' own already-hardened handling of the identical error code,
+     * which reads back the bundle on disk and verifies its real content first. An
+     * operator running recovery-abandon on a connection that happens to collide with a
+     * genuinely DIFFERENT session's bundle_id would silently discard this connection's
+     * only remaining unrecoverable record. Apply the same content verification here. */
+    let verified;
+    try {
+      verified = verifyAndRepairBundleCollision(stateDir, sealed, log);
+    } catch (repairError) {
+      throw fail(
+        `recovery-abandon: connection "${connectionId}" bundle "${sealed.bundle.manifest.bundle_id}" was content-verified as this connection's own record, but completing its missing chain.jsonl append failed: ${repairError.message}. Refusing to abandon: this connection's WAL/intents are NOT cleaned up (the chain still does not durably reference this bundle) -- investigate and retry.`,
+        "GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED"
+      );
+    }
+    if (!verified) {
+      throw fail(
+        `recovery-abandon: connection "${connectionId}" produced bundle_id "${sealed.bundle.manifest.bundle_id}", which already exists on disk, but its recorded content does NOT match this connection's recovered session -- a genuine conflict with a different session, not a repeated abandon attempt. Refusing to abandon: deleting this connection's WAL/intents now would discard its only remaining, unrecoverable record. Investigate the existing bundle before retrying.`,
+        "GATEWAY_RECOVERY_UNVERIFIED_BUNDLE_COLLISION"
+      );
+    }
+    log(`recovery-abandon: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
+  }
+  recovery.deleteWal(stateDir, connectionId);
+  for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) recovery.deleteIntent(stateDir, intent.intent_key);
+  log(`recovery-abandon: connection "${connectionId}" sealed (${s.calls.length} call(s)) and its idempotency fence(s) released.`);
+}
+
+/** Minimal `--flag value` / `--boolean-flag` parser for the recovery-* CLI subcommands
+ * below. Not a general-purpose arg parser (no short flags, no `=` form) -- these two
+ * subcommands are the only CLI surface this build needs beyond `node gateway.js
+ * [configPath]` itself. */
+function parseFlags(argv) {
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+    }
+  }
+  return flags;
+}
+
+/** `node scripts/gateway/gateway.js recovery-resolve --connection <id> --intent <key>
+ * --confirmed executed|not-executed [--result-file <path>] [--config <path>]`: answers
+ * recoverCrashedSessions' own RECOVERY_AMBIGUOUS_INTENT log line. Does not itself seal the
+ * connection -- only updates the one intent record; restart the gateway (or run
+ * recovery-abandon) to actually finish sealing once every ambiguous intent on a connection
+ * has been resolved this way. */
+function runRecoveryResolveCli(argv, log) {
+  const flags = parseFlags(argv);
+  const configPath = flags.config || path.join(process.cwd(), "gateway-config.json");
+  const config = gatewayConfig.loadConfig(configPath);
+  const connectionId = flags.connection;
+  const intentKey = flags.intent;
+  const confirmed = flags.confirmed;
+  if (!connectionId || !intentKey || !confirmed) {
+    throw fail("recovery-resolve requires --connection <id> --intent <key> --confirmed executed|not-executed", "GATEWAY_RECOVERY_CLI_USAGE");
+  }
+  if (confirmed !== "executed" && confirmed !== "not-executed") {
+    throw fail(`--confirmed must be "executed" or "not-executed", got ${JSON.stringify(confirmed)}.`, "GATEWAY_RECOVERY_CLI_USAGE");
+  }
+  /* Codex PR #33 review "acquire the writer claim before resolving intents": this
+   * mutates the same intent files the live proxy dispatch guard consults and updates
+   * (recovery.js's readIntent/updateIntent/deleteIntent), unlike recovery-abandon (which
+   * already takes the claim below). Without this, the documented operator workflow --
+   * run this command, then restart the gateway -- could instead run WHILE a gateway
+   * still holds the claim: a live dispatch resolving the same intent to "completed"/
+   * "ambiguous" and this command deleting/overwriting it concurrently can each observe
+   * the other's half-applied state (updateIntent throwing GATEWAY_RECOVERY_INTENT_NOT_FOUND
+   * on a competing delete, or a plain last-write-wins clobber of either resolution). */
+  const writerClaim = new WriterClaim(config.state_dir, { hostId: config.host_id });
+  writerClaim.acquire();
+  try {
+    const existing = recovery.readIntent(config.state_dir, intentKey);
+    if (!existing) throw fail(`No such intent "${intentKey}" under this gateway's state_dir.`, "GATEWAY_RECOVERY_INTENT_NOT_FOUND");
+    if (existing.connection_id !== connectionId) {
+      throw fail(`Intent "${intentKey}" belongs to connection "${existing.connection_id}", not "${connectionId}" -- refusing (likely a copy/paste mismatch).`, "GATEWAY_RECOVERY_CLI_MISMATCH");
+    }
+    if (confirmed === "executed") {
+      /* CodeRabbit PR #33 review "require --result-file for --confirmed executed": a
+       * missing --result-file used to silently resolve with cached_result: null, which
+       * recoverCrashedSessions then replays as an ordinary CLEAN SUCCESS (isError:
+       * false) -- the sealed bundle would attest a confident, is_error:false null
+       * result for a call the gateway itself never actually observed completing; the
+       * operator confirmed only that the external effect occurred, not what it
+       * returned. Reject instead of guessing a shape for evidence that doesn't exist. */
+      if (!flags["result-file"]) {
+        /* Codex PR #33 review "stop advising a false not-executed resolution": this
+         * message used to suggest "use --confirmed not-executed instead" as the fallback
+         * when the operator lacks a result file -- but an operator who chose --confirmed
+         * executed in the first place is telling this CLI they KNOW the side effect ran;
+         * following that suggestion would record the opposite of what they know happened,
+         * seal it as a failed/non-executed call, and release the fence so a retry repeats
+         * the side effect. The only truthful options when the exact result is unrecoverable
+         * are to leave the intent unresolved for now, or to explicitly give up the fence
+         * via recovery-abandon -- never to assert non-execution that isn't true. */
+        throw fail(
+          "recovery-resolve --confirmed executed requires --result-file <path>: a null result would be " +
+            "replayed as an unverified clean success in the sealed bundle. If you know this call executed " +
+            "but cannot recover its exact result, do NOT use --confirmed not-executed -- that records the " +
+            "opposite of what you know happened and lets a future retry repeat the side effect. Instead, " +
+            "either supply the real result via --result-file once you can recover it, leave this intent " +
+            "unresolved for now (this connection will keep being flagged for operator review on every " +
+            "restart, harmlessly), or use recovery-abandon to explicitly give up the fence on this connection.",
+          "GATEWAY_RECOVERY_CLI_USAGE"
+        );
+      }
+      const result = JSON.parse(fs.readFileSync(flags["result-file"], "utf8"));
+      recovery.resolveIntentExecuted(config.state_dir, intentKey, result);
+      log(`recovery-resolve: intent "${intentKey}" (connection "${connectionId}") marked EXECUTED. Restart the gateway to finish sealing this connection.`);
+    } else {
+      recovery.resolveIntentNotExecuted(config.state_dir, intentKey);
+      log(`recovery-resolve: intent "${intentKey}" (connection "${connectionId}") marked NOT EXECUTED; fence released. Restart the gateway to finish sealing this connection.`);
+    }
+  } finally {
+    writerClaim.release();
+  }
+}
+
+/** `node scripts/gateway/gateway.js recovery-abandon --connection <id> [--config <path>]`:
+ * the "give up on the fence, seal what we have" override -- see abandonConnection's own
+ * doc comment above for exactly what this does and does not guarantee. Requires the
+ * writer-claim (this mutates the same trusted chain a live gateway instance would), so it
+ * cannot run concurrently with an actual gateway process against the same state_dir. */
+function runRecoveryAbandonCli(argv, log) {
+  const flags = parseFlags(argv);
+  const configPath = flags.config || path.join(process.cwd(), "gateway-config.json");
+  const config = gatewayConfig.loadConfig(configPath);
+  const connectionId = flags.connection;
+  if (!connectionId) throw fail("recovery-abandon requires --connection <id>", "GATEWAY_RECOVERY_CLI_USAGE");
+  const keys = loadSigningKeys(config);
+  const writerClaim = new WriterClaim(config.state_dir, { hostId: config.host_id });
+  writerClaim.acquire();
+  try {
+    abandonConnection(config.state_dir, keys, connectionId, log, writerClaim);
+  } finally {
+    writerClaim.release();
+  }
 }
 
 /* Cluster D: operational exposure for buildHealthStatus(ctx) above. This is a
@@ -552,6 +1189,35 @@ async function startGateway(options) {
   };
   writerClaim.startHeartbeat();
 
+  /* Option C (crash-recovery/idempotency hardening, external-panel-reviewed design --
+   * see option-c-hardened-design.md): replay any WAL left behind by a crashed prior
+   * instance now, while this process holds exclusive writer ownership of state_dir and
+   * BEFORE any new downstream/agent work starts. Recovery must not race a fresh
+   * session's own WAL writes, and no new session should be admitted while a prior
+   * session's calls are still ambiguous. */
+  /* CodeRabbit PR #33 review "release the writer claim when startup recovery fails":
+   * the writer-claim and its heartbeat are already live by this point. Without this,
+   * an exception from recoverCrashedSessions (an unreadable WAL/intent this function's
+   * own per-connection try/catch does not fully absorb, or any other unexpected
+   * failure) would reject startGateway's promise while leaving the claim held -- an
+   * immediate restart would then be refused until the lease goes stale, and any other
+   * live handle to this WriterClaim instance would keep renewing an orphaned claim
+   * indefinitely (writerClaim.release() already stops the heartbeat itself). */
+  let pendingOperatorReview;
+  try {
+    ({ pendingOperatorReview } = recoverCrashedSessions(config.state_dir, keys, log, writerClaim));
+  } catch (error) {
+    writerClaim.release();
+    throw error;
+  }
+  if (pendingOperatorReview.length > 0) {
+    log(
+      `startup recovery: ${pendingOperatorReview.length} connection(s) left pending operator ` +
+        `review (see RECOVERY_AMBIGUOUS_INTENT log lines above) -- resolve via the ` +
+        "recovery-resolve/recovery-abandon CLI before their state is cleaned up."
+    );
+  }
+
   /* Mutable box, not a plain variable: connectAllDownstreams() below runs (and each
    * downstream stdio connection's onRequest closure over it is created) BEFORE the
    * agent transport is started further down, so at closure-creation time there is
@@ -639,6 +1305,10 @@ async function startGateway(options) {
     keys,
     stateDir: config.state_dir,
     log,
+    // Frontier-panel decision (Paul, 2026-09-10, cluster E2): see proxy.js's own
+    // pendingOperatorReviewConnections constructor comment for why a startup snapshot
+    // is sufficient here.
+    pendingOperatorReviewConnections: pendingOperatorReview,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
     onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size, quarantinedTo: error.quarantinedTo || null })),
     // Cluster C: read fresh from disk (WriterClaim#status's own contract) rather than
@@ -760,8 +1430,22 @@ async function startGateway(options) {
       });
     }
     // Finalize any still-open sessions (drained above, or forced closed after the timeout).
+    /* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
+     * closeConnection can throw before reaching its own guarded sealing block (e.g.
+     * recovery.listIntentsForConnection hitting a corrupt/unreadable intent FILE for this
+     * connection -- a genuine fs-level problem, not the kind of failure this codebase
+     * treats as recoverable). Previously unguarded here, so one such connection's failure
+     * escaped this loop entirely, skipping every remaining connection's own close, every
+     * downstream conn.close() below, and writerClaim.release() -- leaking a stale claim
+     * that blocks the next restart. Isolate per-connection failures (mirrors
+     * recoverCrashedSessions' own per-connection try/catch) so shutdown always reaches
+     * the downstream-close and writer-claim-release steps regardless. */
     for (const connectionId of Array.from(proxy.sessions.keys())) {
-      await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
+      try {
+        await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
+      } catch (error) {
+        log(`SHUTDOWN CLOSE FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- continuing shutdown for other sessions and releasing the writer claim regardless.`);
+      }
     }
     /* Codex PR #29 review round 8 "bound termination of stdio downstream children": same
      * reasoning as the startup-failure cleanup above -- await close() so a downstream that
@@ -855,7 +1539,18 @@ function runStatusCommand(configPathArg) {
 }
 
 function main() {
+  const log = (...args) => console.error("[graphsmith-gateway]", ...args);
   const argv = process.argv.slice(2);
+  if (argv[0] === "recovery-resolve" || argv[0] === "recovery-abandon") {
+    try {
+      if (argv[0] === "recovery-resolve") runRecoveryResolveCli(argv.slice(1), log);
+      else runRecoveryAbandonCli(argv.slice(1), log);
+    } catch (error) {
+      console.error(`[graphsmith-gateway] FATAL: ${error.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (argv[0] === "status") {
     runStatusCommand(argv[1]);
     return;
@@ -883,6 +1578,10 @@ module.exports = {
   buildHealthStatus,
   loadSigningKeys,
   drainOpenSessions,
+  recoverCrashedSessions,
+  abandonConnection,
+  runRecoveryResolveCli,
+  runRecoveryAbandonCli,
   gatewayStatusPath,
   STATUS_WRITE_INTERVAL_MS,
   runStatusCommand,

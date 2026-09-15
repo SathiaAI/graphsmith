@@ -246,7 +246,13 @@ async function samplingForwardStillWorksBelowTheCap() {
   const { forwardDownstreamRequestToAgent } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
   const sessionModule = require(path.join(ROOT, "scripts", "gateway", "session.js"));
   const s = sessionModule.createSession("agent-conn-2");
-  const proxy = { sessions: new Map([["agent-conn-2", s]]), now: () => Date.now() };
+  // Cluster H (frontier-panel review, 2026-09-14): forwardDownstreamRequestToAgent now
+  // unconditionally appends a CALL_START/CALL_RESULT pair to the recovery WAL for this
+  // path too (PR #33), so this fake proxy needs a real stateDir for recovery.appendWalEvent
+  // to write into -- this test predates that addition and previously got away with a
+  // bare {sessions, now} stand-in.
+  const stateDir = freshDir("sampling-forward-below-cap");
+  const proxy = { sessions: new Map([["agent-conn-2", s]]), now: () => Date.now(), stateDir };
   const agentPusher = { current: () => Promise.resolve({ role: "assistant", content: { type: "text", text: "ok" } }), connectionId: "agent-conn-2" };
 
   const resp = await forwardDownstreamRequestToAgent(

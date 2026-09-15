@@ -19,6 +19,7 @@
  */
 "use strict";
 
+const crypto = require("crypto");
 const { sealBoundaryBundle } = require("../gsa-mcp-shim.js");
 
 function fail(message, code = "GATEWAY_SESSION_ERROR") {
@@ -27,13 +28,44 @@ function fail(message, code = "GATEWAY_SESSION_ERROR") {
   return error;
 }
 
-/** Creates a fresh, empty in-memory session record (SS5.1's shape). */
+/** Creates a fresh, empty in-memory session record (SS5.1's shape).
+ *
+ * `options.sessionId` (Cluster B: session-identity distinctness in the audit trail --
+ * see gsa-mcp-shim.js#sealBoundaryBundle's own doc comment on why bundle_id needs this):
+ * a permanent, unique identifier for this session, generated ONCE, folded into the
+ * sealed bundle's bundle_id so two sessions that happen to record identical
+ * {init, tools, calls} content are never treated as "the same session" just because a
+ * content-only hash cannot tell them apart.
+ *
+ * Three ways this argument is used, distinguished so replay never invents a new
+ * identity for an old session (which would break replay-idempotency -- the same
+ * session's own WAL replayed twice must produce the same bundle_id) while a genuinely
+ * new live session always gets a real one:
+ *   - omitted entirely (proxy.js#openConnection, the live-dispatch path): a fresh
+ *     `crypto.randomUUID()` is minted here, once, and the caller is expected to persist
+ *     it (proxy.js writes it into the WAL's own SESSION_START event) so a later replay
+ *     of this exact session reads the SAME id back rather than minting a new one.
+ *   - a non-empty string (gateway.js#recoverCrashedSessions/abandonConnection replaying
+ *     a WAL whose SESSION_START event already carries a `session_id`): reused verbatim,
+ *     so replaying the same WAL twice yields the same session_id and therefore the same
+ *     bundle_id.
+ *   - explicitly `null`/absent-on-the-event (replaying an older WAL written before this
+ *     field existed): stays `null` rather than randomly generated -- an old WAL replayed
+ *     twice must still be idempotent, and inventing a random id here on every replay
+ *     would break that for data that predates this fix. */
 function createSession(connectionId, options = {}) {
   if (typeof connectionId !== "string" || connectionId.length === 0) {
     throw fail("connectionId must be a non-empty string", "INVALID_ARGUMENT");
   }
+  const sessionId =
+    typeof options.sessionId === "string" && options.sessionId.length > 0
+      ? options.sessionId
+      : options.sessionId === undefined
+      ? crypto.randomUUID()
+      : null;
   return {
     connectionId,
+    sessionId,
     initialize: null,
     tools: [],
     calls: [],
@@ -130,8 +162,60 @@ function recordCallResult(session, jsonRpcId, result) {
  * discipline as MAX_PENDING_CALLS_PER_SESSION/MAX_COMPLETED_CALLS_PER_SESSION (proxy.js).
  * Without one, a misbehaving or compromised downstream emitting a stream of responses
  * with unknown ids could grow this array (and the eventual sealed bundle) without bound,
- * independently of both call-history caps -- neither of which this ever went through. */
+ * independently of both call-history caps -- neither of which this ever went through.
+ *
+ * Cluster I (frontier-panel review, 2026-09-14, 5/5 unanimous): Option C's own
+ * recordAnomaly (below) originally bypassed this cap entirely on the theory that an
+ * internally-detected event (an ambiguous-retry-blocked attestation) is trusted where an
+ * externally-supplied one is not. The panel's unanimous view: internal detection doesn't
+ * make the FREQUENCY trusted -- an agent that can repeatedly trigger the internal
+ * condition (e.g. by retrying ambiguously) can still drive unbounded growth through an
+ * uncapped path, reopening the exact resource-exhaustion class this cap was added to
+ * close. Both anomaly-recording entry points below now share one capped, internal
+ * implementation so there is a single bound on session.anomalies regardless of which
+ * one records the event. */
 const MAX_ANOMALIES_PER_SESSION = 1000;
+
+/** Shared internal implementation for every anomaly-recording entry point in this file.
+ * Appends `anomaly` (stamped with ts unless the caller already supplied one) once
+ * session.anomalies is below MAX_ANOMALIES_PER_SESSION; once the cap is reached, further
+ * anomalies are dropped rather than grow session.anomalies without bound, but the cap
+ * being hit is itself recorded once (a single terminal marker entry) so it leaves a
+ * trace rather than silently truncating. Returns true if the anomaly was recorded
+ * (or the cap-reached marker was just appended), false if it was dropped. Not exported --
+ * recordAnomaly and recordUnmatchedResponseAnomaly are the only external entry points,
+ * so no existing call site anywhere in this codebase needs to change. */
+function pushCappedAnomaly(session, anomaly) {
+  if (session.finalized) throw fail("Cannot record into a finalized session", "SESSION_FINALIZED");
+  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) return false;
+  const entry = { ts: Date.now(), ...anomaly };
+  session.anomalies.push(entry);
+  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) {
+    // Reuses entry.ts (an explicit historical ts if the caller supplied one, e.g.
+    // recordUnmatchedResponseAnomaly's ts param) rather than a fresh Date.now(), matching
+    // recordUnmatchedResponseAnomaly's original pre-merge behavior exactly.
+    session.anomalies.push({
+      kind: "ANOMALY_CAP_REACHED",
+      detail: `This session reached the ${MAX_ANOMALIES_PER_SESSION}-anomaly cap -- further anomalies are dropped, not recorded.`,
+      ts: entry.ts,
+    });
+  }
+  return true;
+}
+
+/** Records a protocol-level irregularity that is not itself a call outcome -- generic
+ * and additive, mirroring recordCallResult's own UNMATCHED_RESPONSE anomaly shape so
+ * sealBoundaryBundle's existing anomaly handling needs no changes. Added for Option C
+ * (Codex PR #29 Finding 2, external-panel-reviewed design -- see
+ * option-c-hardened-design.md): records an ambiguous-retry-blocked event so the sealed
+ * bundle attests that a duplicate dispatch was prevented, not just that one happened to
+ * not occur. Routed through the shared, capped pushCappedAnomaly (Cluster I,
+ * frontier-panel review 2026-09-14) rather than appending directly -- see that helper's
+ * comment for why an internally-detected event still needs the same cap as an
+ * externally-supplied one. */
+function recordAnomaly(session, anomaly) {
+  return pushCappedAnomaly(session, anomaly);
+}
 
 /** Records a downstream response that could not be correlated to any pending call,
  * WITHOUT going through recordCallResult's agent-facing pendingCalls lookup (CodeRabbit
@@ -146,27 +230,16 @@ const MAX_ANOMALIES_PER_SESSION = 1000;
  * session trace and losing the UNMATCHED_RESPONSE anomaly entirely. This function only
  * ever appends the anomaly -- it never touches pendingCalls.
  *
- * Capped at MAX_ANOMALIES_PER_SESSION (Codex PR #29 review round 8 "cap unmatched-response
- * anomalies per session"): once reached, further anomalies are dropped rather than grow
- * session.anomalies without bound, but the cap being hit is itself recorded once (a single
- * terminal marker entry) so it leaves a trace rather than silently truncating. */
+ * Capped at MAX_ANOMALIES_PER_SESSION via the shared pushCappedAnomaly helper (Codex
+ * PR #29 review round 8 "cap unmatched-response anomalies per session", generalized by
+ * Cluster I, frontier-panel review 2026-09-14). */
 function recordUnmatchedResponseAnomaly(session, jsonRpcId, detail, ts) {
-  if (session.finalized) throw fail("Cannot record into a finalized session", "SESSION_FINALIZED");
-  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) return false;
-  session.anomalies.push({
+  return pushCappedAnomaly(session, {
     kind: "UNMATCHED_RESPONSE",
     jsonRpcId,
     detail: detail || "response arrived for a JSON-RPC id with no matching pending call",
     ts: ts !== undefined ? ts : Date.now(),
   });
-  if (session.anomalies.length >= MAX_ANOMALIES_PER_SESSION) {
-    session.anomalies.push({
-      kind: "ANOMALY_CAP_REACHED",
-      detail: `This session reached the ${MAX_ANOMALIES_PER_SESSION}-anomaly cap -- further anomalies are dropped, not recorded.`,
-      ts: ts !== undefined ? ts : Date.now(),
-    });
-  }
-  return true;
 }
 
 /** Called when the downstream side of a connection disconnects (or the whole session is
@@ -244,6 +317,7 @@ function markPendingAsDisconnected(session, reason, now, serverFilter, onDisconn
 function toSealableSession(session) {
   const orderedCalls = session.calls.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
   return {
+    session_id: session.sessionId || null,
     initialize: session.initialize || {},
     tools: session.tools,
     calls: orderedCalls.map((c) => ({
@@ -299,6 +373,7 @@ module.exports = {
   recordToolsList,
   recordCallStart,
   recordCallResult,
+  recordAnomaly,
   recordUnmatchedResponseAnomaly,
   MAX_ANOMALIES_PER_SESSION,
   markPendingAsDisconnected,
