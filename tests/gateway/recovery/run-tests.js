@@ -1183,7 +1183,8 @@ function main() {
     .then(() => {
       const passed = results.filter((r) => r.status === "PASS").length;
       const failed = results.filter((r) => r.status === "FAIL").length;
-      console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
+      const skipped = results.filter((r) => r.status === "SKIP").length;
+      console.log(`SUMMARY passed=${passed} failed=${failed} skipped=${skipped}`);
       process.exit(failures ? 1 : 0);
     });
 }

@@ -186,10 +186,27 @@ function fsyncDir(dir) {
  * until every byte of the encoded line has actually been written, on the same fd, before
  * the fsync that is supposed to make it durable. */
 function writeFullySync(fd, buffer) {
+  /* CodeRabbit PR #33 review "truncate the partial record before throwing
+   * GATEWAY_RECOVERY_SHORT_WRITE": a short write that makes SOME progress before
+   * stalling (or a later call in this same loop stalling after earlier calls already
+   * wrote bytes) leaves an incomplete JSON line appended past the file's prior end --
+   * readWalEvents' own "stop at the first malformed line" replay logic (see its header)
+   * then discards that truncated line AND every real, complete event appended after it.
+   * Capturing the size before any write lets a stall truncate the file back to exactly
+   * its pre-append state, so a subsequent successful append starts clean rather than
+   * leaving a torn line for replay to trip over. */
+  const originalSize = fs.fstatSync(fd).size;
   let offset = 0;
   while (offset < buffer.length) {
     const written = fs.writeSync(fd, buffer, offset, buffer.length - offset);
     if (!(written > 0)) {
+      try {
+        fs.ftruncateSync(fd, originalSize);
+      } catch (truncateError) {
+        /* best effort -- if truncation itself fails, the original SHORT_WRITE error
+         * below is still the one that matters; masking it with a truncate failure
+         * would hide the more actionable diagnosis. */
+      }
       throw fail(`fs.writeSync made no progress (wrote ${written} of ${buffer.length - offset} remaining byte(s)) -- refusing to fsync a possibly-incomplete record.`, "GATEWAY_RECOVERY_SHORT_WRITE");
     }
     offset += written;
@@ -202,7 +219,13 @@ function writeFullySync(fd, buffer) {
  * another module's private internals) is to duplicate a tiny fs primitive like this
  * rather than change chain.js's export surface for an unrelated module's benefit. */
 function appendDurableLine(filePath, line) {
-  const fd = fs.openSync(filePath, "a");
+  /* CodeRabbit PR #33 review "create recovery files with mode 0o600 at creation":
+   * fs.openSync's default mode (0666 & ~umask) leaves a freshly-created WAL file
+   * group/world-readable for the window between creation and restrictFileMode's chmod
+   * below under a permissive (022) umask. Passing 0o600 here closes that window for new
+   * files; restrictFileMode is kept unchanged so a file created by an older build still
+   * gets tightened on its next append. */
+  const fd = fs.openSync(filePath, "a", 0o600);
   try {
     writeFullySync(fd, Buffer.from(`${line}\n`, "utf8"));
     fs.fsyncSync(fd);
