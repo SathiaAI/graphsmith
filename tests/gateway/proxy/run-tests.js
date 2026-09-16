@@ -310,6 +310,63 @@ async function stopAcceptingNewSessionsRefusesNewButNotExisting() {
   check("already-open-session-still-finalizes-after-stop", entry !== null, "existing session was not finalized");
 }
 
+/* Round-1 fix-plan commit 6: getChainIntegrityFailure defaults to `() => null`
+ * (never latched), mirroring isWriterClaimValid's own always-valid default -- every
+ * existing test in this file that constructs a bare GatewayProxy (no chain-integrity
+ * concern of its own) must stay unaffected by this commit. */
+function getChainIntegrityFailureDefaultsToNeverLatchedSoBareProxiesAreUnaffected() {
+  const dir = freshDir("chain-integrity-default");
+  const proxy = makeProxy(dir, new Map(), [], new Map());
+  let threw = null;
+  try { proxy.openConnection("conn-1"); } catch (error) { threw = error; }
+  check("chain-integrity-default-does-not-block-admission", threw === null, threw && threw.message);
+  check("chain-integrity-default-session-actually-opened", proxy.sessions.has("conn-1"), "conn-1 missing from proxy.sessions");
+}
+
+/* Round-1 fix-plan commit 6: PRIMARY enforcement point. A latched chain-integrity
+ * failure must refuse every NEW admission (mirroring stopAcceptingNewSessions'
+ * own new-vs-existing split above) while never force-closing a session already open
+ * before the latch fired -- belt-and-braces on top of the append-time check, not a
+ * second drain mechanism. */
+async function chainIntegrityLatchRefusesNewAdmissionButNotExisting() {
+  const dir = freshDir("chain-integrity-latch");
+  const conn = fakeConnection(async () => ({ ok: true }));
+  let latched = null;
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), [], new Map(), { getChainIntegrityFailure: () => latched });
+  proxy.openConnection("conn-1");
+
+  latched = { status: "refuse", class: "tampered", reason: "test: genuine structural corruption at seq 2", at: "2026-09-16T00:00:00.000Z" };
+  let threw = null;
+  try { proxy.openConnection("conn-2"); } catch (error) { threw = error; }
+  check("chain-integrity-latch-refuses-new-admission", threw && threw.code === "GATEWAY_CHAIN_INTEGRITY_FAILED", threw && threw.code);
+  check(
+    "chain-integrity-latch-error-names-the-reason-not-a-generic-message",
+    threw && threw.message.includes("test: genuine structural corruption at seq 2") && threw.message.includes("class=tampered"),
+    threw && threw.message
+  );
+  check("chain-integrity-latch-second-connection-never-published", !proxy.sessions.has("conn-2"), "conn-2 leaked into proxy.sessions despite the throw");
+
+  const entry = await proxy.closeConnection("conn-1", "already-open session still finalizes despite the latch");
+  check("chain-integrity-latch-does-not-force-close-existing-sessions", entry !== null, "existing session was not finalized");
+}
+
+/* Round-1 fix-plan commit 6: the naming rationale itself -- getChainIntegrityFailure
+ * must be consulted for its DETAIL OBJECT (reason/class/at), not coerced to a bare
+ * boolean, so the thrown error can actually name what happened. */
+function chainIntegrityLatchCarriesTheDiagnosticDetailNotJustABoolean() {
+  const dir = freshDir("chain-integrity-detail");
+  const proxy = makeProxy(dir, new Map(), [], new Map(), {
+    getChainIntegrityFailure: () => ({ status: "refuse", class: "sequence-gap", reason: "entry[4] seq=6 expected 5", at: "2026-09-16T01:02:03.000Z" }),
+  });
+  let threw = null;
+  try { proxy.openConnection("conn-1"); } catch (error) { threw = error; }
+  check(
+    "chain-integrity-detail-message-includes-reason-class-and-timestamp",
+    Boolean(threw) && threw.message.includes("entry[4] seq=6 expected 5") && threw.message.includes("class=sequence-gap") && threw.message.includes("2026-09-16T01:02:03.000Z"),
+    threw && threw.message
+  );
+}
+
 /* Board decision 2026-09-04, PR #29 review "honor MCP tool-level error results": a
  * `tools/call` result carrying `isError: true` on the RESULT itself (not a thrown
  * transport/RPC error) must be recorded as an error in the session, but the JSON-RPC
@@ -1406,6 +1463,9 @@ async function main() {
   await downstreamDisconnectEmitsCompletionLog();
   await completedCallHistoryCapped();
   await stopAcceptingNewSessionsRefusesNewButNotExisting();
+  getChainIntegrityFailureDefaultsToNeverLatchedSoBareProxiesAreUnaffected();
+  await chainIntegrityLatchRefusesNewAdmissionButNotExisting();
+  chainIntegrityLatchCarriesTheDiagnosticDetailNotJustABoolean();
   await toolLevelErrorRecordedButNotProtocolError();
   await preservesDownstreamJsonRpcErrorEnvelope();
   await initializationLifecycleEnforced();

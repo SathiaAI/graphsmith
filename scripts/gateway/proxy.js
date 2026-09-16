@@ -116,6 +116,23 @@ class GatewayProxy {
    *   the moment onClaimLost first fires. Defaults to always-valid so existing callers/tests that
    *   construct a GatewayProxy directly (no writer-claim of their own) are unaffected, mirroring
    *   onSessionFinalized/onSealFailure's own default-no-op contract above.
+   * @param {() => ({reason: string, at: string}|null)} [opts.getChainIntegrityFailure]
+   *   Round-1 fix-plan commit 6: the PRIMARY enforcement point for a genuine chain-
+   *   integrity failure (chain.js's own process-local latch, set by commit 4's
+   *   checkHeadAgainstTailOrRepair/reconcileHead -- see chain.js#getChainIntegrityFailure's
+   *   own doc comment). Consulted at the top of openConnection, before the
+   *   acceptingNewSessions drain/writer-claim-lost gate below, so the error a caller sees
+   *   names the failure that actually happened rather than a generic "not accepting
+   *   sessions" message. Deliberately a DETAIL-OBJECT accessor, never a bare
+   *   `(): boolean` -- a boolean cannot carry the diagnostic reason a human needs to act
+   *   on (this is the exact naming trap this commit's own contract calls out). Checking
+   *   this here, not only at startup, is what makes a runtime transition into failure
+   *   have the SAME effect as detecting it at startup: the moment ANY append-time check
+   *   anywhere in this process latches a genuine failure, the very next openConnection
+   *   call refuses, with no separate "stop accepting sessions" step required. Defaults
+   *   to `() => null` (never latched) so existing callers/tests that construct a
+   *   GatewayProxy directly (no chain-integrity concern of their own) are unaffected,
+   *   mirroring isWriterClaimValid's own always-valid default just above.
    */
   constructor(opts) {
     this.connections = opts.connections;
@@ -128,6 +145,7 @@ class GatewayProxy {
     this.stateDir = opts.stateDir;
     this.now = opts.now || (() => Date.now());
     this.isWriterClaimValid = typeof opts.isWriterClaimValid === "function" ? opts.isWriterClaimValid : () => true;
+    this.getChainIntegrityFailure = typeof opts.getChainIntegrityFailure === "function" ? opts.getChainIntegrityFailure : () => null;
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
     this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
@@ -180,6 +198,30 @@ class GatewayProxy {
   }
 
   openConnection(connectionId, options = {}) {
+    /* Round-1 fix-plan commit 6: PRIMARY enforcement point (see this class's own
+     * getChainIntegrityFailure doc above) -- a genuine chain-integrity failure,
+     * however and whenever it was detected (startup reconcileHead, or an append-time
+     * checkHeadAgainstTailOrRepair failure from this same process's own prior
+     * closeConnection/recoverCrashedSessions), must immediately stop admitting NEW
+     * sessions. This is belt-and-braces on top of the append-time check (commit 4),
+     * which remains the PRIMARY correctness guarantee: even if a caller somehow got a
+     * session opened and its downstream calls dispatched, chain.appendSession's own
+     * checkHeadAgainstTailOrRepair would still refuse the eventual append. Refusing
+     * HERE, at admission, is what makes a runtime transition into failure behave the
+     * same as detecting it at startup rather than merely being recorded for the next
+     * restart. Checked before the acceptingNewSessions drain/writer-claim-lost gate
+     * below so the error a caller sees names the failure that actually happened, not a
+     * generic "not accepting sessions" message. */
+    const integrityFailure = this.getChainIntegrityFailure();
+    if (integrityFailure) {
+      throw fail(
+        `Gateway is not accepting new sessions: a chain-integrity failure is latched (${integrityFailure.reason}` +
+          `${integrityFailure.class ? `, class=${integrityFailure.class}` : ""}, latched at ${integrityFailure.at}). ` +
+          `This is a structural-corruption finding, not a transient condition a retry will clear -- see ` +
+          `${chain.CHAIN_CORRUPTION_RUNBOOK} for the recovery procedure.`,
+        "GATEWAY_CHAIN_INTEGRITY_FAILED"
+      );
+    }
     if (!this.acceptingNewSessions) {
       throw fail("Gateway is no longer accepting new sessions (writer-claim lost or shutting down)", "GATEWAY_NOT_ACCEPTING");
     }

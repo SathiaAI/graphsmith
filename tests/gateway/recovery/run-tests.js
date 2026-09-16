@@ -35,7 +35,7 @@ const ROOT = path.resolve(__dirname, "../../..");
 const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
 const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
-const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli, forwardDownstreamRequestToAgent, buildHealthStatus } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
+const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli, forwardDownstreamRequestToAgent, buildHealthStatus, writeStatusFile } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
 const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 
 let failures = 0;
@@ -677,6 +677,12 @@ function bundleCollisionRewriteAllowsAncestorEntryWhenHeadPointsAtANewerTail() {
 function bundleCollisionRewriteRefusesOnAGenuineForkNotJustAnyAncestorMismatch() {
   const dir = freshDir("collision-fork-refuses");
   const keys = makeKeys();
+  // Round-1 fix-plan commit 6: this test's own fork below is exactly the genuine
+  // structural failure that now latches chain.js's process-local admission gate
+  // (getChainIntegrityFailure). Reset before AND after, so this test's fixture never
+  // depends on latch state left behind by an earlier test, and never leaks its own
+  // latch into whatever runs next in this same process/file.
+  chain._resetChainIntegrityFailureForTests();
   const connA = "conn-fork-a";
   seedCleanCallWal(dir, connA);
   recovery.appendWalEvent(dir, connA, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
@@ -702,6 +708,7 @@ function bundleCollisionRewriteRefusesOnAGenuineForkNotJustAnyAncestorMismatch()
   check("collision-fork-wal-not-discarded", recovery.readWalEvents(dir, connA).length > 0, "WAL deleted despite an unresolved fork");
   const headAfterFork = JSON.parse(fs.readFileSync(chain.headPath(dir), "utf8"));
   check("collision-fork-head-left-untouched-not-silently-fixed", headAfterFork.entry_sha256 === forkedHead.entry_sha256, JSON.stringify(headAfterFork));
+  chain._resetChainIntegrityFailureForTests();
 }
 
 /* Codex PR #33 review "verify the chain entry before cleaning a colliding WAL": content
@@ -1306,6 +1313,106 @@ function writerClaimIsReleasedWhenStartupRecoveryThrows() {
  * a genuine fork the same way the bundle-collision regression test above does, so
  * startGateway's own reconcileHead call hits exactly the "worse than single-step lag"
  * case this whole commit exists to hard-fail on. */
+/* Round-1 fix-plan commit 6: if an earlier connection's own repair path latches a
+ * genuine chain-integrity failure partway through this loop, every remaining
+ * connection is guaranteed to hit the identical failure -- this function must abort
+ * immediately rather than spend more fsyncs parsing/replaying WALs guaranteed to be
+ * quarantined anyway. Builds the latch through the real public detector
+ * (chain.reconcileHead on a genuinely forked chain), exactly as commit 4's own
+ * startup-hard-fail test above does, rather than poking chain.js's private state. */
+function recoverCrashedSessionsAbortsImmediatelyWhenAlreadyLatched() {
+  const dir = freshDir("recover-already-latched");
+  const keys = makeKeys();
+
+  const connA = "conn-already-latched-a";
+  seedCleanCallWal(dir, connA);
+  recovery.appendWalEvent(dir, connA, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 1 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const entryA = chain.readHead(dir);
+
+  // Fork HEAD against the real, already-sealed tail -- the exact "worse than
+  // single-step lag" case commit 4's own reconcileHead refuses and latches on.
+  const forkedHead = Object.assign({}, entryA, { entry_sha256: "9".repeat(64) });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(forkedHead));
+  chain._resetChainIntegrityFailureForTests();
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    // expected: this is exactly how a real process would come to have this latched.
+  }
+  check("recover-abort-fixture-is-latched", Boolean(chain.getChainIntegrityFailure()), JSON.stringify(chain.getChainIntegrityFailure()));
+
+  // Two brand-new crashed connections, each with a fully clean, resolvable WAL -- if
+  // recoverCrashedSessions did not abort early, both would ordinarily seal without issue.
+  const connB = "conn-already-latched-b";
+  seedCleanCallWal(dir, connB);
+  recovery.appendWalEvent(dir, connB, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 2 });
+  const connC = "conn-already-latched-c";
+  seedCleanCallWal(dir, connC);
+  recovery.appendWalEvent(dir, connC, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 3 });
+
+  const logs = [];
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, (l) => logs.push(l));
+  check("recover-abort-processes-nothing", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+  const stillActive = recovery.listActiveConnections(dir);
+  check("recover-abort-leaves-conn-b-wal-in-place", stillActive.includes(connB), JSON.stringify(stillActive));
+  check("recover-abort-leaves-conn-c-wal-in-place", stillActive.includes(connC), JSON.stringify(stillActive));
+  check("recover-abort-logs-a-recovery-aborted-message", logs.some((l) => /RECOVERY ABORTED/.test(l)), JSON.stringify(logs));
+  chain._resetChainIntegrityFailureForTests();
+}
+
+/* Round-1 fix-plan commit 6: documented explicitly, in both code comments and the
+ * WRITTEN status output, that the periodic status walk never latches (docs/contracts/
+ * chain-validity.md SS5/SS6) and that its cadence is not what stops admission on any
+ * finding -- see writeStatusFile's own doc comment for the full rationale. */
+function writeStatusFileDocumentsTheCadenceLimitationInTheWrittenOutput() {
+  const dir = freshDir("status-cadence-note");
+  fs.mkdirSync(dir, { recursive: true });
+  const ctx = { config: { state_dir: dir }, writerClaim: { status: () => ({}) }, connections: new Map(), proxy: { openSessionCount: () => 0 } };
+  writeStatusFile(ctx, silentLog);
+  const written = JSON.parse(fs.readFileSync(path.join(dir, "gateway-status.json"), "utf8"));
+  check(
+    "status-file-documents-the-cadence-mid-chain-limitation",
+    typeof written.session_chain_integrity_cadence_note === "string" &&
+      /mid-chain/i.test(written.session_chain_integrity_cadence_note) &&
+      /HEAD\/tail/i.test(written.session_chain_integrity_cadence_note) &&
+      /evidence only/i.test(written.session_chain_integrity_cadence_note),
+    JSON.stringify(written.session_chain_integrity_cadence_note)
+  );
+}
+
+/* Round-1 fix-plan commit 6: a genuine content-level structural finding (a tampered
+ * interior entry) that the periodic status walk's own evidence surfaces must NOT, by
+ * itself, latch admission -- per docs/contracts/chain-validity.md SS5, this walk is
+ * evidence-only and mixing its own hand-rolled classification into the admission-latch
+ * path would violate the "one authoritative structural validator" contract. Real
+ * on-disk chain/bundle files (not chain.validateChain's in-memory fixtures) so this
+ * exercises the exact path buildHealthStatus/writeStatusFile actually runs. */
+function writeStatusFileNeverLatchesEvenOnAGenuineTamperedEntryItFinds() {
+  const dir = freshDir("status-never-latches-tampered");
+  const e1 = { schema_version: "1.0", seq: 1, bundle_id: "gsa-status-tampered-0000001", prev_entry_sha256: null };
+  e1.entry_sha256 = chain.computeEntrySha256(e1);
+  const e2 = { schema_version: "1.0", seq: 2, bundle_id: "gsa-status-tampered-0000002", prev_entry_sha256: e1.entry_sha256 };
+  e2.entry_sha256 = chain.computeEntrySha256(e2);
+  const tamperedE2 = Object.assign({}, e2, { entry_sha256: "7".repeat(64) });
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  fs.writeFileSync(chain.chainPath(dir), JSON.stringify(e1) + "\n" + JSON.stringify(tamperedE2) + "\n");
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: "1.0", seq: 2, bundle_id: tamperedE2.bundle_id, entry_sha256: tamperedE2.entry_sha256 }));
+  fs.writeFileSync(chain.bundlePath(dir, e1.bundle_id), "{}");
+  fs.writeFileSync(chain.bundlePath(dir, tamperedE2.bundle_id), "{}");
+
+  chain._resetChainIntegrityFailureForTests();
+  const ctx = { config: { state_dir: dir }, writerClaim: { status: () => ({}) }, connections: new Map(), proxy: { openSessionCount: () => 0 } };
+  const health = buildHealthStatus(ctx);
+  check(
+    "status-walk-fixture-actually-finds-the-tampered-entry",
+    health.session_chain_integrity.status === "failed" && /TAMPERED/.test(health.session_chain_integrity.evidence.join(" ")),
+    JSON.stringify(health.session_chain_integrity)
+  );
+  writeStatusFile(ctx, silentLog);
+  check("status-walk-does-not-latch-even-on-a-genuine-finding", chain.getChainIntegrityFailure() === null, JSON.stringify(chain.getChainIntegrityFailure()));
+}
+
 function startupHardFailsWritesDiagnosticAndReleasesTheClaimOnAGenuineChainFork() {
   const root = freshDir("startup-chain-fork");
   const stateDir = path.join(root, "state");
@@ -1513,6 +1620,10 @@ function recoveryResolveRefusesWhileAnotherWriterHoldsTheClaim() {
 }
 
 function main() {
+  // Round-1 fix-plan commit 6: chain.js's admission latch is process-local module
+  // state, not per-test -- start this whole suite from a known-clean slate regardless
+  // of require-time or import-order side effects in any dependency.
+  chain._resetChainIntegrityFailureForTests();
   walAppendAndReadRoundTrip();
   walReadOfMissingConnectionReturnsEmpty();
   walTornTailLineToleratedRestKept();
@@ -1579,6 +1690,11 @@ function main() {
       recoverDoesNotBlockAutoSealOnAnUnresolvedSamplingCall();
     })
     .then(() => writerClaimIsReleasedWhenStartupRecoveryThrows())
+    .then(() => {
+      recoverCrashedSessionsAbortsImmediatelyWhenAlreadyLatched();
+      writeStatusFileDocumentsTheCadenceLimitationInTheWrittenOutput();
+      writeStatusFileNeverLatchesEvenOnAGenuineTamperedEntryItFinds();
+    })
     .then(() => startupHardFailsWritesDiagnosticAndReleasesTheClaimOnAGenuineChainFork())
     .then(() => {
       const passed = results.filter((r) => r.status === "PASS").length;

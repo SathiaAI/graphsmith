@@ -584,6 +584,115 @@ async function httpAgentSessionsAreIdBasedNotSocketBased() {
   await gw.exitCode();
 }
 
+/** Polls the on-disk quarantine directory (proxy.js#quarantineSealedBundle) rather
+ * than sleeping a fixed duration -- matches this suite's own "signal, not sleep"
+ * discipline (see waitForHttpPort above). A quarantined bundle appearing is the
+ * externally-observable proof that a real closeConnection ran chain.appendSession,
+ * hit the genuine chain-integrity failure, and (per round-1 fix-plan commit 6) latched
+ * admission -- agent-transport.js's own DELETE handler fires closeConnection
+ * fire-and-forget (never awaited before the 204 response), so this cannot be inferred
+ * from the DELETE response alone. */
+function waitForQuarantinedBundle(stateDir, timeoutMs = 5000) {
+  const quarantineDir = path.join(chain.sessionsDir(stateDir), "quarantine");
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      if (fs.existsSync(quarantineDir) && fs.readdirSync(quarantineDir).length > 0) {
+        resolve();
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error("timed out waiting for a quarantined bundle to appear"));
+        return;
+      }
+      setTimeout(poll, 25);
+    };
+    poll();
+  });
+}
+
+function httpDelete(port, token, sessionId) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, method: "DELETE", headers: { authorization: `Bearer ${token}`, "mcp-session-id": sessionId } }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/** Round-1 fix-plan commit 6, full-stack wiring proof: a genuine chain-integrity
+ * failure discovered by a RUNNING gateway's own append-time check (commit 4,
+ * chain.js#checkHeadAgainstTailOrRepair) must immediately refuse every subsequent new
+ * session admission on that same process -- not merely be recorded for the next
+ * restart. Uses the HTTP agent transport (unlike the stdio-based tests above, it
+ * supports multiple independent, still-running sessions on one live gateway process),
+ * and corrupts HEAD.json on disk from this TEST process -- deliberately not via any
+ * chain.js private test hook, since chain.js's own process-local latch lives inside
+ * the SEPARATE gateway subprocess and can only actually be exercised by making that
+ * subprocess's own code discover the divergence itself. */
+async function chainIntegrityLatchRefusesNewHttpSessionAdmission() {
+  const root = freshRoot("chain-integrity-http");
+  writeConfirmedMode(root, "standalone");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath, stateDir } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const gw = spawnGateway(root, configPath);
+  const port = await waitForHttpPort(gw);
+  const token = fs.readFileSync(tokenPath, "utf8").trim();
+
+  // Session A: a normal, fully clean session, sealed via an explicit DELETE -- gives
+  // the chain a real, verified first entry to fork HEAD against below.
+  const initA = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-A", version: "1.0" } } });
+  const sessionA = initA.headers["mcp-session-id"];
+  await httpNotify(port, token, { jsonrpc: "2.0", method: "notifications/initialized" }, undefined, sessionA);
+  await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, undefined, sessionA);
+  const deleteAStatus = await httpDelete(port, token, sessionA);
+  check("e2e-chain-integrity-session-a-deletes-cleanly", deleteAStatus === 204, String(deleteAStatus));
+
+  const realHead = chain.readHead(stateDir);
+  check("e2e-chain-integrity-fixture-session-a-actually-sealed", Boolean(realHead) && realHead.seq === 1, JSON.stringify(realHead));
+
+  // Corrupt HEAD.json into a genuine fork -- the same "worse than single-step lag"
+  // divergence commit 4's append-time check refuses and latches on -- directly on
+  // disk, exactly like the startup-hard-fail test above does for reconcileHead.
+  const forkedHead = Object.assign({}, realHead, { entry_sha256: "9".repeat(64) });
+  fs.writeFileSync(chain.headPath(stateDir), JSON.stringify(forkedHead));
+
+  // Session B: admission itself is unaffected (nothing has re-checked HEAD since
+  // session A's own clean append) -- it is session B's own CLOSE that is the append
+  // which discovers the fork, refuses it (quarantining the sealed bundle), and
+  // latches admission for the whole process.
+  const initB = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-B", version: "1.0" } } });
+  const sessionB = initB.headers["mcp-session-id"];
+  check("e2e-chain-integrity-session-b-opens-fine-before-the-close-time-check-reruns", typeof sessionB === "string" && sessionB.length > 0, JSON.stringify(initB.body));
+  await httpNotify(port, token, { jsonrpc: "2.0", method: "notifications/initialized" }, undefined, sessionB);
+  await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, undefined, sessionB);
+  const deleteBStatus = await httpDelete(port, token, sessionB);
+  check("e2e-chain-integrity-session-b-delete-still-returns-204-even-though-its-append-was-refused", deleteBStatus === 204, String(deleteBStatus));
+
+  // Wait for externally-observable proof that closeConnection's own chain.appendSession
+  // ran and was refused (see waitForQuarantinedBundle's own doc comment on why this
+  // cannot be inferred from the DELETE response alone).
+  await waitForQuarantinedBundle(stateDir);
+  check("e2e-chain-integrity-chain-not-advanced-past-session-a", chain.readChain(stateDir).length === 1, JSON.stringify(chain.readChain(stateDir).map((e) => e.seq)));
+
+  // Session C: a brand-new admission attempt AFTER the latch -- commit 6's own primary
+  // enforcement point. Must be refused immediately by openConnection, surfaced by
+  // agent-transport.js's existing openSession() try/catch as a 503 naming the reason.
+  const initC = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-C", version: "1.0" } } });
+  check(
+    "e2e-chain-integrity-latch-refuses-new-session-admission",
+    Boolean(initC.body && initC.body.error && /chain-integrity/i.test(initC.body.error.message) && /GATEWAY_CHAIN_INTEGRITY_FAILED|chain-integrity failure is latched/i.test(initC.body.error.message)),
+    JSON.stringify(initC.body)
+  );
+  check("e2e-chain-integrity-latch-mints-no-session-id-for-the-refused-attempt", !initC.headers["mcp-session-id"], JSON.stringify(initC.headers));
+
+  gw.child.kill();
+  await gw.exitCode();
+}
+
 /** Codex PR #29 review "validate initialize before allocating an HTTP session": a
  * headerless request whose method is "initialize" but whose envelope is otherwise
  * malformed (missing "jsonrpc": "2.0" here) previously still got a real session with a
@@ -857,6 +966,7 @@ async function main() {
   await agentHttpListenerRejectsNonPostMethod();
   await agentHttpListenerBindFailureRejectedCleanly();
   await httpAgentSessionsAreIdBasedNotSocketBased();
+  await chainIntegrityLatchRefusesNewHttpSessionAdmission();
   await httpFailedInitializeDoesNotLeakSession();
   await modeDormantExitsZero();
   await secondInstanceRefused();

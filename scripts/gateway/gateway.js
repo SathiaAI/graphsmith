@@ -736,6 +736,32 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
   const pendingOperatorReview = [];
   const leaseGuard = createLeaseGuard(writerClaim);
   for (const connectionId of recovery.listActiveConnections(stateDir)) {
+    /* Round-1 fix-plan commit 6: a genuine chain-integrity failure latched by ANY
+     * earlier connection's own append-time check in THIS SAME loop (chain.appendSession
+     * / verifyAndRepairBundleCollision below, both routed through chain.js's
+     * checkHeadAgainstTailOrRepair) means every remaining connection in this loop is
+     * guaranteed to hit the identical genuine failure the instant its own
+     * chain.appendSession runs -- the corruption is a property of the shared chain, not
+     * of any one connection's WAL. Checking chain.getChainIntegrityFailure() here, before
+     * spending another connection's worth of fsyncs parsing and replaying its WAL only to
+     * rediscover the same already-known failure, is what "abort immediately" (round-1
+     * fix-round plan, commit 6) means in practice -- this loop has no way to unlatch
+     * mid-run (only a restart re-runs reconcileHead), so continuing is strictly wasted
+     * work, never a second chance at success. Left-untouched connections' WAL/intent
+     * state is exactly as safe to leave in place as any other connection this function
+     * already flags for operator review -- a future restart (after the corruption is
+     * fixed per the runbook) replays them normally. */
+    const alreadyLatched = chain.getChainIntegrityFailure();
+    if (alreadyLatched) {
+      log(
+        `RECOVERY ABORTED: a chain-integrity failure is already latched (${alreadyLatched.reason}` +
+          `${alreadyLatched.class ? `, class=${alreadyLatched.class}` : ""}, at=${alreadyLatched.at}) -- refusing ` +
+          `to replay any further crash-left WAL, since every remaining connection would be quarantined by the ` +
+          `identical failure. Leaving their WAL/intent state untouched for investigation. See ` +
+          `${chain.CHAIN_CORRUPTION_RUNBOOK} for the recovery procedure.`
+      );
+      break;
+    }
     /* Codex PR #33 review "renew ownership during synchronous recovery": this whole
      * per-connection body below is synchronous fs work (WAL replay, session.finalizeSession,
      * chain.appendSession) -- with enough or large enough crash-left WALs it can run past
@@ -1273,7 +1299,39 @@ function writeStatusFile(ctx, log) {
   try {
     const stateDir = ctx.config.state_dir;
     fs.mkdirSync(stateDir, { recursive: true });
-    const status = { ...buildHealthStatus(ctx), written_at: new Date().toISOString() };
+    const status = {
+      ...buildHealthStatus(ctx),
+      written_at: new Date().toISOString(),
+      /* Round-1 fix-plan commit 6: documented explicitly, per this commit's own
+       * requirement, both here (the WRITTEN status output an operator actually reads)
+       * and in checks/register-gateway-sessions.js's own header comment -- this walk
+       * reports `session_chain_integrity` as EVIDENCE ONLY (docs/contracts/
+       * chain-validity.md SS5: "the status walk only reports evidence and never writes
+       * anything") and never engages getChainIntegrityFailure()'s admission latch,
+       * regardless of what it finds. That means the ~10s STATUS_WRITE_INTERVAL_MS
+       * cadence is NOT what stops new-session admission on a genuine finding -- only
+       * commit 4's own detectors (the O(1) append-time checkHeadAgainstTailOrRepair, and
+       * reconcileHead's full walk at startup) ever latch. A HEAD/tail POINTER divergence
+       * mid-run is caught immediately (not on any cadence) by that append-time check the
+       * next time this gateway tries to append. Mid-chain INTERIOR corruption -- an
+       * entry whose own hash no longer recomputes, a sequence gap, or a broken link,
+       * where HEAD and the chain's own tail already agree -- is structurally invisible
+       * to that O(1) tail-only check; this walk's own evidence field is currently the
+       * only place such a finding surfaces at all, and it does not stop anything by
+       * itself. Detecting AND acting on that class depends on reconcileHead's full walk
+       * running again at the next startup (which hard-fails per Paul's 2026-09-15
+       * decision), or on an explicit, separately-scheduled deep walk that does not exist
+       * in this build -- see checks/register-gateway-sessions.js's own header for why it
+       * is deliberately not wired to write/latch anything itself. */
+      session_chain_integrity_cadence_note:
+        `session_chain_integrity above is refreshed roughly every ${STATUS_WRITE_INTERVAL_MS}ms and is EVIDENCE ONLY -- ` +
+        "it never stops new-session admission by itself. A HEAD/tail POINTER divergence is instead caught " +
+        "immediately by the append-time check (or by reconcileHead at startup), not by this cadence. Mid-chain " +
+        "INTERIOR corruption (HEAD and the chain's own tail already agreeing, but an interior record tampered, a " +
+        "sequence gap, or a broken link) is invisible to that O(1) check; this field may show it as evidence, but " +
+        "detecting AND acting on it (stopping admission) depends on the full validator running again at the next " +
+        "startup, or on a separately-scheduled deep walk this build does not implement.",
+    };
     stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir, { mode: null });
   } catch (error) {
     log(`failed to write status file (non-fatal): ${error.message}`);
@@ -1570,6 +1628,13 @@ async function startGateway(options) {
     // caught here even if this instance's own heartbeat hasn't yet noticed and fired
     // onClaimLost.
     isWriterClaimValid: () => writerClaim.status().held_by_this_instance,
+    /* Round-1 fix-plan commit 6: wires this process's own chain-integrity latch
+     * (chain.js's process-local getChainIntegrityFailure(), set by commit 4's
+     * checkHeadAgainstTailOrRepair/reconcileHead) into the ONE place a genuine
+     * failure must actually stop new work -- see GatewayProxy#openConnection's own
+     * doc comment for why this is the primary enforcement point and how a runtime
+     * transition into failure gets the same effect as detecting it at startup. */
+    getChainIntegrityFailure: () => chain.getChainIntegrityFailure(),
   });
 
   for (const [name, conn] of downstreamHandles.connections.entries()) {
@@ -1829,6 +1894,7 @@ module.exports = {
   startGateway,
   checkModeGate,
   buildHealthStatus,
+  writeStatusFile,
   loadSigningKeys,
   drainOpenSessions,
   createLeaseGuard,

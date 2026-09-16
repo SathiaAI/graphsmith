@@ -30,6 +30,22 @@
  *   - fail-closed: any broken link, sequence gap, bad shape, or head mismatch => failed.
  *   - no clock/randomness in the decision path; timestamps are evidence only, if present.
  *   - Report contract: { status, evidence[], assumptions[], failure_domain? }; pure.
+ *   - Round-1 fix-plan commit 6 / docs/contracts/chain-validity.md SS5: this walk (run
+ *     by gateway.js#buildHealthStatus roughly every STATUS_WRITE_INTERVAL_MS) reports
+ *     EVIDENCE ONLY and never mutates chain.js's own process-local admission latch
+ *     (getChainIntegrityFailure) -- only chain.js's own detectors (the O(1) append-time
+ *     checkHeadAgainstTailOrRepair, and reconcileHead's full walk at startup) ever latch.
+ *     Concretely: a HEAD/tail POINTER divergence this walk finds is redundant with (and
+ *     slower than) the append-time check, which already catches it immediately. Mid-
+ *     chain INTERIOR corruption (a tampered/gap/broken-link entry where HEAD and the
+ *     chain's own tail already agree) IS visible in this walk's own evidence, but
+ *     nothing consumes that to stop admission -- an operator reading the written status
+ *     output has to notice and act (restart, which re-runs reconcileHead's own full
+ *     walk and hard-fails startup per Paul's 2026-09-15 decision), or a future,
+ *     separately-scheduled deep walk would have to be built to close that gap. This is
+ *     not an oversight to route around here: mixing this module's own hand-rolled
+ *     classification into the admission-latch path would violate SS5's "one
+ *     authoritative structural validator" contract.
  *   - Honest limit (A6, same as register-retention.js's): a privileged local attacker who
  *     rewrites both the chain and its own HEAD.json is out of scope for THIS verifier alone
  *     -- SG-FR-6 (remote anchoring, not yet implemented -- see scripts/gateway/chain.js's

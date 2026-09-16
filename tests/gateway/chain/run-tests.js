@@ -721,6 +721,81 @@ function reconcileHeadRefusesAGenuineFork() {
   check("reconcile-fork-latches-the-integrity-failure", Boolean(latched) && latched.class === "fork", JSON.stringify(latched));
 }
 
+/* Round-1 fix-plan commit 6 (classified false positives): an OPERATIONAL failure
+ * merely opening chain.jsonl (EACCES/EPERM -- exactly what a misapplied or
+ * in-progress commit-2 group-readable chmod pass produces) must refuse THIS append
+ * but must NOT engage the process-wide admission latch. Simulated via a targeted
+ * fs.openSync patch (this sandbox runs as root, where a real chmod would not actually
+ * deny the read) rather than real OS permissions -- mirrors tests/gateway/
+ * startup-permissions/run-tests.js's own withPatched/codeError fault-injection style. */
+function checkHeadAgainstTailOperationalPermissionFailureRefusesButDoesNotLatch() {
+  const dir = freshDir("tail-eacces-operational");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  chain._resetChainIntegrityFailureForTests();
+
+  const targetPath = chain.chainPath(dir);
+  const originalOpenSync = fs.openSync;
+  fs.openSync = function (p, ...rest) {
+    if (p === targetPath) {
+      const err = new Error("permission denied");
+      err.code = "EACCES";
+      throw err;
+    }
+    return originalOpenSync.apply(fs, [p, ...rest]);
+  };
+  let threw = null;
+  try {
+    chain.checkHeadAgainstTailOrRepair(dir, null, () => {});
+  } catch (error) {
+    threw = error;
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+  check(
+    "tail-eacces-refuses-this-append-with-the-operational-code",
+    threw !== null && threw.code === "GATEWAY_CHAIN_TAIL_UNREADABLE_OPERATIONAL",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+  check("tail-eacces-does-not-latch-admission", chain.getChainIntegrityFailure() === null, JSON.stringify(chain.getChainIntegrityFailure()));
+}
+
+/* Companion regression lock: a non-permission open failure (anything other than
+ * EACCES/EPERM) for the exact same "could not even open chain.jsonl" shape must still
+ * refuse AND latch -- proves the operational carve-out above is narrowly scoped to
+ * permission codes, not a general "any open failure is fine" loophole. */
+function checkHeadAgainstTailGenuineUnreadableTailStillLatches() {
+  const dir = freshDir("tail-genuine-unreadable");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  chain._resetChainIntegrityFailureForTests();
+
+  const targetPath = chain.chainPath(dir);
+  const originalOpenSync = fs.openSync;
+  fs.openSync = function (p, ...rest) {
+    if (p === targetPath) {
+      const err = new Error("I/O error");
+      err.code = "EIO";
+      throw err;
+    }
+    return originalOpenSync.apply(fs, [p, ...rest]);
+  };
+  let threw = null;
+  try {
+    chain.checkHeadAgainstTailOrRepair(dir, null, () => {});
+  } catch (error) {
+    threw = error;
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+  check(
+    "tail-eio-refuses-this-append-with-the-diverged-code",
+    threw !== null && threw.code === "GATEWAY_CHAIN_HEAD_DIVERGED",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+  const latched = chain.getChainIntegrityFailure();
+  check("tail-eio-latches-admission", Boolean(latched) && latched.class === "tail-unreadable", JSON.stringify(latched));
+  chain._resetChainIntegrityFailureForTests();
+}
+
 function reconcileHeadAheadRefuses() {
   const dir = freshDir("reconcile-head-ahead");
   const keys = makeKeys();
@@ -825,6 +900,8 @@ function main() {
   appendTimeCheckAutoAdvancesASingleStepLaggingHead();
   appendTimeCheckRefusesATwoStepLaggingHead();
   appendTimeCheckRefusesAForkedHead();
+  checkHeadAgainstTailOperationalPermissionFailureRefusesButDoesNotLatch();
+  checkHeadAgainstTailGenuineUnreadableTailStillLatches();
   reconcileHeadEmptyChainIsANoOpWithZeroWrites();
   reconcileHeadRefusesAMultiStepLaggingHeadAtStartupToo();
   reconcileHeadRebuildsFromAMalformedHeadFile();

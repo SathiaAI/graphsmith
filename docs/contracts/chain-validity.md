@@ -165,6 +165,65 @@ never writes `HEAD` outside of `appendSession`'s own normal flow and, on rows 7/
 performs the same in-place advance under the same lease; the status walk only
 reports evidence and never writes anything.
 
+## 6. Admission latch (commit 6)
+
+`chain.getChainIntegrityFailure(): {status, class, reason, at} | null` is the single,
+process-local surface every genuine structural failure this contract's detectors
+(reconciliation and the append-time check, §1/§5) latch into. Deliberately a
+detail-object accessor, never a bare `(): boolean` -- a boolean cannot carry the
+diagnostic reason a human needs to act on.
+
+**Primary enforcement point: session admission.** `GatewayProxy#openConnection`
+consults `getChainIntegrityFailure()` first, before its existing
+writer-claim-lost/draining check, and refuses every new session the instant it is
+non-null. This is **belt-and-braces on top of the append-time check** (§1/§5), which
+remains the primary correctness guarantee -- even a session that somehow got admitted
+would still have its own eventual `chain.appendSession` refused. Refusing at
+admission is what makes a **runtime** transition into failure behave identically to
+detecting it at startup: nothing separate has to "notice" the latch and call a
+stop-accepting method: the very next `openConnection` call already sees it.
+
+**`recoverCrashedSessions` aborts immediately once latched.** If an earlier
+connection's own repair path (`verifyAndRepairBundleCollision` ->
+`checkHeadAgainstTailOrRepair`) latches a genuine failure partway through startup
+recovery's per-connection loop, every connection not yet processed is guaranteed to
+hit the identical failure the moment its own `chain.appendSession` runs -- the
+corruption is a property of the shared chain, not of any one connection's WAL.
+Continuing to parse and replay their WALs (with attendant fsyncs and lease renewals)
+only to rediscover the same already-known failure is pure waste; this function checks
+the latch once per loop iteration and stops instead, leaving their WAL/intent state
+untouched for the next restart (or an explicit `recovery-abandon`).
+
+**Classification, not a one-off exception list.** A failure only latches when it is
+genuinely structural/content-level per §1/§3's own taxonomy (fork, tamper, sequence
+gap, invalid genesis, malformed interior record, a lag worse than the single-step
+case, or a tail `readChainTail` could open and read but that does not parse/shape-
+check). An **operational** failure never latches:
+
+- `readChainTail` failing to even **open** `chain.jsonl` with `EACCES`/`EPERM` (a
+  misapplied or in-progress commit-2 group-readable chmod pass, or an operator's own
+  filesystem-permission change) is refused for that one append
+  (`GATEWAY_CHAIN_TAIL_UNREADABLE_OPERATIONAL`) but does **not** engage the latch --
+  a permission problem says nothing about the chain's own integrity.
+- `checks/register-gateway-sessions.js`'s own periodic status walk (run roughly every
+  `STATUS_WRITE_INTERVAL_MS` by `gateway.js#writeStatusFile`) reports
+  `session_chain_integrity` as **evidence only** and never writes to the latch at all,
+  per §5's "one authoritative structural validator" contract -- its own missing-
+  bundle-file finding (an operator archiving/moving a sealed bundle) is exactly the
+  false positive this rule exists to keep out of the latch.
+
+**Known limitation, stated here and in the written `gateway-status.json` itself**
+(`session_chain_integrity_cadence_note`): because the status walk never latches, its
+~10s cadence is not what stops admission on any finding. A HEAD/tail **pointer**
+divergence is instead caught immediately by the append-time check. Mid-chain
+**interior** corruption -- an entry whose own hash no longer recomputes, a sequence
+gap, or a broken link, where HEAD and the chain's own tail already agree -- is
+structurally invisible to that O(1), tail-only check; the status walk's own evidence
+field may show it, but nothing currently *acts* on that evidence mid-run. Detecting
+**and stopping admission for** that class depends on `reconcileHead`'s full walk
+running again at the next startup (which hard-fails per §4), or on an explicit,
+separately-scheduled deep walk that does not exist in this build.
+
 ## Summary (for code comments)
 
 > Per `docs/contracts/chain-validity.md` (C2): one structural validator (seqs,
@@ -173,4 +232,8 @@ reports evidence and never writes anything.
 > hash-matching HEAD lag (or its torn-final-record counterpart) is not corruption —
 > auto-catch-up under the lease with a loud anomaly. Everything else refuses and
 > latches. Structural failure at startup hard-fails loudly with a runbook pointer,
-> per Paul's 2026-09-15 decision.
+> per Paul's 2026-09-15 decision. The latch (`chain.getChainIntegrityFailure()`) is
+> enforced primarily at session ADMISSION (`GatewayProxy#openConnection`), belt-and-
+> braces on top of the append-time check; classified, not a one-off list -- an
+> EACCES/EPERM opening chain.jsonl, or the status walk's own missing-bundle finding,
+> is OPERATIONAL and never latches.
