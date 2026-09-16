@@ -1092,7 +1092,7 @@ class GatewayProxy {
      * contract as a sealing failure so the documented behavior actually holds. */
     let entry;
     try {
-      entry = chain.appendSession(this.stateDir, sealed);
+      entry = chain.appendSession(this.stateDir, sealed, { log: this.log });
     } catch (error) {
       error.quarantinedTo = quarantineSealedBundle(this.stateDir, connectionId, sealed, error);
       this.onSealFailure(s, error);

@@ -576,6 +576,201 @@ function readChainTailAbsentEmptyCorruptAreThreeDistinctOutcomes() {
   check("read-chain-tail-absent-empty-corrupt-are-three-distinct-outcomes", new Set(statuses).size === 3 && statuses.includes("absent") && statuses.includes("empty") && statuses.includes("corrupt"), JSON.stringify(statuses));
 }
 
+/* ==================================================================================
+ * Round-1 fix-plan commit 4 -- reconcileHead (startup) + the classified append-time
+ * HEAD/tail check (chain.appendSession / chain.repairMissingChainEntry). Constructs a
+ * genuinely stale HEAD through the real public API (chain.appendSession + a targeted
+ * HEAD.json overwrite mirroring exactly the crash window between chain.appendSession's
+ * own step 2 (chain.jsonl append) and step 3 (HEAD.json update) -- never by disabling
+ * the safety check itself.
+ * ================================================================================== */
+
+function makeStaleHeadFixture(dir, keys, n) {
+  // Appends `n` real, distinct sessions, then rolls HEAD.json back to name an EARLIER
+  // entry -- exactly the on-disk shape a crash between chain.appendSession's own
+  // chain.jsonl-append and HEAD.json-update steps leaves behind, reproduced through the
+  // real public API rather than by hand-crafting a chain.jsonl fixture.
+  const entries = [];
+  for (let i = 0; i < n; i++) {
+    entries.push(chain.appendSession(dir, sealTrivialSession(`stale-head-${i}`, keys)));
+  }
+  return entries;
+}
+
+function appendTimeCheckAutoAdvancesASingleStepLaggingHead() {
+  const dir = freshDir("append-time-single-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  // Roll HEAD back to entry[0] -- exactly one step behind the real tail (entry[1]).
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+  check("append-time-lag-fixture-head-still-stale", chain.readHead(dir).seq === 1, JSON.stringify(chain.readHead(dir)));
+
+  const logs = [];
+  const newEntry = chain.appendSession(dir, sealTrivialSession("stale-head-third", keys), { log: (l) => logs.push(l) });
+  check("append-time-lag-auto-advance-new-entry-is-seq-3", newEntry.seq === 3, JSON.stringify(newEntry));
+  check("append-time-lag-auto-advance-new-entry-links-to-entry2", newEntry.prev_entry_sha256 === entries[1].entry_sha256, JSON.stringify(newEntry));
+  const headAfter = chain.readHead(dir);
+  check("append-time-lag-auto-advance-head-ends-at-entry3", headAfter.seq === 3 && headAfter.bundle_id === newEntry.bundle_id, JSON.stringify(headAfter));
+  check("append-time-lag-auto-advance-chain-has-exactly-3-entries-no-fork", chain.readChain(dir).length === 3, JSON.stringify(chain.readChain(dir).map((e) => e.seq)));
+  const anomalyLog = logs.find((l) => l.includes("gateway_chain_head_lag_auto_advanced"));
+  check("append-time-lag-auto-advance-logs-a-loud-anomaly", Boolean(anomalyLog), JSON.stringify(logs));
+}
+
+function appendTimeCheckRefusesATwoStepLaggingHead() {
+  const dir = freshDir("append-time-two-step-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 3);
+  // Roll HEAD back TWO steps behind the real tail (entry[2]) -- not the auto-repairable
+  // single-step case.
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+
+  chain._resetChainIntegrityFailureForTests();
+  let threw = null;
+  try {
+    chain.appendSession(dir, sealTrivialSession("two-step-lag-new", keys));
+  } catch (error) {
+    threw = error;
+  }
+  check("append-time-two-step-lag-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_HEAD_DIVERGED", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("append-time-two-step-lag-chain-unchanged-no-fourth-entry", chain.readChain(dir).length === 3, JSON.stringify(chain.readChain(dir).map((e) => e.seq)));
+  check("append-time-two-step-lag-head-untouched", chain.readHead(dir).seq === 1, JSON.stringify(chain.readHead(dir)));
+  const latched = chain.getChainIntegrityFailure();
+  check("append-time-two-step-lag-latches-the-integrity-failure", Boolean(latched) && latched.class === "multi-step-lag", JSON.stringify(latched));
+}
+
+function appendTimeCheckRefusesAForkedHead() {
+  const dir = freshDir("append-time-fork");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  // A genuine fork: same seq/bundle_id as the real tail, but a bogus hash that does not
+  // match anything actually in chain.jsonl.
+  const forked = Object.assign({}, entries[1], { entry_sha256: "d".repeat(64) });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(forked));
+
+  let threw = null;
+  try {
+    chain.appendSession(dir, sealTrivialSession("fork-new", keys));
+  } catch (error) {
+    threw = error;
+  }
+  check("append-time-fork-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_HEAD_DIVERGED", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("append-time-fork-chain-unchanged", chain.readChain(dir).length === 2, JSON.stringify(chain.readChain(dir).map((e) => e.seq)));
+}
+
+function reconcileHeadEmptyChainIsANoOpWithZeroWrites() {
+  const dir = freshDir("reconcile-empty");
+  fs.mkdirSync(dir, { recursive: true }); // no gateway-sessions/ dir at all yet
+  const result = chain.reconcileHead(dir);
+  check("reconcile-empty-action-none", result.action === "none", JSON.stringify(result));
+  check("reconcile-empty-writes-no-head-file", !fs.existsSync(chain.headPath(dir)), "HEAD.json was written for a genuinely empty chain");
+  check("reconcile-empty-writes-no-chain-file", !fs.existsSync(chain.chainPath(dir)), "chain.jsonl was written for a genuinely empty chain");
+}
+
+function reconcileHeadRefusesAMultiStepLaggingHeadAtStartupToo() {
+  // Round-1 fix-plan commit 4: multi-step lag is a REFUSE case per C2 row 7's own last
+  // sentence, at BOTH call sites -- reconcileHead delegates entirely to the same
+  // classifyHeadAgainstTail/validateChain classification the O(1) append-time check
+  // uses, it does not get a weaker/more-permissive version just because it can afford a
+  // full walk. Only an EXACT single-step, hash-matching lag ever auto-catches-up.
+  const dir = freshDir("reconcile-multi-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 4);
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+
+  chain._resetChainIntegrityFailureForTests();
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-multi-step-lag-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("reconcile-multi-step-lag-head-untouched", chain.readHead(dir).bundle_id === entries[0].bundle_id, JSON.stringify(chain.readHead(dir)));
+  const latched = chain.getChainIntegrityFailure();
+  check("reconcile-multi-step-lag-latches-the-integrity-failure", Boolean(latched) && latched.class === "multi-step-lag", JSON.stringify(latched));
+}
+
+function reconcileHeadRebuildsFromAMalformedHeadFile() {
+  const dir = freshDir("reconcile-malformed-head");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  fs.writeFileSync(chain.headPath(dir), "{not even close to json");
+
+  const result = chain.reconcileHead(dir);
+  check("reconcile-malformed-head-action-advanced", result.action === "advanced" && result.to.seq === 2, JSON.stringify(result));
+  check("reconcile-malformed-head-rebuilt-correctly", chain.readHead(dir).bundle_id === entries[1].bundle_id, JSON.stringify(chain.readHead(dir)));
+}
+
+function reconcileHeadRefusesAGenuineFork() {
+  const dir = freshDir("reconcile-fork");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  const forked = Object.assign({}, entries[1], { entry_sha256: "c".repeat(64) });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(forked));
+
+  chain._resetChainIntegrityFailureForTests();
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-fork-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("reconcile-fork-head-untouched", chain.readHead(dir).entry_sha256 === "c".repeat(64), JSON.stringify(chain.readHead(dir)));
+  const latched = chain.getChainIntegrityFailure();
+  check("reconcile-fork-latches-the-integrity-failure", Boolean(latched) && latched.class === "fork", JSON.stringify(latched));
+}
+
+function reconcileHeadAheadRefuses() {
+  const dir = freshDir("reconcile-head-ahead");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 1);
+  const ahead = { schema_version: "1.0", seq: 5, bundle_id: "ghost", entry_sha256: "b".repeat(64) };
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(ahead));
+
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-head-ahead-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+}
+
+function reconcileHeadRefusesWhenChainFailsStructuralValidation() {
+  const dir = freshDir("reconcile-tampered");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  // Tamper the interior (first) entry directly in chain.jsonl.
+  const lines = fs.readFileSync(chain.chainPath(dir), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  lines[0].entry_sha256 = "9".repeat(64);
+  fs.writeFileSync(chain.chainPath(dir), lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-tampered-chain-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+}
+
+function reconcileHeadRefusesEmptyChainWithHeadPresent() {
+  const dir = freshDir("reconcile-empty-with-head");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: "1.0", seq: 1, bundle_id: "ghost", entry_sha256: "a".repeat(64) }));
+  // chain.jsonl itself does not exist -- HEAD.json names a tail that cannot possibly
+  // exist. Zero entries, but NOT the empty-chain-is-fine case (C2 row 2).
+
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-empty-with-head-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+}
+
 function main() {
   tenSessionsInSequence();
   fixtureDataVerifiesIndependently();
@@ -626,6 +821,17 @@ function main() {
   readChainTailUtf8LastEntryItselfSurvivesGrowth();
   readChainTailHandlesShortReads();
   readChainTailAbsentEmptyCorruptAreThreeDistinctOutcomes();
+
+  appendTimeCheckAutoAdvancesASingleStepLaggingHead();
+  appendTimeCheckRefusesATwoStepLaggingHead();
+  appendTimeCheckRefusesAForkedHead();
+  reconcileHeadEmptyChainIsANoOpWithZeroWrites();
+  reconcileHeadRefusesAMultiStepLaggingHeadAtStartupToo();
+  reconcileHeadRebuildsFromAMalformedHeadFile();
+  reconcileHeadRefusesAGenuineFork();
+  reconcileHeadAheadRefuses();
+  reconcileHeadRefusesWhenChainFailsStructuralValidation();
+  reconcileHeadRefusesEmptyChainWithHeadPresent();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;

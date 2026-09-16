@@ -391,6 +391,27 @@ function seedCleanCallWal(dir, connectionId) {
   return intentKey;
 }
 
+/* Round-1 fix-plan commit 4 test fixture: seedCleanCallWal's own bundle_id formula
+ * (gsa-mcp-shim.js: sha256({init, grantedTools, n: calls.length})) depends only on the
+ * CALL COUNT, not on any call's actual arguments -- two connections both built from
+ * seedCleanCallWal always collide on bundle_id regardless of their argument values. This
+ * variant makes TWO calls (n=2) instead of one, so a session sealed from it lands on a
+ * genuinely different bundle_id than seedCleanCallWal's own -- needed to advance the
+ * chain's tail to a second, distinct entry so a test can then re-present the FIRST
+ * connection's own (now-ancestor, no-longer-tail) chain entry as a bundle-id collision. */
+function seedTwoCallWal(dir, connectionId) {
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [{ name: "echo", server: "srv", schema: {} }] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "echo", server: "srv", arguments: { a: 1 }, ts: 10 });
+  const intentKey1 = recovery.computeIntentKey(connectionId, "echo", { a: 1 });
+  recovery.createIntentIfAbsent(dir, intentKey1, { connection_id: connectionId, tool: "echo", arguments: { a: 1 }, state: "dispatched", dispatched_at: 9 });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 2, tool: "echo", server: "srv", arguments: { a: 2 }, ts: 12 });
+  const intentKey2 = recovery.computeIntentKey(connectionId, "echo", { a: 2 });
+  recovery.createIntentIfAbsent(dir, intentKey2, { connection_id: connectionId, tool: "echo", arguments: { a: 2 }, state: "dispatched", dispatched_at: 9 });
+  return intentKey2;
+}
+
 function recoverAutoSealsASessionThatCrashedAfterCleanDisconnect() {
   const dir = freshDir("recover-clean");
   const keys = makeKeys();
@@ -589,6 +610,98 @@ function bundleCollisionWithDifferentContentIsFlaggedNotDiscarded() {
   check("bundle-collision-genuine-conflict-intent-not-discarded", recovery.readIntent(dir, intentKeyY) !== null, "intent was deleted despite unverified collision");
   const headAfter = chain.readHead(dir);
   check("bundle-collision-genuine-conflict-no-second-chain-entry-appended", headAfter && headAfter.seq === firstHead.seq, JSON.stringify(headAfter));
+}
+
+/* Round-1 fix-plan commit 4 regression test ("WAL-survives-failed-cleanup"): reproduces
+ * the exact scenario the rewritten verifyAndRepairBundleCollision exists for. The OLD
+ * shipped check compared HEAD directly against the colliding bundle's OWN chain entry --
+ * which breaks the instant any OTHER session sealed afterward and moved HEAD on, even
+ * though the original entry is still a perfectly valid, verified ANCESTOR of the current
+ * tail. Sequence: connection A seals (chain tail becomes A's entry); a different
+ * connection B then also seals (chain tail advances to B's entry, A's entry is now an
+ * ancestor, not the tail); A's own WAL/intent is then re-seeded EXACTLY as it looked
+ * before recovery ever cleaned it up (its own real "recovery completed but the WAL
+ * unlink never landed" crash signature) and recovery is run a third time. The rewritten
+ * check (HEAD equals the chain's own current tail, not equals this bundle's own entry)
+ * must allow this cleanup rather than refusing it. */
+function bundleCollisionRewriteAllowsAncestorEntryWhenHeadPointsAtANewerTail() {
+  const dir = freshDir("collision-ancestor-ok");
+  const keys = makeKeys();
+  const connA = "conn-ancestor-a";
+  seedCleanCallWal(dir, connA);
+  recovery.appendWalEvent(dir, connA, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const entryA = chain.readHead(dir);
+  check("collision-ancestor-fixture-a-sealed", entryA && entryA.seq === 1, JSON.stringify(entryA));
+
+  const connB = "conn-ancestor-b";
+  seedTwoCallWal(dir, connB);
+  recovery.appendWalEvent(dir, connB, { type: "CALL_RESULT", call_seq: 2, result: { ok: true }, isError: false, ts: 13 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const entryB = chain.readHead(dir);
+  check(
+    "collision-ancestor-fixture-b-sealed-as-new-tail",
+    entryB && entryB.seq === 2 && entryB.bundle_id !== entryA.bundle_id,
+    JSON.stringify({ entryA, entryB })
+  );
+
+  // Re-seed connection A's WAL with IDENTICAL content -- the WAL-survives-a-failed-
+  // cleanup scenario: recovery's own post-seal cleanup for A crashed before deleting its
+  // WAL/intent, leaving an exact duplicate on disk that a later recovery pass must still
+  // be able to clean up even though HEAD has since moved on to B's entry.
+  seedCleanCallWal(dir, connA);
+  recovery.appendWalEvent(dir, connA, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("collision-ancestor-not-flagged-for-operator-review", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+  check("collision-ancestor-wal-cleaned-up", recovery.readWalEvents(dir, connA).length === 0, "WAL still present after ancestor-collision cleanup");
+  const headAfter2 = chain.readHead(dir);
+  check(
+    "collision-ancestor-head-still-points-at-b-not-duplicated",
+    headAfter2 && headAfter2.seq === 2 && headAfter2.bundle_id === entryB.bundle_id,
+    JSON.stringify(headAfter2)
+  );
+  const chainEntriesAfter = chain.readChain(dir);
+  check("collision-ancestor-no-third-chain-entry-appended", chainEntriesAfter.length === 2, JSON.stringify(chainEntriesAfter.map((e) => e.seq)));
+}
+
+/* Round-1 fix-plan commit 4 regression test (the negative half of the rewrite above):
+ * proves the new HEAD-vs-tail check has real teeth, not just permissiveness. Same setup
+ * (A seals, then B seals as the new tail) but HEAD.json is then corrupted into a genuine
+ * fork -- same seq/bundle_id as A's own real entry, but a bogus entry_sha256 that does
+ * not match anything actually in chain.jsonl -- before A's WAL is re-seeded and recovery
+ * run again. This is neither "HEAD already equals the tail" nor a genuine single-step-lag
+ * ancestor of it, so the shared classifier must refuse (flag for operator review, leave
+ * the WAL/intent/chain untouched) rather than silently accept it as another instance of
+ * the legitimate ancestor case above. */
+function bundleCollisionRewriteRefusesOnAGenuineForkNotJustAnyAncestorMismatch() {
+  const dir = freshDir("collision-fork-refuses");
+  const keys = makeKeys();
+  const connA = "conn-fork-a";
+  seedCleanCallWal(dir, connA);
+  recovery.appendWalEvent(dir, connA, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const entryA = chain.readHead(dir);
+
+  const connB = "conn-fork-b";
+  seedTwoCallWal(dir, connB);
+  recovery.appendWalEvent(dir, connB, { type: "CALL_RESULT", call_seq: 2, result: { ok: true }, isError: false, ts: 13 });
+  recoverCrashedSessions(dir, keys, silentLog);
+
+  // Corrupt HEAD.json into a genuine fork: same seq/bundle_id as entry A's real position,
+  // but a bogus entry_sha256 that matches no real entry in chain.jsonl -- distinct from
+  // the legitimate single-step-lag ancestor case the classifier auto-repairs.
+  const forkedHead = Object.assign({}, entryA, { entry_sha256: "f".repeat(64) });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(forkedHead));
+
+  seedCleanCallWal(dir, connA);
+  recovery.appendWalEvent(dir, connA, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("collision-fork-flagged-for-operator-review", pendingOperatorReview.includes(connA), JSON.stringify(pendingOperatorReview));
+  check("collision-fork-wal-not-discarded", recovery.readWalEvents(dir, connA).length > 0, "WAL deleted despite an unresolved fork");
+  const headAfterFork = JSON.parse(fs.readFileSync(chain.headPath(dir), "utf8"));
+  check("collision-fork-head-left-untouched-not-silently-fixed", headAfterFork.entry_sha256 === forkedHead.entry_sha256, JSON.stringify(headAfterFork));
 }
 
 /* Codex PR #33 review "verify the chain entry before cleaning a colliding WAL": content
@@ -1184,6 +1297,89 @@ function writerClaimIsReleasedWhenStartupRecoveryThrows() {
   });
 }
 
+/* Round-1 fix-plan commit 4, Paul's 2026-09-15 startup-posture decision: a genuine
+ * chain-integrity failure found by chain.reconcileHead at startup must hard-fail --
+ * refuse to start, write a diagnostic artifact naming the manual-recovery runbook, and
+ * release the writer-claim lease -- rather than starting in some degraded/silent state.
+ * Builds a real state_dir with two genuinely sealed sessions (via recoverCrashedSessions,
+ * the real public API -- not by disabling the safety check), then corrupts HEAD.json into
+ * a genuine fork the same way the bundle-collision regression test above does, so
+ * startGateway's own reconcileHead call hits exactly the "worse than single-step lag"
+ * case this whole commit exists to hard-fail on. */
+function startupHardFailsWritesDiagnosticAndReleasesTheClaimOnAGenuineChainFork() {
+  const root = freshDir("startup-chain-fork");
+  const stateDir = path.join(root, "state");
+  fs.mkdirSync(path.join(root, ".graphsmith", "state"), { recursive: true });
+  const { writeConfirmedMode } = require(path.join(ROOT, "tests", "gateway", "_fixtures", "mode-file.js"));
+  writeConfirmedMode(root, "standalone");
+  const kp = crypto.generateKeyPairSync("ed25519");
+  const keyPath = path.join(root, "signing-key.pem");
+  fs.writeFileSync(keyPath, kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  const configPath = path.join(root, "gateway-config.json");
+  fs.writeFileSync(configPath, JSON.stringify({
+    schema_version: "1.0",
+    state_dir: stateDir,
+    // Never actually reached -- reconcileHead throws before connectAllDownstreams runs.
+    downstream_servers: [{ name: "unused", transport: "stdio", endpoint: "node -e process.exit(1)" }],
+    signing_key_ref: keyPath,
+  }));
+
+  const keys = makeKeys();
+  const connA = "conn-startup-fork-a";
+  seedCleanCallWal(stateDir, connA);
+  recovery.appendWalEvent(stateDir, connA, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recoverCrashedSessions(stateDir, keys, silentLog);
+  const entryA = chain.readHead(stateDir);
+
+  const connB = "conn-startup-fork-b";
+  seedTwoCallWal(stateDir, connB);
+  recovery.appendWalEvent(stateDir, connB, { type: "CALL_RESULT", call_seq: 2, result: { ok: true }, isError: false, ts: 13 });
+  recoverCrashedSessions(stateDir, keys, silentLog);
+
+  const forkedHead = Object.assign({}, entryA, { entry_sha256: "e".repeat(64) });
+  fs.writeFileSync(chain.headPath(stateDir), JSON.stringify(forkedHead));
+
+  let rejection = null;
+  return startGateway({ configPath, root, log: () => {} }).then(
+    () => { rejection = null; },
+    (error) => { rejection = error; }
+  ).then(() => {
+    check(
+      "startup-hard-fail-rejects-with-the-structural-failure-code",
+      rejection !== null && rejection.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE",
+      rejection ? `${rejection.code}: ${rejection.message}` : "startGateway resolved instead of rejecting"
+    );
+
+    const diagnosticPath = path.join(stateDir, "gateway-startup-failure.json");
+    let diagnostic = null;
+    let readError = null;
+    try {
+      diagnostic = JSON.parse(fs.readFileSync(diagnosticPath, "utf8"));
+    } catch (error) {
+      readError = error;
+    }
+    check("startup-hard-fail-writes-a-diagnostic-artifact", diagnostic !== null, readError && readError.message);
+    check(
+      "startup-hard-fail-diagnostic-names-the-structural-failure-code",
+      Boolean(diagnostic) && diagnostic.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE",
+      JSON.stringify(diagnostic)
+    );
+    check(
+      "startup-hard-fail-diagnostic-references-the-manual-recovery-runbook",
+      Boolean(diagnostic) && typeof diagnostic.runbook === "string" && diagnostic.runbook.includes("docs/runbooks/gateway-chain-corruption-recovery.md") && String(diagnostic.action_required || "").includes(diagnostic.runbook),
+      JSON.stringify(diagnostic)
+    );
+
+    // The writer-claim file must be gone -- proof that writerClaim.release() actually ran
+    // rather than leaking a claim an immediate restart would then be refused for.
+    const { WriterClaim: WC } = require(path.join(ROOT, "scripts", "writer-claim.js"));
+    const fresh = new WC(stateDir, { hostId: "test-second-instance-chain-fork" });
+    let acquireError = null;
+    try { fresh.acquire(); fresh.release(); } catch (error) { acquireError = error; }
+    check("startup-hard-fail-releases-the-writer-claim", acquireError === null, acquireError && acquireError.message);
+  });
+}
+
 /* Codex PR #33 review "report each unresolved intent key in recovery output": a bare
  * `in_flight` COUNT cannot distinguish an ordinary live in-progress call from a crashed
  * connection's own unresolved one left in the same "dispatched" state -- an operator needs
@@ -1353,6 +1549,8 @@ function main() {
 
   pathBearingIdentifiersAreRejected();
   bundleCollisionWithDifferentContentIsFlaggedNotDiscarded();
+  bundleCollisionRewriteAllowsAncestorEntryWhenHeadPointsAtANewerTail();
+  bundleCollisionRewriteRefusesOnAGenuineForkNotJustAnyAncestorMismatch();
   recoverRepairsAPartialAppendMissingItsChainEntry();
   recoverCrashedSessionsRenewsTheWriterClaimPerConnection();
   recoverCrashedSessionsWithoutAWriterClaimStillWorks();
@@ -1381,6 +1579,7 @@ function main() {
       recoverDoesNotBlockAutoSealOnAnUnresolvedSamplingCall();
     })
     .then(() => writerClaimIsReleasedWhenStartupRecoveryThrows())
+    .then(() => startupHardFailsWritesDiagnosticAndReleasesTheClaimOnAGenuineChainFork())
     .then(() => {
       const passed = results.filter((r) => r.status === "PASS").length;
       const failed = results.filter((r) => r.status === "FAIL").length;

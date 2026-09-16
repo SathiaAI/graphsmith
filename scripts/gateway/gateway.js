@@ -673,18 +673,48 @@ function createLeaseGuard(writerClaim) {
   };
 }
 
+/* Round-1 fix-plan commit 4 rewrite (docs/contracts/chain-validity.md's C2): the
+ * original shape of this check ("does chain.jsonl contain SOME entry for this
+ * bundle_id") never actually compared HEAD to anything -- it is strengthened here to
+ * also assert that HEAD genuinely names the chain's own CURRENT TAIL, not merely that
+ * this bundle's own entry exists somewhere in the chain. Critically, this new check
+ * does NOT compare HEAD to THIS bundle's own entry (a draft of this fix did, and that
+ * would have been wrong): a bundle's chain entry can legitimately be an ANCESTOR of a
+ * verified, HEAD-consistent tail -- e.g. this exact connection's own WAL survived a
+ * failed post-seal cleanup, a genuinely newer bundle was committed afterward, and HEAD
+ * correctly points at that newer bundle. Comparing HEAD to "this entry" would refuse
+ * that valid, ordinary case; comparing HEAD to the chain's own tail does not. */
 function verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard = null) {
   if (!bundleCollisionIsSameContent(stateDir, sealed)) return false;
   const bundleId = sealed.bundle.manifest.bundle_id;
-  if (!chain.chainHasEntryForBundle(stateDir, bundleId)) {
+
+  const chainEntries = chain.readChain(stateDir);
+  const ownEntry = chainEntries.find((e) => e.bundle_id === bundleId);
+
+  if (!ownEntry) {
     if (leaseGuard) leaseGuard.renew();
-    chain.repairMissingChainEntry(stateDir, bundleId);
+    chain.repairMissingChainEntry(stateDir, bundleId, log);
     log(
       `recovery: bundle "${bundleId}" was durably written but never chain-appended (crash between ` +
         `chain.appendSession's own bundle-write and chain.jsonl-append steps) -- completed the missing ` +
         `chain.jsonl/HEAD.json append now.`
     );
+    return true;
   }
+
+  // This bundle's own chain entry already exists (possibly not as the tail -- see this
+  // function's own doc comment above). What still needs verifying is that HEAD itself
+  // has not diverged from the chain as a whole: reuse the exact same append-time
+  // classifier appendSession/repairMissingChainEntry use (single-step auto-catch-up,
+  // anything else refuses and latches) rather than hand-rolling a third comparison.
+  const head = (() => {
+    try {
+      return chain.readHead(stateDir);
+    } catch (error) {
+      return null; // an unreadable HEAD is handled the same as "missing" by the classifier below.
+    }
+  })();
+  chain.checkHeadAgainstTailOrRepair(stateDir, head, log);
   return true;
 }
 
@@ -897,7 +927,7 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
       // recently the per-event maybeRenew() above last renewed.
       leaseGuard.renew();
       try {
-        chain.appendSession(stateDir, sealed);
+        chain.appendSession(stateDir, sealed, { log });
       } catch (error) {
         if (error.code === "GATEWAY_BUNDLE_ID_COLLISION") {
           let verified;
@@ -1040,7 +1070,7 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
   // same as recoverCrashedSessions' own normal path above.
   leaseGuard.renew();
   try {
-    chain.appendSession(stateDir, sealed);
+    chain.appendSession(stateDir, sealed, { log });
   } catch (error) {
     if (error.code !== "GATEWAY_BUNDLE_ID_COLLISION") throw error;
     /* Codex PR #33 review "verify collisions in recovery-abandon before cleanup": this
@@ -1250,6 +1280,54 @@ function writeStatusFile(ctx, log) {
   }
 }
 
+/* Round-1 fix-plan commit 4: filename for the startup-only diagnostic artifact written
+ * when chain.reconcileHead finds a genuine structural failure (see startGateway's own
+ * call site below and Paul's 2026-09-15 startup-posture decision, docs/contracts/
+ * chain-validity.md SS4). Distinct from STATUS_FILE_NAME above: that one is refreshed
+ * every STATUS_WRITE_INTERVAL_MS by a RUNNING gateway; this one is written exactly once,
+ * by a gateway that is refusing to start at all, and is never cleaned up automatically
+ * (an operator's own recovery action, per the referenced runbook, is what resolves it --
+ * a future successful startup does not delete it, so its presence and mtime remain a
+ * durable record of the last startup failure even after the underlying corruption is
+ * fixed and the gateway starts normally again). */
+const CHAIN_CORRUPTION_DIAGNOSTIC_FILE_NAME = "gateway-startup-failure.json";
+
+function chainCorruptionDiagnosticPath(stateDir) {
+  return path.join(stateDir, CHAIN_CORRUPTION_DIAGNOSTIC_FILE_NAME);
+}
+
+/** Round-1 fix-plan commit 4, Paul's 2026-09-15 startup-posture decision (docs/
+ * contracts/chain-validity.md SS4): when chain.reconcileHead (or, in principle, any
+ * other startup structural-failure verdict) forces a hard-fail, this must be LOUD, not
+ * a silent status field -- a structured top-level diagnostic (logged so it appears even
+ * if the artifact write below itself fails), a written failure artifact (a status file
+ * does not require a running gateway), and an explicit pointer to the manual recovery
+ * runbook this commit ships alongside it, so the diagnostic always ends in a concrete
+ * next step. Writing the artifact is best-effort (mirrors writeStatusFile's own
+ * contract just above) -- a failure to write it must never mask or replace the
+ * already-logged, already-propagating original startup failure. */
+function writeChainCorruptionDiagnostic(stateDir, error, log) {
+  const diagnostic = {
+    schema_version: "1.0",
+    event: "gateway_startup_chain_integrity_failure",
+    code: error && error.code ? error.code : "GATEWAY_CHAIN_STRUCTURAL_FAILURE",
+    message: error && error.message ? error.message : String(error),
+    at: new Date().toISOString(),
+    runbook: chain.CHAIN_CORRUPTION_RUNBOOK,
+    action_required:
+      "This gateway will not start while its gateway-session chain fails structural verification -- " +
+      `no new sessions are being accepted. Follow ${chain.CHAIN_CORRUPTION_RUNBOOK} (restore from backup ` +
+      "/ truncate-at-last-good / rebuild HEAD from the validated chain tail) before restarting.",
+  };
+  log(`FATAL STARTUP CHAIN INTEGRITY FAILURE: ${JSON.stringify(diagnostic)}`);
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    stateStore.atomicOverwriteFile(chainCorruptionDiagnosticPath(stateDir), JSON.stringify(diagnostic, null, 2), stateDir);
+  } catch (writeError) {
+    log(`failed to write the startup chain-integrity diagnostic artifact (non-fatal, already logged above): ${writeError.message}`);
+  }
+}
+
 /**
  * Starts the standalone gateway process. Returns { dormant: true } if attach mode is
  * active (caller should exit 0). Otherwise returns a running gateway handle with
@@ -1333,6 +1411,36 @@ async function startGateway(options) {
     // detected, but by re-checking liveness at the one write that matters.
   };
   writerClaim.startHeartbeat();
+
+  /* Round-1 fix-plan commit 4 (docs/contracts/chain-validity.md's C2 + SS4): fixes a
+   * stale HEAD pointer ONCE, under the writer-claim and after the heartbeat has
+   * started (commit 1's own generalized keepalive covers reconcileHead's own O(n) walk
+   * via its per-entry maybeRenew()) -- BEFORE recoverCrashedSessions or any chain
+   * append can ever read HEAD stale. Per Paul's 2026-09-15 startup-posture decision: a
+   * genuine structural-failure verdict here must hard-fail startup, loudly (never a
+   * silent status field) -- log a structured top-level diagnostic, write a failure
+   * artifact naming the recovery runbook, release the writer-claim, and rethrow so
+   * this process exits non-zero (main()'s own top-level .catch already turns any
+   * rejected startGateway() into `process.exitCode = 1` with a FATAL log line). */
+  try {
+    const reconciliation = chain.reconcileHead(config.state_dir, writerClaim);
+    if (reconciliation.action === "advanced") {
+      log(
+        JSON.stringify({
+          event: "gateway_startup_chain_head_reconciled",
+          detail:
+            `startup chain reconciliation advanced a lagging HEAD.json to the chain's own verified ` +
+            `tail (seq=${reconciliation.to.seq}, bundle_id=${reconciliation.to.bundle_id}) -- this is ` +
+            "the expected signature of a crash between chain.jsonl's append and HEAD.json's update; " +
+            "no data was lost.",
+        })
+      );
+    }
+  } catch (error) {
+    writeChainCorruptionDiagnostic(config.state_dir, error, log);
+    writerClaim.release();
+    throw error;
+  }
 
   /* Option C (crash-recovery/idempotency hardening, external-panel-reviewed design --
    * see option-c-hardened-design.md): replay any WAL left behind by a crashed prior
