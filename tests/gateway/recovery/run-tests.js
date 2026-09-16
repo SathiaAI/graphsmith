@@ -641,9 +641,14 @@ function recoverCrashedSessionsRenewsTheWriterClaimPerConnection() {
   recovery.appendWalEvent(dir, "conn-2", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
 
   let renewCalls = 0;
+  // No maybeRenew() on this fake -- createLeaseGuard's own maybeRenew() wrapper treats
+  // its absence as a no-op (exactly like an omitted writerClaim), so only this fixture's
+  // TWO unconditional renew() call sites per connection (the per-connection renew at the
+  // top of the loop, and the pre-append renew immediately before chain.appendSession)
+  // are actually counted here.
   const fakeWriterClaim = { renew: () => { renewCalls++; } };
   const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog, fakeWriterClaim);
-  check("recover-renews-the-claim-once-per-connection", renewCalls === 2, String(renewCalls));
+  check("recover-renews-the-claim-twice-per-connection", renewCalls === 4, String(renewCalls));
   check("recover-with-a-fake-claim-still-seals-normally", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
 }
 
@@ -689,6 +694,129 @@ function recoverCrashedSessionsAbortsImmediatelyIfTheClaimIsLost() {
   const remaining = recovery.listActiveConnections(dir);
   check("recover-leaves-every-connections-wal-untouched-once-the-claim-is-lost", remaining.length === 2 && remaining.includes("conn-a") && remaining.includes("conn-b"), JSON.stringify(remaining));
   check("recover-appended-no-chain-entry-once-the-claim-is-lost", chain.readHead(dir) === null, JSON.stringify(chain.readHead(dir)));
+}
+
+/* Round-1 fix-plan item 1 (lease keepalive, generalized): renew()'s own failure can be a
+ * raw fs error (e.g. EIO from writer-claim.js's own openSync) that carries no
+ * WRITER_CLAIM_LOST code at all -- the required comparison is by reference identity
+ * (createLeaseGuard's own isLeaseError), never `error.code === "WRITER_CLAIM_LOST"` string
+ * matching, so a raw fs error must be treated exactly the same as a named claim-loss
+ * error: fatal to the whole recovery pass, never downgraded to this connection's own
+ * per-connection "flag for operator review, continue" handling. This exercises the
+ * UNCONDITIONAL renew() immediately before chain.appendSession specifically (not the
+ * per-connection renew() at the top of the loop, already covered by
+ * recoverCrashedSessionsAbortsImmediatelyIfTheClaimIsLost above). */
+function recoverAbortsOnARawFsErrorFromThePreAppendRenewNotJustNamedClaimCodes() {
+  const dir = freshDir("recover-raw-fs-error-pre-append");
+  const keys = makeKeys();
+  seedCleanCallWal(dir, "conn-a");
+  recovery.appendWalEvent(dir, "conn-a", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  let renewCalls = 0;
+  const rawFsError = new Error("EIO: i/o error, open '/state/writer-claim.json'");
+  rawFsError.errno = -5;
+  rawFsError.code = "EIO"; // deliberately NOT "WRITER_CLAIM_LOST" -- a genuine raw fs error
+  const fakeWriterClaim = {
+    renew: () => {
+      renewCalls++;
+      if (renewCalls === 2) throw rawFsError; // 1: top-of-loop renew, 2: pre-append renew
+    },
+  };
+  let threw = null;
+  try {
+    recoverCrashedSessions(dir, keys, silentLog, fakeWriterClaim);
+  } catch (error) {
+    threw = error;
+  }
+  check("pre-append-renew-raw-fs-error-aborts-with-the-exact-detected-error", threw === rawFsError, threw && threw.message);
+  check("pre-append-renew-raw-fs-error-never-reaches-chain-append", chain.readHead(dir) === null, JSON.stringify(chain.readHead(dir)));
+}
+
+/* Round-1 fix-plan item 1: the per-event maybeRenew() call inside recoverCrashedSessions'
+ * own WAL-replay loop must detect a lease taken over by a competing writer mid-replay --
+ * not only once per connection at the loop's own top. This also proves the detected loss
+ * aborts the WHOLE function, not merely the one connection whose replay happened to be
+ * running when it fired: conn-1 (whose replay/seal finishes before the simulated takeover
+ * fires) is fully sealed into the chain, but conn-2 (where the takeover is actually
+ * detected) is left completely untouched -- recoverCrashedSessions never falls through to
+ * its own per-connection "flag for operator review, continue with the next connection"
+ * handling for a lease-loss error, unlike every other failure mode that same per-connection
+ * try/catch already tolerates. */
+function recoverAbortsOnLeaseTakeoverDuringWalReplayNotJustOneConnection() {
+  const dir = freshDir("recover-takeover-mid-replay");
+  const keys = makeKeys();
+  seedCleanCallWal(dir, "conn-1");
+  recovery.appendWalEvent(dir, "conn-1", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  seedCleanCallWal(dir, "conn-2");
+  recovery.appendWalEvent(dir, "conn-2", { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  let callCount = 0;
+  const takeoverError = new Error("simulated competing writer took over this state_dir mid-replay");
+  const fakeWriterClaim = {
+    renew: () => {},
+    maybeRenew: () => {
+      callCount++;
+      // Each connection's WAL replay above has 4 events (SESSION_START, INITIALIZE,
+      // CALL_START, CALL_RESULT), so calls 1-4 are conn-1's own replay and call 5 is
+      // conn-2's very first event -- strictly after conn-1's own replay/seal/chain-append
+      // has already completed in full.
+      if (callCount === 5) throw takeoverError;
+    },
+  };
+  let threw = null;
+  try {
+    recoverCrashedSessions(dir, keys, silentLog, fakeWriterClaim);
+  } catch (error) {
+    threw = error;
+  }
+  check("takeover-mid-replay-aborts-with-the-exact-detected-error", threw === takeoverError, threw && threw.message);
+  check("takeover-mid-replay-conn-1-was-already-fully-sealed-first", chain.readHead(dir) !== null, JSON.stringify(chain.readHead(dir)));
+  check(
+    "takeover-mid-replay-conn-2-left-completely-untouched-not-flagged-for-operator-review",
+    recovery.readWalEvents(dir, "conn-2").length === 4,
+    String(recovery.readWalEvents(dir, "conn-2").length)
+  );
+}
+
+/* Round-1 fix-plan item 1: a lease loss detected by verifyAndRepairBundleCollision's own
+ * leaseGuard.renew() (called immediately before chain.repairMissingChainEntry) must not be
+ * relabeled as an ordinary "RECOVERY CHAIN-REPAIR FAILURE" -- it must propagate by
+ * reference identity all the way out of recoverCrashedSessions entirely, exactly like every
+ * other detected lease loss in this same function. */
+function recoverRepairPathLeaseLossIsNotRelabeledAsAnOrdinaryFailure() {
+  const dir = freshDir("recover-repair-path-lease-loss");
+  const keys = makeKeys();
+  const connectionId = "conn-repair-lease";
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  recoverCrashedSessions(dir, keys, silentLog);
+  const firstHead = chain.readHead(dir);
+  check("repair-path-lease-loss-fixture-first-pass-sealed", firstHead && firstHead.seq === 1, JSON.stringify(firstHead));
+
+  // Roll chain.jsonl/HEAD.json back to "nothing appended yet" (same partial-append
+  // simulation recoverRepairsAPartialAppendMissingItsChainEntry above uses), then replay
+  // the identical WAL again so the second pass hits GATEWAY_BUNDLE_ID_COLLISION and
+  // attempts the repair path.
+  fs.unlinkSync(chain.chainPath(dir));
+  fs.unlinkSync(chain.headPath(dir));
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  let renewCalls = 0;
+  const rawError = new Error("simulated lease loss during the repair-path renew");
+  const fakeWriterClaim = {
+    renew: () => {
+      renewCalls++;
+      if (renewCalls === 3) throw rawError; // 1: top-of-loop, 2: pre-append, 3: repair-path
+    },
+  };
+  let threw = null;
+  try {
+    recoverCrashedSessions(dir, keys, silentLog, fakeWriterClaim);
+  } catch (error) {
+    threw = error;
+  }
+  check("repair-path-lease-loss-propagates-by-reference-not-relabeled", threw === rawError, threw && threw.message);
 }
 
 function unreadableWalForOneConnectionDoesNotBlockAnother() {
@@ -769,6 +897,74 @@ function abandonConnectionStillSucceedsOnAGenuineRepeatedAttempt() {
   check("abandon-repeated-genuine-attempt-cleans-up-the-wal", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present");
   const headAfter = chain.readHead(dir);
   check("abandon-repeated-genuine-attempt-no-duplicate-chain-entry", headAfter && headAfter.seq === firstHead.seq, JSON.stringify(headAfter));
+}
+
+/* Round-1 fix-plan item 1: same unconditional pre-append renew() as recoverCrashedSessions'
+ * own normal path, applied to abandonConnection's own single-connection chain-append. This
+ * function has no per-connection try/catch of its own -- a detected lease loss simply
+ * propagates uncaught out to runRecoveryAbandonCli's caller, exactly as fatal as
+ * recoverCrashedSessions' own explicit rethrow. */
+function abandonConnectionAbortsWhenThePreAppendRenewFails() {
+  const dir = freshDir("abandon-pre-append-renew-fails");
+  const keys = makeKeys();
+  const connectionId = "conn-abandon-renew-fail";
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  let renewCalls = 0;
+  const rawError = new Error("simulated lease loss immediately before abandonConnection's own chain.appendSession");
+  const fakeWriterClaim = {
+    renew: () => {
+      renewCalls++;
+      if (renewCalls === 2) throw rawError; // 1: top-of-function renew, 2: pre-append renew
+    },
+  };
+  let threw = null;
+  try {
+    abandonConnection(dir, keys, connectionId, silentLog, fakeWriterClaim);
+  } catch (error) {
+    threw = error;
+  }
+  check("abandon-pre-append-renew-failure-aborts-with-the-exact-detected-error", threw === rawError, threw && threw.message);
+  check("abandon-pre-append-renew-failure-never-reaches-chain-append", chain.readHead(dir) === null, JSON.stringify(chain.readHead(dir)));
+  check("abandon-pre-append-renew-failure-leaves-the-wal-in-place", recovery.readWalEvents(dir, connectionId).length > 0, "WAL was deleted despite the aborted renew");
+}
+
+/* Round-1 fix-plan item 1: same reference-identity, not-relabeled requirement as
+ * recoverCrashedSessions' own repair path, for abandonConnection's own
+ * GATEWAY_BUNDLE_ID_COLLISION handling -- the repair-path lease loss must be rethrown
+ * unwrapped, not wrapped in fail()'s own GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED. */
+function abandonConnectionRepairPathLeaseLossIsNotRelabeledAsChainRepairFailure() {
+  const dir = freshDir("abandon-repair-path-lease-loss");
+  const keys = makeKeys();
+  const connectionId = "conn-abandon-repair-lease";
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+  abandonConnection(dir, keys, connectionId, silentLog);
+  const firstHead = chain.readHead(dir);
+  check("abandon-repair-path-lease-loss-fixture-first-pass-sealed", firstHead && firstHead.seq === 1, JSON.stringify(firstHead));
+
+  fs.unlinkSync(chain.chainPath(dir));
+  fs.unlinkSync(chain.headPath(dir));
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  let renewCalls = 0;
+  const rawError = new Error("simulated lease loss during abandonConnection's own repair-path renew");
+  const fakeWriterClaim = {
+    renew: () => {
+      renewCalls++;
+      if (renewCalls === 3) throw rawError; // 1: top-of-function, 2: pre-append, 3: repair-path
+    },
+  };
+  let threw = null;
+  try {
+    abandonConnection(dir, keys, connectionId, silentLog, fakeWriterClaim);
+  } catch (error) {
+    threw = error;
+  }
+  check("abandon-repair-path-lease-loss-propagates-by-reference-not-wrapped-in-fail", threw === rawError, threw && threw.message);
+  check("abandon-repair-path-lease-loss-has-no-gateway-recovery-error-code", !(threw && threw.code === "GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED"), threw && threw.code);
 }
 
 function abandonConnectionQuarantinesAnUnreadableWal() {
@@ -1161,10 +1357,15 @@ function main() {
   recoverCrashedSessionsRenewsTheWriterClaimPerConnection();
   recoverCrashedSessionsWithoutAWriterClaimStillWorks();
   recoverCrashedSessionsAbortsImmediatelyIfTheClaimIsLost();
+  recoverAbortsOnARawFsErrorFromThePreAppendRenewNotJustNamedClaimCodes();
+  recoverAbortsOnLeaseTakeoverDuringWalReplayNotJustOneConnection();
+  recoverRepairPathLeaseLossIsNotRelabeledAsAnOrdinaryFailure();
   unreadableWalForOneConnectionDoesNotBlockAnother();
   abandonConnectionQuarantinesAnUnreadableWal();
   abandonConnectionRefusesOnUnverifiedBundleCollision();
   abandonConnectionStillSucceedsOnAGenuineRepeatedAttempt();
+  abandonConnectionAbortsWhenThePreAppendRenewFails();
+  abandonConnectionRepairPathLeaseLossIsNotRelabeledAsChainRepairFailure();
   notExecutedIntentReplaysAsAFailedCallAndIsThenCleanedUp();
   healthStatusItemizesDispatchedIntentsAlongsideTheCount();
   recoverAmbiguousIntentLogNamesTheRealKeyNotAPlaceholder();

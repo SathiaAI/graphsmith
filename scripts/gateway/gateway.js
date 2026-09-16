@@ -613,10 +613,70 @@ function bundleCollisionIsSameContent(stateDir, sealed) {
  * a genuinely different session; caller must not clean up). May throw if content is
  * verified but the repair write itself fails -- callers must not clean up in that case
  * either, since the chain still does not durably reference this bundle. */
-function verifyAndRepairBundleCollision(stateDir, sealed, log) {
+/* Round-1 fix-plan item 1 (lease keepalive, generalized): a small per-writerClaim wrapper
+ * shared by recoverCrashedSessions/abandonConnection (and verifyAndRepairBundleCollision,
+ * which both of those call into) so every call site renews the SAME claim through the SAME
+ * two methods -- writer-claim.js's own time-gated maybeRenew() for the WAL-replay per-event
+ * loop, and its unconditional renew() immediately before any write that mutates shared
+ * chain state (chain.appendSession, chain.repairMissingChainEntry). `writerClaim` may be
+ * null (existing direct callers/tests that construct no real claim) -- both wrapped methods
+ * then become no-ops, exactly like the bare `if (writerClaim) writerClaim.renew()` guard
+ * they replace.
+ *
+ * isLeaseError(error) lets a catch block further up this same call chain recognize a
+ * failure that ALREADY passed through this guard's own renew()/maybeRenew() and distinguish
+ * it from an unrelated failure (a chain-append error, a repair-write error) caught at the
+ * same try/catch -- by reference identity, not by error.code string matching, since
+ * writer-claim.js's renew() can propagate a raw fs error (e.g. EIO) that carries no
+ * WRITER_CLAIM_LOST code at all. A detected lease loss must never be downgraded to
+ * per-connection "flag for operator review, continue" handling -- that per-connection
+ * recovery of DIFFERENT connections' state under a claim this process may no longer
+ * exclusively hold is exactly the split-brain condition this fix exists to prevent, so
+ * every catch block that checks isLeaseError rethrows immediately instead, letting it
+ * propagate all the way out (recoverCrashedSessions' caller, startGateway, already releases
+ * the claim and rethrows -- see its own comment above -- making a detected lease loss fatal
+ * to the whole process).
+ *
+ * DISCLOSED, NOT FIXED HERE: this narrows the exposure window (a claim renewed just before
+ * each mutating write is checked far more often than one renewed only by the heartbeat
+ * interval) but does NOT provide atomic fencing -- a competitor could still acquire between
+ * this guard's own renew() call returning and the write it guards actually landing. Never
+ * describe this as "preventing corruption"; see writer-claim.js's own maybeRenew() doc
+ * comment for the same disclosure at the primitive's own level. */
+function createLeaseGuard(writerClaim) {
+  let leaseError = null;
+  return {
+    renew() {
+      if (!writerClaim) return;
+      try {
+        writerClaim.renew();
+      } catch (error) {
+        leaseError = error;
+        throw error;
+      }
+    },
+    maybeRenew() {
+      if (!writerClaim || typeof writerClaim.maybeRenew !== "function") return;
+      try {
+        writerClaim.maybeRenew();
+      } catch (error) {
+        leaseError = error;
+        throw error;
+      }
+    },
+    // Reference-identity check, deliberately not `error.code === "WRITER_CLAIM_LOST"` --
+    // see this function's own doc comment above.
+    isLeaseError(error) {
+      return error === leaseError;
+    },
+  };
+}
+
+function verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard = null) {
   if (!bundleCollisionIsSameContent(stateDir, sealed)) return false;
   const bundleId = sealed.bundle.manifest.bundle_id;
   if (!chain.chainHasEntryForBundle(stateDir, bundleId)) {
+    if (leaseGuard) leaseGuard.renew();
     chain.repairMissingChainEntry(stateDir, bundleId);
     log(
       `recovery: bundle "${bundleId}" was durably written but never chain-appended (crash between ` +
@@ -643,6 +703,7 @@ function verifyAndRepairBundleCollision(stateDir, sealed, log) {
  * terminal is auto-sealed. Anything else is left alone and reported -- never guessed. */
 function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
   const pendingOperatorReview = [];
+  const leaseGuard = createLeaseGuard(writerClaim);
   for (const connectionId of recovery.listActiveConnections(stateDir)) {
     /* Codex PR #33 review "renew ownership during synchronous recovery": this whole
      * per-connection body below is synchronous fs work (WAL replay, session.finalizeSession,
@@ -658,8 +719,11 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
      * startGateway's own real call site below always passes its live claim. A failed renew
      * means another process may already hold this state_dir -- propagate immediately
      * (uncaught by this loop's own per-connection try/catch further down) rather than keep
-     * mutating shared chain/WAL state under a claim that might no longer be exclusive. */
-    if (writerClaim) writerClaim.renew();
+     * mutating shared chain/WAL state under a claim that might no longer be exclusive.
+     * Round-1 fix-plan item 1: routed through createLeaseGuard's own leaseGuard.renew()
+     * (rather than a bare writerClaim.renew() call) so a failure here is later
+     * recognizable by isLeaseError -- see this loop's own outer catch below. */
+    leaseGuard.renew();
     /* CodeRabbit PR #33 review "continue recovery after an unreadable connection state":
      * readWalEvents/readIntent below can throw (GATEWAY_RECOVERY_WAL_UNREADABLE,
      * GATEWAY_RECOVERY_INTENT_UNREADABLE, GATEWAY_RECOVERY_INTENT_CORRUPT) on a genuine
@@ -697,6 +761,14 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
       const keyToStartEvent = new Map();
 
       for (const event of events) {
+        /* Round-1 fix-plan item 1: this per-event loop is exactly the "long synchronous
+         * phase this claim is held across" the per-connection leaseGuard.renew() above
+         * already anticipates for the whole-connection case -- a single sufficiently large
+         * WAL can itself run long enough between yields to the event loop that even a
+         * once-per-connection renew is not enough. maybeRenew() is time-gated by the
+         * claim's own clock (never Date.now()), so this costs nothing beyond an in-memory
+         * comparison on every iteration that doesn't actually need to renew. */
+        leaseGuard.maybeRenew();
         if (event.type === "SESSION_START") {
           session.recordToolsList(s, event.tools || []);
         } else if (event.type === "INITIALIZE") {
@@ -817,14 +889,24 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
         pendingOperatorReview.push(connectionId);
         continue;
       }
+      // Round-1 fix-plan item 1: unconditional renew() (not maybeRenew()) immediately
+      // before every chain.appendSession call, in both this normal path and the repair
+      // path below -- this is the one write per connection that actually mutates the
+      // shared chain, so it gets its own fresh, unconditional renewal regardless of how
+      // recently the per-event maybeRenew() above last renewed.
+      leaseGuard.renew();
       try {
         chain.appendSession(stateDir, sealed);
       } catch (error) {
         if (error.code === "GATEWAY_BUNDLE_ID_COLLISION") {
           let verified;
           try {
-            verified = verifyAndRepairBundleCollision(stateDir, sealed, log);
+            verified = verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard);
           } catch (repairError) {
+            // A lease loss detected by verifyAndRepairBundleCollision's own leaseGuard.renew()
+            // must not be relabeled as an ordinary chain-repair failure -- rethrow so it
+            // reaches this function's own outer catch below and propagates as fatal.
+            if (leaseGuard.isLeaseError(repairError)) throw repairError;
             log(`RECOVERY CHAIN-REPAIR FAILURE for connection "${connectionId}": ${repairError.message} -- leaving its WAL in place for investigation.`);
             pendingOperatorReview.push(connectionId);
             continue;
@@ -853,6 +935,17 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
       }
       log(`recovery: connection "${connectionId}" recovered and sealed from a crash-left WAL (${s.calls.length} call(s)).`);
     } catch (error) {
+      // Round-1 fix-plan item 1: a lease loss detected anywhere in this connection's own
+      // body above (the per-connection renew(), the per-event maybeRenew(), the pre-append
+      // renew(), or a repair-path renew() rethrown from the inner catch above) must never
+      // be downgraded to this function's own per-connection "flag for operator review,
+      // continue with the next connection" handling -- that would keep mutating OTHER
+      // connections' chain/WAL state under a claim this process may no longer exclusively
+      // hold, which is exactly the split-brain condition this fix exists to prevent.
+      // Rethrow so it propagates out of this whole loop/function -- startGateway's own
+      // call site above already releases the claim and rethrows again, making a detected
+      // lease loss fatal to the whole process, not just this one connection.
+      if (leaseGuard.isLeaseError(error)) throw error;
       log(`RECOVERY FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- leaving its state in place for investigation. Use "recovery-abandon --connection ${connectionId}" to quarantine it without needing to re-read that state.`);
       pendingOperatorReview.push(connectionId);
     }
@@ -875,8 +968,16 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
   /* Codex PR #33 review "renew ownership during synchronous recovery": same rationale as
    * recoverCrashedSessions' own per-connection renew() above, applied to this CLI's own
    * synchronous WAL replay/finalize/chain-append for its one connection -- "sufficiently
-   * large" applies just as well to a single big WAL as to many small ones. */
-  if (writerClaim) writerClaim.renew();
+   * large" applies just as well to a single big WAL as to many small ones. Round-1
+   * fix-plan item 1: routed through createLeaseGuard so a lease loss anywhere in this
+   * function is recognizable by isLeaseError below and never relabeled as an ordinary
+   * chain-repair/abandon failure; a lease-loss failure here is simply left uncaught
+   * (this function has no per-connection try/catch of its own to swallow it), propagating
+   * out to runRecoveryAbandonCli's caller exactly like any other uncaught error already
+   * would -- fatal to this CLI invocation, consistent with recoverCrashedSessions' own
+   * process-fatal handling. */
+  const leaseGuard = createLeaseGuard(writerClaim);
+  leaseGuard.renew();
   /* Codex PR #33 review "continue recovery after an unreadable connection state": this
    * command is recoverCrashedSessions' own documented remediation path for a connection
    * it could not process -- including one whose WAL could not even be READ (permissions/
@@ -912,6 +1013,9 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
   const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
   const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
   for (const event of events) {
+    // Round-1 fix-plan item 1: same time-gated renewal as recoverCrashedSessions' own
+    // per-event loop above, for this CLI's own single-connection WAL replay.
+    leaseGuard.maybeRenew();
     if (event.type === "SESSION_START") {
       session.recordToolsList(s, event.tools || []);
     } else if (event.type === "INITIALIZE") {
@@ -931,6 +1035,9 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
     session.markPendingAsDisconnected(s, "operator ran recovery-abandon: outcome could not be confirmed and was not waited on further", () => Date.now());
   }
   const sealed = session.finalizeSession(s, keys);
+  // Round-1 fix-plan item 1: unconditional renew() immediately before chain.appendSession,
+  // same as recoverCrashedSessions' own normal path above.
+  leaseGuard.renew();
   try {
     chain.appendSession(stateDir, sealed);
   } catch (error) {
@@ -945,8 +1052,14 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
      * only remaining unrecoverable record. Apply the same content verification here. */
     let verified;
     try {
-      verified = verifyAndRepairBundleCollision(stateDir, sealed, log);
+      verified = verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard);
     } catch (repairError) {
+      // Round-1 fix-plan item 1: a lease loss detected by verifyAndRepairBundleCollision's
+      // own leaseGuard.renew() must not be relabeled as an ordinary chain-repair failure --
+      // rethrow the original error unwrapped (by reference) rather than wrapping it in
+      // fail()'s own GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED, so isLeaseError-style identity
+      // checks further up this same process's call stack still recognize it.
+      if (leaseGuard.isLeaseError(repairError)) throw repairError;
       throw fail(
         `recovery-abandon: connection "${connectionId}" bundle "${sealed.bundle.manifest.bundle_id}" was content-verified as this connection's own record, but completing its missing chain.jsonl append failed: ${repairError.message}. Refusing to abandon: this connection's WAL/intents are NOT cleaned up (the chain still does not durably reference this bundle) -- investigate and retry.`,
         "GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED"
@@ -1578,6 +1691,7 @@ module.exports = {
   buildHealthStatus,
   loadSigningKeys,
   drainOpenSessions,
+  createLeaseGuard,
   recoverCrashedSessions,
   abandonConnection,
   runRecoveryResolveCli,
