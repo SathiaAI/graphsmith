@@ -120,6 +120,119 @@ function anomaliesCappedWithTerminalMarker() {
   );
 }
 
+/* Round-1 fix-round follow-up (2026-09-15, "anomaly cap tests and the WAL/disk-growth
+ * follow-up ticket"): the existing anomaliesCappedWithTerminalMarker test above only ever
+ * drives the cap through recordUnmatchedResponseAnomaly. recordAnomaly is a SEPARATE
+ * external entry point (used by proxy.js's blocked-retry path, not by unmatched-response
+ * handling) that happens to share the same pushCappedAnomaly implementation -- prove the
+ * cap boundary holds for THIS entry point directly rather than assuming the shared
+ * implementation makes that redundant. Also settles, with a test rather than an
+ * assumption (per Paul's 2026-09-15 instruction -- prior review rounds disagreed on this),
+ * that recordAnomaly's return value flips from true to false exactly at the cap boundary:
+ * true for every one of the first MAX_ANOMALIES_PER_SESSION calls (including the one that
+ * also appends the ANOMALY_CAP_REACHED terminal marker), false for every call after. */
+function recordAnomalyRespectsCapWithTerminalMarker() {
+  const { MAX_ANOMALIES_PER_SESSION } = session;
+  const s = session.createSession("conn-record-anomaly-cap");
+  const returns = [];
+  for (let i = 0; i < MAX_ANOMALIES_PER_SESSION; i++) {
+    returns.push(session.recordAnomaly(s, { kind: "GATEWAY_AMBIGUOUS_RETRY", tool: "t", detail: `attempt ${i}` }));
+  }
+  check(
+    "recordAnomaly-returns-true-for-every-call-up-to-and-including-the-cap",
+    returns.every((r) => r === true),
+    JSON.stringify(returns.filter((r) => r !== true))
+  );
+  check(
+    "recordAnomaly-cap-plus-terminal-marker-present-at-MAX",
+    s.anomalies.length === MAX_ANOMALIES_PER_SESSION + 1 && s.anomalies[s.anomalies.length - 1].kind === "ANOMALY_CAP_REACHED",
+    `length=${s.anomalies.length}`
+  );
+  // Past the cap: every further call is dropped (returns false) and anomalies stops
+  // growing entirely -- not even a second terminal marker.
+  const post1 = session.recordAnomaly(s, { kind: "GATEWAY_AMBIGUOUS_RETRY", tool: "t", detail: "past cap #1" });
+  const post2 = session.recordAnomaly(s, { kind: "GATEWAY_AMBIGUOUS_RETRY", tool: "t", detail: "past cap #2" });
+  check("recordAnomaly-returns-false-once-cap-is-reached", post1 === false && post2 === false, JSON.stringify([post1, post2]));
+  check(
+    "recordAnomaly-past-cap-does-not-grow-anomalies-further",
+    s.anomalies.length === MAX_ANOMALIES_PER_SESSION + 1,
+    `length=${s.anomalies.length}`
+  );
+}
+
+/* Frontier-panel decision (Paul, 2026-09-10, cluster E2, see proxy.js's own comment on
+ * "a reconnecting agent gets a brand-new connectionId"): a reconnect is, at the
+ * session-capture layer, simply a fresh session.createSession call with its own empty
+ * anomalies array -- the cap is a PER-SESSION budget, not a per-agent or per-connectionId-
+ * string lifetime budget. Prove that a session exhausted to its cap does not poison a
+ * later session: the later one starts at zero and can independently record up to its own
+ * full budget. */
+function reconnectStartsWithAFreshAnomalyBudget() {
+  const { MAX_ANOMALIES_PER_SESSION } = session;
+  const exhausted = session.createSession("conn-reconnect-before-crash");
+  for (let i = 0; i < MAX_ANOMALIES_PER_SESSION + 3; i++) {
+    session.recordAnomaly(exhausted, { kind: "GATEWAY_AMBIGUOUS_RETRY", tool: "t", detail: `attempt ${i}` });
+  }
+  check(
+    "pre-reconnect-session-is-fully-exhausted",
+    exhausted.anomalies.length === MAX_ANOMALIES_PER_SESSION + 1,
+    `length=${exhausted.anomalies.length}`
+  );
+
+  // The reconnecting agent's new connection -- a DIFFERENT connectionId, matching
+  // proxy.js's own documented behavior that a reconnect never reuses the old one.
+  const reconnected = session.createSession("conn-reconnect-after-crash");
+  check("reconnected-session-starts-with-zero-anomalies", reconnected.anomalies.length === 0, `length=${reconnected.anomalies.length}`);
+  const recorded = session.recordAnomaly(reconnected, { kind: "GATEWAY_AMBIGUOUS_RETRY", tool: "t", detail: "first attempt after reconnect" });
+  check("reconnected-session-records-normally-despite-the-old-session-being-exhausted", recorded === true && reconnected.anomalies.length === 1, JSON.stringify(reconnected.anomalies));
+
+  // And the reconnected session has its OWN full budget, unaffected by the old one's cap
+  // having been hit -- fill it independently and confirm it caps at the same boundary.
+  for (let i = 1; i < MAX_ANOMALIES_PER_SESSION + 3; i++) {
+    session.recordAnomaly(reconnected, { kind: "GATEWAY_AMBIGUOUS_RETRY", tool: "t", detail: `attempt ${i}` });
+  }
+  check(
+    "reconnected-session-caps-independently-at-its-own-full-budget",
+    reconnected.anomalies.length === MAX_ANOMALIES_PER_SESSION + 1,
+    `length=${reconnected.anomalies.length}`
+  );
+}
+
+/* LIMITATION, confirmed here rather than silently accepted (per Paul's 2026-09-15
+ * instruction): MAX_ANOMALIES_PER_SESSION is a plain event-COUNT cap with no notion of
+ * severity or evidentiary value -- it drops the (count+1)-th anomaly regardless of
+ * whether it is one more low-value duplicate of noise already recorded or the single
+ * highest-value entry in the whole session (e.g. the one GATEWAY_AMBIGUOUS_RETRY that
+ * proves a duplicate dispatch was actually prevented). A sufficiently large flood of
+ * low-value anomalies (e.g. UNMATCHED_RESPONSE from a chatty misbehaving downstream) can
+ * therefore silently crowd out and suppress a later high-value one from ever reaching the
+ * sealed bundle. This test proves the suppression happens (it is not hypothetical) and
+ * exists to keep this limitation visible rather than let it regress into an unexamined
+ * assumption; see KNOWN-LIMITATIONS.md ("Anomaly cap is an event count, not a value or
+ * byte budget") for the tracked follow-up. */
+function cappedAnomaliesCanSuppressAHigherValueLaterEvent() {
+  const { MAX_ANOMALIES_PER_SESSION } = session;
+  const s = session.createSession("conn-suppression-risk");
+  for (let i = 0; i < MAX_ANOMALIES_PER_SESSION; i++) {
+    session.recordAnomaly(s, { kind: "UNMATCHED_RESPONSE", detail: `low-value noise #${i}` });
+  }
+  check("suppression-setup-cap-exactly-reached", s.anomalies.length === MAX_ANOMALIES_PER_SESSION + 1, `length=${s.anomalies.length}`);
+
+  // A genuinely high-value event arrives immediately after: a blocked duplicate dispatch,
+  // the exact kind of anomaly Option C's design depends on the sealed bundle attesting.
+  const recorded = session.recordAnomaly(s, {
+    kind: "GATEWAY_AMBIGUOUS_RETRY",
+    tool: "transfer-funds",
+    detail: "a prior attempt of this exact operation was still in flight -- dispatch halted",
+  });
+  check("high-value-anomaly-after-cap-is-silently-dropped-not-recorded", recorded === false, String(recorded));
+  check(
+    "high-value-anomaly-kind-does-not-appear-anywhere-in-the-sealed-anomalies",
+    !s.anomalies.some((a) => a.kind === "GATEWAY_AMBIGUOUS_RETRY"),
+    JSON.stringify(s.anomalies.filter((a) => a.kind === "GATEWAY_AMBIGUOUS_RETRY"))
+  );
+}
+
 function disconnectMarksPendingAsError() {
   const s = session.createSession("conn-4");
   session.recordCallStart(s, 1, { tool: "hangs", server: "srv", arguments: {}, ts: 1 });
@@ -257,6 +370,9 @@ function main() {
   unmatchedResponseIsAnomalyNotCrash();
   unmatchedResponseAnomalyDoesNotTouchPendingCalls();
   anomaliesCappedWithTerminalMarker();
+  recordAnomalyRespectsCapWithTerminalMarker();
+  reconnectStartsWithAFreshAnomalyBudget();
+  cappedAnomaliesCanSuppressAHigherValueLaterEvent();
   disconnectMarksPendingAsError();
   disconnectCallbackFailureDoesNotAbortLoopOrPropagate();
   modelCallFlagPreserved();

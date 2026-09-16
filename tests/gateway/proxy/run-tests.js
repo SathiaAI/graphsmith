@@ -773,6 +773,71 @@ async function blockedRetryAnomalyIsDurablyRecorded() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* Round-1 fix-round follow-up (2026-09-15, "anomaly cap tests and the WAL/disk-growth
+ * follow-up ticket", tying back to the still-open 2026-09-14 Cluster H recommendation):
+ * MAX_ANOMALIES_PER_SESSION (session.js) bounds session.anomalies -- the in-memory array
+ * that becomes the sealed bundle's anomalies -- but proxy.js's blocked-retry path (the
+ * "block" branch above) appends an ANOMALY event to the WAL UNCONDITIONALLY, every single
+ * time it is hit, regardless of what session.recordAnomaly returned. A blocked-retry
+ * attempt never goes through MAX_PENDING_CALLS_PER_SESSION or
+ * MAX_COMPLETED_CALLS_PER_SESSION either -- it is rejected before ever being admitted as a
+ * pending or completed call -- so nothing in this codebase bounds how many ANOMALY WAL
+ * lines one connection can generate. Proves both halves directly against the real
+ * dispatch path (not just session.js in isolation): the in-memory/sealed-bundle side
+ * plateaus at the cap while the WAL keeps growing past it. This is deliberately NOT
+ * treated as closing out the broader disk-growth risk -- see the WAL/disk-growth ticket
+ * in KNOWN-LIMITATIONS.md; neither this event-count cap nor WAL rotation alone bounds
+ * disk usage when event SIZE varies. */
+async function blockedRetryAnomaliesAreUncappedInTheWalDespiteTheSessionCap() {
+  const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
+  const { MAX_ANOMALIES_PER_SESSION } = session;
+  const dir = freshDir("anomaly-cap-vs-wal");
+  let resolveCall;
+  const conn = fakeConnectionCapturing(() => new Promise((resolve) => { resolveCall = resolve; }));
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  // Keeps the original call in flight for the whole test, so every subsequent identical
+  // call is blocked as an ambiguous retry rather than dispatched or admitted anywhere.
+  const firstPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const blockedAttempts = MAX_ANOMALIES_PER_SESSION + 5;
+  for (let i = 0; i < blockedAttempts; i++) {
+    const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 100 + i, method: "tools/call", params: { name: "slow", arguments: { x: 1 } } });
+    if (!(resp && resp.error && resp.error.code === -32080)) {
+      check("every-retry-in-this-loop-is-actually-blocked-as-ambiguous", false, `attempt ${i}: ${JSON.stringify(resp)}`);
+      break;
+    }
+  }
+
+  const s = proxy.sessions.get("conn-1");
+  check(
+    "session-side-anomalies-plateau-at-the-cap-plus-terminal-marker",
+    Boolean(s) && s.anomalies.length === MAX_ANOMALIES_PER_SESSION + 1,
+    `length=${s && s.anomalies.length}, blockedAttempts=${blockedAttempts}`
+  );
+
+  const walAnomalyCount = recovery.readWalEvents(dir, "conn-1").filter((e) => e.type === "ANOMALY").length;
+  check(
+    "wal-anomaly-count-is-not-bounded-by-the-session-cap-and-matches-every-blocked-attempt",
+    walAnomalyCount === blockedAttempts,
+    `walAnomalyCount=${walAnomalyCount}, blockedAttempts=${blockedAttempts}, sessionCap=${MAX_ANOMALIES_PER_SESSION}`
+  );
+  check(
+    "wal-anomaly-count-exceeds-what-the-session-cap-would-allow-if-it-applied-to-the-wal-too",
+    walAnomalyCount > MAX_ANOMALIES_PER_SESSION + 1,
+    `walAnomalyCount=${walAnomalyCount}`
+  );
+
+  resolveCall({ ok: true });
+  await firstPromise;
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
 /* Codex PR #33 review "emit complete step logs for replayed and blocked calls": a
  * completed-intent replay previously logged only the special-purpose
  * gateway_intent_replayed event, missing the normal step/status/duration shape every
@@ -1079,6 +1144,19 @@ async function anomalyWalAppendFailureDoesNotEscapeHandleMessage() {
   }
   check("anomaly-wal-failure-does-not-escape-handleMessage", threw === null, threw && threw.message);
   check("anomaly-wal-failure-still-returns-the-block-response", Boolean(resp && resp.error && resp.error.code === -32080), JSON.stringify(resp));
+  /* Round-1 fix-round follow-up (2026-09-15): settle, with a test rather than an
+   * assumption, whether session.recordAnomaly consumes the MAX_ANOMALIES_PER_SESSION
+   * budget BEFORE this path's WAL append (and its outcome) or after -- prior review
+   * rounds disagreed on this. proxy.js calls session.recordAnomaly(...) unconditionally,
+   * THEN attempts the (here, deliberately failing) WAL append in its own try/catch --
+   * so the in-memory/sealed-bundle accounting must already be done by the time the WAL
+   * append is even attempted, independent of whether that append succeeds. */
+  const sAfterWalFailure = proxy.sessions.get("conn-1");
+  check(
+    "anomaly-budget-was-consumed-in-memory-before-the-failed-wal-append-was-even-attempted",
+    Boolean(sAfterWalFailure) && sAfterWalFailure.anomalies.length === 1 && sAfterWalFailure.anomalies[0].kind === "GATEWAY_AMBIGUOUS_RETRY",
+    JSON.stringify(sAfterWalFailure && sAfterWalFailure.anomalies)
+  );
   resolveCall({ ok: true });
   await firstPromise;
   await proxy.closeConnection("conn-1", "test cleanup");
@@ -1488,6 +1566,7 @@ async function main() {
   await walRecordsLifecycleEventsAndIsCleanedUpOnClose();
 
   await blockedRetryAnomalyIsDurablyRecorded();
+  await blockedRetryAnomaliesAreUncappedInTheWalDespiteTheSessionCap();
   await replayedCallGetsAStructuredCompletionLogToo();
   await callStartWalAppendFailureRollsBackAndStaysRetryable();
   await postDispatchUpdateSkippedWhenIntentConcurrentlyRemoved();
