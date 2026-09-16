@@ -185,6 +185,397 @@ function emptyChainIsNotApplicable() {
   check("empty-chain-not-applicable", result.status === "not-applicable", JSON.stringify(result));
 }
 
+/* ==================================================================================
+ * C2 (docs/contracts/chain-validity.md) -- commit 3: validateChain + readChainTail.
+ * ================================================================================== */
+
+function mkEntry(seq, prev, bundleId) {
+  const partial = { schema_version: "1.0", seq, bundle_id: bundleId, prev_entry_sha256: prev };
+  return { ...partial, entry_sha256: chain.computeEntrySha256(partial) };
+}
+function mkHeadFor(entry) {
+  return { schema_version: "1.0", seq: entry.seq, bundle_id: entry.bundle_id, entry_sha256: entry.entry_sha256 };
+}
+function line(entry) {
+  return JSON.stringify(entry);
+}
+function writeChainFile(dir, text) {
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  fs.writeFileSync(chain.chainPath(dir), text);
+}
+
+/* ---- validateChain: rows 1/2 (empty states) ---- */
+
+function validateChainEmptyGenesisIsNotAFailure() {
+  const result = chain.validateChain([], null);
+  check("validate-chain-empty-genesis-is-not-a-failure", result.status === "empty", JSON.stringify(result));
+}
+
+function validateChainEmptyWithHeadRefuses() {
+  const e1 = mkEntry(1, null, "b1");
+  const result = chain.validateChain([], mkHeadFor(e1));
+  check("validate-chain-empty-with-head-refuses", result.status === "refuse" && result.class === "empty-chain-with-head", JSON.stringify(result));
+}
+
+/* ---- validateChain: rows 5/6/8 (structural/integrity failures -- refuse-and-latch) ---- */
+
+function validateChainDetectsSequenceGap() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  const result = chain.validateChain([e1, e3], null); // e2 deleted -> gap
+  check("validate-chain-detects-sequence-gap", result.status === "refuse" && result.class === "sequence-gap", JSON.stringify(result));
+}
+
+function validateChainDetectsDuplicateSeqAsFork() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2a = mkEntry(2, e1.entry_sha256, "b2a");
+  const e2b = mkEntry(2, e1.entry_sha256, "b2b"); // same seq, different bundle+hash
+  const result = chain.validateChain([e1, e2a, e2b], null);
+  check("validate-chain-detects-duplicate-seq-as-fork", result.status === "refuse" && result.class === "fork", JSON.stringify(result));
+}
+
+function validateChainDetectsTamperedEntry() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const tampered = { ...e2, entry_sha256: "9".repeat(64) };
+  const result = chain.validateChain([e1, tampered], null);
+  check("validate-chain-detects-tampered-entry", result.status === "refuse" && result.class === "tampered" && result.at === 1, JSON.stringify(result));
+}
+
+function validateChainDetectsBrokenLink() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, "d".repeat(64), "b2"); // internally hash-consistent, wrong link
+  const result = chain.validateChain([e1, e2], null);
+  check("validate-chain-detects-broken-link", result.status === "refuse" && result.class === "broken-link", JSON.stringify(result));
+}
+
+function validateChainDetectsInvalidGenesisSeq() {
+  const forged = mkEntry(2, null, "b1"); // hash-consistent, but not seq=1
+  const result = chain.validateChain([forged], null);
+  check("validate-chain-detects-invalid-genesis-seq", result.status === "refuse" && result.class === "invalid-genesis", JSON.stringify(result));
+}
+
+function validateChainDetectsInvalidGenesisPrev() {
+  const forged = mkEntry(1, "a".repeat(64), "b1"); // seq=1 but prev != null
+  const result = chain.validateChain([forged], null);
+  check("validate-chain-detects-invalid-genesis-prev", result.status === "refuse" && result.class === "invalid-genesis", JSON.stringify(result));
+}
+
+function validateChainRefusesMalformedInteriorRecordNotJustTheLast() {
+  const e1 = mkEntry(1, null, "b1");
+  const e3 = mkEntry(3, "irrelevant-since-interior-is-what-fails", "b3");
+  // null in the MIDDLE (not the physical last position) must never get the
+  // torn-tail accommodation -- always refuse, per C2 row 8.
+  const result = chain.validateChain([e1, null, e3], null);
+  check("validate-chain-refuses-malformed-interior-record", result.status === "refuse" && result.class === "malformed-interior" && result.at === 1, JSON.stringify(result));
+}
+
+/* ---- validateChain: row 7 (mid-run lagging HEAD, single-step, hash-verified) ---- */
+
+function validateChainAutoAdvancesSingleStepLaggingHead() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  const result = chain.validateChain([e1, e2, e3], mkHeadFor(e2));
+  check("validate-chain-auto-advances-single-step-lagging-head", result.status === "reconcilable" && result.headAction === "advance" && result.tail.seq === 3, JSON.stringify(result));
+  check("validate-chain-single-step-lag-emits-a-loud-anomaly", typeof result.anomaly === "string" && result.anomaly.length > 0, JSON.stringify(result));
+}
+
+function validateChainRefusesMultiStepLaggingHead() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  const result = chain.validateChain([e1, e2, e3], mkHeadFor(e1)); // two steps behind
+  check("validate-chain-refuses-multi-step-lagging-head", result.status === "refuse" && result.class === "multi-step-lag", JSON.stringify(result));
+}
+
+function validateChainRefusesHeadAheadOfTail() {
+  const e1 = mkEntry(1, null, "b1");
+  const fakeAhead = { schema_version: "1.0", seq: 2, bundle_id: "ghost", entry_sha256: "b".repeat(64) };
+  const result = chain.validateChain([e1], fakeAhead);
+  check("validate-chain-refuses-head-ahead-of-tail", result.status === "refuse" && result.class === "head-ahead-of-tail", JSON.stringify(result));
+}
+
+function validateChainRefusesHeadSameSeqDifferentHashAsFork() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const forkedHead = { schema_version: "1.0", seq: 2, bundle_id: "b2-other", entry_sha256: "c".repeat(64) };
+  const result = chain.validateChain([e1, e2], forkedHead);
+  check("validate-chain-refuses-head-same-seq-different-hash-as-fork", result.status === "refuse" && result.class === "fork", JSON.stringify(result));
+}
+
+function validateChainRefusesOneStepBackHeadThatIsNotAGenuineAncestor() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  // seq is exactly one behind tail (looks like row 7 at a glance) but its hash does
+  // not actually match tail.prev_entry_sha256 -- must NOT auto-catch-up.
+  const notAnAncestor = { schema_version: "1.0", seq: 1, bundle_id: "b1-impostor", entry_sha256: "e".repeat(64) };
+  const result = chain.validateChain([e1, e2], notAnAncestor);
+  check("validate-chain-refuses-one-step-back-head-that-is-not-a-genuine-ancestor", result.status === "refuse" && result.class === "head-not-ancestor", JSON.stringify(result));
+}
+
+/* ---- validateChain: rows 3/4 (HEAD absent/unusable -- rebuild from verified tail) ---- */
+
+function validateChainRebuildsMissingHeadFromVerifiedTail() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const result = chain.validateChain([e1, e2], null);
+  check("validate-chain-rebuilds-missing-head-from-verified-tail", result.status === "reconcilable" && result.headAction === "rebuild" && result.tail.seq === 2, JSON.stringify(result));
+}
+
+function validateChainDoesNotRebuildWhenTheChainItselfDoesNotValidate() {
+  const e1 = mkEntry(1, null, "b1");
+  // Shape-valid (64-hex prev), but wrong link AND a sequence gap -- HEAD being
+  // absent must never bypass the structural walk and rebuild blindly.
+  const e3 = mkEntry(3, "d".repeat(64), "b3");
+  const result = chain.validateChain([e1, e3], null);
+  check("validate-chain-does-not-rebuild-when-the-chain-itself-does-not-validate", result.status === "refuse", JSON.stringify(result));
+}
+
+/* ---- validateChain: row 9 (torn/unparseable FINAL record) ---- */
+
+function validateChainTruncatesTornFinalRecordAndRebuildsHead() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  // `null` stands in for "this physical line could not be parsed at all" (per
+  // validateChain's own documented input contract).
+  const result = chain.validateChain([e1, e2, null], null);
+  check("validate-chain-truncates-torn-final-record-and-rebuilds-head", result.status === "reconcilable" && result.truncatedTail === true && result.headAction === "rebuild" && result.tail.seq === 2, JSON.stringify(result));
+}
+
+function validateChainTornFinalRecordWithHeadAlreadyAtTheTruncatedTailStillReportsReconciliation() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  // HEAD already matches what the truncated chain's tail will be -- this must NOT
+  // be silently reported as "valid" (nothing to do): the on-disk garbage still
+  // needs isolating/truncating, so it must surface as a reconciliation action.
+  const result = chain.validateChain([e1, e2, null], mkHeadFor(e2));
+  check("validate-chain-torn-tail-with-head-already-consistent-still-reconciles-not-silently-valid", result.status === "reconcilable" && result.truncatedTail === true, JSON.stringify(result));
+}
+
+function validateChainTornSoleGenesisRecordWithNoHeadReconcilesToEmptyTail() {
+  const result = chain.validateChain([null], null);
+  check("validate-chain-torn-sole-genesis-record-with-no-head-reconciles-to-empty-tail", result.status === "reconcilable" && result.tail === null && result.truncatedTail === true, JSON.stringify(result));
+}
+
+function validateChainTornSoleRecordWithHeadPresentRefuses() {
+  const ghostHead = { schema_version: "1.0", seq: 1, bundle_id: "ghost", entry_sha256: "f".repeat(64) };
+  const result = chain.validateChain([null], ghostHead);
+  check("validate-chain-torn-sole-record-with-head-present-refuses", result.status === "refuse", JSON.stringify(result));
+}
+
+function validateChainNeverConflatesTornTailWithInteriorCorruption() {
+  // A shape-VALID final record whose hash simply does not recompute is TAMPERING,
+  // not a torn write -- must be refused via the ordinary hash check, never given
+  // the row-9 accommodation.
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const tamperedTail = { ...e2, entry_sha256: "7".repeat(64) };
+  const result = chain.validateChain([e1, tamperedTail], null);
+  check("validate-chain-never-conflates-a-tampered-tail-with-a-torn-tail", result.status === "refuse" && result.class === "tampered", JSON.stringify(result));
+}
+
+/* ---- readChainTail: absent / empty / corrupt stay three distinct outcomes ---- */
+
+function readChainTailAbsentWhenFileDoesNotExist() {
+  const dir = freshDir("tail-absent");
+  fs.mkdirSync(dir, { recursive: true }); // no gateway-sessions/ dir at all
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-absent-when-file-does-not-exist", result.status === "absent", JSON.stringify(result));
+}
+
+function readChainTailEmptyWhenFileIsZeroBytes() {
+  const dir = freshDir("tail-zero-bytes");
+  writeChainFile(dir, "");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-empty-when-file-is-zero-bytes", result.status === "empty", JSON.stringify(result));
+}
+
+function readChainTailEmptyWhenFileIsOnlyBlankLines() {
+  const dir = freshDir("tail-blank-only");
+  writeChainFile(dir, "\n\n\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-empty-when-file-is-only-blank-lines", result.status === "empty", JSON.stringify(result));
+}
+
+function readChainTailSucceedsWithTrailingNewline() {
+  const dir = freshDir("tail-trailing-nl");
+  const e1 = mkEntry(1, null, "b1");
+  writeChainFile(dir, line(e1) + "\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-succeeds-with-trailing-newline", result.status === "ok" && result.hadTrailingNewline === true && result.entry.bundle_id === "b1", JSON.stringify(result));
+}
+
+function readChainTailSucceedsWithoutTrailingNewline() {
+  const dir = freshDir("tail-no-trailing-nl");
+  const e1 = mkEntry(1, null, "b1");
+  writeChainFile(dir, line(e1)); // no trailing \n
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-succeeds-without-trailing-newline", result.status === "ok" && result.hadTrailingNewline === false && result.entry.bundle_id === "b1", JSON.stringify(result));
+}
+
+function readChainTailReturnsTheSameEntryRegardlessOfTrailingNewline() {
+  const dir1 = freshDir("tail-nl-a");
+  const dir2 = freshDir("tail-nl-b");
+  const e1 = mkEntry(1, null, "same-content");
+  writeChainFile(dir1, line(e1) + "\n");
+  writeChainFile(dir2, line(e1));
+  const r1 = chain.readChainTail(dir1);
+  const r2 = chain.readChainTail(dir2);
+  check("read-chain-tail-trailing-newline-does-not-change-the-parsed-entry", r1.status === "ok" && r2.status === "ok" && JSON.stringify(r1.entry) === JSON.stringify(r2.entry), JSON.stringify({ r1, r2 }));
+}
+
+function readChainTailSkipsBlankLinesBeforeTheLastEntry() {
+  const dir = freshDir("tail-blank-between");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  writeChainFile(dir, line(e1) + "\n\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-skips-blank-lines-before-the-last-entry", result.status === "ok" && result.entry.bundle_id === "b2", JSON.stringify(result));
+}
+
+function readChainTailFindsTheLastEntryWhenTheWindowStartsMidRecord() {
+  const dir = freshDir("tail-mid-record");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n" + line(e3) + "\n");
+  // A tiny initial window guarantees the first read starts strictly inside e3's own
+  // line (no newline visible), forcing at least one grow-and-retry before success.
+  const result = chain.readChainTail(dir, { initialWindowBytes: 8 });
+  check("read-chain-tail-finds-the-last-entry-when-the-window-starts-mid-record", result.status === "ok" && result.entry.bundle_id === "b3", JSON.stringify(result));
+}
+
+function readChainTailGrowsPastTheInitialWindowForAnOversizedFinalRecord() {
+  const dir = freshDir("tail-oversized-final");
+  const e1 = mkEntry(1, null, "b1");
+  const bigBundleId = "b2-" + "x".repeat(9000); // final record now well over 8 KiB
+  const e2 = mkEntry(2, e1.entry_sha256, bigBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir); // default 8 KiB initial window
+  check("read-chain-tail-grows-past-the-initial-window-for-an-oversized-final-record", result.status === "ok" && result.entry.bundle_id === bigBundleId, JSON.stringify({ status: result.status, matched: result.status === "ok" && result.entry.bundle_id === bigBundleId }));
+}
+
+function readChainTailFindsALargeFinalRecordWhenANewlineIsAlreadyInTheFirstWindow() {
+  // Distinct from the grow case above: here the record is large but the FIRST read
+  // already contains the newline that starts it (no growth needed) -- exercises the
+  // "final record larger than the window, but the window still contains a newline"
+  // boundary without conflating it with the retry path.
+  const dir = freshDir("tail-large-first-window");
+  const e1 = mkEntry(1, null, "b1");
+  const bigBundleId = "b2-" + "y".repeat(4000); // large, but smaller than the window
+  const e2 = mkEntry(2, e1.entry_sha256, bigBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir); // default 8 KiB window comfortably covers this
+  check("read-chain-tail-finds-a-large-final-record-already-inside-the-first-window", result.status === "ok" && result.entry.bundle_id === bigBundleId, JSON.stringify({ status: result.status }));
+}
+
+function readChainTailFailsClosedWhenNoNewlineIsFoundWithinTheCappedWindow() {
+  const dir = freshDir("tail-uncapped");
+  const e1 = mkEntry(1, null, "b1");
+  const hugeBundleId = "z".repeat(5000); // final record itself exceeds the test's tiny cap
+  const e2 = mkEntry(2, e1.entry_sha256, hugeBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2)); // no trailing newline either
+  const result = chain.readChainTail(dir, { initialWindowBytes: 64, maxEntryBytes: 512 });
+  check("read-chain-tail-fails-closed-when-no-newline-boundary-is-found-within-the-capped-window", result.status === "corrupt", JSON.stringify(result));
+  check("read-chain-tail-fail-closed-does-not-fall-back-to-an-earlier-valid-record", !(result.entry && result.entry.bundle_id === "b1"), JSON.stringify(result));
+}
+
+function readChainTailReportsCorruptForATruncatedFinalRecord() {
+  const dir = freshDir("tail-truncated-final");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const full = line(e1) + "\n" + line(e2) + "\n";
+  const tornPoint = full.length - 5; // cut the last record off mid-field
+  writeChainFile(dir, full.slice(0, tornPoint));
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-reports-corrupt-for-a-truncated-final-record", result.status === "corrupt", JSON.stringify(result));
+  check("read-chain-tail-truncated-final-record-does-not-silently-return-the-earlier-valid-entry", !(result.entry && result.entry.bundle_id === "b1"), JSON.stringify(result));
+}
+
+function readChainTailReportsCorruptForAMalformedFinalRecord() {
+  const dir = freshDir("tail-malformed-final");
+  const e1 = mkEntry(1, null, "b1");
+  writeChainFile(dir, line(e1) + "\n" + "{not even close to json\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-reports-corrupt-for-a-malformed-final-record", result.status === "corrupt", JSON.stringify(result));
+}
+
+function readChainTailReportsCorruptWhenTheFinalRecordFailsItsShapeCheck() {
+  const dir = freshDir("tail-bad-shape-final");
+  const e1 = mkEntry(1, null, "b1");
+  const badShape = { schema_version: "1.0", seq: 2, bundle_id: "b2" }; // missing hash fields, but VALID json
+  writeChainFile(dir, line(e1) + "\n" + JSON.stringify(badShape) + "\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-reports-corrupt-when-the-final-record-fails-its-shape-check", result.status === "corrupt", JSON.stringify(result));
+}
+
+function readChainTailHandlesUtf8BoundariesSplitAcrossTheWindowEdge() {
+  const dir = freshDir("tail-utf8-boundary");
+  // Multi-byte bundle_id (emoji + accented chars are 2-4 byte UTF-8 sequences) on
+  // the record BEFORE the last one, positioned so a small window's left edge is
+  // very likely to land inside one of its multi-byte characters -- the last
+  // entry's own content must still parse correctly regardless, because only bytes
+  // strictly after the boundary newline are ever decoded.
+  const e1 = mkEntry(1, null, "héllo-🎉-bündle-" + "€".repeat(40));
+  const e2 = mkEntry(2, e1.entry_sha256, "plain-ascii-tail-résumé-日本語");
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  // Small window forced to start somewhere inside e1's multi-byte content.
+  const result = chain.readChainTail(dir, { initialWindowBytes: 20 });
+  check("read-chain-tail-handles-utf8-boundaries-split-across-the-window-edge", result.status === "ok" && result.entry.bundle_id === "plain-ascii-tail-résumé-日本語", JSON.stringify(result));
+}
+
+function readChainTailUtf8LastEntryItselfSurvivesGrowth() {
+  const dir = freshDir("tail-utf8-last-entry-grows");
+  const e1 = mkEntry(1, null, "b1");
+  // The LAST entry itself contains multi-byte UTF-8 content and is large enough
+  // that the window must grow at least once to capture all of it.
+  const unicodeBundleId = "🎉-" + "日".repeat(3000);
+  const e2 = mkEntry(2, e1.entry_sha256, unicodeBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir, { initialWindowBytes: 64 });
+  check("read-chain-tail-utf8-last-entry-itself-survives-growth", result.status === "ok" && result.entry.bundle_id === unicodeBundleId, JSON.stringify({ status: result.status }));
+}
+
+function readChainTailHandlesShortReads() {
+  const dir = freshDir("tail-short-reads");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+
+  const realReadSync = fs.readSync;
+  let calls = 0;
+  fs.readSync = function shortReadingReadSync(fd, buffer, offset, length, position) {
+    calls++;
+    const cappedLength = Math.min(length, 3); // force many short reads, 3 bytes at a time
+    return realReadSync(fd, buffer, offset, cappedLength, position);
+  };
+  let result;
+  try {
+    result = chain.readChainTail(dir);
+  } finally {
+    fs.readSync = realReadSync;
+  }
+  check("read-chain-tail-handles-short-reads", result.status === "ok" && result.entry.bundle_id === "b2", JSON.stringify(result));
+  check("read-chain-tail-short-reads-actually-exercised-multiple-calls", calls > 1, `calls=${calls}`);
+}
+
+function readChainTailAbsentEmptyCorruptAreThreeDistinctOutcomes() {
+  const absentDir = freshDir("distinct-absent");
+  fs.mkdirSync(absentDir, { recursive: true });
+  const emptyDir = freshDir("distinct-empty");
+  writeChainFile(emptyDir, "");
+  const corruptDir = freshDir("distinct-corrupt");
+  writeChainFile(corruptDir, "{not json\n");
+
+  const absent = chain.readChainTail(absentDir);
+  const empty = chain.readChainTail(emptyDir);
+  const corrupt = chain.readChainTail(corruptDir);
+  const statuses = [absent.status, empty.status, corrupt.status];
+  check("read-chain-tail-absent-empty-corrupt-are-three-distinct-outcomes", new Set(statuses).size === 3 && statuses.includes("absent") && statuses.includes("empty") && statuses.includes("corrupt"), JSON.stringify(statuses));
+}
+
 function main() {
   tenSessionsInSequence();
   fixtureDataVerifiesIndependently();
@@ -194,6 +585,47 @@ function main() {
   missingGenesisPrefixDetected();
   bundleIdCollisionRefused();
   emptyChainIsNotApplicable();
+
+  validateChainEmptyGenesisIsNotAFailure();
+  validateChainEmptyWithHeadRefuses();
+  validateChainDetectsSequenceGap();
+  validateChainDetectsDuplicateSeqAsFork();
+  validateChainDetectsTamperedEntry();
+  validateChainDetectsBrokenLink();
+  validateChainDetectsInvalidGenesisSeq();
+  validateChainDetectsInvalidGenesisPrev();
+  validateChainRefusesMalformedInteriorRecordNotJustTheLast();
+  validateChainAutoAdvancesSingleStepLaggingHead();
+  validateChainRefusesMultiStepLaggingHead();
+  validateChainRefusesHeadAheadOfTail();
+  validateChainRefusesHeadSameSeqDifferentHashAsFork();
+  validateChainRefusesOneStepBackHeadThatIsNotAGenuineAncestor();
+  validateChainRebuildsMissingHeadFromVerifiedTail();
+  validateChainDoesNotRebuildWhenTheChainItselfDoesNotValidate();
+  validateChainTruncatesTornFinalRecordAndRebuildsHead();
+  validateChainTornFinalRecordWithHeadAlreadyAtTheTruncatedTailStillReportsReconciliation();
+  validateChainTornSoleGenesisRecordWithNoHeadReconcilesToEmptyTail();
+  validateChainTornSoleRecordWithHeadPresentRefuses();
+  validateChainNeverConflatesTornTailWithInteriorCorruption();
+
+  readChainTailAbsentWhenFileDoesNotExist();
+  readChainTailEmptyWhenFileIsZeroBytes();
+  readChainTailEmptyWhenFileIsOnlyBlankLines();
+  readChainTailSucceedsWithTrailingNewline();
+  readChainTailSucceedsWithoutTrailingNewline();
+  readChainTailReturnsTheSameEntryRegardlessOfTrailingNewline();
+  readChainTailSkipsBlankLinesBeforeTheLastEntry();
+  readChainTailFindsTheLastEntryWhenTheWindowStartsMidRecord();
+  readChainTailGrowsPastTheInitialWindowForAnOversizedFinalRecord();
+  readChainTailFindsALargeFinalRecordWhenANewlineIsAlreadyInTheFirstWindow();
+  readChainTailFailsClosedWhenNoNewlineIsFoundWithinTheCappedWindow();
+  readChainTailReportsCorruptForATruncatedFinalRecord();
+  readChainTailReportsCorruptForAMalformedFinalRecord();
+  readChainTailReportsCorruptWhenTheFinalRecordFailsItsShapeCheck();
+  readChainTailHandlesUtf8BoundariesSplitAcrossTheWindowEdge();
+  readChainTailUtf8LastEntryItselfSurvivesGrowth();
+  readChainTailHandlesShortReads();
+  readChainTailAbsentEmptyCorruptAreThreeDistinctOutcomes();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
