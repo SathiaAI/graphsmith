@@ -62,6 +62,17 @@ function codeError(code, message) {
   return Object.assign(new Error(message || code), { code });
 }
 
+/* process.umask() is PROCESS-GLOBAL, not per-call -- every test below that uses this
+ * sets it, runs the assertion synchronously (no `await`, no callback, nothing that could
+ * yield the event loop between the set and the restore), and restores the ORIGINAL value
+ * in `finally` before returning. This file's own `main()` calls each test function to
+ * completion, one at a time, in a single process -- there is no concurrent test that
+ * could observe or race the umask while it is temporarily changed here. */
+function withUmask(mask, fn) {
+  const original = process.umask(mask);
+  try { return fn(); } finally { process.umask(original); }
+}
+
 /* ---- atomicCreateExclusive ---- */
 
 function atomicCreateExclusiveContentIsActuallyWritten() {
@@ -259,6 +270,179 @@ function atomicOverwriteFileUnlistedCodeSwallowedOnWin32() {
     "the rename must have already happened before the swallowed dir-fsync failure");
 }
 
+/* ---- access-model defaults (Paul's decision, 2026-09-15 fix round -- see
+ * claude/graphsmith-fix-round-plan-round1-2026-09-15.md, "Access model"): group-readable
+ * (0750/0640), NOT single-user (0700/0600). These two functions are the ONLY ones that
+ * create genuinely new files going forward; the retrofit of files that already exist on
+ * disk is a separate startup pass (scripts/gateway/startup-permissions.js, tested in its
+ * own suite). ---- */
+
+function atomicCreateExclusiveDefaultModeIsGroupReadable() {
+  const dir = freshDir("create-default-mode");
+  const target = path.join(dir, "record.json");
+  stateStore.atomicCreateExclusive(target, "payload");
+  const mode = fs.statSync(target).mode & 0o777;
+  check("atomicCreateExclusive-default-mode-is-0640", mode === 0o640,
+    `expected the new access-model default 0640, got ${mode.toString(8)}`);
+}
+
+function atomicOverwriteFileDefaultModeIsGroupReadable() {
+  const dir = freshDir("overwrite-default-mode");
+  const target = path.join(dir, "record.json");
+  fs.writeFileSync(target, "seed");
+  stateStore.atomicOverwriteFile(target, "new-content", dir);
+  const mode = fs.statSync(target).mode & 0o777;
+  check("atomicOverwriteFile-default-mode-is-0640", mode === 0o640,
+    `expected the new access-model default 0640, got ${mode.toString(8)}`);
+}
+
+/* THE REQUIRED umask(0) CASE: proves fchmodSync is doing real, load-bearing work, not
+ * merely riding along with whatever the ambient umask would have produced anyway. Under
+ * umask 0, fs.openSync's own default mode (0666, unmasked) would leave the file WORLD
+ * WRITABLE if this function only relied on the mode passed to open()/the process umask --
+ * exactly the defect this test exists to catch. The access-model default (0640) can only
+ * appear here because atomicCreateExclusive explicitly fchmodSync's the temp file
+ * afterward, irrespective of umask. */
+function atomicCreateExclusiveUmaskZeroStillProducesConfiguredMode() {
+  const dir = freshDir("create-umask-zero");
+  const target = path.join(dir, "record.json");
+  withUmask(0, () => {
+    stateStore.atomicCreateExclusive(target, "payload");
+  });
+  const mode = fs.statSync(target).mode & 0o777;
+  check("atomicCreateExclusive-umask-0-still-yields-0640-not-0666", mode === 0o640,
+    `expected 0640 regardless of umask 0 -- a result of 0666 here would mean fchmodSync ` +
+    `is not actually running, only the ambient umask is -- got ${mode.toString(8)}`);
+}
+
+/* THE REQUIRED umask(022) / pre-existing-0644 CASE: proves atomicOverwriteFile's rename
+ * delivers the NEW temp file's mode, not whatever mode the OLD target file already had.
+ * Under umask 022, a temp file created with NO explicit mode would land at 0644 -- THE
+ * SAME as the pre-existing target -- which would make this assertion pass even if the
+ * rename silently preserved the old target's mode instead of replacing it. Choosing a
+ * DIFFERENT default (0640) for the temp file is what makes "did the final mode come from
+ * the rename's new inode, or survive from the old target" an observable, falsifiable
+ * question rather than a coincidence of two paths agreeing on 0644. */
+function atomicOverwriteFileRenameCarriesNewInodeModeOverPreExistingFile() {
+  const dir = freshDir("overwrite-umask-022-preexisting");
+  const target = path.join(dir, "record.json");
+  fs.writeFileSync(target, "seed");
+  fs.chmodSync(target, 0o644);
+  const preExistingMode = fs.statSync(target).mode & 0o777;
+  withUmask(0o022, () => {
+    stateStore.atomicOverwriteFile(target, "new-content", dir);
+  });
+  const mode = fs.statSync(target).mode & 0o777;
+  check("atomicOverwriteFile-pre-existing-target-really-was-0644", preExistingMode === 0o644,
+    `test setup invariant broken: expected the pre-existing target to be 0644, got ${preExistingMode.toString(8)}`);
+  check("atomicOverwriteFile-rename-carries-new-inode-mode-not-preexisting-0644", mode === 0o640,
+    `expected the post-rename target to carry the NEW temp file's mode (0640), not the ` +
+    `pre-existing target's 0644 -- got ${mode.toString(8)}`);
+  check("atomicOverwriteFile-rename-carries-new-inode-mode-content-still-correct",
+    fs.readFileSync(target, "utf8") === "new-content",
+    "content should still be correctly written despite the mode assertion");
+}
+
+function atomicCreateExclusiveModeNullOptsOutOfEnforcement() {
+  const dir = freshDir("create-mode-null");
+  const target = path.join(dir, "record.json");
+  withUmask(0, () => {
+    stateStore.atomicCreateExclusive(target, "payload", { mode: null });
+  });
+  const mode = fs.statSync(target).mode & 0o777;
+  check("atomicCreateExclusive-mode-null-opts-out-of-enforcement", mode === 0o666,
+    `expected { mode: null } to leave the raw, umask-governed default (0666 under umask ` +
+    `0) untouched rather than enforce 0640, got ${mode.toString(8)}`);
+}
+
+function atomicOverwriteFileModeNullSkipsFchmodEnforcement() {
+  const dir = freshDir("overwrite-mode-null");
+  const target = path.join(dir, "record.json");
+  fs.writeFileSync(target, "seed");
+  fs.chmodSync(target, 0o644);
+  withUmask(0, () => {
+    stateStore.atomicOverwriteFile(target, "new-content", dir, { mode: null });
+  });
+  const mode = fs.statSync(target).mode & 0o777;
+  check("atomicOverwriteFile-mode-null-skips-fchmod-enforcement", mode === 0o666,
+    `expected { mode: null } under umask 0 to leave the temp file's raw default (0666) ` +
+    `rather than enforce 0640 -- got ${mode.toString(8)}`);
+}
+
+function atomicCreateExclusiveSurfacesRealChmodFailures() {
+  const dir = freshDir("create-chmod-fails");
+  const target = path.join(dir, "record.json");
+  let threw = null;
+  withPlatform("linux", () => {
+    withPatched(fs, "fchmodSync", () => { throw codeError("EACCES", "no chmod for you"); }, () => {
+      try { stateStore.atomicCreateExclusive(target, "payload"); }
+      catch (error) { threw = error; }
+    });
+  });
+  check("atomicCreateExclusive-real-chmod-failure-surfaces",
+    threw && threw.code === "STATE_STORE_CHMOD_FAILED",
+    `expected STATE_STORE_CHMOD_FAILED, got ${threw ? threw.code : "no error"}`);
+}
+
+function atomicCreateExclusiveSwallowsChmodFailureOnWin32() {
+  const dir = freshDir("create-chmod-win32");
+  const target = path.join(dir, "record.json");
+  let threw = null;
+  withPlatform("win32", () => {
+    withPatched(fs, "fchmodSync", () => { throw codeError("EACCES", "no posix modes here"); }, () => {
+      try { stateStore.atomicCreateExclusive(target, "payload"); }
+      catch (error) { threw = error; }
+    });
+  });
+  check("atomicCreateExclusive-chmod-failure-swallowed-on-win32", threw === null,
+    `expected a win32 chmod failure to be swallowed, but it threw: ${threw && threw.code}`);
+  check("atomicCreateExclusive-chmod-failure-swallowed-on-win32-content-still-written",
+    fs.readFileSync(target, "utf8") === "payload",
+    "content should still land despite the swallowed chmod failure");
+}
+
+function chmodPathOrFailSkipsMissingPathSilently() {
+  const dir = freshDir("chmod-path-missing");
+  const missing = path.join(dir, "does-not-exist.json");
+  const result = stateStore.chmodPathOrFail(missing, 0o640);
+  check("chmodPathOrFail-missing-path-returns-false-not-throw", result === false,
+    `expected false for a missing path, got ${result}`);
+}
+
+function chmodPathOrFailSurfacesRealErrorOnPosix() {
+  const dir = freshDir("chmod-path-real-error");
+  const target = path.join(dir, "record.json");
+  fs.writeFileSync(target, "seed");
+  let threw = null;
+  withPlatform("linux", () => {
+    withPatched(fs, "chmodSync", () => { throw codeError("EACCES", "denied"); }, () => {
+      try { stateStore.chmodPathOrFail(target, 0o640); }
+      catch (error) { threw = error; }
+    });
+  });
+  check("chmodPathOrFail-real-error-surfaces",
+    threw && threw.code === "STATE_STORE_CHMOD_FAILED",
+    `expected STATE_STORE_CHMOD_FAILED, got ${threw ? threw.code : "no error"}`);
+}
+
+function chmodPathOrFailSwallowsOnWin32() {
+  const dir = freshDir("chmod-path-win32");
+  const target = path.join(dir, "record.json");
+  fs.writeFileSync(target, "seed");
+  let threw = null;
+  let result;
+  withPlatform("win32", () => {
+    withPatched(fs, "chmodSync", () => { throw codeError("EACCES", "denied"); }, () => {
+      try { result = stateStore.chmodPathOrFail(target, 0o640); }
+      catch (error) { threw = error; }
+    });
+  });
+  check("chmodPathOrFail-win32-swallowed-not-thrown", threw === null,
+    `expected a win32 chmod failure to be swallowed, got ${threw && threw.code}`);
+  check("chmodPathOrFail-win32-swallowed-returns-false", result === false,
+    `expected false for a swallowed win32 chmod failure, got ${result}`);
+}
+
 /* ---- validateNamedRecord ---- */
 
 function validateNamedRecordRejectsUnknownDefName() {
@@ -296,6 +480,17 @@ function main() {
   atomicOverwriteFileRenameFailureCleansUpTempFile();
   atomicOverwriteFileUnlistedCodePropagatesOnPosixOnly();
   atomicOverwriteFileUnlistedCodeSwallowedOnWin32();
+  atomicCreateExclusiveDefaultModeIsGroupReadable();
+  atomicOverwriteFileDefaultModeIsGroupReadable();
+  atomicCreateExclusiveUmaskZeroStillProducesConfiguredMode();
+  atomicOverwriteFileRenameCarriesNewInodeModeOverPreExistingFile();
+  atomicCreateExclusiveModeNullOptsOutOfEnforcement();
+  atomicOverwriteFileModeNullSkipsFchmodEnforcement();
+  atomicCreateExclusiveSurfacesRealChmodFailures();
+  atomicCreateExclusiveSwallowsChmodFailureOnWin32();
+  chmodPathOrFailSkipsMissingPathSilently();
+  chmodPathOrFailSurfacesRealErrorOnPosix();
+  chmodPathOrFailSwallowsOnWin32();
   validateNamedRecordRejectsUnknownDefName();
   validateNamedRecordInvalidRecordMessageNamesDefAndContext();
 

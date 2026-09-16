@@ -186,6 +186,89 @@ function clone(value) {
  * .plans/v0.5.0/GATEWAY-MULTI-INSTANCE-HANDOFF.md) reuses the same two functions rather
  * than inventing new ones, per that plan's NFR-2 (no new atomic-write primitive). */
 
+/* Access-model defaults (Paul's decision, 2026-09-15 fix round -- see
+ * claude/graphsmith-fix-round-plan-round1-2026-09-15.md, "Access model"): group-readable
+ * (0750 dirs / 0640 files), NOT single-user (0700/0600) -- other-uid ops tooling must
+ * keep working against these directories. Every NEW file either of the two primitives
+ * below creates defaults to DEFAULT_FILE_MODE from here on; a caller that genuinely
+ * needs a different mode (or, for the one named exception -- gateway.js's
+ * operator-facing gateway-status.json health file, which must NOT be narrowed by this
+ * change -- no mode enforcement at all) passes `{ mode }` explicitly. `DEFAULT_DIR_MODE`
+ * has no analogous enforcement point in these two functions (neither creates a
+ * directory), but is exported so the gateway startup permission-tightening pass
+ * (scripts/gateway/startup-permissions.js) and this same file's own directory creation
+ * use the identical constant rather than a second, driftable copy of the number. */
+const DEFAULT_FILE_MODE = 0o640;
+const DEFAULT_DIR_MODE = 0o750;
+
+/* Applies `mode` to an already-open file descriptor via fchmodSync, which -- unlike the
+ * mode argument to fs.openSync/fs.mkdirSync -- is never masked by the process umask. That
+ * distinction is the entire point: a mode merely PASSED to open() only produces the
+ * requested bits under a permissive umask (see tests/state-store/atomic-primitives'
+ * `-umask-0-` case, which proves this call is doing real work rather than the ambient
+ * umask happening to already produce 0640), and it does nothing at all for
+ * atomicOverwriteFile's rename-into-place, which inherits whatever mode the file HAD
+ * BEFORE the overwrite unless something explicitly sets the new inode's mode first (see
+ * that suite's `-umask-022-` case, over a pre-existing 0644 target).
+ *
+ * `mode === null` is a deliberate, explicit opt-out -- not "forgot to pass one". The one
+ * caller that must NOT be tightened by this change (gateway.js's `writeStatusFile`,
+ * writing the operator-facing gateway-status.json health file -- Paul's decision: it
+ * stays at its current, operator-readable mode, "do not tighten it") passes `{ mode:
+ * null }` to keep the pre-existing, umask-governed default completely untouched rather
+ * than guessing a replacement literal mode that might not match every deployment's own
+ * umask.
+ *
+ * A real chmod failure (EPERM, EIO, ...) is surfaced, not swallowed: these primitives
+ * back the writer-claim, the signed session chain, and the crash-recovery WAL/intent
+ * store, several of which can hold a bearer credential or a full raw session bundle -- a
+ * failed permission-tightening attempt on one of those is an operational fault, not a
+ * cosmetic nitpick. The one exception, matching this codebase's own existing convention
+ * (see mode-selection.js's ensureSecret, which draws exactly this line already) is a
+ * platform with no POSIX mode bits to set at all (win32): there is nothing to fail at,
+ * so that case is skipped silently rather than reported as an error. */
+function applyFileMode(fd, mode, targetPath) {
+  if (mode === null || mode === undefined) return;
+  try {
+    fs.fchmodSync(fd, mode);
+  } catch (error) {
+    if (process.platform === "win32") return; // no POSIX mode bits here: nothing to do
+    throw fail(
+      `Failed to set permissions (mode ${mode.toString(8)}) on ${targetPath}: ${error.message}. ` +
+      "This file can hold sensitive material (a bearer credential, raw tool arguments, or a " +
+      "signed session bundle) -- a failed permission-tightening attempt is treated as an " +
+      "operational error rather than silently ignored.",
+      "STATE_STORE_CHMOD_FAILED"
+    );
+  }
+}
+
+/* Same real-error-vs-unsupported-platform distinction as applyFileMode above, for a
+ * caller that already has a PATH on disk rather than an open fd -- the gateway startup
+ * permission-tightening pass (scripts/gateway/startup-permissions.js), which re-chmods
+ * files/directories that ALREADY EXIST (created by an older build, or before this fix),
+ * rather than creating new ones. A missing path (ENOENT) is treated as "nothing to do
+ * yet" rather than a fault -- a fresh deployment legitimately has no chain/recovery
+ * directories yet the first time this runs. Returns true if the mode was actually
+ * applied, false if the path was skipped (missing, or no POSIX mode bits on this
+ * platform) -- never swallows an EPERM/EIO the caller needs to know about. */
+function chmodPathOrFail(targetPath, mode) {
+  try {
+    fs.chmodSync(targetPath, mode);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false; // nothing there yet: not a fault
+    if (process.platform === "win32") return false; // no POSIX mode bits: nothing to do
+    throw fail(
+      `Failed to set permissions (mode ${mode.toString(8)}) on ${targetPath}: ${error.message}. ` +
+      "This path can hold sensitive material (a bearer credential, raw tool arguments, or a " +
+      "signed session bundle/chain record) -- a failed permission-tightening attempt is " +
+      "surfaced as an operational error rather than silently ignored.",
+      "STATE_STORE_CHMOD_FAILED"
+    );
+  }
+}
+
 // The file must never be OBSERVABLE in a half-formed state. The historical
 // `openSync(target, "wx")` + `writeSync` pair made the file exist before its content
 // did, so a competing reader that hit EEXIST and read it saw "" (or a truncated
@@ -194,11 +277,18 @@ function clone(value) {
 // exactly as "wx" did -- while making the record atomically visible, fully formed.
 // Filesystems without hard links fall back to the old two-step create; the caller's
 // bounded retry loop covers that residual window.
-function atomicCreateExclusive(targetPath, payload) {
+//
+// `options.mode` (default DEFAULT_FILE_MODE, 0640) is applied via fchmodSync to the
+// TEMPORARY file before it is linked/renamed into place -- a hard link shares the
+// source's inode (and therefore its mode) with the target, so setting it on the
+// temporary file is sufficient for both the link path and the no-hard-link fallback
+// below. Pass `{ mode: null }` to opt out entirely (see applyFileMode's own doc comment).
+function atomicCreateExclusive(targetPath, payload, options = {}) {
+  const mode = Object.prototype.hasOwnProperty.call(options, "mode") ? options.mode : DEFAULT_FILE_MODE;
   const temporary = `${targetPath}.new-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const writeTo = (target, flag) => {
     const fd = fs.openSync(target, flag);
-    try { fs.writeSync(fd, payload); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    try { fs.writeSync(fd, payload); applyFileMode(fd, mode, target); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   };
   writeTo(temporary, "wx");
   try {
@@ -217,11 +307,23 @@ function atomicCreateExclusive(targetPath, payload) {
 // Unconditional atomic overwrite (temp file + fsync + rename + best-effort directory
 // fsync) for a caller that already holds verified exclusive ownership of `targetPath`
 // and needs to update the record's content in place.
-function atomicOverwriteFile(targetPath, content, dirPath) {
+//
+// `options.mode` (default DEFAULT_FILE_MODE, 0640) is applied via fchmodSync to the
+// TEMPORARY file before the rename -- rename(2) replaces the target's directory entry
+// with the temporary file's own inode, so the target ends up with whatever mode the
+// temporary file had, REGARDLESS of what mode a pre-existing target used to have (see
+// this file's own atomic-primitives test suite for a case pinning exactly that: a
+// pre-existing 0644 target overwritten with the default options ends up 0640, not
+// 0644). Pass `{ mode: null }` to opt out entirely and keep the pre-existing,
+// umask-governed default untouched (see applyFileMode's own doc comment for why
+// gateway.js's operator-facing status file needs exactly that).
+function atomicOverwriteFile(targetPath, content, dirPath, options = {}) {
+  const mode = Object.prototype.hasOwnProperty.call(options, "mode") ? options.mode : DEFAULT_FILE_MODE;
   const temporary = `${targetPath}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const fd = fs.openSync(temporary, "wx");
   try {
     fs.writeSync(fd, content);
+    applyFileMode(fd, mode, temporary);
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
   try {
@@ -1575,6 +1677,16 @@ api.atomicOverwriteFile = atomicOverwriteFile;
 api.pidAlive = pidAlive;
 api.validateNamedRecord = validateNamedRecord;
 api.recordLeaseClockConstruction = recordLeaseClockConstruction;
+
+/* Access-model constants/helpers (see this file's own doc comments above
+ * atomicCreateExclusive/atomicOverwriteFile): exported so the gateway startup
+ * permission-tightening pass (scripts/gateway/startup-permissions.js) re-chmods
+ * EXISTING sensitive files/directories to the identical target mode these two
+ * primitives now default NEW files to, rather than a second, driftable copy of the
+ * numbers or the real-error-vs-unsupported-platform distinction. */
+api.DEFAULT_FILE_MODE = DEFAULT_FILE_MODE;
+api.DEFAULT_DIR_MODE = DEFAULT_DIR_MODE;
+api.chmodPathOrFail = chmodPathOrFail;
 
 module.exports = api;
 

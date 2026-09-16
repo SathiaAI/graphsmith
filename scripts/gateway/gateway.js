@@ -38,6 +38,7 @@ const writerClaimModule = require("../writer-claim.js");
 const { WriterClaim } = writerClaimModule;
 const registerGatewaySessions = require("../../checks/register-gateway-sessions.js");
 const stateStore = require("../state-store.js");
+const { tightenStateDirPermissions } = require("./startup-permissions.js");
 
 /** SS3.7's bounded drain: waits (polling) until every open session on `proxy` has no
  * calls still in flight, or `timeoutMs` elapses, whichever first. Extracted as its own
@@ -1227,13 +1228,23 @@ function gatewayStatusPath(stateDir) {
  * this is purely an observability side channel, not part of SG-FR-5's persisted-session
  * write path. Reuses state-store.js's own atomic-write primitive (temp file + fsync +
  * rename), same as chain.js#appendSession's HEAD.json write, so a reader (the `status`
- * subcommand, or an operator's own tool) can never observe a half-written file. */
+ * subcommand, or an operator's own tool) can never observe a half-written file.
+ *
+ * `{ mode: null }`: the ONE named exception to the group-readable access model (Paul's
+ * decision, 2026-09-15 fix round -- see
+ * claude/graphsmith-fix-round-plan-round1-2026-09-15.md, "Access model"). Every other
+ * caller of atomicOverwriteFile gets that primitive's new 0640-by-default mode; this
+ * file is the operator-facing health surface commit 6 (SG-NFR-3) depends on being
+ * readable by whatever ops tooling polls it, so it stays at its current, pre-existing,
+ * umask-governed mode -- not narrowed, and not pinned to a guessed literal that might
+ * not match every deployment's own umask either. startup-permissions.js's own startup
+ * chmod pass likewise never lists this file among the ones it tightens. */
 function writeStatusFile(ctx, log) {
   try {
     const stateDir = ctx.config.state_dir;
     fs.mkdirSync(stateDir, { recursive: true });
     const status = { ...buildHealthStatus(ctx), written_at: new Date().toISOString() };
-    stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir);
+    stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir, { mode: null });
   } catch (error) {
     log(`failed to write status file (non-fatal): ${error.message}`);
   }
@@ -1284,6 +1295,27 @@ async function startGateway(options) {
   const writerClaim = new WriterClaim(config.state_dir, { hostId: config.host_id });
   writerClaim.acquire(); // FR-1: throws and this process must exit non-zero on refusal
   log(`writer-claim acquired: instance ${writerClaim.instanceId} on host ${writerClaim.hostId}`);
+
+  /* Access model (Paul's decision, 2026-09-15 fix round -- see
+   * claude/graphsmith-fix-round-plan-round1-2026-09-15.md, "Access model"): re-chmod
+   * every known-sensitive file/directory already on disk (from a prior run, or an older
+   * build) to this codebase's group-readable model (0750 dirs / 0640 files) BEFORE
+   * recovery reads any of them and before this process accepts any new session. Runs
+   * once we hold the writer-claim (so the state directory and the claim file itself are
+   * guaranteed to exist) but before recoverCrashedSessions. A real permission fault here
+   * (see startup-permissions.js's own doc comment on what is and is not swallowed) must
+   * stop startup outright rather than be discovered later against a file that turned out
+   * to still be more permissive than this model requires -- released the same way, and
+   * for the same reason, as the CodeRabbit PR #33 fix just below release the claim on a
+   * failed recoverCrashedSessions: without this, the claim and its heartbeat are already
+   * live, and an uncaught throw here would reject startGateway's promise while leaving
+   * an orphaned claim blocking the next restart. */
+  try {
+    tightenStateDirPermissions(config.state_dir);
+  } catch (error) {
+    writerClaim.release();
+    throw error;
+  }
 
   let proxy;
   writerClaim.onClaimLost = (error) => {
