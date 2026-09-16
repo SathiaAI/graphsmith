@@ -75,6 +75,17 @@ function createSession(connectionId, options = {}) {
     startedAt: typeof options.now === "function" ? options.now() : Date.now(),
     finalized: false,
     nextCallSeq: 1, // monotonic per-session invocation counter; see recordCallStart.
+    /* Per docs/contracts/wal-append-failure-semantics.md (C1 SS2): the moment an
+     * appendWalEvent call fails for this connection, this is set to {reason, at} and
+     * every later append attempt on the same connection must be refused before it
+     * touches the filesystem -- a torn line from the first failure could otherwise be
+     * concatenated onto by a second attempt (see the contract doc). In-memory only,
+     * connection-scoped, never written to the sealed bundle (toSealableSession below
+     * does not include it) or the WAL itself; a fresh connection/session always starts
+     * with this null. Not read or written anywhere in this file -- callers (currently
+     * gateway.js's forwardDownstreamRequestToAgent) set and check it directly on the
+     * session record, the same way they already read/write pendingCalls/calls. */
+    walPoisoned: null,
   };
 }
 

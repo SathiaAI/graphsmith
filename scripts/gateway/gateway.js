@@ -135,6 +135,23 @@ function withTimeout(promise, timeoutMs, makeError) {
  * see agent-transport.js's header). Any other case (an http agent transport, or no agent
  * currently connected) gets a real JSON-RPC error naming exactly why, rather than the
  * silent drop this was before. */
+/* Per docs/contracts/wal-append-failure-semantics.md (C1 SS1-2): a throw from
+ * recovery.appendWalEvent means UNKNOWN persistence (possibly nothing written,
+ * possibly a torn line, possibly a complete line that only failed a later fsync/close),
+ * never confirmed absence. Any of those three outcomes is grounds to poison the
+ * connection: marks `session.walPoisoned` on the FIRST such failure only (a later
+ * failure on an already-poisoned connection is not a new fact worth overwriting the
+ * original reason with), so every later appendWalEvent attempt on this connection is
+ * refused before touching the filesystem instead of risking a second write landing on
+ * top of a possibly-torn line. Shared by every appendWalEvent call site in this
+ * function (CALL_START and both CALL_RESULT branches) so the contract is enforced
+ * uniformly rather than re-implemented per call site. */
+function poisonWalOnFailure(s, walError, proxy) {
+  if (s && !s.walPoisoned) {
+    s.walPoisoned = { reason: walError.message, at: proxy ? proxy.now() : Date.now() };
+  }
+}
+
 function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName) {
   if (msg.method !== "sampling/createMessage") {
     return Promise.resolve({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not forward downstream-initiated method "${msg.method}" to the agent.` } });
@@ -214,6 +231,30 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
       },
     });
   }
+  /* Per docs/contracts/wal-append-failure-semantics.md (C1 SS2): once an earlier call on
+   * this connection poisoned its WAL (see the CALL_START/CALL_RESULT append catches
+   * below, which set s.walPoisoned on the very first append failure), every later
+   * appendWalEvent attempt on the SAME connection must be refused "before it touches the
+   * filesystem" -- not attempted-and-caught again. Checking here, before recordCallStart
+   * or any WAL write, is what makes that true for a brand-new sampling request: it never
+   * reaches the try/catch below at all. The poison is in-memory and connection-scoped
+   * (cleared by a fresh connection getting a fresh session object), so this never blocks
+   * a different connection or survives a reconnect. */
+  if (s && s.walPoisoned) {
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32000,
+        message:
+          "This connection's WAL was poisoned by an earlier append failure " +
+          `(${s.walPoisoned.reason}) and is refusing every further durable write on this ` +
+          "connection rather than risk concatenating onto a possibly-torn line -- per " +
+          "docs/contracts/wal-append-failure-semantics.md (C1). Not admitting this " +
+          "sampling/createMessage request; close and reopen the connection to get a fresh WAL.",
+      },
+    });
+  }
   /* Codex PR #33 review "persist sampling calls in the recovery WAL": this forward is
    * recorded into the in-memory session (above) but, before this fix, NEVER into
    * recovery.js's WAL at all -- unlike proxy.js's own tools/call path. A crash after the
@@ -265,21 +306,34 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
         ts: proxy.now(),
       });
     } catch (walError) {
+      poisonWalOnFailure(s, walError, proxy);
       walAppendFailed = walError;
     }
   }
   if (walAppendFailed) {
-    /* Codex PR #33 review "refuse sampling when its CALL_START cannot be saved": unlike
-     * the CALL_RESULT append further below (where the downstream call has ALREADY
-     * completed and there is no "don't forward" option left), this append happens
-     * strictly BEFORE agentPusher.current() is ever invoked -- nothing has been sent to
-     * the agent yet at this point, so forwarding anyway is not "already in flight," it is
-     * choosing to forward work this gateway just proved it cannot durably attest. A crash
-     * before this connection's own close would then replay with no CALL_START for this
-     * call at all, recreating exactly the attestation gap Finding 1 exists to close. Roll
-     * back the in-memory pending-call entry (there is nothing durable to undo) and return
-     * a real JSON-RPC error to the downstream server instead, matching proxy.js's own
-     * "not dispatched -- safe to retry" contract for the identical failure mode. */
+    /* Codex PR #33 review "refuse sampling when its CALL_START cannot be saved": this
+     * append happens strictly BEFORE agentPusher.current() is ever invoked -- nothing
+     * has been sent to the agent yet at this point, so forwarding anyway is not "already
+     * in flight," it is choosing to forward work this gateway just proved it cannot
+     * durably attest.
+     *
+     * Corrected per docs/contracts/wal-append-failure-semantics.md (C1): this comment
+     * used to say the CALL_RESULT append further below has "no 'don't forward' option
+     * left" because the downstream call had already completed. That is no longer true --
+     * the CALL_RESULT success-branch append below is now fail-closed too (see its own
+     * comment): the gateway withholds the real result and returns an error instead when
+     * that append fails, exactly the same "don't hand back what we can't durably attest"
+     * choice made here. The two branches differ only in WHEN the choice is available: a
+     * CALL_START failure can refuse to forward at all (this branch); a CALL_RESULT
+     * failure can only refuse to RETURN a result the agent already produced -- it cannot
+     * un-invoke the agent.
+     *
+     * A crash before this connection's own close would then replay with no CALL_START
+     * for this call at all, recreating exactly the attestation gap Finding 1 exists to
+     * close. Roll back the in-memory pending-call entry (there is nothing durable to
+     * undo) and return a real JSON-RPC error to the downstream server instead, matching
+     * proxy.js's own "not dispatched -- safe to retry" contract for the identical
+     * failure mode. */
     if (s) s.pendingCalls.delete(correlationKey);
     log(`Refusing to forward a downstream-initiated sampling/createMessage request to the agent: its CALL_START could not be durably recorded (${walAppendFailed.message}).`);
     return Promise.resolve({
@@ -319,14 +373,84 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
        * entry the gateway itself already removed. */
       const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
       if (correlatedNow) {
-        session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
+        /* Fail-closed CALL_RESULT WAL append, per docs/contracts/wal-append-failure-
+         * semantics.md (C1) and the 2026-09-15 fix-round decision record. Reordered to
+         * attempt the WAL append BEFORE session.recordCallResult -- matching CALL_START's
+         * own append-before-commit shape above -- rather than the other way around.
+         * recordCallResult moves this call out of pendingCalls into the permanent s.calls
+         * array that toSealableSession later seals verbatim; appending first means that if
+         * the append fails, nothing durable-looking has been committed to the in-memory
+         * record yet, and the caller below can choose what to commit instead of having to
+         * undo an already-sealed-shaped success entry.
+         *
+         * On failure: mark this connection's WAL poisoned (no best-effort second append --
+         * C1 SS3 -- the agent's real result is deliberately NOT re-attempted onto a
+         * possibly-torn line), attest the failure with the SAME anomaly kind the tools/call
+         * path already uses for the identical failure mode (GATEWAY_RECOVERY_WAL_APPEND_
+         * FAILED at proxy.js:344/795/932 -- reusing it, not minting a new kind, keeps one
+         * grep-able string for anything that keys on it), and record the call itself as an
+         * error rather than the real result -- the sealed bundle must not attest a success
+         * this gateway could not durably record.
+         *
+         * `discarded_result_sha256` is deliberately OMITTED here rather than populated: per
+         * C1 SS5, that field is only trustworthy when it hashes the EXACT serialized buffer
+         * recovery.appendWalEvent attempted (recovery.js computes that buffer internally,
+         * stamping its own recorded_at, and does not expose it to this caller) -- hashing a
+         * fresh, separate JSON.stringify(result) here would be a digest of different bytes
+         * than what was actually attempted on disk, which C1 says is worse than no digest.
+         *
+         * Honesty correction (this failure mode is NOT "safe to retry"): the agent already
+         * ran real inference and produced `result` by the time this append is attempted --
+         * unlike the CALL_START failure above, there is no "nothing happened yet" to fall
+         * back on. The message below says so plainly: the gateway did not durably record
+         * the result, the underlying model call may already have executed, and retrying it
+         * may re-execute it -- never "safe to retry."
+         *
+         * Asymmetry with tools/call, disclosed rather than silently copied: proxy.js's own
+         * CALL_RESULT append (its `correlatedNow` branch) stays fail-OPEN on the identical
+         * failure mode -- it logs/attests but still returns the real result, relying on the
+         * intent file's own cached_result as recovery's fallback source of truth. This path
+         * has no such intent fence (sampling is deliberately unfenced, per Finding 2's own
+         * scope), so there is no fallback to lean on here and fail-closed is the only honest
+         * option. Whether proxy.js's fail-open choice is itself still correct now that this
+         * sibling path no longer matches it is out of scope for this commit and is tracked
+         * as SAT-1118, not left as only this comment. */
+        let walError = null;
         if (walCallSeq !== null) {
           try {
             recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError: false, ts: proxy.now() });
-          } catch (walError) {
-            log(`Failed to durably record a downstream-initiated sampling call's result: ${walError.message}`);
+          } catch (e) {
+            walError = e;
           }
         }
+        if (walError) {
+          poisonWalOnFailure(s, walError, proxy);
+          session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: "sampling/createMessage", detail: walError.message });
+          session.recordCallResult(s, correlationKey, {
+            result: {
+              error:
+                `This sampling call's result was not durably recorded (${walError.message}). ` +
+                "The gateway did not durably record this result; the underlying model call may " +
+                "already have executed, and retrying it may re-execute it.",
+            },
+            isError: true,
+            ts: proxy.now(),
+          });
+          logCompletion(true);
+          log(`Refusing to return a downstream-initiated sampling/createMessage result: its CALL_RESULT could not be durably recorded (${walError.message}).`);
+          return {
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: {
+              code: -32000,
+              message:
+                `Failed to durably record this sampling call's result: ${walError.message}. ` +
+                "The gateway did not durably record the result; the underlying model call may " +
+                "already have executed, and retrying may re-execute it.",
+            },
+          };
+        }
+        session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
         logCompletion(false);
       }
       return { jsonrpc: "2.0", id: msg.id, result };
@@ -359,6 +483,20 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
           try {
             recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result: { error: error.message }, isError: true, ts: proxy.now() });
           } catch (walError) {
+            /* Mirror-image of the success branch above, per docs/contracts/
+             * wal-append-failure-semantics.md (C1): the downstream already received (or
+             * is about to receive, via the return below) a real JSON-RPC error for this
+             * call, so there is nothing left to withhold -- this stays fail-OPEN, unlike
+             * the success branch. But per C1 SS2 this failure still poisons the
+             * connection's WAL (a torn line from THIS append is just as real a hazard as
+             * one from the success branch), and it must be ATTESTED, not just logged: a
+             * plain log() line here would leave the sealed bundle silent about a WAL
+             * write this gateway genuinely attempted and failed. Reuses the same
+             * GATEWAY_RECOVERY_WAL_APPEND_FAILED kind as the success branch and the
+             * tools/call path (proxy.js:344/795/932) -- one kind for this whole failure
+             * class, not a new one per call site. */
+            poisonWalOnFailure(s, walError, proxy);
+            session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: "sampling/createMessage", detail: walError.message });
             log(`Failed to durably record a downstream-initiated sampling call's error result: ${walError.message}`);
           }
         }

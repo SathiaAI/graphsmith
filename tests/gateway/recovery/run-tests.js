@@ -58,6 +58,15 @@ function makeKeys() {
 }
 function silentLog() {} // most tests don't care about the operational log lines
 
+// Mirrors gsa-mcp-shim.js's own sha256Hex(JSON.stringify(...)) exactly -- the sealed
+// execution_trace.jsonl only ever stores a call's result as this hash (privacy-preserving
+// by design; see session.js's own doc comment on why), so a test proving replay recovered
+// a SPECIFIC real result must compare against this same hash, not grep for raw text that
+// the trace never contains.
+function expectedResultSha256(result) {
+  return crypto.createHash("sha256").update(Buffer.from(JSON.stringify(result === undefined ? null : result), "utf8")).digest("hex");
+}
+
 // ---------------------------------------------------------------------------
 // WAL primitives
 // ---------------------------------------------------------------------------
@@ -1192,7 +1201,381 @@ function samplingForwardRefusesWhenCallStartCannotBeSaved() {
     check("sampling-wal-failure-does-not-forward-to-the-agent", agentWasCalled === false, "agentPusher.current was called despite the WAL append failing");
     check("sampling-wal-failure-returns-a-jsonrpc-error", Boolean(resp.error), JSON.stringify(resp));
     check("sampling-wal-failure-rolls-back-the-pending-call-entry", s.pendingCalls.size === 0, String(s.pendingCalls.size));
+    // Per C1 (docs/contracts/wal-append-failure-semantics.md SS2), ANY appendWalEvent
+    // failure on this connection poisons it, not only a CALL_RESULT failure -- otherwise
+    // a second sampling request on the same connection could still attempt an append onto
+    // whatever the first failure may have left behind.
+    check("sampling-wal-failure-poisons-the-connection-too", Boolean(s.walPoisoned) && typeof s.walPoisoned.reason === "string", JSON.stringify(s.walPoisoned));
   });
+}
+
+// ---------------------------------------------------------------------------
+// Item 5 (2026-09-15 fix-round, C1 contract): fail-closed CALL_RESULT WAL handling for
+// forwardDownstreamRequestToAgent's success branch, the mirror-image fail-open error
+// branch, and connection-wide WAL poisoning on any append failure on this path. See
+// docs/contracts/wal-append-failure-semantics.md for the contract these tests verify.
+// ---------------------------------------------------------------------------
+
+/** Monkeypatches recovery.appendWalEvent (the SAME module-singleton object gateway.js
+ * itself calls through -- both this test file and gateway.js require the identical
+ * "./recovery.js"/"scripts/gateway/recovery.js" module instance) so that only the ONE
+ * next append whose event.type === failType runs through `injectFault` instead of going
+ * straight to the real implementation; every other append (including a later one for the
+ * same connection, once the poison check should have refused it) runs unpatched. Always
+ * restores the original in `finally`, whether `fn` resolves, rejects, or throws
+ * synchronously. `injectFault` receives the REAL appendWalEvent (bound with its original
+ * arguments) so it can inject a raw fs-level failure around an append that actually still
+ * writes to the real filesystem for real (this is fault injection at the syscall layer,
+ * not a fake that skips the disk -- see its callers below). */
+function withOneAppendWalEventFaultForType(failType, injectFault, fn) {
+  const original = recovery.appendWalEvent;
+  let armed = true;
+  recovery.appendWalEvent = function (stateDir, connectionId, event) {
+    if (!armed || event.type !== failType) return original.apply(recovery, arguments);
+    armed = false;
+    const args = arguments;
+    return injectFault(() => original.apply(recovery, args));
+  };
+  const restore = () => { recovery.appendWalEvent = original; };
+  let result;
+  try {
+    result = fn();
+  } catch (error) {
+    restore();
+    throw error;
+  }
+  if (result && typeof result.then === "function") {
+    return result.then(
+      (value) => { restore(); return value; },
+      (error) => { restore(); throw error; }
+    );
+  }
+  restore();
+  return result;
+}
+
+function samplingCallResultWalFailurePoisonsTheConnectionAndFailsClosed() {
+  const dir = freshDir("sampling-result-poison");
+  const connectionId = "conn-sample-poison";
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  let agentCallCount = 0;
+  const agentPusher = {
+    current: () => { agentCallCount++; return Promise.resolve({ content: [{ type: "text", text: "hi" }] }); },
+    connectionId,
+  };
+  const msg = { method: "sampling/createMessage", id: 8, params: { prompt: "hi" } };
+  return withOneAppendWalEventFaultForType(
+    "CALL_RESULT",
+    () => { throw new Error("ENOSPC: simulated CALL_RESULT append failure"); },
+    () => forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy)
+  ).then((resp) => {
+    check("sampling-result-wal-failure-returns-a-jsonrpc-error-not-the-real-result", Boolean(resp.error), JSON.stringify(resp));
+    check("sampling-result-wal-failure-does-not-claim-safe-to-retry", !/safe to retry/i.test(resp.error.message), resp.error.message);
+    check(
+      "sampling-result-wal-failure-states-the-honest-risk-not-a-false-safety-claim",
+      /did not durably record/i.test(resp.error.message) && /may already have executed/i.test(resp.error.message) && /retrying/i.test(resp.error.message),
+      resp.error.message
+    );
+    check("sampling-result-wal-failure-records-the-call-as-an-error", s.calls.length === 1 && s.calls[0].isError === true, JSON.stringify(s.calls));
+    check(
+      "sampling-result-wal-failure-does-not-attach-a-fabricated-digest",
+      s.calls[0].result && s.calls[0].result.discarded_result_sha256 === undefined,
+      JSON.stringify(s.calls[0].result)
+    );
+    const anomaly = s.anomalies.find((a) => a.kind === "GATEWAY_RECOVERY_WAL_APPEND_FAILED" && a.tool === "sampling/createMessage");
+    check("sampling-result-wal-failure-reuses-the-existing-anomaly-kind-not-a-new-one", Boolean(anomaly), JSON.stringify(s.anomalies));
+    check("sampling-result-wal-failure-poisons-the-connection", Boolean(s.walPoisoned) && typeof s.walPoisoned.reason === "string", JSON.stringify(s.walPoisoned));
+    check("sampling-result-wal-failure-still-called-the-agent-once", agentCallCount === 1, String(agentCallCount));
+
+    // A second, brand-new sampling request on the SAME (now-poisoned) connection must be
+    // refused before it ever reaches agentPusher.current or attempts another append --
+    // C1 SS3's "no best-effort second append," generalized to the whole connection.
+    const msg2 = { method: "sampling/createMessage", id: 9, params: { prompt: "again" } };
+    return forwardDownstreamRequestToAgent(msg2, agentPusher, () => {}, proxy).then((resp2) => {
+      check("sampling-result-wal-poisoned-refuses-a-second-call-without-touching-the-agent", agentCallCount === 1, String(agentCallCount));
+      check("sampling-result-wal-poisoned-second-call-returns-an-error", Boolean(resp2.error), JSON.stringify(resp2));
+      check("sampling-result-wal-poisoned-second-call-names-the-poison", /poisoned/i.test(resp2.error.message), resp2.error.message);
+      check("sampling-result-wal-poisoned-does-not-grow-pending-calls", s.pendingCalls.size === 0, String(s.pendingCalls.size));
+    });
+  });
+}
+
+/* Mirror-image of the success-branch failure above (C1): the downstream already got a
+ * real JSON-RPC error from the agent's own rejection, so a WAL append failure recording
+ * THAT error result must stay fail-open (nothing left to withhold) -- but per C1 SS2 it
+ * still poisons the connection, and per this item's own requirement it must be attested
+ * via session.recordAnomaly, not merely logged. */
+function samplingCallResultErrorBranchWalFailureStaysFailOpenButIsAttestedAndPoisons() {
+  const dir = freshDir("sampling-error-result-wal-fail");
+  const connectionId = "conn-sample-error-wal-fail";
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  const agentPusher = { current: () => Promise.reject(new Error("agent unreachable")), connectionId };
+  const msg = { method: "sampling/createMessage", id: 10, params: { prompt: "hi" } };
+  return withOneAppendWalEventFaultForType(
+    "CALL_RESULT",
+    () => { throw new Error("EROFS: simulated CALL_RESULT append failure on the error branch"); },
+    () => forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy)
+  ).then((resp) => {
+    check(
+      "sampling-error-branch-wal-failure-still-fails-open-and-returns-the-agents-real-error",
+      Boolean(resp.error) && resp.error.message === "agent unreachable",
+      JSON.stringify(resp)
+    );
+    check("sampling-error-branch-wal-failure-still-records-the-error-result", s.calls.length === 1 && s.calls[0].isError === true, JSON.stringify(s.calls));
+    const anomaly = s.anomalies.find((a) => a.kind === "GATEWAY_RECOVERY_WAL_APPEND_FAILED" && a.tool === "sampling/createMessage");
+    check("sampling-error-branch-wal-failure-is-attested-not-just-logged", Boolean(anomaly), JSON.stringify(s.anomalies));
+    check("sampling-error-branch-wal-failure-still-poisons-the-connection", Boolean(s.walPoisoned), JSON.stringify(s.walPoisoned));
+  });
+}
+
+/* Real fault injection at the syscall layer (not a fake that skips the disk), followed by
+ * an actual crash-recovery/replay pass over whatever the injected failure genuinely left
+ * on disk -- per C1 SS1, a caught append failure does not tell the caller which of the
+ * three outcomes actually happened, so these three tests drive each one directly and
+ * confirm replay behaves correctly for each. */
+
+/* C1 outcome 3, first half: "the line was written completely, and a later step failed" --
+ * writeFullySync AND appendDurableLine's own file-level fsyncSync both genuinely succeed
+ * (every byte is written and confirmed durable), and only the subsequent fs.closeSync of
+ * that same fd throws. (Note: fsyncDir, recovery.js's OTHER post-write step, is
+ * deliberately best-effort/non-throwing by its own design -- see its doc comment -- so it
+ * cannot be the source of a propagating append failure; closeSync is the real one here.)
+ * The content is genuinely, completely, durably on disk despite the throw. */
+function samplingCallResultFailureAfterACompleteWriteIsWalAuthoritativeOnReplay() {
+  const dir = freshDir("sampling-result-after-complete-write");
+  const connectionId = "conn-sample-after-complete-write";
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  const agentPusher = { current: () => Promise.resolve({ content: [{ type: "text", text: "real-result-after-complete-write" }] }), connectionId };
+  const msg = { method: "sampling/createMessage", id: 11, params: { prompt: "hi" } };
+
+  return withOneAppendWalEventFaultForType(
+    "CALL_RESULT",
+    (runRealAppend) => {
+      const originalCloseSync = fs.closeSync;
+      let closeCalls = 0;
+      fs.closeSync = function (fd) {
+        closeCalls++;
+        // The first closeSync call within this one append is appendDurableLine's own
+        // file-fd close, reached only after writeFullySync + fsyncSync[file] both
+        // already returned successfully for real.
+        if (closeCalls === 1) throw new Error("EIO: simulated close failure after a complete, fsynced write");
+        return originalCloseSync.apply(fs, arguments);
+      };
+      try {
+        return runRealAppend();
+      } finally {
+        fs.closeSync = originalCloseSync;
+      }
+    },
+    () => forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy)
+  ).then((resp) => {
+    check("sampling-after-complete-write-still-fails-closed-to-the-live-caller", Boolean(resp.error), JSON.stringify(resp));
+    check("sampling-after-complete-write-poisons-the-connection", Boolean(s.walPoisoned), JSON.stringify(s.walPoisoned));
+
+    // Confirm the bytes actually made it to disk complete, despite the throw.
+    const events = recovery.readWalEvents(dir, connectionId);
+    const resultEvent = events.find((e) => e.type === "CALL_RESULT");
+    check(
+      "sampling-after-complete-write-wal-line-is-genuinely-complete-on-disk",
+      Boolean(resultEvent) && resultEvent.isError === false,
+      JSON.stringify(events)
+    );
+
+    // An actual crash-recovery/replay pass over this exact on-disk state, as if this
+    // process had crashed right after the failed append (which the live gateway, above,
+    // could not distinguish from total loss -- it told the caller "error" regardless).
+    // Per C1, replay is WAL-authoritative: it must recover the REAL successful result the
+    // WAL actually holds, not re-derive the live process's own "not durably recorded"
+    // error.
+    const keys = makeKeys();
+    const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+    check("sampling-after-complete-write-replay-needs-no-operator-review", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+    const headEntry = chain.readHead(dir);
+    check("sampling-after-complete-write-replay-auto-seals", Boolean(headEntry) && headEntry.seq === 1, JSON.stringify(headEntry));
+    const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, headEntry.bundle_id), "utf8"));
+    const trace = bundle.contents["execution_trace.jsonl"];
+    const expectedHash = expectedResultSha256({ content: [{ type: "text", text: "real-result-after-complete-write" }] });
+    check(
+      "sampling-after-complete-write-replay-recovers-the-real-successful-result",
+      /"is_error":false/.test(trace) && trace.includes(expectedHash),
+      trace
+    );
+  });
+}
+
+/* C1 outcome 3b: "fsyncSync (data) ... can throw after writeFullySync has already returned
+ * successfully" -- the FILE-level fsync itself is the one that fails this time, before the
+ * directory fsync is ever reached. The complete line is still genuinely present in the
+ * file (writeSync already delivered every byte); only durability-confirmation failed. */
+function samplingCallResultFailureDuringFsyncIsWalAuthoritativeOnReplay() {
+  const dir = freshDir("sampling-result-during-fsync");
+  const connectionId = "conn-sample-during-fsync";
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  const agentPusher = { current: () => Promise.resolve({ content: [{ type: "text", text: "real-result-during-fsync" }] }), connectionId };
+  const msg = { method: "sampling/createMessage", id: 12, params: { prompt: "hi" } };
+
+  return withOneAppendWalEventFaultForType(
+    "CALL_RESULT",
+    (runRealAppend) => {
+      const originalFsyncSync = fs.fsyncSync;
+      fs.fsyncSync = function () {
+        // The very first fsyncSync call for this append IS the file-level one --
+        // fail it immediately, before fsyncDir is ever reached.
+        fs.fsyncSync = originalFsyncSync;
+        throw new Error("EIO: simulated file-level fsync failure right after a complete write");
+      };
+      try {
+        return runRealAppend();
+      } finally {
+        fs.fsyncSync = originalFsyncSync;
+      }
+    },
+    () => forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy)
+  ).then((resp) => {
+    check("sampling-during-fsync-still-fails-closed-to-the-live-caller", Boolean(resp.error), JSON.stringify(resp));
+    check("sampling-during-fsync-poisons-the-connection", Boolean(s.walPoisoned), JSON.stringify(s.walPoisoned));
+
+    const events = recovery.readWalEvents(dir, connectionId);
+    const resultEvent = events.find((e) => e.type === "CALL_RESULT");
+    check(
+      "sampling-during-fsync-wal-line-is-genuinely-complete-on-disk",
+      Boolean(resultEvent) && resultEvent.isError === false,
+      JSON.stringify(events)
+    );
+
+    const keys = makeKeys();
+    const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+    check("sampling-during-fsync-replay-needs-no-operator-review", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+    const headEntry = chain.readHead(dir);
+    check("sampling-during-fsync-replay-auto-seals", Boolean(headEntry) && headEntry.seq === 1, JSON.stringify(headEntry));
+    const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, headEntry.bundle_id), "utf8"));
+    const trace = bundle.contents["execution_trace.jsonl"];
+    const expectedHash = expectedResultSha256({ content: [{ type: "text", text: "real-result-during-fsync" }] });
+    check(
+      "sampling-during-fsync-replay-recovers-the-real-successful-result",
+      /"is_error":false/.test(trace) && trace.includes(expectedHash),
+      trace
+    );
+  });
+}
+
+/* C1 outcome 2: a torn/partial line. fs.writeSync makes SOME progress and then a LATER
+ * call in writeFullySync's own loop THROWS outright (not merely returns 0) -- unlike
+ * appendWalEventFailsClosedWhenWriteSyncMakesNoProgress above (a "no progress" return,
+ * which writeFullySync's own stall handling cleanly truncates back to the pre-append
+ * size), a raw throw from mid-loop bypasses that truncate-on-stall path entirely and
+ * leaves a genuinely torn, unparseable line physically on disk. */
+function samplingCallResultFailureAfterAPartialWriteReplaysTheOrphanedCallStartAsUnresolved() {
+  const dir = freshDir("sampling-result-partial-write");
+  const connectionId = "conn-sample-partial-write";
+  const s = session.createSession(connectionId, { now: () => 1000 });
+  session.recordToolsList(s, []);
+  const proxy = fakeProxyWithSession(dir, connectionId, s);
+  const agentPusher = { current: () => Promise.resolve({ content: [{ type: "text", text: "never-durably-recorded" }] }), connectionId };
+  const msg = { method: "sampling/createMessage", id: 13, params: { prompt: "hi" } };
+
+  return withOneAppendWalEventFaultForType(
+    "CALL_RESULT",
+    (runRealAppend) => {
+      const originalWriteSync = fs.writeSync;
+      let calls = 0;
+      fs.writeSync = function (fd, buffer, offset, length, position) {
+        calls++;
+        if (calls === 1) {
+          // Genuine partial progress: only half the requested bytes actually land.
+          const partial = Math.max(1, Math.floor(length / 2));
+          return originalWriteSync(fd, buffer, offset, partial, position);
+        }
+        // The NEXT call throws outright -- writeFullySync's own stall-truncate path
+        // never runs, so the partial bytes from call 1 are left behind, torn.
+        throw new Error("EIO: simulated mid-write failure leaving a torn line");
+      };
+      try {
+        return runRealAppend();
+      } finally {
+        fs.writeSync = originalWriteSync;
+      }
+    },
+    () => forwardDownstreamRequestToAgent(msg, agentPusher, () => {}, proxy)
+  ).then((resp) => {
+    check("sampling-partial-write-still-fails-closed-to-the-live-caller", Boolean(resp.error), JSON.stringify(resp));
+    check("sampling-partial-write-poisons-the-connection", Boolean(s.walPoisoned), JSON.stringify(s.walPoisoned));
+
+    // The torn line is not a parseable CALL_RESULT at all -- readWalEvents' own
+    // stop-at-first-bad-line contract drops it entirely.
+    const events = recovery.readWalEvents(dir, connectionId);
+    check("sampling-partial-write-torn-line-produces-no-parseable-call-result", !events.some((e) => e.type === "CALL_RESULT"), JSON.stringify(events));
+    check("sampling-partial-write-call-start-before-the-tear-is-still-intact", events.some((e) => e.type === "CALL_START"), JSON.stringify(events));
+
+    // An actual crash-recovery/replay pass: only the CALL_START survives, so this is
+    // exactly the existing "orphaned sampling CALL_START" replay path -- recorded as a
+    // real, disconnected/unproven error and auto-sealed, never guessed as a success and
+    // never left stuck pending operator review (there is no intent fence for a sampling
+    // call to review in the first place).
+    const keys = makeKeys();
+    const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+    check("sampling-partial-write-replay-needs-no-operator-review", pendingOperatorReview.length === 0, JSON.stringify(pendingOperatorReview));
+    const headEntry = chain.readHead(dir);
+    check("sampling-partial-write-replay-auto-seals", Boolean(headEntry) && headEntry.seq === 1, JSON.stringify(headEntry));
+    const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, headEntry.bundle_id), "utf8"));
+    const trace = bundle.contents["execution_trace.jsonl"];
+    check(
+      "sampling-partial-write-replay-records-an-error-not-a-guessed-success",
+      /"is_error":true/.test(trace) && !/never-durably-recorded/.test(trace),
+      trace
+    );
+  });
+}
+
+/* Not a fault-injection scenario at all: a genuinely SUCCESSFUL append, with the process
+ * (hypothetically) crashing in the gap between that successful append returning and
+ * forwardDownstreamRequestToAgent's own session.recordCallResult/logCompletion ever
+ * running -- there is no in-memory session left to consult, only the WAL. Per C1, replay
+ * must be WAL-authoritative (recover the real result from disk, not need any live state)
+ * and CALL_RESULT replay must be idempotent (a second recovery pass over the identical
+ * WAL content, e.g. this same recovery pass itself crashing before cleanup, must not
+ * throw, must not re-seal, and must not append a second chain entry). */
+function samplingCallResultCrashBetweenSuccessfulAppendAndInMemoryMutationReplaysIdempotently() {
+  const dir = freshDir("sampling-crash-between-append-and-memory");
+  const keys = makeKeys();
+  const connectionId = "conn-sampling-crash-gap";
+  const seed = () => {
+    recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [] });
+    recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+    recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 1, tool: "sampling/createMessage", server: "sampling", arguments: { prompt: "hi" }, isModelCall: true, ts: 10 });
+    // This append itself succeeds for real -- "crash between a successful append and the
+    // in-memory mutation" means the live process got exactly this far and then died
+    // before session.recordCallResult/logCompletion ever ran.
+    recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { content: [{ type: "text", text: "hi back" }] }, isError: false, ts: 11 });
+  };
+  seed();
+  const first = recoverCrashedSessions(dir, keys, silentLog);
+  check("sampling-crash-gap-replay-needs-no-operator-review", first.pendingOperatorReview.length === 0, JSON.stringify(first.pendingOperatorReview));
+  const headEntry = chain.readHead(dir);
+  check("sampling-crash-gap-replay-is-wal-authoritative-and-auto-seals", Boolean(headEntry) && headEntry.seq === 1, JSON.stringify(headEntry));
+  const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, headEntry.bundle_id), "utf8"));
+  const trace = bundle.contents["execution_trace.jsonl"];
+  const expectedHash = expectedResultSha256({ content: [{ type: "text", text: "hi back" }] });
+  check("sampling-crash-gap-replay-recovers-the-real-successful-result", /"is_error":false/.test(trace) && trace.includes(expectedHash), trace);
+  check("sampling-crash-gap-replay-cleans-up-the-wal", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present");
+
+  // Idempotency: simulate THIS recovery pass itself crashing between sealing and cleanup
+  // by re-seeding the identical WAL and running recovery again (same idiom as
+  // recoverIsIdempotentAcrossACrashDuringRecoveryItself above) -- must not throw, must not
+  // append a second chain entry, and must not need operator review the second time either.
+  seed();
+  const second = recoverCrashedSessions(dir, keys, silentLog);
+  check("sampling-crash-gap-second-replay-pass-is-not-flagged-for-operator-review", second.pendingOperatorReview.length === 0, JSON.stringify(second.pendingOperatorReview));
+  check("sampling-crash-gap-second-replay-pass-does-not-append-a-second-chain-entry", chain.readHead(dir).seq === 1, JSON.stringify(chain.readHead(dir)));
+  check("sampling-crash-gap-call-result-replay-is-idempotent", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present after second pass");
 }
 
 function recoverPreservesModelCallFlagOnSamplingReplay() {
@@ -1685,6 +2068,12 @@ function main() {
   return samplingForwardSuccessIsPersistedToWalWithModelCallFlag()
     .then(() => samplingForwardErrorIsPersistedAsFailedResult())
     .then(() => samplingForwardRefusesWhenCallStartCannotBeSaved())
+    .then(() => samplingCallResultWalFailurePoisonsTheConnectionAndFailsClosed())
+    .then(() => samplingCallResultErrorBranchWalFailureStaysFailOpenButIsAttestedAndPoisons())
+    .then(() => samplingCallResultFailureAfterACompleteWriteIsWalAuthoritativeOnReplay())
+    .then(() => samplingCallResultFailureDuringFsyncIsWalAuthoritativeOnReplay())
+    .then(() => samplingCallResultFailureAfterAPartialWriteReplaysTheOrphanedCallStartAsUnresolved())
+    .then(() => samplingCallResultCrashBetweenSuccessfulAppendAndInMemoryMutationReplaysIdempotently())
     .then(() => {
       recoverPreservesModelCallFlagOnSamplingReplay();
       recoverDoesNotBlockAutoSealOnAnUnresolvedSamplingCall();
