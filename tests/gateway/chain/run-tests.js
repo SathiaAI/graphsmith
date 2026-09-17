@@ -116,9 +116,24 @@ function incompleteAppendDetected() {
   fs.appendFileSync(chain.chainPath(dir), JSON.stringify(entry2) + "\n");
   // HEAD.json still points at entry1 -- exactly the "stale head" incomplete-append shape.
 
+  /* Round-2 fix-round follow-up (docs/contracts/chain-validity.md C2 SS2 row 7, SS5):
+   * this on-disk shape -- HEAD exactly one hash-verified step behind a fully valid
+   * chain tail -- is EXACTLY C2's row-7 single-step lagging-HEAD case, which the
+   * canonical validator (chain.validateChain, which this walk now delegates to
+   * instead of re-deriving its own classification) correctly reports as
+   * `reconcilable` / `headAction: "advance"`, NOT a structural failure: per C2 SS3,
+   * this is the expected shape of "the process died between two of its own writes"
+   * and is auto-caught-up by the append-time check on the very next append (see
+   * appendTimeCheckAutoAdvancesASingleStepLaggingHead below), not genuine corruption
+   * needing an operator's own recovery-runbook intervention. The OLD assertions here
+   * (`status === "failed"`, reason matching /incomplete append/) predate C2's binding
+   * 2026-09-15 decision and were themselves the less-correct classification this
+   * refactor exists to fix -- updated to the canonical validator's more correct
+   * verdict, not weakened. See statusWalkAndAppendTimeCheckAgreeOnSingleStepLaggingHead
+   * below for the explicit divergence test C2 SS5 asks for. */
   const result = verifyDir(dir);
-  check("incomplete-append-detected-as-failed", result.status === "failed", JSON.stringify(result));
-  check("incomplete-append-reason-names-incomplete-append", /incomplete append/.test(result.reason || ""), JSON.stringify(result));
+  check("incomplete-append-is-reconcilable-not-a-structural-failure", result.status === "reconcilable" && result.headAction === "advance", JSON.stringify(result));
+  check("incomplete-append-reason-names-the-single-step-lagging-head-signature", /one step behind/.test(result.reason || ""), JSON.stringify(result));
 }
 
 /* SS8 test 16: mutate a middle entry's entry_sha256. */
@@ -692,6 +707,60 @@ function appendTimeCheckAutoAdvancesASingleStepLaggingHead() {
   check("append-time-lag-auto-advance-logs-a-loud-anomaly", Boolean(anomalyLog), JSON.stringify(logs));
 }
 
+/* C2 (docs/contracts/chain-validity.md) SS5's own required proof: "one implementation,
+ * not three copies" -- reconcileHead, the append-time check, and this walk must all
+ * reach the SAME classification for the same on-disk state, because all three now
+ * delegate to the identical chain.validateChain. This constructs C2's row 7 (single-
+ * step lagging HEAD, hash-verified ancestor) -- chosen because it is already the
+ * best-tested case elsewhere (appendTimeCheckAutoAdvancesASingleStepLaggingHead
+ * above) and is unambiguous per the contract: NOT corruption at either call site --
+ * and asserts the status walk (checks/register-gateway-sessions.js, via verifyDir)
+ * and the append-time check (chain.checkHeadAgainstTailOrRepair, the exact function
+ * chain.appendSession calls before every append) agree: neither refuses/latches what
+ * the other treats as a silently-repairable lag. */
+function statusWalkAndAppendTimeCheckAgreeOnSingleStepLaggingHead() {
+  const dir = freshDir("divergence-single-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  const staleHead = { schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 };
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(staleHead));
+
+  // The status walk, on the stale-HEAD state, BEFORE anything repairs it on disk.
+  const walkResult = verifyDir(dir);
+  check(
+    "divergence-status-walk-classifies-single-step-lag-as-reconcilable-not-failed",
+    walkResult.status === "reconcilable" && walkResult.headAction === "advance",
+    JSON.stringify(walkResult)
+  );
+
+  // The append-time check, on the exact same on-disk state -- called directly (rather
+  // than via chain.appendSession) so this test exercises the check in isolation,
+  // without also appending a new entry, which would change what state the two are
+  // being compared against.
+  chain._resetChainIntegrityFailureForTests();
+  const logs = [];
+  let threw = null;
+  let repairedHead = null;
+  try {
+    repairedHead = chain.checkHeadAgainstTailOrRepair(dir, staleHead, (l) => logs.push(l));
+  } catch (error) {
+    threw = error;
+  }
+  check("divergence-append-time-check-does-not-refuse-the-same-state", threw === null, threw ? `${threw.code}: ${threw.message}` : "threw unexpectedly");
+  check("divergence-append-time-check-does-not-latch-the-same-state", chain.getChainIntegrityFailure() === null, JSON.stringify(chain.getChainIntegrityFailure()));
+
+  // Agreement, stated explicitly: both call sites, given the identical on-disk state,
+  // land on the SAME verified tail (entry[1], seq=2) as what HEAD should point at --
+  // neither one refuses/latches what the other one silently repairs.
+  check(
+    "divergence-both-call-sites-agree-on-the-verified-tail",
+    Boolean(repairedHead) && repairedHead.seq === entries[1].seq && repairedHead.entry_sha256 === entries[1].entry_sha256,
+    JSON.stringify(repairedHead)
+  );
+  const anomalyLog = logs.find((l) => l.includes("gateway_chain_head_lag_auto_advanced"));
+  check("divergence-append-time-check-logs-the-same-auto-advance-anomaly-the-walk-reports", Boolean(anomalyLog), JSON.stringify(logs));
+}
+
 function appendTimeCheckRefusesATwoStepLaggingHead() {
   const dir = freshDir("append-time-two-step-lag");
   const keys = makeKeys();
@@ -974,6 +1043,7 @@ function main() {
   readChainTailAbsentEmptyCorruptAreThreeDistinctOutcomes();
 
   appendTimeCheckAutoAdvancesASingleStepLaggingHead();
+  statusWalkAndAppendTimeCheckAgreeOnSingleStepLaggingHead();
   appendTimeCheckRefusesATwoStepLaggingHead();
   appendTimeCheckRefusesAForkedHead();
   checkHeadAgainstTailOperationalPermissionFailureRefusesButDoesNotLatch();
