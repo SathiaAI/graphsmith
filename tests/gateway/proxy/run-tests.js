@@ -1043,7 +1043,15 @@ async function retainedSignatureReplayStillBlockedByQuarantine() {
  * created (dispatched) before this WAL append -- if the append itself fails (e.g. a full
  * disk), the call never actually reaches conn.call(). Without a rollback, the intent
  * stays "dispatched" forever (every retry permanently blocked) and, worse, the exception
- * used to escape handleMessage entirely, breaking its documented "never throws" contract. */
+ * used to escape handleMessage entirely, breaking its documented "never throws" contract.
+ *
+ * Round-2 fix pass update: this append failure now also poisons the CONNECTION (see
+ * poisonWalOnFailure above), per docs/contracts/wal-append-failure-semantics.md (C1 SS2)
+ * -- "the caller should treat the refusal exactly like a second append failure," which
+ * for a retry on the SAME connection means every subsequent appendWalEvent attempt is
+ * refused too, not just this one intent's own fence. "Stays retryable" therefore now
+ * means retryable on a fresh connection (close and reopen, per the poisoned error's own
+ * wording), not a bare retry on the same, now-poisoned one -- this test asserts both. */
 async function callStartWalAppendFailureRollsBackAndStaysRetryable() {
   const dir = freshDir("call-start-wal-failure");
   const conn = fakeConnectionCapturing(async () => ({ ok: true }));
@@ -1077,9 +1085,25 @@ async function callStartWalAppendFailureRollsBackAndStaysRetryable() {
   const intentKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
   check("call-start-wal-failure-rolled-back-the-intent", recovery.readIntent(dir, intentKey) === null, "intent still present");
 
-  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
-  check("call-start-wal-failure-retry-dispatches-normally-afterward", Boolean(retry && retry.result && retry.result.ok === true), JSON.stringify(retry));
+  // Round-2 fix pass: a bare retry on the SAME (now-poisoned) connection must be
+  // refused, not silently allowed through onto a possibly-torn WAL line.
+  const sameConnRetry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  check(
+    "call-start-wal-failure-retry-on-the-same-connection-is-refused-poisoned",
+    Boolean(sameConnRetry && sameConnRetry.error && /poisoned/i.test(sameConnRetry.error.message)),
+    JSON.stringify(sameConnRetry)
+  );
+  check("call-start-wal-failure-retry-on-the-same-connection-did-not-dispatch", conn.calls.length === 0, JSON.stringify(conn.calls));
   await proxy.closeConnection("conn-1", "test cleanup");
+
+  // A fresh connection (close-and-reopen, exactly as the poisoned error's own wording
+  // instructs) gets its own fresh WAL and dispatches normally.
+  proxy.openConnection("conn-2");
+  await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-2");
+  const freshConnRetry = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  check("call-start-wal-failure-retry-on-a-fresh-connection-dispatches-normally", Boolean(freshConnRetry && freshConnRetry.result && freshConnRetry.result.ok === true), JSON.stringify(freshConnRetry));
+  await proxy.closeConnection("conn-2", "test cleanup");
 }
 
 /* Codex PR #33 review "guard the post-dispatch intent update": a concurrent removal of
@@ -1339,9 +1363,23 @@ async function initializeWalFailureDoesNotEscapeAndRollsBack() {
   check("initialize-wal-failure-returns-a-retryable-jsonrpc-error", Boolean(resp && resp.error && resp.error.code === -32000), JSON.stringify(resp));
   check("initialize-wal-failure-did-not-flip-agentInitialized", proxy.agentInitialized.get("conn-1") === "none", `agentInitialized unexpectedly advanced: ${proxy.agentInitialized.get("conn-1")}`);
 
-  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
-  check("initialize-retry-succeeds-normally-afterward", Boolean(retry && retry.result && retry.result.protocolVersion), JSON.stringify(retry));
+  // Round-2 fix pass: this append failure now also poisons the CONNECTION (see
+  // poisonWalOnFailure above) -- a bare retry of initialize on the SAME connection must
+  // be refused too, not silently allowed through onto a possibly-torn WAL line.
+  const sameConnRetry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  check(
+    "initialize-retry-on-the-same-connection-is-refused-poisoned",
+    Boolean(sameConnRetry && sameConnRetry.error && /poisoned/i.test(sameConnRetry.error.message)),
+    JSON.stringify(sameConnRetry)
+  );
   await proxy.closeConnection("conn-1", "test cleanup");
+
+  // A fresh connection (close-and-reopen) gets its own fresh WAL and initializes
+  // normally.
+  proxy.openConnection("conn-2");
+  const freshConnRetry = await proxy.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  check("initialize-retry-on-a-fresh-connection-succeeds-normally", Boolean(freshConnRetry && freshConnRetry.result && freshConnRetry.result.protocolVersion), JSON.stringify(freshConnRetry));
+  await proxy.closeConnection("conn-2", "test cleanup");
 }
 
 /* Codex PR #33 review "roll back session publication when its first WAL write fails": a
@@ -1426,6 +1464,230 @@ async function callResultWalFailureDoesNotEscapeHandleMessage() {
  * independent connections is now the only way to reproduce that collision on purpose
  * (a real, live connection always gets its own random one) -- exactly mirroring what
  * "two connections with identical content" meant before session_id existed. */
+
+// ---------------------------------------------------------------------------
+// Round-2 fix pass (2026-09-16): closing commit 5's WAL-poison enforcement gap.
+//
+// The independent verify pass on commit 5 (b14bf35c) found that gateway.js:142/
+// session.js:88 document a connection-wide contract -- once an appendWalEvent call
+// fails for a connection, `s.walPoisoned` is set and EVERY later appendWalEvent
+// attempt on that same connection must be refused before touching the filesystem
+// (docs/contracts/wal-append-failure-semantics.md, C1 SS2-3) -- but that contract was
+// only actually enforced on gateway.js's own downstream-initiated sampling-forward
+// path. proxy.js's own appendWalEvent call sites (SESSION_START/INITIALIZE/ANOMALY/
+// CALL_START/CALL_RESULT/CLOSING) neither checked nor set it, so an agent-initiated
+// call could still dispatch onto (and CLOSING would unconditionally append onto) a
+// connection's own already-poisoned or already-torn WAL. The four tests below cover:
+// (1) proxy.js's own append failures now actually SET s.walPoisoned (not just check
+// it); (2) an already-poisoned connection refuses a brand-new CALL_START before
+// touching the filesystem, attested as an anomaly; (3) the CLOSING append -- the
+// guaranteed-violation path the verify pass named explicitly, since every connection
+// eventually closes -- is skipped and attested rather than unconditionally attempted;
+// (4) the fail-open CALL_RESULT path still returns the agent's real result when
+// skipping its own append due to poisoning, attested the same way.
+// ---------------------------------------------------------------------------
+
+/* Closes the other half of the gap: not just gating on s.walPoisoned before an append,
+ * but proxy.js's OWN append failures must actually SET it (matching gateway.js#
+ * poisonWalOnFailure's identical contract), so a second, otherwise-healthy call on the
+ * SAME now-poisoned connection is refused too, without the filesystem ever being
+ * touched a second time. */
+async function ownAppendFailurePoisonsConnectionForEverySubsequentCallSite() {
+  const dir = freshDir("own-failure-poisons");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  let failNextCallStart = true;
+  recovery.appendWalEvent = (...args) => {
+    if (failNextCallStart && args[2] && args[2].type === "CALL_START") {
+      failNextCallStart = false;
+      throw Object.assign(new Error("simulated ENOSPC"), { code: "ENOSPC" });
+    }
+    return realAppendWalEvent(...args);
+  };
+  let firstResp;
+  try {
+    firstResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("own-failure-first-call-refused-as-not-dispatched", Boolean(firstResp && firstResp.error && firstResp.error.code === -32000), JSON.stringify(firstResp));
+
+  const s = proxy.sessions.get("conn-1");
+  check("own-CALL_START-failure-sets-walPoisoned-on-the-session", Boolean(s.walPoisoned) && s.walPoisoned.reason === "simulated ENOSPC", JSON.stringify(s.walPoisoned));
+
+  const attemptedTypes = [];
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type) attemptedTypes.push(args[2].type);
+    return realAppendWalEvent(...args);
+  };
+  let secondResp, threw = null;
+  try {
+    secondResp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { a: 2 } } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("own-failure-second-call-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("own-failure-second-call-refused-via-the-poisoned-gate-not-a-fresh-append-attempt", !attemptedTypes.includes("CALL_START"), JSON.stringify(attemptedTypes));
+  check("own-failure-second-call-returns-a-poisoned-wal-error", Boolean(secondResp && secondResp.error && /poisoned/i.test(secondResp.error.message)), JSON.stringify(secondResp));
+  check("own-failure-connection-never-dispatched-downstream-at-all", conn.calls.length === 0, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* An already-poisoned connection must refuse a brand-new tools/call's CALL_START append
+ * before ever touching the filesystem -- treated exactly like a caught append failure
+ * (rollback pendingCalls/intent, attest an anomaly, return "not dispatched -- safe to
+ * retry"), never silently dispatched onto a possibly-torn WAL line. */
+async function poisonedConnectionRefusesNewCallStartAndAttestsSkip() {
+  const dir = freshDir("poisoned-call-start");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+
+  const s = proxy.sessions.get("conn-1");
+  s.walPoisoned = { reason: "simulated earlier ENOSPC", at: Date.now() };
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  const attemptedTypes = [];
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type) attemptedTypes.push(args[2].type);
+    return realAppendWalEvent(...args);
+  };
+  let resp, threw = null;
+  try {
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("poisoned-call-start-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("poisoned-call-start-returns-a-poisoned-wal-error", Boolean(resp && resp.error && resp.error.code === -32000 && /poisoned/i.test(resp.error.message)), JSON.stringify(resp));
+  check("poisoned-call-start-never-attempted-the-CALL_START-append", !attemptedTypes.includes("CALL_START"), JSON.stringify(attemptedTypes));
+  check("poisoned-call-start-did-not-dispatch-downstream", conn.calls.length === 0, JSON.stringify(conn.calls));
+  const intentKey = recovery.computeIntentKey("conn-1", "echo", { a: 1 });
+  check("poisoned-call-start-did-not-leave-an-orphaned-intent", recovery.readIntent(dir, intentKey) === null, "intent unexpectedly present");
+  check(
+    "poisoned-call-start-skip-is-attested-as-an-anomaly",
+    s.anomalies.some((a) => a.kind === "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED" && a.tool === "echo"),
+    JSON.stringify(s.anomalies)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* The fail-OPEN CALL_RESULT path (the downstream call has already genuinely completed --
+ * there is no "don't return the result" option left) must still skip its own append when
+ * the connection is poisoned, attest the skip, and still hand back the real result. */
+async function poisonedConnectionSkipsCallResultAppendButStillReturnsResult() {
+  const dir = freshDir("poisoned-call-result");
+  let resolveCall;
+  const conn = fakeConnectionCapturing(() => new Promise((resolve) => { resolveCall = resolve; }));
+  const mergedTools = [{ name: "slow", server: "srv", schema: {} }];
+  const toolOwners = new Map([["slow", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  const callPromise = proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow", arguments: {} } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // Poison mid-flight (after this call's own CALL_START already durably appended, before
+  // its CALL_RESULT does) -- simulating an earlier failed append on this connection
+  // (e.g. a concurrent downstream-initiated sampling forward via gateway.js) without
+  // needing to force a real filesystem error on this specific append.
+  const s = proxy.sessions.get("conn-1");
+  s.walPoisoned = { reason: "simulated mid-flight poisoning", at: Date.now() };
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  const attemptedTypes = [];
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type) attemptedTypes.push(args[2].type);
+    return realAppendWalEvent(...args);
+  };
+  resolveCall({ value: 7 });
+  let resp, threw = null;
+  try {
+    resp = await callPromise;
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+  check("poisoned-call-result-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("poisoned-call-result-still-returns-the-real-result", Boolean(resp && resp.result && resp.result.value === 7), JSON.stringify(resp));
+  check("poisoned-call-result-never-attempted-the-CALL_RESULT-append", !attemptedTypes.includes("CALL_RESULT"), JSON.stringify(attemptedTypes));
+  check(
+    "poisoned-call-result-skip-is-attested-as-an-anomaly",
+    s.anomalies.some((a) => a.kind === "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED"),
+    JSON.stringify(s.anomalies)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* The explicitly-required regression: the independent verify pass on commit 5 named
+ * closeConnection's CLOSING append as a GUARANTEED violation path, since it ran with no
+ * guard at all and every open connection eventually closes. Poisons a connection's WAL,
+ * drives it through a real close, and asserts the CLOSING append is never attempted (not
+ * attempted-and-caught -- refused before touching the filesystem, per C1 SS2-3) and that
+ * the skip is attested in the sealed bundle's own anomaly list, not silently swallowed. */
+async function poisonedConnectionSkipsClosingAppendAndAttestsIt() {
+  const dir = freshDir("poisoned-closing");
+  const conn = fakeConnectionCapturing(async () => ({ ok: true }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
+
+  // Poison the connection's WAL exactly the way a real appendWalEvent failure would
+  // (poisonWalOnFailure's own {reason, at} shape), simulating an earlier failure on this
+  // connection without needing to force a real filesystem error at close time itself.
+  const s = proxy.sessions.get("conn-1");
+  s.walPoisoned = { reason: "simulated earlier ENOSPC", at: Date.now() };
+
+  const realAppendWalEvent = recovery.appendWalEvent;
+  const attemptedTypes = [];
+  recovery.appendWalEvent = (...args) => {
+    if (args[2] && args[2].type) attemptedTypes.push(args[2].type);
+    return realAppendWalEvent(...args);
+  };
+  let entry, threw = null;
+  try {
+    entry = await proxy.closeConnection("conn-1", "test cleanup");
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.appendWalEvent = realAppendWalEvent;
+  }
+
+  check("poisoned-closing-does-not-escape-closeConnection", threw === null, threw && threw.message);
+  check("poisoned-closing-still-seals-and-appends-the-session", Boolean(entry), "closeConnection returned null");
+  check("poisoned-closing-never-attempts-the-CLOSING-append-at-all", !attemptedTypes.includes("CLOSING"), JSON.stringify(attemptedTypes));
+  // `s` is the same in-memory session object closeConnection operated on (only removed
+  // from proxy.sessions, never replaced) -- session.recordAnomaly's push onto s.anomalies
+  // happens before finalizeSession seals it, so this is exactly what the sealed bundle's
+  // own decision_record.md "## Anomalies" section (scripts/gsa-mcp-shim.js) attests from.
+  check(
+    "poisoned-closing-skip-is-attested-as-an-anomaly",
+    s.anomalies.some((a) => a.kind === "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED" && a.detail === "simulated earlier ENOSPC"),
+    JSON.stringify(s.anomalies)
+  );
+}
+
 async function persistenceFailureQuarantinesSealedBundle() {
   const dir = freshDir("quarantine");
   const conn = fakeConnection(async () => ({ ok: true }));
@@ -1580,6 +1842,12 @@ async function main() {
   await initializeWalFailureDoesNotEscapeAndRollsBack();
   await openConnectionWalFailureDoesNotPublishGhostSession();
   await callResultWalFailureDoesNotEscapeHandleMessage();
+
+  // Round-2 fix pass (2026-09-16): closing commit 5's WAL-poison enforcement gap.
+  await ownAppendFailurePoisonsConnectionForEverySubsequentCallSite();
+  await poisonedConnectionRefusesNewCallStartAndAttestsSkip();
+  await poisonedConnectionSkipsCallResultAppendButStillReturnsResult();
+  await poisonedConnectionSkipsClosingAppendAndAttestsIt();
 
   // From feature/track-1.2-standalone-gateway (merged into PR #33):
   await persistenceFailureQuarantinesSealedBundle();

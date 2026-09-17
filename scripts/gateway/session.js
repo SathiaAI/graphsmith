@@ -82,9 +82,11 @@ function createSession(connectionId, options = {}) {
      * concatenated onto by a second attempt (see the contract doc). In-memory only,
      * connection-scoped, never written to the sealed bundle (toSealableSession below
      * does not include it) or the WAL itself; a fresh connection/session always starts
-     * with this null. Not read or written anywhere in this file -- callers (currently
-     * gateway.js's forwardDownstreamRequestToAgent) set and check it directly on the
-     * session record, the same way they already read/write pendingCalls/calls. */
+     * with this null. Not read or written anywhere in this file -- callers (gateway.js's
+     * forwardDownstreamRequestToAgent, and every appendWalEvent call site in proxy.js as
+     * of the round-2 fix pass closing commit 5's enforcement gap) set and check it
+     * directly on the session record, the same way they already read/write
+     * pendingCalls/calls. */
     walPoisoned: null,
   };
 }

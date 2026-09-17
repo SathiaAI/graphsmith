@@ -60,6 +60,53 @@ function isModelCallMethod(method) {
   return method === "sampling/createMessage";
 }
 
+/* Round-2 fix pass (2026-09-16), closing commit 5's WAL-poison enforcement gap: commit 5
+ * (b14bf35c) made gateway.js#forwardDownstreamRequestToAgent (the downstream-initiated
+ * sampling-forward path) mark `s.walPoisoned` on its own first appendWalEvent failure and
+ * refuse every later append on that connection -- see gateway.js#poisonWalOnFailure and
+ * its call site's own doc comments. session.js#createSession's own walPoisoned doc
+ * comment states that contract as connection-wide ("every later append attempt on the
+ * same connection must be refused"), but until now THIS file's own appendWalEvent call
+ * sites (SESSION_START/INITIALIZE/ANOMALY/CALL_START/CALL_RESULT/CLOSING) never set or
+ * checked it at all -- an agent-initiated call could still append to (and poison, or
+ * concatenate onto an already-torn) the very same connection's WAL that the sampling path
+ * had already given up on, and CLOSING's own append ran completely unguarded on every
+ * connection close, including one already poisoned by an earlier failure on this file's
+ * own dispatch path. These two helpers give every appendWalEvent call site below in THIS
+ * file the identical set/check contract gateway.js's sampling path already has, per
+ * docs/contracts/wal-append-failure-semantics.md (C1 SS2-3). Defined locally rather than
+ * imported from gateway.js to avoid a proxy.js/gateway.js circular require (gateway.js
+ * already requires this file) -- kept identical in shape/semantics to
+ * gateway.js#poisonWalOnFailure by design, not a new mechanism. */
+function poisonWalOnFailure(s, walError, now) {
+  if (s && !s.walPoisoned) {
+    s.walPoisoned = { reason: walError.message, at: typeof now === "function" ? now() : Date.now() };
+  }
+}
+
+/* Companion to poisonWalOnFailure above: the shared refusal every gated call site below
+ * returns once `s.walPoisoned` is already set, matching gateway.js#
+ * forwardDownstreamRequestToAgent's own wording/JSON-RPC shape for the identical
+ * situation on the sampling-forward path (commit 5) verbatim, so both paths present one
+ * consistent contract to whatever is on the other end of a connection. `verb` names the
+ * specific durable write being refused (e.g. "initializing this connection") so the
+ * message stays accurate per call site while everything else -- including the contract
+ * cited -- stays identical everywhere it is used. */
+function walPoisonedError(id, s, verb) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: -32000,
+      message:
+        `This connection's WAL was poisoned by an earlier append failure (${s.walPoisoned.reason}) ` +
+        "and is refusing every further durable write on this connection rather than risk " +
+        "concatenating onto a possibly-torn line -- per docs/contracts/wal-append-failure-" +
+        `semantics.md (C1). Not ${verb}; close and reopen the connection to get a fresh WAL.`,
+    },
+  };
+}
+
 /* This build only ever negotiates the one protocol version it actually implements
  * (matching the literal default this file used to echo back unconditionally). Kept as a
  * named constant so "what we claim to speak" and "what we validate against" cannot drift
@@ -375,6 +422,19 @@ class GatewayProxy {
        * never see an INITIALIZE event for this connection, sealing an inconsistent
        * recovered session. Persist first; only commit the in-memory mutations once the WAL
        * durably has this event, matching the existing CALL_START-failure pattern below. */
+      /* Round-2 fix pass: this connection's WAL cannot legitimately already be poisoned
+       * this early (SESSION_START, the only prior append for this connectionId, either
+       * durably succeeds or -- per its own doc comment in openConnection -- throws
+       * straight out before this session is ever published, leaving no session here to
+       * poison) -- gated anyway, uniformly with every other call site below, so this
+       * file's own enforcement is a single provable invariant ("every appendWalEvent call
+       * site in this file checks s.walPoisoned first") rather than one that happens to
+       * hold only because of each site's own reachability analysis. */
+      if (s.walPoisoned) {
+        session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED", tool: "initialize", detail: s.walPoisoned.reason });
+        if (isNotification) return null;
+        return walPoisonedError(id, s, "initializing this connection");
+      }
       try {
         recovery.appendWalEvent(this.stateDir, connectionId, {
           type: "INITIALIZE",
@@ -383,6 +443,7 @@ class GatewayProxy {
           model: params && params.model,
         });
       } catch (walError) {
+        poisonWalOnFailure(s, walError, this.now);
         session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: "initialize", detail: walError.message });
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error: { code: -32000, message: `Failed to durably record this connection's initialize before completing it: ${walError.message}. Not initialized -- safe to retry.` } };
@@ -762,10 +823,21 @@ class GatewayProxy {
            * returning the block response the gateway already decided on. Degraded
            * durability for this one anomaly (already recorded in-memory above) is
            * preferable to an escaping exception on the fence path. */
-          try {
-            recovery.appendWalEvent(this.stateDir, connectionId, { type: "ANOMALY", kind: intentDecision.gatewayCode, tool: toolName, intent_key: intentKey, detail: intentDecision.message, ts: this.now() });
-          } catch (walError) {
-            this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, type: "ANOMALY", detail: walError.message }));
+          /* Round-2 fix pass: gated on s.walPoisoned like every other appendWalEvent call
+           * site in this file (see poisonWalOnFailure/walPoisonedError's own doc comments
+           * above) -- this append is already best-effort (a failure here does not change
+           * the block response returned below), so a skip-due-to-poisoning is likewise
+           * best-effort: attest it via the same structured log line a real append failure
+           * gets, rather than silently doing nothing. */
+          if (s.walPoisoned) {
+            this.log(JSON.stringify({ event: "gateway_wal_append_skipped_poisoned", connection_id: connectionId, tool: toolName, type: "ANOMALY", detail: s.walPoisoned.reason }));
+          } else {
+            try {
+              recovery.appendWalEvent(this.stateDir, connectionId, { type: "ANOMALY", kind: intentDecision.gatewayCode, tool: toolName, intent_key: intentKey, detail: intentDecision.message, ts: this.now() });
+            } catch (walError) {
+              poisonWalOnFailure(s, walError, this.now);
+              this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, type: "ANOMALY", detail: walError.message }));
+            }
           }
           this.log(JSON.stringify({ event: "gateway_call_completed", connection_id: connectionId, step: null, tool: toolName, server: serverName, status: "blocked", duration_ms: 0 }));
           if (isNotification) return null;
@@ -796,6 +868,38 @@ class GatewayProxy {
          * blocked forever as "still in flight" for an operation that in fact never
          * dispatched. Roll back both the intent and the just-added pendingCalls entry, and
          * return a normal, retryable JSON-RPC error instead. */
+        /* Round-2 fix pass, closing commit 5's WAL-poison enforcement gap: this is the
+         * one call site on this path where a poisoned connection was previously able to
+         * dispatch a brand-new tools/call and append its CALL_START straight onto a
+         * possibly-torn WAL line -- the exact violation the independent verify pass on
+         * commit 5 flagged. Treated exactly like a caught append failure just below (per
+         * docs/contracts/wal-append-failure-semantics.md C1 SS2: "the caller should treat
+         * the refusal exactly like a second append failure"): roll back the pendingCalls
+         * entry and the just-created/superseded intent the same way, attest it as an
+         * anomaly, and return the same "not dispatched -- safe to retry" shape (via
+         * walPoisonedError) a real append failure would. */
+        if (s.walPoisoned) {
+          s.pendingCalls.delete(correlationKey);
+          try {
+            if (supersededIntentSnapshot) {
+              recovery.updateIntent(this.stateDir, intentKey, {
+                state: supersededIntentSnapshot.state,
+                dispatched_at: undefined,
+                idempotency_key: supersededIntentSnapshot.idempotency_key,
+                generation: supersededIntentSnapshot.generation,
+                cached_result: supersededIntentSnapshot.cached_result,
+                completed_at: supersededIntentSnapshot.completed_at,
+                resolved_at: supersededIntentSnapshot.resolved_at,
+                resolution: supersededIntentSnapshot.resolution,
+              });
+            } else {
+              recovery.deleteIntent(this.stateDir, intentKey);
+            }
+          } catch (cleanupError) { /* best effort */ }
+          session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED", tool: toolName, intent_key: intentKey, detail: s.walPoisoned.reason });
+          if (isNotification) return null;
+          return walPoisonedError(id, s, "dispatching this call");
+        }
         try {
           /* Cluster A (generation-aware crash recovery): tags this CALL_START event with
            * the dispatch generation active at THIS dispatch, rather than leaving
@@ -808,6 +912,7 @@ class GatewayProxy {
            * own generation-match check for the other half of this fix. */
           recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: walCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts, generation: dispatchGeneration });
         } catch (walError) {
+          poisonWalOnFailure(s, walError, this.now);
           s.pendingCalls.delete(correlationKey);
           try {
             /* CodeRabbit/Codex PR #33 review "restore the prior completed intent when
@@ -966,13 +1071,26 @@ class GatewayProxy {
            * (updated separately above) remains the source of truth recovery-replay falls
            * back to if this WAL line never lands; see recoverCrashedSessions' own
            * intent-consultation comment. */
-          try {
-            // Cluster A: tagged with the same dispatchGeneration as this call's own
-            // CALL_START event above -- see that event's own doc comment.
-            recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt, generation: dispatchGeneration });
-          } catch (walError) {
-            session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
-            this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: walError.message }));
+          /* Round-2 fix pass: gated on s.walPoisoned like every other appendWalEvent call
+           * site in this file. Same best-effort shape as the real-failure catch just
+           * below (the downstream call already completed for real -- there is no
+           * "don't return the result" option left on this fail-OPEN path, see this
+           * block's own header comment on why proxy.js stays fail-open here unlike
+           * gateway.js's sampling CALL_RESULT path): skip the append, attest it as an
+           * anomaly and a structured log line, and still return the real result. */
+          if (s.walPoisoned) {
+            session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED", tool: toolName, intent_key: intentKey, detail: s.walPoisoned.reason });
+            this.log(JSON.stringify({ event: "gateway_wal_append_skipped_poisoned", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: s.walPoisoned.reason }));
+          } else {
+            try {
+              // Cluster A: tagged with the same dispatchGeneration as this call's own
+              // CALL_START event above -- see that event's own doc comment.
+              recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt, generation: dispatchGeneration });
+            } catch (walError) {
+              poisonWalOnFailure(s, walError, this.now);
+              session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
+              this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: walError.message }));
+            }
           }
         }
         /* Board decision 2026-09-04, PR #29 review "emit the required structured log for
@@ -1080,7 +1198,27 @@ class GatewayProxy {
     }
     this.sessions.delete(connectionId);
     this.agentInitialized.delete(connectionId);
-    recovery.appendWalEvent(this.stateDir, connectionId, { type: "CLOSING", reason: reason || null });
+    /* Round-2 fix pass, closing commit 5's WAL-poison enforcement gap: the independent
+     * verify pass on commit 5 (b14bf35c) named this exact append as a GUARANTEED
+     * violation path -- every connection eventually closes, so any connection poisoned
+     * by an earlier append failure on this same file's own dispatch path (CALL_START/
+     * CALL_RESULT/ANOMALY/INITIALIZE above) was previously 100% certain to have this
+     * CLOSING event concatenated onto its possibly-torn WAL line, with no check at all.
+     * `s` here is the same session object fetched at the top of this method (still
+     * pre-finalization -- session.recordAnomaly below only rejects a FINALIZED session,
+     * and finalizeSession has not run yet), so its walPoisoned flag (if any) is the
+     * live, current one. Skipping this append changes nothing else about close: the
+     * WAL file is left as-is (not deleted -- recovery.deleteWal below only ever runs
+     * after a successful chain.appendSession, unaffected by this) for an operator to
+     * inspect per the poisoned-connection contract; sealing/finalization proceeds
+     * exactly as it would if this append had been attempted and skipped for any other
+     * best-effort reason. */
+    if (s.walPoisoned) {
+      session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED", detail: s.walPoisoned.reason });
+      this.safeLog(JSON.stringify({ event: "gateway_wal_append_skipped_poisoned", connection_id: connectionId, type: "CLOSING", detail: s.walPoisoned.reason }));
+    } else {
+      recovery.appendWalEvent(this.stateDir, connectionId, { type: "CLOSING", reason: reason || null });
+    }
     let sealed;
     try {
       sealed = session.finalizeSession(s, this.keys);
