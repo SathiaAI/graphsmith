@@ -198,7 +198,24 @@ function writeFullySync(fd, buffer) {
   const originalSize = fs.fstatSync(fd).size;
   let offset = 0;
   while (offset < buffer.length) {
-    const written = fs.writeSync(fd, buffer, offset, buffer.length - offset);
+    /* Codex PR #33 review "roll back the WAL when a write throws, not only when it
+     * returns non-positive progress": fs.writeSync can itself throw (e.g. ENOSPC,
+     * EIO) partway through a multi-call write, leaving bytes from a prior successful
+     * writeSync call in this same loop already appended past the file's pre-append
+     * end. Only checking `written > 0` misses that case entirely, since a throw never
+     * reaches that check. Wrap the call itself so a throw also truncates back to
+     * originalSize before propagating, matching the short-write branch below. */
+    let written;
+    try {
+      written = fs.writeSync(fd, buffer, offset, buffer.length - offset);
+    } catch (writeError) {
+      try {
+        fs.ftruncateSync(fd, originalSize);
+      } catch (truncateError) {
+        /* best effort -- see the short-write branch's identical comment below. */
+      }
+      throw writeError;
+    }
     if (!(written > 0)) {
       try {
         fs.ftruncateSync(fd, originalSize);
@@ -353,8 +370,16 @@ function computeIntentKey(connectionId, tool, args) {
 /** The signature identity Cluster A's cross-connection replay needs: (tool, logical
  * arguments) alone, deliberately WITHOUT connectionId (unlike computeIntentKey above) --
  * see this file's own header comment on DEFAULT_RETAINED_SIGNATURE_TTL_MS for why. */
-function computeSignatureKey(tool, args) {
-  const material = `${tool}\0${canonicalJson(args === undefined ? null : args)}`;
+function computeSignatureKey(tool, args, idempotencyKey) {
+  /* CodeRabbit PR #33 review "signature key collides across different idempotency
+   * keys for the same (tool, args)": two distinct caller-supplied idempotencyKeys
+   * calling the same tool with the same logical arguments previously hashed to the
+   * exact same signature, so the second caller's genuinely-distinct request would
+   * read back the first caller's cached result (or overwrite it) instead of being
+   * treated as its own operation. Folding idempotencyKey into the hashed material
+   * disambiguates them; omitting it (undefined/null) still hashes deterministically
+   * to the same key as before for callers that never supplied one. */
+  const material = `${tool}\0${canonicalJson(args === undefined ? null : args)}\0${idempotencyKey === undefined || idempotencyKey === null ? "" : idempotencyKey}`;
   return "gs_sig_" + crypto.createHash("sha256").update(material, "utf8").digest("hex").slice(0, 32);
 }
 

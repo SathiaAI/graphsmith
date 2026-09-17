@@ -552,27 +552,27 @@ class GatewayProxy {
       const callArgs = method === "tools/call" ? (params && params.arguments) : params;
 
       /* Correlate by an internally-generated marker even for notification-shaped calls
-       * (SS3.3's Map-keyed-by-id requirement is about the DOWNSTREAM leg's own id, which
-       * downstream.js already manages; here we key the SESSION record by the AGENT's own
-       * JSON-RPC id when present, or a synthetic one for a fire-and-forget call).
-       * Codex PR #29 review "handle JSON-RPC null IDs before recording calls": JSON-RPC
-       * 2.0 permits an explicit `id: null` on a REQUEST (distinct from a notification,
-       * which omits the id key entirely) -- `isNotification` above only catches the
-       * latter. A null id still gets a real response below (the outer `id` variable,
-       * unchanged, is echoed back as JSON-RPC requires) -- only the internal bookkeeping
-       * key needs to never be null.
+       * (SS3.3's Map-keyed-by-id requirement is about the DOWNSTREAM leg's own id,
+       * which downstream.js already manages; here we key the SESSION record by the
+       * AGENT's own JSON-RPC id when present, or a synthetic one for a fire-and-forget
+       * call). Codex PR #29 review "handle JSON-RPC null IDs before recording calls":
+       * JSON-RPC 2.0 permits an explicit `id: null` on a REQUEST (distinct from a
+       * notification, which omits the id key entirely) -- `isNotification` above only
+       * catches the latter. A null id still gets a real response below (the outer `id`
+       * variable, unchanged, is echoed back as JSON-RPC requires) -- only the internal
+       * bookkeeping key needs to never be null.
        *
        * Computed HERE, before the idempotency-intent dispatch guard below (Codex PR #33
        * review "reject duplicate request IDs before creating intents"): this used to be
        * computed only right before session.recordCallStart, well after a durable
        * "dispatched" intent could already have been created for a brand-new intentKey.
        * An agent reusing an in-flight JSON-RPC id for a genuinely different operation
-       * would then get that intent created, dispatch never actually reach recordCallStart
-       * (it throws DUPLICATE_JSONRPC_ID) -- an exception that, unguarded, escaped
-       * handleMessage entirely -- and be left with an orphaned "dispatched" intent
-       * permanently blocking a call that never happened. Checking id availability first
-       * means a genuine duplicate id is rejected as an ordinary JSON-RPC error before
-       * anything durable is touched. */
+       * would then get that intent created, dispatch never actually reach
+       * recordCallStart (it throws DUPLICATE_JSONRPC_ID) -- an exception that,
+       * unguarded, escaped handleMessage entirely -- and be left with an orphaned
+       * "dispatched" intent permanently blocking a call that never happened. Checking
+       * id availability first means a genuine duplicate id is rejected as an ordinary
+       * JSON-RPC error before anything durable is touched. */
       const correlationKey = isNotification || id === null ? Symbol(`${isNotification ? "notify" : "null-id"}:${toolName}`) : id;
       if (!isNotification && id !== null && s.pendingCalls.has(correlationKey)) {
         return { jsonrpc: "2.0", id, error: { code: -32600, message: `Duplicate in-flight JSON-RPC id ${JSON.stringify(id)} on this connection -- a response for it is still pending.` } };
@@ -756,7 +756,7 @@ class GatewayProxy {
               if (callerIdempotencyKey) {
                 let retained = null;
                 try {
-                  retained = recovery.readCompletedSignature(this.stateDir, recovery.computeSignatureKey(toolName, callArgs));
+                  retained = recovery.readCompletedSignature(this.stateDir, recovery.computeSignatureKey(toolName, callArgs, callerIdempotencyKey));
                 } catch (signatureError) {
                   // Fail closed, same rationale as the quarantine scan above: a retained
                   // signature that cannot be proven safe to use must not be replayed.
@@ -1022,7 +1022,7 @@ class GatewayProxy {
              * completed -- the primary intent record above is already durable, and this
              * is only ever an ADDITIONAL convenience for a future reconnect. */
             try {
-              recovery.recordCompletedSignature(this.stateDir, recovery.computeSignatureKey(toolName, callArgs), {
+              recovery.recordCompletedSignature(this.stateDir, recovery.computeSignatureKey(toolName, callArgs, callerIdempotencyKey), {
                 tool: toolName,
                 arguments: callArgs,
                 intent_key: intentKey,
@@ -1033,7 +1033,13 @@ class GatewayProxy {
                 completed_at: completedAt,
               });
             } catch (signatureError) {
-              this.log(JSON.stringify({ event: "gateway_retained_signature_write_failed", connection_id: connectionId, tool: toolName, intent_key: intentKey, detail: signatureError.message }));
+              /* CodeRabbit PR #33 review "use safeLog, not log, once the downstream
+               * effect already landed": by this point the real call already completed
+               * and only this best-effort secondary cache write failed -- this.log can
+               * itself throw (see safeLog's own doc comment), which would incorrectly
+               * escape handleMessage and deny the agent the response it is already
+               * owed for a failure in a purely-optional convenience write. */
+              this.safeLog(JSON.stringify({ event: "gateway_retained_signature_write_failed", connection_id: connectionId, tool: toolName, intent_key: intentKey, detail: signatureError.message }));
             }
           } else {
             recovery.updateIntent(this.stateDir, intentKey, {
@@ -1089,7 +1095,11 @@ class GatewayProxy {
             } catch (walError) {
               poisonWalOnFailure(s, walError, this.now);
               session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
-              this.log(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: walError.message }));
+              /* Codex PR #33 review "use safeLog once the downstream call already
+               * completed": the real tools/call result is already committed to being
+               * returned by this point -- a throw from this.log here must not be
+               * allowed to escape and deny the agent that already-earned response. */
+              this.safeLog(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: walError.message }));
             }
           }
         }
