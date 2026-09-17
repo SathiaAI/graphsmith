@@ -48,3 +48,18 @@
 # entire value is that one specific byte survives.
 scripts/ci-check-pr-separation.js binary
 tests/watcher/sonnet/run-tests.js binary
+
+# scripts/gateway/chain.js also carries a literal NUL byte -- the hash-chain's own
+# field-separator sentinel inside a .join("\0") call, so no legitimate field value
+# can collide across two different joins. Unlike the two fixtures above, this
+# file's whole point is that its CODE gets reviewed, so it must stay diffable.
+# `binary` (the directive used for those two files) is the wrong tool here: it is
+# shorthand for `-diff -merge -text`, so copying it verbatim would leave chain.js
+# permanently in the exact same "Binary files ... differ" state the plain
+# NUL-byte auto-detection already produces today -- it would not fix the
+# reviewability problem, it would lock it in. `diff` (bare, positive) is narrower:
+# it does not touch -text/-merge, it only tells git's diff engine to treat this
+# one path as text for diff purposes despite the byte that trips the binary
+# heuristic, so a real line-based diff renders on GitHub. Verified locally via
+# `git check-attr` and `git diff` before this attribute was added and after.
+scripts/gateway/chain.js diff
