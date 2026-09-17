@@ -300,7 +300,7 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
         type: "CALL_START",
         call_seq: walCallSeq,
         tool: "sampling/createMessage",
-        server: "sampling",
+        server: recordedServerName,
         arguments: msg.params,
         isModelCall: true,
         ts: proxy.now(),
@@ -1037,7 +1037,7 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
       // command": collected as we go so the RECOVERY_AMBIGUOUS_INTENT log below can name
       // every actual unresolved key, rather than the literal "<key>" placeholder it used
       // to print regardless of how many calls (or which ones) were actually unresolved --
-      // recovery-resolve requires the exact key, which an operator otherwise had to
+      // recovery-resolve requires the exact intent key, which an operator otherwise had to
       // discover by hand-parsing raw recovery files.
       const unresolvedIntentKeys = [];
       for (const [key] of Array.from(s.pendingCalls.entries())) {
@@ -1209,7 +1209,7 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
    * process-fatal handling. */
   const leaseGuard = createLeaseGuard(writerClaim);
   leaseGuard.renew();
-  /* Codex PR #33 review "continue recovery after an unreadable connection state": this
+  /* CodeRabbit PR #33 review "continue recovery after an unreadable connection state": this
    * command is recoverCrashedSessions' own documented remediation path for a connection
    * it could not process -- including one whose WAL could not even be READ (permissions/
    * I/O error, not a content problem). Before this, that same unreadable-WAL error would
