@@ -1330,6 +1330,79 @@ async function quarantineScanFailureFailsClosed() {
   await proxy.closeConnection("conn-1", "test cleanup");
 }
 
+/* Codex PR #33 review "block dispatch when a retained signature is unreadable": this catch
+ * claimed to fail closed but converted the failure to `null` -- a CACHE MISS that fell
+ * straight through to a fresh dispatched intent and a real downstream call. An EIO or a
+ * corrupt signature file therefore repeated an already-completed side effect at exactly the
+ * moment its deduplication evidence could not be verified. */
+async function unreadableRetainedSignatureBlocksInsteadOfDispatching() {
+  const dir = freshDir("retained-signature-unreadable");
+  const conn = fakeConnectionCapturing(async () => ({ value: 7 }));
+  const mergedTools = [{ name: "charge", server: "srv", schema: {} }];
+  const toolOwners = new Map([["charge", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners);
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+
+  const realReadCompletedSignature = recovery.readCompletedSignature;
+  recovery.readCompletedSignature = () => {
+    throw Object.assign(new Error("EIO: simulated unreadable retained signature"), { code: "GATEWAY_RECOVERY_SIGNATURE_UNREADABLE" });
+  };
+  let resp, threw = null;
+  try {
+    resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "charge", arguments: { amount: 5 }, _meta: { idempotencyKey: "customer-key-1" } } });
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.readCompletedSignature = realReadCompletedSignature;
+  }
+  check("unreadable-retained-signature-does-not-escape-handleMessage", threw === null, threw && threw.message);
+  check("unreadable-retained-signature-fails-closed-with-its-own-code", Boolean(resp && resp.error && resp.error.code === -32083), JSON.stringify(resp));
+  check("unreadable-retained-signature-did-not-dispatch-downstream", conn.calls.length === 0, JSON.stringify(conn.calls));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "make the post-fence diagnostic non-throwing": on the supersede path
+ * the durable intent is already flipped to "dispatched" before this diagnostic is logged.
+ * A caller-supplied logger that throws there was caught by the surrounding block's catch
+ * and rethrown, aborting before recordCallStart / the CALL_START WAL append / the
+ * downstream dispatch -- leaving a false in-flight fence that blocks every future retry of
+ * an effect that never occurred. */
+async function throwingLoggerOnTheSupersedePathDoesNotStrandTheFence() {
+  const dir = freshDir("supersede-logger-throws");
+  let callCount = 0;
+  const conn = fakeConnectionCapturing(async () => { callCount += 1; return { value: callCount }; });
+  const mergedTools = [{ name: "charge", server: "srv", schema: {} }];
+  const toolOwners = new Map([["charge", "srv"]]);
+  let loggerThrows = 0;
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, {
+    log: (payload) => {
+      if (typeof payload === "string" && payload.includes("gateway_intent_signature_reused_without_key")) {
+        loggerThrows += 1;
+        throw new Error("simulated caller-supplied logger failure");
+      }
+    },
+  });
+  const args = { amount: 5 };
+
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "charge", arguments: args, _meta: { idempotencyKey: "key-1" } } });
+
+  // Same connection, same tool+arguments, NO idempotency key -> the supersede path, which
+  // is where the post-fence diagnostic (and the throwing logger) lives.
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "charge", arguments: args } });
+  check("supersede-logger-throw-was-actually-exercised", loggerThrows === 1, String(loggerThrows));
+  check("supersede-logger-throw-does-not-abort-the-dispatch", Boolean(resp && resp.result && resp.result.value === 2), JSON.stringify(resp));
+  check("supersede-logger-throw-still-reaches-downstream", conn.calls.length === 2, JSON.stringify(conn.calls));
+  const intentKey = recovery.computeIntentKey("conn-1", "charge", args);
+  const intent = recovery.readIntent(dir, intentKey);
+  check("supersede-logger-throw-leaves-no-false-in-flight-fence", Boolean(intent) && intent.state === "completed", JSON.stringify(intent));
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
 /* Codex PR #33 review "commit initialization only after its WAL event succeeds": a WAL
  * failure on the INITIALIZE append used to be unguarded (escaping handleMessage) AND ran
  * after agentInitialized was already flipped true, so a retry would be rejected as a
@@ -1839,6 +1912,10 @@ async function main() {
   await duplicateJsonRpcIdRejectedBeforeIntentCreated();
   await supersedeCallStartWalFailureRestoresPriorCompletedIntent();
   await quarantineScanFailureFailsClosed();
+
+  // Codex PR #33 review round 2 (2026-09-17):
+  await unreadableRetainedSignatureBlocksInsteadOfDispatching();
+  await throwingLoggerOnTheSupersedePathDoesNotStrandTheFence();
   await initializeWalFailureDoesNotEscapeAndRollsBack();
   await openConnectionWalFailureDoesNotPublishGhostSession();
   await callResultWalFailureDoesNotEscapeHandleMessage();

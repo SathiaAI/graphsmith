@@ -132,11 +132,21 @@ function signaturePath(stateDir, signatureKey) {
  * passed to mkdirSync) also re-tightens a directory that was created by an older build
  * of this file before this fix, since `recursive: true` does not revisit dirs that
  * already existed. Best-effort: a chmod that fails (e.g. a filesystem that does not
- * support POSIX modes) must not mask the real error from the write that follows. */
+ * support POSIX modes) must not mask the real error from the write that follows.
+ *
+ * Codex PR #33 review "preserve group access when creating recovery state": the literal
+ * `0700`/`0600` this originally used predate startup-permissions.js's access model, which
+ * is explicitly group-readable (stateStore.DEFAULT_DIR_MODE 0750 / DEFAULT_FILE_MODE 0640,
+ * "NOT single-user 0700/0600") so same-group ops tooling running under another UID can
+ * read recovery state. That startup pass chmods these very directories to 0750 -- and
+ * then every subsequent WAL/intent/signature write came back through this helper and
+ * reset them to 0700, silently undoing it. Use the shared constants so the two agree; the
+ * original intent (never the umask-dependent world-readable 0755/0644 default) is
+ * unchanged, only the group bit that the later access model deliberately requires. */
 function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(dir, { recursive: true, mode: stateStore.DEFAULT_DIR_MODE });
   try {
-    fs.chmodSync(dir, 0o700);
+    fs.chmodSync(dir, stateStore.DEFAULT_DIR_MODE);
   } catch (error) {
     /* best effort -- see doc comment above */
   }
@@ -144,12 +154,14 @@ function ensureDir(dir) {
 
 /* Same rationale as ensureDir's own doc comment above, for the individual WAL/intent
  * files themselves: `fs.openSync(path, "a")`/atomicCreateExclusive/atomicOverwriteFile
- * all default to `0666 & ~umask` (typically `0644`), which is world/group-readable under
- * a `022` umask. Called after every write (mirroring fsyncDir's own "not just on first
- * creation" convention above) so a file that predates this fix is re-tightened too. */
+ * all default to `0666 & ~umask` (typically `0644`), which is WORLD-readable under a
+ * `022` umask. Called after every write (mirroring fsyncDir's own "not just on first
+ * creation" convention above) so a file that predates this fix is re-tightened too.
+ * Uses stateStore.DEFAULT_FILE_MODE (0640) rather than a literal 0600 for the same
+ * reason ensureDir's own doc comment above gives. */
 function restrictFileMode(filePath) {
   try {
-    fs.chmodSync(filePath, 0o600);
+    fs.chmodSync(filePath, stateStore.DEFAULT_FILE_MODE);
   } catch (error) {
     /* best effort -- see doc comment above */
   }
@@ -161,16 +173,35 @@ function restrictFileMode(filePath) {
  * directory) survives a power loss -- that needs the parent directory's own fd fsynced
  * too. Mirrors state-store.js's atomicOverwriteFile, which already fsyncs its target
  * directory on every write for the same reason; called after every append/create here
- * rather than only on first creation, matching that existing convention. Best-effort: a
- * directory that cannot be opened for this (e.g. mid-teardown in a test) should not mask
- * the real error from the write that already durably succeeded. */
+ * rather than only on first creation, matching that existing convention.
+ *
+ * Codex PR #33 review "propagate real directory fsync failures": this used to swallow
+ * EVERY error, so a genuine storage fault (EIO, ENOSPC) while making a brand-new WAL or
+ * intent's DIRECTORY ENTRY durable was reported to the caller as success. The file's own
+ * fsync does not cover its directory entry, so the gateway could dispatch a side effect
+ * believing CALL_START and its fence were durable and then restart to find neither. Only
+ * the cases this was actually written to tolerate are still ignored: the directory being
+ * gone (ENOENT -- mid-teardown in a test, the case the original comment names) and a
+ * platform/filesystem that simply does not support fsync on a directory fd. Everything
+ * else propagates, before dispatch. */
+const DIR_FSYNC_TOLERATED_CODES = new Set([
+  "ENOENT",   // the directory is already gone -- nothing left to make durable
+  "EINVAL",   // filesystem rejects fsync on a directory fd
+  "ENOTSUP",
+  "EOPNOTSUPP",
+  "ENOSYS",
+  "EISDIR",   // platforms (Windows) that refuse to open a directory as a file at all
+  "EPERM",
+  "EACCES",
+]);
 function fsyncDir(dir) {
   let fd;
   try {
     fd = fs.openSync(dir, "r");
     fs.fsyncSync(fd);
   } catch (error) {
-    /* best effort -- see doc comment above */
+    if (!DIR_FSYNC_TOLERATED_CODES.has(error.code)) throw error;
+    /* tolerated platform/teardown case only -- see doc comment above */
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
@@ -239,10 +270,11 @@ function appendDurableLine(filePath, line) {
   /* CodeRabbit PR #33 review "create recovery files with mode 0o600 at creation":
    * fs.openSync's default mode (0666 & ~umask) leaves a freshly-created WAL file
    * group/world-readable for the window between creation and restrictFileMode's chmod
-   * below under a permissive (022) umask. Passing 0o600 here closes that window for new
-   * files; restrictFileMode is kept unchanged so a file created by an older build still
-   * gets tightened on its next append. */
-  const fd = fs.openSync(filePath, "a", 0o600);
+   * below under a permissive (022) umask. Passing an explicit mode here closes that
+   * window for new files; restrictFileMode is kept unchanged so a file created by an older
+   * build still gets tightened on its next append. The mode is stateStore.DEFAULT_FILE_MODE
+   * (0640) to match restrictFileMode -- see ensureDir's doc comment for why. */
+  const fd = fs.openSync(filePath, "a", stateStore.DEFAULT_FILE_MODE);
   try {
     writeFullySync(fd, Buffer.from(`${line}\n`, "utf8"));
     fs.fsyncSync(fd);
@@ -569,12 +601,47 @@ function resolveIntentExecuted(stateDir, intentKey, result) {
       "GATEWAY_RECOVERY_INTENT_TERMINAL"
     );
   }
-  return updateIntent(stateDir, intentKey, {
+  const resolvedAt = Date.now();
+  const updated = updateIntent(stateDir, intentKey, {
     state: "completed",
-    resolved_at: Date.now(),
+    resolved_at: resolvedAt,
     resolution: "operator_confirmed_executed",
     cached_result: result,
   });
+  /* Codex PR #33 review "retain operator-confirmed results for reconnect replay": this
+   * used to update only the CONNECTION-SCOPED intent. Startup recovery then consumes that
+   * result and deletes the intent -- so, unlike proxy.js's live completion path, nothing
+   * ever wrote the connection-INDEPENDENT completed-signature record, and a reconnecting
+   * agent presenting the same caller idempotency key computed a brand-new intentKey,
+   * found nothing, and dispatched the already-executed side effect a second time. Write
+   * the same record the live path writes, from the same proven-executed outcome.
+   *
+   * Gated on a caller idempotency key actually being present, which is where this
+   * deliberately differs from proxy.js's unconditional write: proxy.js's own read gate
+   * (`retained.idempotency_key && retained.idempotency_key === callerIdempotencyKey`)
+   * can never replay an unkeyed record, so writing one here would only leave a file that
+   * is unreplayable by construction until its retention window expires.
+   *
+   * Best-effort, for the same reason the live path's own write is: the operator's
+   * decision is already durable in the intent record above, and this secondary
+   * cross-connection cache must not be able to undo or fail it. */
+  if (typeof current.idempotency_key === "string" && current.idempotency_key.length > 0) {
+    try {
+      recordCompletedSignature(stateDir, computeSignatureKey(current.tool, current.arguments, current.idempotency_key), {
+        tool: current.tool,
+        arguments: current.arguments,
+        intent_key: intentKey,
+        connection_id: current.connection_id,
+        generation: current.generation,
+        idempotency_key: current.idempotency_key,
+        cached_result: result,
+        completed_at: resolvedAt,
+      });
+    } catch (error) {
+      /* best effort -- see doc comment above */
+    }
+  }
+  return updated;
 }
 
 /** Confirmed NOT executed. Codex PR #33 review "persist a terminal not-executed

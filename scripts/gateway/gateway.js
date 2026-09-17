@@ -1304,8 +1304,18 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
     }
     log(`recovery-abandon: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
   }
+  /* Codex PR #33 review "keep the WAL until corrupt-intent cleanup succeeds":
+   * listIntentsForConnection reads EVERY intent record on disk before filtering, and
+   * readIntent throws GATEWAY_RECOVERY_INTENT_UNREADABLE/_CORRUPT on any damaged one --
+   * including an unrelated one. Running it AFTER deleteWal meant recovery-abandon could
+   * irreversibly destroy this connection's last remaining record and then abort on that
+   * scan, leaving the corrupt fence in place with nothing left to quarantine or replay,
+   * and every retry failing at the same point. Enumerate first: a failing scan now leaves
+   * the WAL intact and the whole command safely re-runnable (the bundle is already sealed,
+   * so a re-run takes the content-verified bundle_id-collision path above). */
+  const intentsToClear = recovery.listIntentsForConnection(stateDir, connectionId);
   recovery.deleteWal(stateDir, connectionId);
-  for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) recovery.deleteIntent(stateDir, intent.intent_key);
+  for (const intent of intentsToClear) recovery.deleteIntent(stateDir, intent.intent_key);
   log(`recovery-abandon: connection "${connectionId}" sealed (${s.calls.length} call(s)) and its idempotency fence(s) released.`);
 }
 

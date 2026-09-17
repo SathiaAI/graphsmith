@@ -35,6 +35,7 @@ const ROOT = path.resolve(__dirname, "../../..");
 const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
 const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
+const stateStore = require(path.join(ROOT, "scripts", "state-store.js"));
 const { recoverCrashedSessions, abandonConnection, startGateway, runRecoveryResolveCli, forwardDownstreamRequestToAgent, buildHealthStatus, writeStatusFile } = require(path.join(ROOT, "scripts", "gateway", "gateway.js"));
 const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 
@@ -152,29 +153,200 @@ function appendWalEventFailsClosedWhenWriteSyncMakesNoProgress() {
  * hold raw goals, tool arguments, and cached results -- data the signed execution trace
  * otherwise only ever stores as hashes. Under a common 022 umask, the previous default
  * modes (0755 dirs, 0644 files) let any other local user on the host read them. POSIX-only
- * (Windows has no equivalent permission bits to assert against). */
-function recoveryFilesAndDirsAreOwnerOnlyPermissions() {
+ * (Windows has no equivalent permission bits to assert against).
+ *
+ * Codex PR #33 review round 2 "preserve group access when creating recovery state": the
+ * asserted modes are now the SHARED access model (stateStore.DEFAULT_DIR_MODE 0750 /
+ * DEFAULT_FILE_MODE 0640) that startup-permissions.js applies to these exact paths, not
+ * the single-user 0700/0600 literals recovery.js used to reset them to on every write --
+ * which silently undid that startup pass and locked same-group ops tooling out again. The
+ * property under test is unchanged (never the umask-dependent world-readable default);
+ * only the group bit the later access model deliberately requires has changed. */
+function recoveryFilesAndDirsUseTheSharedAccessModel() {
   if (process.platform === "win32") {
-    record("recovery-permissions-owner-only", "SKIP", "POSIX file mode bits do not apply on win32");
+    record("recovery-permissions-shared-access-model", "SKIP", "POSIX file mode bits do not apply on win32");
     return;
   }
   const dir = freshDir("permissions");
   recovery.appendWalEvent(dir, "conn-1", { type: "SESSION_START", goal: null });
   const walMode = fs.statSync(recovery.walPath(dir, "conn-1")).mode & 0o777;
-  check("recovery-wal-file-is-0600", walMode === 0o600, walMode.toString(8));
+  check("recovery-wal-file-is-0640", walMode === 0o640, walMode.toString(8));
+  check("recovery-wal-file-is-never-world-readable", (walMode & 0o007) === 0, walMode.toString(8));
   const activeDirMode = fs.statSync(recovery.activeDir(dir)).mode & 0o777;
-  check("recovery-active-dir-is-0700", activeDirMode === 0o700, activeDirMode.toString(8));
+  check("recovery-active-dir-is-0750", activeDirMode === 0o750, activeDirMode.toString(8));
 
   const intentKey = recovery.computeIntentKey("conn-1", "toolA", {});
   recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-1", tool: "toolA", arguments: {}, state: "dispatched", dispatched_at: 1 });
   const intentModeAfterCreate = fs.statSync(recovery.intentPath(dir, intentKey)).mode & 0o777;
-  check("recovery-intent-file-is-0600-after-create", intentModeAfterCreate === 0o600, intentModeAfterCreate.toString(8));
+  check("recovery-intent-file-is-0640-after-create", intentModeAfterCreate === 0o640, intentModeAfterCreate.toString(8));
   const intentsDirMode = fs.statSync(recovery.intentsDir(dir)).mode & 0o777;
-  check("recovery-intents-dir-is-0700", intentsDirMode === 0o700, intentsDirMode.toString(8));
+  check("recovery-intents-dir-is-0750", intentsDirMode === 0o750, intentsDirMode.toString(8));
 
   recovery.updateIntent(dir, intentKey, { state: "ambiguous", ambiguous_at: 2 });
   const intentModeAfterUpdate = fs.statSync(recovery.intentPath(dir, intentKey)).mode & 0o777;
-  check("recovery-intent-file-is-0600-after-update", intentModeAfterUpdate === 0o600, intentModeAfterUpdate.toString(8));
+  check("recovery-intent-file-is-0640-after-update", intentModeAfterUpdate === 0o640, intentModeAfterUpdate.toString(8));
+
+  // The point of the fix: startup-permissions.js's pass and recovery.js's own per-write
+  // re-tightening must agree, so a write after startup cannot undo it.
+  check(
+    "recovery-runtime-modes-match-the-startup-permissions-pass",
+    activeDirMode === stateStore.DEFAULT_DIR_MODE && walMode === stateStore.DEFAULT_FILE_MODE,
+    `${activeDirMode.toString(8)}/${walMode.toString(8)} vs ${stateStore.DEFAULT_DIR_MODE.toString(8)}/${stateStore.DEFAULT_FILE_MODE.toString(8)}`
+  );
+}
+
+/* Codex PR #33 review "propagate real directory fsync failures": fsyncDir used to swallow
+ * EVERY error, so a genuine EIO while making a new WAL/intent's DIRECTORY ENTRY durable
+ * was reported to the caller as success -- the gateway could dispatch believing its fence
+ * was durable and restart to find no record of it. deleteIntent is the smallest public
+ * call that ends in fsyncDir and nothing else, so it isolates the behavior exactly.
+ * Only the directory open (flags "r") is faulted; the record's own unlink is left real. */
+function directoryFsyncRealIoFailurePropagates() {
+  const dir = freshDir("fsyncdir-eio");
+  const intentKey = recovery.computeIntentKey("conn-fsync", "toolA", {});
+  recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-fsync", tool: "toolA", arguments: {}, state: "dispatched", dispatched_at: 1 });
+
+  const realOpenSync = fs.openSync;
+  let threw = null;
+  fs.openSync = function (p, flags, mode) {
+    if (flags === "r") throw Object.assign(new Error("EIO: simulated directory fsync failure"), { code: "EIO" });
+    return realOpenSync.call(fs, p, flags, mode);
+  };
+  try {
+    recovery.deleteIntent(dir, intentKey);
+  } catch (error) {
+    threw = error;
+  } finally {
+    fs.openSync = realOpenSync;
+  }
+  check("directory-fsync-eio-propagates-instead-of-reporting-success", threw !== null && threw.code === "EIO", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+}
+
+/* The other half: the cases this helper was actually written to tolerate must still be
+ * tolerated -- a directory that is simply gone (ENOENT, e.g. mid-teardown in a test) and a
+ * platform/filesystem that does not support fsync on a directory fd (EINVAL) are NOT real
+ * I/O faults and must not turn a durably-completed write into a failure. */
+function directoryFsyncUnsupportedAndMissingAreStillTolerated() {
+  for (const code of ["ENOENT", "EINVAL", "ENOTSUP", "EPERM"]) {
+    const dir = freshDir(`fsyncdir-tolerated-${code.toLowerCase()}`);
+    const intentKey = recovery.computeIntentKey("conn-fsync", "toolA", {});
+    recovery.createIntentIfAbsent(dir, intentKey, { connection_id: "conn-fsync", tool: "toolA", arguments: {}, state: "dispatched", dispatched_at: 1 });
+
+    const realOpenSync = fs.openSync;
+    let threw = null;
+    fs.openSync = function (p, flags, mode) {
+      if (flags === "r") throw Object.assign(new Error(`${code}: simulated`), { code });
+      return realOpenSync.call(fs, p, flags, mode);
+    };
+    try {
+      recovery.deleteIntent(dir, intentKey);
+    } catch (error) {
+      threw = error;
+    } finally {
+      fs.openSync = realOpenSync;
+    }
+    check(`directory-fsync-${code.toLowerCase()}-is-still-tolerated`, threw === null, threw && `${threw.code}: ${threw.message}`);
+    check(`directory-fsync-${code.toLowerCase()}-still-completed-the-real-work`, recovery.readIntent(dir, intentKey) === null, "intent was not actually deleted");
+  }
+}
+
+/* Codex PR #33 review "retain operator-confirmed results for reconnect replay": when an
+ * operator resolves a crashed keyed call as EXECUTED, this used to update only the
+ * connection-scoped intent. Startup recovery then consumes and deletes that intent, so --
+ * unlike proxy.js's live completion path -- nothing ever wrote the connection-INDEPENDENT
+ * completed-signature record, and a reconnecting agent presenting the same idempotency key
+ * computed a brand-new intentKey, found nothing, and dispatched the already-executed side
+ * effect a second time. */
+function operatorConfirmedExecutedRetainsTheCrossConnectionSignature() {
+  const dir = freshDir("operator-confirmed-signature");
+  const intentKey = recovery.computeIntentKey("conn-crashed", "charge", { amount: 5 });
+  recovery.createIntentIfAbsent(dir, intentKey, {
+    connection_id: "conn-crashed",
+    tool: "charge",
+    arguments: { amount: 5 },
+    state: "dispatched",
+    dispatched_at: 1,
+    idempotency_key: "customer-key-1",
+    generation: 1,
+  });
+  recovery.resolveIntentExecuted(dir, intentKey, { value: 7 });
+
+  const signatureKey = recovery.computeSignatureKey("charge", { amount: 5 }, "customer-key-1");
+  const retained = recovery.readCompletedSignature(dir, signatureKey);
+  check("operator-confirmed-executed-writes-the-completed-signature", retained !== null, "no retained signature was written");
+  check(
+    "operator-confirmed-executed-signature-carries-the-confirmed-result-and-key",
+    Boolean(retained) && retained.idempotency_key === "customer-key-1" && retained.cached_result && retained.cached_result.value === 7,
+    JSON.stringify(retained)
+  );
+
+  // The operator's own primary resolution is unchanged by the secondary write.
+  const resolved = recovery.readIntent(dir, intentKey);
+  check("operator-confirmed-executed-intent-still-terminal-completed", resolved.state === "completed" && resolved.resolution === "operator_confirmed_executed", JSON.stringify(resolved));
+}
+
+/* Same review item, negative half: a call with NO caller idempotency key can never be
+ * replayed by proxy.js's own read gate (which requires retained.idempotency_key to match),
+ * so resolving it must not leave an unreplayable-by-construction file sitting in the
+ * signature store until its retention window expires. */
+function operatorConfirmedExecutedWithoutAKeyWritesNoSignature() {
+  const dir = freshDir("operator-confirmed-no-key");
+  const intentKey = recovery.computeIntentKey("conn-crashed", "charge", { amount: 5 });
+  recovery.createIntentIfAbsent(dir, intentKey, {
+    connection_id: "conn-crashed",
+    tool: "charge",
+    arguments: { amount: 5 },
+    state: "dispatched",
+    dispatched_at: 1,
+    idempotency_key: null,
+    generation: 1,
+  });
+  recovery.resolveIntentExecuted(dir, intentKey, { value: 7 });
+  const retained = recovery.readCompletedSignature(dir, recovery.computeSignatureKey("charge", { amount: 5 }, null));
+  check("operator-confirmed-executed-without-a-key-writes-no-signature", retained === null, JSON.stringify(retained));
+}
+
+/* Codex PR #33 review "keep the WAL until corrupt-intent cleanup succeeds":
+ * listIntentsForConnection reads every intent file on disk before filtering and throws on
+ * any damaged one -- including an unrelated one. Running it AFTER deleteWal meant
+ * recovery-abandon could irreversibly destroy this connection's last remaining record and
+ * then abort, leaving the corrupt fence with nothing left to quarantine or replay. */
+function abandonConnectionKeepsTheWalWhenTheIntentScanFails() {
+  const dir = freshDir("abandon-intent-scan-failure");
+  const keys = makeKeys();
+  const connectionId = "conn-scan-failure";
+  seedCleanCallWal(dir, connectionId);
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_RESULT", call_seq: 1, result: { ok: true }, isError: false, ts: 11 });
+
+  const realListIntentsForConnection = recovery.listIntentsForConnection;
+  recovery.listIntentsForConnection = () => {
+    throw Object.assign(new Error("Corrupt intent record \"gs_int_unrelated\": Unexpected end of JSON input"), { code: "GATEWAY_RECOVERY_INTENT_CORRUPT" });
+  };
+  let threw = null;
+  try {
+    abandonConnection(dir, keys, connectionId, silentLog);
+  } catch (error) {
+    threw = error;
+  } finally {
+    recovery.listIntentsForConnection = realListIntentsForConnection;
+  }
+  check("abandon-intent-scan-failure-surfaces-the-error", threw !== null && threw.code === "GATEWAY_RECOVERY_INTENT_CORRUPT", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check(
+    "abandon-intent-scan-failure-leaves-the-wal-intact",
+    recovery.readWalEvents(dir, connectionId).length > 0,
+    "the WAL was deleted before the intent scan that failed -- nothing left to quarantine or replay"
+  );
+
+  // And the whole command stays re-runnable once the corrupt record is dealt with: the
+  // bundle is already sealed, so the retry takes the content-verified collision path.
+  let secondThrow = null;
+  try {
+    abandonConnection(dir, keys, connectionId, silentLog);
+  } catch (error) {
+    secondThrow = error;
+  }
+  check("abandon-intent-scan-failure-is-re-runnable-after-the-scan-is-fixed", secondThrow === null, secondThrow && `${secondThrow.code}: ${secondThrow.message}`);
+  check("abandon-intent-scan-failure-retry-cleans-up-the-wal", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present after the successful retry");
 }
 
 function walListActiveConnectionsAndDelete() {
@@ -2012,7 +2184,14 @@ function main() {
   walTornTailLineToleratedRestKept();
   walListActiveConnectionsAndDelete();
   walListActiveConnectionsReturnsSortedOrder();
-  recoveryFilesAndDirsAreOwnerOnlyPermissions();
+  recoveryFilesAndDirsUseTheSharedAccessModel();
+
+  // Codex PR #33 review round 2 (2026-09-17):
+  directoryFsyncRealIoFailurePropagates();
+  directoryFsyncUnsupportedAndMissingAreStillTolerated();
+  operatorConfirmedExecutedRetainsTheCrossConnectionSignature();
+  operatorConfirmedExecutedWithoutAKeyWritesNoSignature();
+  abandonConnectionKeepsTheWalWhenTheIntentScanFails();
   walOnEmptyRecoveryDirReturnsNoActiveConnections();
   appendWalEventRetriesOnAShortWrite();
   appendWalEventFailsClosedWhenWriteSyncMakesNoProgress();

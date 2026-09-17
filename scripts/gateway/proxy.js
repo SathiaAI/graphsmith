@@ -648,7 +648,16 @@ class GatewayProxy {
                 });
                 dispatchGeneration = (existing.generation || 1) + 1;
                 intentDecision = { kind: "dispatch" };
-                this.log(JSON.stringify({ event: "gateway_intent_signature_reused_without_key", connection_id: connectionId, tool: toolName, intent_key: intentKey, generation: dispatchGeneration, detail: "a completed call's signature was reused without a matching idempotency key -- dispatched as a new, independent call rather than replayed" }));
+                /* Codex PR #33 review "make the post-fence diagnostic non-throwing": the
+                 * durable intent was already flipped to "dispatched" by updateIntent
+                 * directly above, so a caller-supplied logger that throws here is caught
+                 * by this block's own catch and rethrown (its code is not
+                 * GATEWAY_RECOVERY_INTENT_NOT_FOUND), aborting before recordCallStart,
+                 * the CALL_START WAL append and the downstream dispatch -- leaving a
+                 * false in-flight fence that blocks every future retry of an effect that
+                 * never happened. safeLog is this file's existing non-throwing wrapper
+                 * for exactly this "log after a durable state change" position. */
+                this.safeLog(JSON.stringify({ event: "gateway_intent_signature_reused_without_key", connection_id: connectionId, tool: toolName, intent_key: intentKey, generation: dispatchGeneration, detail: "a completed call's signature was reused without a matching idempotency key -- dispatched as a new, independent call rather than replayed" }));
               } catch (updateError) {
                 supersededIntentSnapshot = null;
                 if (updateError.code !== "GATEWAY_RECOVERY_INTENT_NOT_FOUND") throw updateError;
@@ -753,20 +762,39 @@ class GatewayProxy {
                * this fix's own design note, rather than give the retained-signature path
                * a way to bypass it. */
               let replayed = null;
+              let signatureReadFailure = null;
               if (callerIdempotencyKey) {
                 let retained = null;
                 try {
                   retained = recovery.readCompletedSignature(this.stateDir, recovery.computeSignatureKey(toolName, callArgs, callerIdempotencyKey));
                 } catch (signatureError) {
-                  // Fail closed, same rationale as the quarantine scan above: a retained
-                  // signature that cannot be proven safe to use must not be replayed.
-                  retained = null;
+                  /* Codex PR #33 review "block dispatch when a retained signature is
+                   * unreadable": this comment already claimed to fail closed, but setting
+                   * `retained = null` is a CACHE MISS -- it fell straight through to
+                   * createIntentIfAbsent and a real downstream dispatch. An EIO/permission
+                   * failure or a corrupt signature file therefore repeated an
+                   * already-completed side effect at precisely the moment its deduplication
+                   * evidence could not be verified. Fail closed for real, the same way the
+                   * quarantine scan above does: turn the unprovable read into a block.
+                   * readCompletedSignature returns null (not a throw) for an absent or
+                   * expired record, so this path is only ever reached by a genuinely
+                   * unreadable/corrupt file, and the blast radius is exactly the one
+                   * (tool, arguments, idempotency key) whose evidence is damaged -- any
+                   * other key hashes to a different signature file. */
+                  signatureReadFailure = signatureError;
                 }
                 if (retained && retained.idempotency_key && retained.idempotency_key === callerIdempotencyKey) {
                   replayed = retained;
                 }
               }
-              if (replayed) {
+              if (signatureReadFailure) {
+                intentDecision = {
+                  kind: "block",
+                  code: -32083,
+                  gatewayCode: "GATEWAY_RETAINED_SIGNATURE_UNREADABLE",
+                  message: `The retained completed-call record that would prove whether this idempotent retry already executed could not be read (${signatureReadFailure.message}) -- dispatch halted rather than risk repeating a side effect that may already have happened. Inspect/remove the damaged record under gateway-recovery/signatures/ before retrying.`,
+                };
+              } else if (replayed) {
                 intentDecision = { kind: "replay", cachedResult: replayed.cached_result };
               } else {
                 const created = recovery.createIntentIfAbsent(this.stateDir, intentKey, {

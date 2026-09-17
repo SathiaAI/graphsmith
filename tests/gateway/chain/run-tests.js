@@ -879,6 +879,77 @@ function reconcileHeadRebuildsFromAMalformedHeadFile() {
   check("reconcile-malformed-head-rebuilt-correctly", chain.readHead(dir).bundle_id === entries[1].bundle_id, JSON.stringify(chain.readHead(dir)));
 }
 
+/* Codex PR #33 review "renew the claim while validating the startup chain": reconcileHead
+ * renewed the writer claim exactly ONCE before handing the whole chain to validateChain --
+ * so on a long chain the synchronous walk itself could outlast the 45s staleness window
+ * and let another same-host gateway steal the claim mid-walk, after which this function
+ * would still write HEAD.json. The status/health walk already had the per-entry hook
+ * (walkGatewaySessionsCallsMaybeRenewOncePerEntry above); this is the same wiring for the
+ * startup walk. 5 valid entries => 1 pre-walk renew + 5 per-entry renews. A chain that
+ * validates clean returns before the repair write, so no sixth renew is expected here. */
+function reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk() {
+  const dir = freshDir("reconcile-per-entry-renew");
+  const keys = makeKeys();
+  for (let i = 0; i < 5; i++) chain.appendSession(dir, sealTrivialSession(`renew-${i}`, keys));
+
+  let renewCalls = 0;
+  const result = chain.reconcileHead(dir, { maybeRenew: () => { renewCalls++; } });
+  check("reconcile-per-entry-renew-chain-is-valid", result.action === "none", JSON.stringify(result));
+  check(
+    "reconcile-renews-the-claim-once-per-chain-entry-not-only-once-before-the-walk",
+    renewCalls === 6,
+    `expected 6 (1 pre-walk + 5 per-entry), got ${renewCalls}`
+  );
+}
+
+/* Second half of the same review item ("revalidate ownership before the repair write"):
+ * the per-entry hook cannot cover a walk of 0-1 entries, so the HEAD.json repair write
+ * gets its own unconditional renew immediately before it, mirroring
+ * gateway.js#abandonConnection's own pre-appendSession renew. 2 entries with a one-step
+ * stale HEAD => 1 pre-walk + 2 per-entry + 1 pre-write = 4. */
+function reconcileHeadRenewsTheClaimAgainImmediatelyBeforeTheRepairWrite() {
+  const dir = freshDir("reconcile-pre-write-renew");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+
+  let renewCalls = 0;
+  const result = chain.reconcileHead(dir, { maybeRenew: () => { renewCalls++; } });
+  check("reconcile-pre-write-renew-advanced-the-head", result.action === "advanced" && result.to.seq === 2, JSON.stringify(result));
+  check(
+    "reconcile-renews-the-claim-immediately-before-the-head-repair-write",
+    renewCalls === 4,
+    `expected 4 (1 pre-walk + 2 per-entry + 1 pre-write), got ${renewCalls}`
+  );
+}
+
+/* And the point of renewing at all: a lease lost PARTWAY THROUGH the walk must abort the
+ * walk where it happened, never fall through to a HEAD.json write this process no longer
+ * owns the right to make. Fails the SECOND maybeRenew call -- the first entry of the walk,
+ * after the pre-walk renew already succeeded. */
+function reconcileHeadPerEntryLeaseLossAbortsBeforeTheRepairWrite() {
+  const dir = freshDir("reconcile-mid-walk-lease-loss");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  const staleHead = { schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 };
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(staleHead));
+
+  let renewCalls = 0;
+  let threw = null;
+  try {
+    chain.reconcileHead(dir, {
+      maybeRenew: () => {
+        renewCalls++;
+        if (renewCalls === 2) throw Object.assign(new Error("simulated lease takeover mid startup chain walk"), { code: "WRITER_CLAIM_LOST" });
+      },
+    });
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-mid-walk-lease-loss-propagates", threw !== null && threw.code === "WRITER_CLAIM_LOST", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("reconcile-mid-walk-lease-loss-leaves-head-untouched", chain.readHead(dir).seq === 1, JSON.stringify(chain.readHead(dir)));
+}
+
 function reconcileHeadRefusesAGenuineFork() {
   const dir = freshDir("reconcile-fork");
   const keys = makeKeys();
@@ -1088,6 +1159,11 @@ function main() {
   reconcileHeadAheadRefuses();
   reconcileHeadRefusesWhenChainFailsStructuralValidation();
   reconcileHeadRefusesEmptyChainWithHeadPresent();
+
+  // Codex PR #33 review round 2 (2026-09-17): startup-walk lease keepalive.
+  reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk();
+  reconcileHeadRenewsTheClaimAgainImmediatelyBeforeTheRepairWrite();
+  reconcileHeadPerEntryLeaseLossAbortsBeforeTheRepairWrite();
 
   walkGatewaySessionsCallsMaybeRenewOncePerEntry();
   walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded();
