@@ -100,6 +100,14 @@ function headShapeOk(h) {
  *                                            // rather than required(), keeping this module
  *                                            // dependency-free like register-retention.js
  *   bundleExists?: (bundle_id) => boolean,  // optional: checked against each chain entry
+ *   maybeRenew?: () => void,   // optional, round-1 fix-plan item 1: the caller's own
+ *                              // writer-claim keepalive (via gateway.js's createLeaseGuard),
+ *                              // called once per chain entry -- same injection discipline as
+ *                              // computeEntrySha256/bundleExists above, never required() here
+ *   isLeaseError?: (error) => boolean,   // optional, paired with maybeRenew: lets the
+ *                              // catch-all below recognize (by reference identity) that a
+ *                              // caught exception IS a detected lease loss and rethrow it
+ *                              // rather than report it as an ordinary failed walk
  * } */
 function walkGatewaySessions(ctx) {
   const evidence = [];
@@ -122,6 +130,21 @@ function walkGatewaySessions(ctx) {
     let prevHash = null;
     let prevSeq = null;
     for (let i = 0; i < chain.length; i++) {
+      /* Round-1 fix-plan item 1 (lease keepalive, generalized), round-2 fix pass
+       * (Paul's 2026-09-16 decision): commit 1's own plan named THIS walk, alongside
+       * reconcileHead and the WAL-replay loops, as a long synchronous phase that can run
+       * across many iterations while a caller holds the writer-claim -- but only
+       * reconcileHead and the WAL-replay loops actually got the call; this one was
+       * missed. `ctx.maybeRenew` is injected exactly like `computeEntrySha256`/
+       * `bundleExists` above (this module stays dependency-free per its own header --
+       * it never requires writer-claim.js itself), and the caller is expected to hand in
+       * writer-claim.js's own time-gated maybeRenew() (via gateway.js's createLeaseGuard,
+       * the SAME shared helper reconcileHead/the WAL-replay loops already use), gated on
+       * that claim's own clock.now() -- never Date.now(). Optional: a caller with no
+       * writer-claim in play (the CLI --selftest below, or a caller that never wires it
+       * in) passes nothing, and this is a no-op, exactly like every other test that
+       * constructs a bare ctx today. */
+      if (typeof ctx.maybeRenew === "function") ctx.maybeRenew();
       const e = chain[i];
       if (!entryShapeOk(e)) return fail(`entry[${i}] has an invalid shape/type -- refusing (fail-closed)`);
 
@@ -170,6 +193,22 @@ function walkGatewaySessions(ctx) {
 
     return { status: "verified", evidence, assumptions };
   } catch (e) {
+    /* Round-1 fix-plan item 1 (generalized keepalive), round-2 fix pass: a lease loss
+     * DETECTED by this walk's own maybeRenew() call above must not be downgraded to this
+     * function's own ordinary fail-closed "report it, evidence only" contract -- that is
+     * exactly the ban createLeaseGuard's own doc comment (scripts/gateway/gateway.js)
+     * states: a detected lease loss must never be relabeled as "flag for operator
+     * review, continue" handling. `ctx.isLeaseError`, injected by the same caller that
+     * injects `ctx.maybeRenew`, lets that caller's own leaseGuard recognize (by
+     * reference identity, not error.code -- see createLeaseGuard's own doc comment for
+     * why) that THIS exception is the one its own maybeRenew() just threw, and rethrow
+     * it here so it propagates out of this walk entirely rather than being absorbed into
+     * a status object, exactly mirroring recoverCrashedSessions'/reconcileHead's own
+     * rethrow-not-downgrade handling of the identical error class. Optional, like
+     * `ctx.maybeRenew` itself: a caller with no writer-claim in play never sets it, and
+     * every exception (this walk's own, or any other injected function's) keeps falling
+     * through to the ordinary fail-closed report below, unchanged. */
+    if (typeof ctx.isLeaseError === "function" && ctx.isLeaseError(e)) throw e;
     return { status: "failed", evidence, assumptions, failure_domain: "trusted-core", reason: "exception during gateway-session walk -- failing closed: " + (e && e.message ? e.message : String(e)) };
   }
 }

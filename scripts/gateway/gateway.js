@@ -633,20 +633,56 @@ function buildHealthStatus(ctx) {
    * real operational path an operator or monitor can act on -- a non-"verified" result
    * here is a fail-closed, visible signal (tampering, a sequence gap, or an incomplete
    * append), not silently invisible until someone thinks to run --selftest by hand. */
+  /* Round-1 fix-plan item 1, round-2 fix pass (Paul's 2026-09-16 decision): computed
+   * once, here, rather than inline inside the returned object below (its own previous
+   * location) so it can ALSO gate the session-chain walk's own maybeRenew() wiring just
+   * below, without a second disk read. `held_by_this_instance` is false both for a
+   * caller that never wires a real writer-claim into ctx.writerClaim (e.g. the bare
+   * `{ status: () => ({}) }` fakes several existing tests already pass) and for the one
+   * real, expected case where this claim was already released before this ran -- doStop
+   * calls writeStatusFile ONE LAST TIME after writerClaim.release() (see writeStatusFile's
+   * own doc comment) specifically so `gateway.js status` still reports an accurate
+   * "not claimed" snapshot; that call must keep succeeding, not start attempting (and
+   * failing) a renewal against a claim this instance deliberately gave up. */
+  const writerClaimStatus = ctx.writerClaim.status();
+
   let sessionChainIntegrity;
   if (headError) {
     // HEAD.json is already known corrupt/unreadable -- don't bother attempting the walk
     // (which needs `head`) just to rediscover the same failure less clearly.
     sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `HEAD.json is corrupt or unreadable: ${headError}` };
   } else {
+    /* Round-1 fix-plan item 1, round-2 fix pass: this walk is exactly the "long
+     * synchronous phase held under a writer-claim" case commit 1's own plan named
+     * alongside reconcileHead's startup walk and the WAL-replay loops -- but unlike
+     * those two (each run exactly once, before any release() can have happened yet),
+     * this walk also runs on every ~STATUS_WRITE_INTERVAL_MS tick of an already-RUNNING
+     * gateway, so it must only attempt renewal while a claim is genuinely still held by
+     * THIS instance (writerClaimStatus, above). createLeaseGuard is the SAME shared
+     * helper recoverCrashedSessions/reconcileHead's own call sites already use -- no new
+     * renewal mechanism. */
+    const leaseGuard = writerClaimStatus.held_by_this_instance ? createLeaseGuard(ctx.writerClaim) : null;
     try {
       sessionChainIntegrity = registerGatewaySessions.run({
         chain: chain.readChain(stateDir),
         head,
         computeEntrySha256: chain.computeEntrySha256,
         bundleExists: (bundleId) => fs.existsSync(chain.bundlePath(stateDir, bundleId)),
+        ...(leaseGuard
+          ? { maybeRenew: () => leaseGuard.maybeRenew(), isLeaseError: (error) => leaseGuard.isLeaseError(error) }
+          : {}),
       });
     } catch (error) {
+      /* A lease loss DETECTED by this walk's own maybeRenew() (wired in just above)
+       * must not be downgraded to this catch's ordinary "report a failed
+       * session_chain_integrity, evidence only" handling -- createLeaseGuard's own doc
+       * comment (above) is explicit that a detected lease loss must never be relabeled
+       * as "flag for operator review, continue". Rethrown here, it propagates out of
+       * buildHealthStatus entirely -- this function's every OTHER internal step already
+       * has its own local try/catch that never lets an exception escape (headError,
+       * lastPersistedAt, recoveryStatus below), so this is buildHealthStatus's only
+       * throw path. See writeStatusFile's own doc comment for what happens next. */
+      if (leaseGuard && leaseGuard.isLeaseError(error)) throw error;
       sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `session-chain verification threw: ${error.message}` };
     }
   }
@@ -688,7 +724,7 @@ function buildHealthStatus(ctx) {
 
   return {
     schema_version: "1.0",
-    writer_claim: ctx.writerClaim.status(),
+    writer_claim: writerClaimStatus,
     downstream_servers: Array.from(ctx.connections.keys()).map((name) => {
       const conn = ctx.connections.get(name);
       return { name, reachable: typeof conn.isReachable === "function" ? conn.isReachable() : !conn.isClosed() };
@@ -1434,42 +1470,67 @@ function gatewayStatusPath(stateDir) {
  * not match every deployment's own umask either. startup-permissions.js's own startup
  * chmod pass likewise never lists this file among the ones it tightens. */
 function writeStatusFile(ctx, log) {
+  const stateDir = ctx.config.state_dir;
   try {
-    const stateDir = ctx.config.state_dir;
     fs.mkdirSync(stateDir, { recursive: true });
-    const status = {
-      ...buildHealthStatus(ctx),
-      written_at: new Date().toISOString(),
-      /* Round-1 fix-plan commit 6: documented explicitly, per this commit's own
-       * requirement, both here (the WRITTEN status output an operator actually reads)
-       * and in checks/register-gateway-sessions.js's own header comment -- this walk
-       * reports `session_chain_integrity` as EVIDENCE ONLY (docs/contracts/
-       * chain-validity.md SS5: "the status walk only reports evidence and never writes
-       * anything") and never engages getChainIntegrityFailure()'s admission latch,
-       * regardless of what it finds. That means the ~10s STATUS_WRITE_INTERVAL_MS
-       * cadence is NOT what stops new-session admission on a genuine finding -- only
-       * commit 4's own detectors (the O(1) append-time checkHeadAgainstTailOrRepair, and
-       * reconcileHead's full walk at startup) ever latch. A HEAD/tail POINTER divergence
-       * mid-run is caught immediately (not on any cadence) by that append-time check the
-       * next time this gateway tries to append. Mid-chain INTERIOR corruption -- an
-       * entry whose own hash no longer recomputes, a sequence gap, or a broken link,
-       * where HEAD and the chain's own tail already agree -- is structurally invisible
-       * to that O(1) tail-only check; this walk's own evidence field is currently the
-       * only place such a finding surfaces at all, and it does not stop anything by
-       * itself. Detecting AND acting on that class depends on reconcileHead's full walk
-       * running again at the next startup (which hard-fails per Paul's 2026-09-15
-       * decision), or on an explicit, separately-scheduled deep walk that does not exist
-       * in this build -- see checks/register-gateway-sessions.js's own header for why it
-       * is deliberately not wired to write/latch anything itself. */
-      session_chain_integrity_cadence_note:
-        `session_chain_integrity above is refreshed roughly every ${STATUS_WRITE_INTERVAL_MS}ms and is EVIDENCE ONLY -- ` +
-        "it never stops new-session admission by itself. A HEAD/tail POINTER divergence is instead caught " +
-        "immediately by the append-time check (or by reconcileHead at startup), not by this cadence. Mid-chain " +
-        "INTERIOR corruption (HEAD and the chain's own tail already agreeing, but an interior record tampered, a " +
-        "sequence gap, or a broken link) is invisible to that O(1) check; this field may show it as evidence, but " +
-        "detecting AND acting on it (stopping admission) depends on the full validator running again at the next " +
-        "startup, or on a separately-scheduled deep walk this build does not implement.",
-    };
+  } catch (error) {
+    log(`failed to write status file (non-fatal): ${error.message}`);
+    return;
+  }
+
+  /* Round-1 fix-plan item 1, round-2 fix pass (Paul's 2026-09-16 decision): unlike the
+   * writes below, buildHealthStatus(ctx) is deliberately called OUTSIDE any try/catch
+   * here. After this round's fix, its only possible throw is a lease loss DETECTED by
+   * checks/register-gateway-sessions.js's own maybeRenew() call during the session-chain
+   * walk (see buildHealthStatus's own doc comment on that call site) -- every one of its
+   * OTHER internal steps already absorbs its own failures locally and never lets an
+   * exception escape. That one throw must NOT be caught here and downgraded to this
+   * function's own "non-fatal" logging below -- createLeaseGuard's own doc comment
+   * (scripts/gateway/gateway.js, above) is explicit that a detected lease loss must
+   * never be relabeled as "flag for operator review, continue", and this status-file
+   * write is no exception to that just because its OTHER failure modes (a momentarily
+   * full disk, an unwritable state_dir) genuinely are non-fatal by design. Left
+   * unguarded, this throw surfaces exactly like the fatal-on-renew-failure policy
+   * already established for reconcileHead/the WAL-replay loops: on the very first call
+   * (synchronous, at startup, before this function returns to startGateway) it rejects
+   * startGateway's own promise, reaching main()'s top-level .catch (process.exitCode =
+   * 1); on a later setInterval tick it is an uncaught exception, halting the process
+   * loudly -- fatal to the whole process either way, never merely logged. */
+  const status = {
+    ...buildHealthStatus(ctx),
+    written_at: new Date().toISOString(),
+    /* Round-1 fix-plan commit 6: documented explicitly, per this commit's own
+     * requirement, both here (the WRITTEN status output an operator actually reads)
+     * and in checks/register-gateway-sessions.js's own header comment -- this walk
+     * reports `session_chain_integrity` as EVIDENCE ONLY (docs/contracts/
+     * chain-validity.md SS5: "the status walk only reports evidence and never writes
+     * anything") and never engages getChainIntegrityFailure()'s admission latch,
+     * regardless of what it finds. That means the ~10s STATUS_WRITE_INTERVAL_MS
+     * cadence is NOT what stops new-session admission on a genuine finding -- only
+     * commit 4's own detectors (the O(1) append-time checkHeadAgainstTailOrRepair, and
+     * reconcileHead's full walk at startup) ever latch. A HEAD/tail POINTER divergence
+     * mid-run is caught immediately (not on any cadence) by that append-time check the
+     * next time this gateway tries to append. Mid-chain INTERIOR corruption -- an
+     * entry whose own hash no longer recomputes, a sequence gap, or a broken link,
+     * where HEAD and the chain's own tail already agree -- is structurally invisible
+     * to that O(1) tail-only check; this walk's own evidence field is currently the
+     * only place such a finding surfaces at all, and it does not stop anything by
+     * itself. Detecting AND acting on that class depends on reconcileHead's full walk
+     * running again at the next startup (which hard-fails per Paul's 2026-09-15
+     * decision), or on an explicit, separately-scheduled deep walk that does not exist
+     * in this build -- see checks/register-gateway-sessions.js's own header for why it
+     * is deliberately not wired to write/latch anything itself. */
+    session_chain_integrity_cadence_note:
+      `session_chain_integrity above is refreshed roughly every ${STATUS_WRITE_INTERVAL_MS}ms and is EVIDENCE ONLY -- ` +
+      "it never stops new-session admission by itself. A HEAD/tail POINTER divergence is instead caught " +
+      "immediately by the append-time check (or by reconcileHead at startup), not by this cadence. Mid-chain " +
+      "INTERIOR corruption (HEAD and the chain's own tail already agreeing, but an interior record tampered, a " +
+      "sequence gap, or a broken link) is invisible to that O(1) check; this field may show it as evidence, but " +
+      "detecting AND acting on it (stopping admission) depends on the full validator running again at the next " +
+      "startup, or on a separately-scheduled deep walk this build does not implement.",
+  };
+
+  try {
     stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir, { mode: null });
   } catch (error) {
     log(`failed to write status file (non-fatal): ${error.message}`);

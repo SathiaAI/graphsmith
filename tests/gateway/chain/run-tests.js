@@ -168,6 +168,82 @@ function missingGenesisPrefixDetected() {
   check("missing-genesis-prefix-reason-names-seq-not-one", /seq=2, expected 1/.test(result.reason || ""), JSON.stringify(result));
 }
 
+/* Round-1 fix-plan item 1 (lease keepalive, generalized), round-2 fix pass (Paul's
+ * 2026-09-16 decision): commit 1's own plan named this walk, alongside reconcileHead's
+ * startup walk and the WAL-replay loops, as a long synchronous per-entry phase that
+ * needs the shared maybeRenew() keepalive -- confirms the wiring actually reaches every
+ * entry of a multi-entry chain, the same way commit 1's own writer-claim unit test
+ * (grFix1_maybeRenewIsTimeGatedByTheClaimsOwnClock) proves the underlying primitive's
+ * own time-gating, but here at this walk's own call-site level. */
+function walkGatewaySessionsCallsMaybeRenewOncePerEntry() {
+  const dir = freshDir("walk-maybe-renew-per-entry");
+  const keys = makeKeys();
+  for (let i = 0; i < 4; i++) chain.appendSession(dir, sealTrivialSession(`conn-${i}`, keys));
+
+  let renewCalls = 0;
+  const result = verifyDir(dir, { maybeRenew: () => { renewCalls++; } });
+  check("walk-verifies-with-maybe-renew-wired-in", result.status === "verified", JSON.stringify(result));
+  check("walk-calls-maybe-renew-once-per-chain-entry", renewCalls === 4, String(renewCalls));
+}
+
+/* Round-1 fix-plan item 1, round-2 fix pass: mirrors
+ * recoverAbortsOnLeaseTakeoverDuringWalReplayNotJustOneConnection (tests/gateway/
+ * recovery/run-tests.js) at this walk's own level. A lease taken over by a competing
+ * writer, detected by this walk's own per-entry maybeRenew() call partway through a
+ * multi-entry chain, must abort the WHOLE walk with the exact detected error -- never
+ * downgraded to this walk's own ordinary fail-closed `{ status: "failed" }` evidence-only
+ * report, which is exactly the per-connection "flag for operator review, continue"
+ * class of handling createLeaseGuard's own doc comment (scripts/gateway/gateway.js) says
+ * a detected lease loss must never receive. That distinction is the whole point of this
+ * test: entry[2]'s own hash chain is perfectly intact (unlike every OTHER failure this
+ * suite exercises above, which the walk legitimately reports as evidence and returns
+ * from) -- the only reason this run does not return a "verified" result is the
+ * lease-loss abort firing first, part way through, and propagating instead of being
+ * reported. */
+function walkAbortsOnLeaseTakeoverMidWalkNotDowngradedToAFailedReport() {
+  const dir = freshDir("walk-lease-takeover-mid-walk");
+  const keys = makeKeys();
+  for (let i = 0; i < 5; i++) chain.appendSession(dir, sealTrivialSession(`conn-${i}`, keys));
+
+  let callCount = 0;
+  const takeoverError = new Error("simulated competing writer took over this state_dir mid-walk");
+  const ctx = {
+    chain: chain.readChain(dir),
+    head: chain.readHead(dir),
+    computeEntrySha256: chain.computeEntrySha256,
+    bundleExists: (id) => fs.existsSync(chain.bundlePath(dir, id)),
+    maybeRenew: () => {
+      callCount++;
+      if (callCount === 3) throw takeoverError; // strictly mid-walk: entries 0-1 already visited, 3-4 never reached.
+    },
+    isLeaseError: (error) => error === takeoverError,
+  };
+
+  let threw = null;
+  let returned = null;
+  try {
+    returned = walkGatewaySessions(ctx);
+  } catch (error) {
+    threw = error;
+  }
+  check("walk-lease-takeover-aborts-with-the-exact-detected-error", threw === takeoverError, threw && threw.message);
+  check("walk-lease-takeover-never-returns-a-downgraded-failed-report", returned === null, JSON.stringify(returned));
+
+  // Without ctx.isLeaseError, the identical maybeRenew failure IS this walk's own
+  // ordinary fail-closed contract (a caller that never wires in lease recognition gets
+  // exactly today's pre-fix behavior for any other injected-function failure, not a
+  // silent behavior change) -- proves the rethrow above is conditional on isLeaseError
+  // being provided, not a blanket "any maybeRenew throw aborts" rule.
+  callCount = 0;
+  const ctxNoLeaseRecognition = { ...ctx, isLeaseError: undefined };
+  const fallback = walkGatewaySessions(ctxNoLeaseRecognition);
+  check(
+    "walk-maybe-renew-failure-without-isLeaseError-still-fails-closed-not-aborts",
+    fallback.status === "failed" && /simulated competing writer/.test(fallback.reason || ""),
+    JSON.stringify(fallback)
+  );
+}
+
 function bundleIdCollisionRefused() {
   const dir = freshDir("collision");
   const keys = makeKeys();
@@ -909,6 +985,9 @@ function main() {
   reconcileHeadAheadRefuses();
   reconcileHeadRefusesWhenChainFailsStructuralValidation();
   reconcileHeadRefusesEmptyChainWithHeadPresent();
+
+  walkGatewaySessionsCallsMaybeRenewOncePerEntry();
+  walkAbortsOnLeaseTakeoverMidWalkNotDowngradedToAFailedReport();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
