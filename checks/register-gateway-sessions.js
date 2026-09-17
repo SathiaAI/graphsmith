@@ -44,22 +44,36 @@
  * chain.validateChain already owns.
  *
  * A NOTE ON THE LEASE-KEEPALIVE LOOP BELOW (round-1 fix-plan item 1, landed the same
- * round as this delegation): before this delegation, `ctx.maybeRenew()` was called once
- * per chain entry from INSIDE this module's own hand-rolled hash/link/sequence loop. That
- * loop no longer exists here -- it is entirely `chain.validateChain`'s -- but the exact
- * per-entry call count and "abort immediately, mid-walk, on a detected lease loss" contract
- * is still load-bearing (see tests/gateway/chain/run-tests.js's
- * `walkGatewaySessionsCallsMaybeRenewOncePerEntry` and
- * `walkAbortsOnLeaseTakeoverMidWalkNotDowngradedToAFailedReport`), so it is preserved here
- * as its own small, decoupled pass over `ctx.chain`, run BEFORE `chain.validateChain` is
- * ever called. This is deliberate, not an oversight: `chain.validateChain` is the one
- * canonical structural validator (C2 SS5) and must not be handed a caller-specific
- * lease-renewal callback just to satisfy this module's own operational needs -- that would
- * make chain.js's "same code, identically, at all three call sites" contract depend on a
- * concern (writer-claim keepalive) that only ONE of those three call sites (this one, run
- * on a live gateway's periodic status timer) actually has. A thrown lease-loss error still
- * aborts before any structural verdict is computed, which is at least as fail-closed as the
- * pre-delegation behavior (which also never reached entries past the failure point).
+ * round as this delegation; round-3 fix pass corrects a defect an independent verifier
+ * found in the round-2 landing described below): before the round-2 delegation,
+ * `ctx.maybeRenew()` was called once per chain entry from INSIDE this module's own
+ * hand-rolled hash/link/sequence loop. Round-2 replaced that loop with a small,
+ * decoupled pre-pass over `ctx.chain`, run BEFORE `chain.validateChain` was ever
+ * called -- reasoning that `chain.validateChain` should not be handed a caller-specific
+ * lease-renewal callback. That was wrong in practice: `maybeRenew()` is time-gated
+ * (scripts/writer-claim.js fires it at most once per heartbeatMs interval), so calling
+ * it N times in a tight synchronous pre-pass loop performs at most ONE real renewal, and
+ * the actual expensive validation work inside `chain.validateChain` then ran with
+ * effectively zero renewal coverage -- exactly the lease-starvation this fix exists to
+ * prevent.
+ *
+ * Fixed here (round-3) by giving `chain.validateChain` an optional `onEntry` hook (see
+ * its own doc comment in scripts/gateway/chain.js) that IT invokes once per entry, in
+ * order, from INSIDE its own per-entry hash/link/sequence loop -- `ctx.maybeRenew` is
+ * passed straight through as that hook below. This still keeps `chain.validateChain` the
+ * one canonical structural validator (C2 SS5) free of any lease-specific logic of its
+ * own: an injected callback is exactly the same shape `ctx.computeEntrySha256` and
+ * `ctx.bundleExists` already are at this call site, not a new mechanism. Renewal is now
+ * genuinely interleaved with the real per-entry work (see
+ * tests/gateway/chain/run-tests.js's new
+ * `walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded`, which proves
+ * the call count is bounded by how far the walk actually got, not by `rawChain.length`),
+ * and a thrown lease-loss error aborts the walk at exactly the entry `onEntry` was called
+ * for -- STRICTLY no later, and often earlier, than the round-2 pre-pass could ever
+ * abort, so the pre-existing "abort immediately, mid-walk, on a detected lease loss"
+ * contract (`walkGatewaySessionsCallsMaybeRenewOncePerEntry` and
+ * `walkAbortsOnLeaseTakeoverMidWalkNotDowngradedToAFailedReport`) holds more strongly
+ * than before, not less.
  *
  * Discipline (mirrors register-retention.js exactly):
  *   - fail-closed for genuine structural/integrity problems: bad entry/HEAD shape, a
@@ -165,12 +179,24 @@ const REFUSE_DOMAIN_BY_CLASS = {
   "head-ahead-of-tail": "trusted-core",
   "multi-step-lag": "trusted-core",
   "head-not-ancestor": "trusted-core",
+  // Round-3 fix pass (verifier-flagged gap): not currently emitted by
+  // chain.validateChain itself (only by checkHeadAgainstTailOrRepair's append-time
+  // check and chain.reconcileHead's startup walk, neither of which this status walk
+  // calls) -- classified explicitly anyway so this map never silently falls through to
+  // the untrusted-input default for either class below if that ever changes.
+  // operational/trusted-core: chain.jsonl's tail could not be read at all -- a
+  // HEAD/tail-plumbing problem, mirroring this module's own HEAD.json convention, not
+  // evidence of tampered chain.jsonl content.
+  "tail-unreadable": "trusted-core",
   "invalid-genesis": "untrusted-input",
   "sequence-gap": "untrusted-input",
   "broken-link": "untrusted-input",
   "tampered": "untrusted-input",
   "fork": "untrusted-input",
   "malformed-interior": "untrusted-input",
+  // untrusted-input/refuse: a torn physical tail is chain.jsonl CONTENT that only
+  // startup reconciliation, under the exclusive writer-claim lease, may repair.
+  "torn-tail-requires-manual-truncation": "untrusted-input",
 };
 
 /* ctx = {
@@ -187,7 +213,10 @@ const REFUSE_DOMAIN_BY_CLASS = {
  *                                            // module's own addition, same as before).
  *   maybeRenew?: () => void,   // optional, round-1 fix-plan item 1: the caller's own
  *                              // writer-claim keepalive (via gateway.js's createLeaseGuard),
- *                              // called once per chain entry -- same injection discipline as
+ *                              // passed straight through as chain.validateChain's own
+ *                              // onEntry hook (round-3 fix pass) so it fires once per chain
+ *                              // entry, genuinely interleaved with chain.validateChain's own
+ *                              // per-entry work -- same injection discipline as
  *                              // computeEntrySha256/bundleExists above, never required() here
  *   isLeaseError?: (error) => boolean,   // optional, paired with maybeRenew: lets the
  *                              // catch-all below recognize (by reference identity) that a
@@ -207,23 +236,22 @@ function walkGatewaySessions(ctx) {
     if (!Array.isArray(rawChain)) return fail("chain must be an array");
     if (typeof ctx.computeEntrySha256 !== "function") return fail("ctx.computeEntrySha256 function is required");
 
-    /* Round-1 fix-plan item 1 (lease keepalive, generalized), round-2 fix pass: this
-     * walk's own small, decoupled pre-pass -- see this file's header note above for why
-     * it is no longer fused into a per-entry structural loop. Still called exactly once
-     * per chain entry, in order, so a thrown lease-loss error aborts at exactly the same
-     * point a caller's own maybeRenew() detects a takeover, before chain.validateChain is
-     * ever invoked. */
-    if (typeof ctx.maybeRenew === "function") {
-      for (let i = 0; i < rawChain.length; i++) ctx.maybeRenew();
-    }
-
     // The one canonical structural validator (C2 SS1/SS5) -- the same function
     // chain.reconcileHead and the append-time check (chain.appendSession /
     // chain.repairMissingChainEntry) already delegate to. `ctx.head` is passed through
     // as-is; chain.validateChain's own documented contract collapses "absent," "not an
     // object," and "fails headShapeOk" to the same `null` case, exactly like its other
     // two callers already do (see chain.js#reconcileHead's own head-read try/catch).
-    const result = chain.validateChain(rawChain, ctx.head === undefined ? null : ctx.head);
+    //
+    // Round-1 fix-plan item 1 (lease keepalive, generalized), round-3 fix pass (fixes
+    // the defect described in this file's header note above): `ctx.maybeRenew`, when
+    // provided, is passed straight through as chain.validateChain's own `onEntry` hook
+    // rather than run in a separate, disconnected pre-pass -- so it fires once per
+    // entry, genuinely interleaved with chain.validateChain's own hash/link/sequence
+    // work as that work actually happens, and a thrown lease-loss error aborts the walk
+    // at exactly the entry chain.validateChain had reached, never after the fact.
+    const validateOptions = typeof ctx.maybeRenew === "function" ? { onEntry: ctx.maybeRenew } : undefined;
+    const result = chain.validateChain(rawChain, ctx.head === undefined ? null : ctx.head, validateOptions);
 
     if (result.status === "empty") {
       return { status: "not-applicable", evidence, assumptions, reason: "empty gateway-session log -- nothing to verify" };
@@ -268,6 +296,21 @@ function walkGatewaySessions(ctx) {
     // HEAD.json); it only makes sure this state is visible, and visibly DIFFERENT from
     // genuine corruption, per C2 SS3's "two failure classes stay distinct everywhere."
     if (result.anomaly) evidence.push(`anomaly: ${result.anomaly}`);
+
+    // Round-3 fix pass (defect 2, docs/contracts/chain-validity.md C2 SS2 row 4): a
+    // headAction of "rebuild" means chain.validateChain found HEAD.json absent/unusable
+    // with no prior pointer to advance -- row 4 says only STARTUP RECONCILIATION, under
+    // the exclusive writer-claim lease (chain.reconcileHead), may treat that as
+    // repairable; every other call site, including this lease-less, periodic status
+    // walk, must REFUSE it instead. chain.reconcileHead's own use of "rebuild" stays
+    // correct and is untouched by this -- the mapping below exists only at THIS call
+    // site's own reporting boundary, per C2's explicit per-call-site distinction. The
+    // row-7 single-step-lag case (headAction: "advance", a genuine hash-verified
+    // ancestor with a real prior pointer to advance) is unaffected and stays
+    // "reconcilable" below, exactly as before.
+    if (result.headAction === "rebuild") {
+      return fail(result.reason, "trusted-core");
+    }
     return {
       status: "reconcilable",
       evidence,
@@ -332,7 +375,10 @@ if (require.main === module) {
     const gapChain = [e1, e3];
     const gap = check.run({ chain: gapChain, head: { ...head, seq: 3 }, computeEntrySha256 });
     // HEAD.json missing entirely, but the chain itself is fully valid -- C2 row 3/4:
-    // reconcilable (rebuild from the verified tail), not corruption.
+    // chain.validateChain itself classifies this as headAction "rebuild", but this
+    // call site's own round-3 defect-2 fix (see above) maps that to `failed`: only
+    // startup reconciliation under the exclusive writer-claim lease may treat an absent
+    // HEAD as repairable, never this lease-less status walk.
     const noHead = check.run({ chain: chainEntries, head: null, computeEntrySha256 });
     // HEAD.json stale by exactly one hash-verified step (crash before the HEAD update)
     // -- C2 row 7: reconcilable (auto-advance), not corruption.
@@ -344,7 +390,7 @@ if (require.main === module) {
       good.status === "verified" &&
       brokenSelf.status === "failed" && /TAMPERED/.test(brokenSelf.evidence.join(" ")) &&
       gap.status === "failed" && /SEQUENCE GAP/.test(gap.evidence.join(" ")) &&
-      noHead.status === "reconcilable" &&
+      noHead.status === "failed" && /HEAD\.json is absent/.test(noHead.evidence.join(" ")) &&
       staleHead.status === "reconcilable" &&
       missingBundle.status === "failed" && /no corresponding bundle file/.test(missingBundle.evidence.join(" "));
 
@@ -353,7 +399,7 @@ if (require.main === module) {
       "| chain=" + (good.status === "verified"),
       "tampered-detected=" + (brokenSelf.status === "failed"),
       "gap-detected=" + (gap.status === "failed"),
-      "no-head-reconcilable=" + (noHead.status === "reconcilable"),
+      "no-head-detected=" + (noHead.status === "failed"),
       "stale-head-reconcilable=" + (staleHead.status === "reconcilable"),
       "missing-bundle-detected=" + (missingBundle.status === "failed")
     );

@@ -199,6 +199,39 @@ function walkGatewaySessionsCallsMaybeRenewOncePerEntry() {
   const result = verifyDir(dir, { maybeRenew: () => { renewCalls++; } });
   check("walk-verifies-with-maybe-renew-wired-in", result.status === "verified", JSON.stringify(result));
   check("walk-calls-maybe-renew-once-per-chain-entry", renewCalls === 4, String(renewCalls));
+  // Note: this assertion alone is satisfied whether maybeRenew fires interleaved with
+  // chain.validateChain's own per-entry walk OR front-loaded in a disconnected pre-pass
+  // before validateChain ever runs -- a fully-valid chain visits every entry either way.
+  // walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded below is what
+  // actually distinguishes the two (round-3 fix pass, defect 1).
+}
+
+/* Round-3 fix pass (defect 1): proves maybeRenew calls are genuinely INTERLEAVED with
+ * chain.validateChain's own per-entry hash/link/sequence walk, not front-loaded in a
+ * separate pre-pass over the whole raw chain before chain.validateChain is ever invoked.
+ * A tampered entry at index 2 of a 5-entry chain makes chain.validateChain's own loop
+ * stop (refuse) after visiting entries 0, 1, and 2 -- entries 3 and 4 are never reached.
+ * Under the (defective) front-loaded pre-pass this fix corrects, maybeRenew would have
+ * been called once per RAW entry (5 times) regardless of where -- or whether --
+ * chain.validateChain's own structural walk ever got to look at any of them. Under the
+ * fixed, interleaved wiring, the call count is bounded by how far the real per-entry
+ * walk actually got: exactly 3, never 5. */
+function walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded() {
+  const dir = freshDir("walk-maybe-renew-interleaved");
+  const keys = makeKeys();
+  for (let i = 0; i < 5; i++) chain.appendSession(dir, sealTrivialSession(`conn-${i}`, keys));
+  const lines = fs.readFileSync(chain.chainPath(dir), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  lines[2].entry_sha256 = "e".repeat(64); // tamper entry index 2 (of 0..4) -- mid-chain.
+  fs.writeFileSync(chain.chainPath(dir), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+  let renewCalls = 0;
+  const result = verifyDir(dir, { maybeRenew: () => { renewCalls++; } });
+  check("walk-interleaved-still-detects-the-tampered-entry", result.status === "failed" && /TAMPERED/.test(result.reason || ""), JSON.stringify(result));
+  check(
+    "walk-maybe-renew-calls-bounded-by-real-progress-not-front-loaded-across-whole-chain",
+    renewCalls === 3,
+    `expected exactly 3 (entries 0,1,2 visited before the walk stopped at the tampered entry), got ${renewCalls}`
+  );
 }
 
 /* Round-1 fix-plan item 1, round-2 fix pass: mirrors
@@ -1057,6 +1090,7 @@ function main() {
   reconcileHeadRefusesEmptyChainWithHeadPresent();
 
   walkGatewaySessionsCallsMaybeRenewOncePerEntry();
+  walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded();
   walkAbortsOnLeaseTakeoverMidWalkNotDowngradedToAFailedReport();
 
   const passed = results.filter((r) => r.status === "PASS").length;
