@@ -116,9 +116,24 @@ function incompleteAppendDetected() {
   fs.appendFileSync(chain.chainPath(dir), JSON.stringify(entry2) + "\n");
   // HEAD.json still points at entry1 -- exactly the "stale head" incomplete-append shape.
 
+  /* Round-2 fix-round follow-up (docs/contracts/chain-validity.md C2 SS2 row 7, SS5):
+   * this on-disk shape -- HEAD exactly one hash-verified step behind a fully valid
+   * chain tail -- is EXACTLY C2's row-7 single-step lagging-HEAD case, which the
+   * canonical validator (chain.validateChain, which this walk now delegates to
+   * instead of re-deriving its own classification) correctly reports as
+   * `reconcilable` / `headAction: "advance"`, NOT a structural failure: per C2 SS3,
+   * this is the expected shape of "the process died between two of its own writes"
+   * and is auto-caught-up by the append-time check on the very next append (see
+   * appendTimeCheckAutoAdvancesASingleStepLaggingHead below), not genuine corruption
+   * needing an operator's own recovery-runbook intervention. The OLD assertions here
+   * (`status === "failed"`, reason matching /incomplete append/) predate C2's binding
+   * 2026-09-15 decision and were themselves the less-correct classification this
+   * refactor exists to fix -- updated to the canonical validator's more correct
+   * verdict, not weakened. See statusWalkAndAppendTimeCheckAgreeOnSingleStepLaggingHead
+   * below for the explicit divergence test C2 SS5 asks for. */
   const result = verifyDir(dir);
-  check("incomplete-append-detected-as-failed", result.status === "failed", JSON.stringify(result));
-  check("incomplete-append-reason-names-incomplete-append", /incomplete append/.test(result.reason || ""), JSON.stringify(result));
+  check("incomplete-append-is-reconcilable-not-a-structural-failure", result.status === "reconcilable" && result.headAction === "advance", JSON.stringify(result));
+  check("incomplete-append-reason-names-the-single-step-lagging-head-signature", /one step behind/.test(result.reason || ""), JSON.stringify(result));
 }
 
 /* SS8 test 16: mutate a middle entry's entry_sha256. */
@@ -168,6 +183,115 @@ function missingGenesisPrefixDetected() {
   check("missing-genesis-prefix-reason-names-seq-not-one", /seq=2, expected 1/.test(result.reason || ""), JSON.stringify(result));
 }
 
+/* Round-1 fix-plan item 1 (lease keepalive, generalized), round-2 fix pass (Paul's
+ * 2026-09-16 decision): commit 1's own plan named this walk, alongside reconcileHead's
+ * startup walk and the WAL-replay loops, as a long synchronous per-entry phase that
+ * needs the shared maybeRenew() keepalive -- confirms the wiring actually reaches every
+ * entry of a multi-entry chain, the same way commit 1's own writer-claim unit test
+ * (grFix1_maybeRenewIsTimeGatedByTheClaimsOwnClock) proves the underlying primitive's
+ * own time-gating, but here at this walk's own call-site level. */
+function walkGatewaySessionsCallsMaybeRenewOncePerEntry() {
+  const dir = freshDir("walk-maybe-renew-per-entry");
+  const keys = makeKeys();
+  for (let i = 0; i < 4; i++) chain.appendSession(dir, sealTrivialSession(`conn-${i}`, keys));
+
+  let renewCalls = 0;
+  const result = verifyDir(dir, { maybeRenew: () => { renewCalls++; } });
+  check("walk-verifies-with-maybe-renew-wired-in", result.status === "verified", JSON.stringify(result));
+  check("walk-calls-maybe-renew-once-per-chain-entry", renewCalls === 4, String(renewCalls));
+  // Note: this assertion alone is satisfied whether maybeRenew fires interleaved with
+  // chain.validateChain's own per-entry walk OR front-loaded in a disconnected pre-pass
+  // before validateChain ever runs -- a fully-valid chain visits every entry either way.
+  // walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded below is what
+  // actually distinguishes the two (round-3 fix pass, defect 1).
+}
+
+/* Round-3 fix pass (defect 1): proves maybeRenew calls are genuinely INTERLEAVED with
+ * chain.validateChain's own per-entry hash/link/sequence walk, not front-loaded in a
+ * separate pre-pass over the whole raw chain before chain.validateChain is ever invoked.
+ * A tampered entry at index 2 of a 5-entry chain makes chain.validateChain's own loop
+ * stop (refuse) after visiting entries 0, 1, and 2 -- entries 3 and 4 are never reached.
+ * Under the (defective) front-loaded pre-pass this fix corrects, maybeRenew would have
+ * been called once per RAW entry (5 times) regardless of where -- or whether --
+ * chain.validateChain's own structural walk ever got to look at any of them. Under the
+ * fixed, interleaved wiring, the call count is bounded by how far the real per-entry
+ * walk actually got: exactly 3, never 5. */
+function walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded() {
+  const dir = freshDir("walk-maybe-renew-interleaved");
+  const keys = makeKeys();
+  for (let i = 0; i < 5; i++) chain.appendSession(dir, sealTrivialSession(`conn-${i}`, keys));
+  const lines = fs.readFileSync(chain.chainPath(dir), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  lines[2].entry_sha256 = "e".repeat(64); // tamper entry index 2 (of 0..4) -- mid-chain.
+  fs.writeFileSync(chain.chainPath(dir), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+  let renewCalls = 0;
+  const result = verifyDir(dir, { maybeRenew: () => { renewCalls++; } });
+  check("walk-interleaved-still-detects-the-tampered-entry", result.status === "failed" && /TAMPERED/.test(result.reason || ""), JSON.stringify(result));
+  check(
+    "walk-maybe-renew-calls-bounded-by-real-progress-not-front-loaded-across-whole-chain",
+    renewCalls === 3,
+    `expected exactly 3 (entries 0,1,2 visited before the walk stopped at the tampered entry), got ${renewCalls}`
+  );
+}
+
+/* Round-1 fix-plan item 1, round-2 fix pass: mirrors
+ * recoverAbortsOnLeaseTakeoverDuringWalReplayNotJustOneConnection (tests/gateway/
+ * recovery/run-tests.js) at this walk's own level. A lease taken over by a competing
+ * writer, detected by this walk's own per-entry maybeRenew() call partway through a
+ * multi-entry chain, must abort the WHOLE walk with the exact detected error -- never
+ * downgraded to this walk's own ordinary fail-closed `{ status: "failed" }` evidence-only
+ * report, which is exactly the per-connection "flag for operator review, continue"
+ * class of handling createLeaseGuard's own doc comment (scripts/gateway/gateway.js) says
+ * a detected lease loss must never receive. That distinction is the whole point of this
+ * test: entry[2]'s own hash chain is perfectly intact (unlike every OTHER failure this
+ * suite exercises above, which the walk legitimately reports as evidence and returns
+ * from) -- the only reason this run does not return a "verified" result is the
+ * lease-loss abort firing first, part way through, and propagating instead of being
+ * reported. */
+function walkAbortsOnLeaseTakeoverMidWalkNotDowngradedToAFailedReport() {
+  const dir = freshDir("walk-lease-takeover-mid-walk");
+  const keys = makeKeys();
+  for (let i = 0; i < 5; i++) chain.appendSession(dir, sealTrivialSession(`conn-${i}`, keys));
+
+  let callCount = 0;
+  const takeoverError = new Error("simulated competing writer took over this state_dir mid-walk");
+  const ctx = {
+    chain: chain.readChain(dir),
+    head: chain.readHead(dir),
+    computeEntrySha256: chain.computeEntrySha256,
+    bundleExists: (id) => fs.existsSync(chain.bundlePath(dir, id)),
+    maybeRenew: () => {
+      callCount++;
+      if (callCount === 3) throw takeoverError; // strictly mid-walk: entries 0-1 already visited, 3-4 never reached.
+    },
+    isLeaseError: (error) => error === takeoverError,
+  };
+
+  let threw = null;
+  let returned = null;
+  try {
+    returned = walkGatewaySessions(ctx);
+  } catch (error) {
+    threw = error;
+  }
+  check("walk-lease-takeover-aborts-with-the-exact-detected-error", threw === takeoverError, threw && threw.message);
+  check("walk-lease-takeover-never-returns-a-downgraded-failed-report", returned === null, JSON.stringify(returned));
+
+  // Without ctx.isLeaseError, the identical maybeRenew failure IS this walk's own
+  // ordinary fail-closed contract (a caller that never wires in lease recognition gets
+  // exactly today's pre-fix behavior for any other injected-function failure, not a
+  // silent behavior change) -- proves the rethrow above is conditional on isLeaseError
+  // being provided, not a blanket "any maybeRenew throw aborts" rule.
+  callCount = 0;
+  const ctxNoLeaseRecognition = { ...ctx, isLeaseError: undefined };
+  const fallback = walkGatewaySessions(ctxNoLeaseRecognition);
+  check(
+    "walk-maybe-renew-failure-without-isLeaseError-still-fails-closed-not-aborts",
+    fallback.status === "failed" && /simulated competing writer/.test(fallback.reason || ""),
+    JSON.stringify(fallback)
+  );
+}
+
 function bundleIdCollisionRefused() {
   const dir = freshDir("collision");
   const keys = makeKeys();
@@ -185,6 +309,993 @@ function emptyChainIsNotApplicable() {
   check("empty-chain-not-applicable", result.status === "not-applicable", JSON.stringify(result));
 }
 
+/* ==================================================================================
+ * C2 (docs/contracts/chain-validity.md) -- commit 3: validateChain + readChainTail.
+ * ================================================================================== */
+
+function mkEntry(seq, prev, bundleId) {
+  const partial = { schema_version: "1.0", seq, bundle_id: bundleId, prev_entry_sha256: prev };
+  return { ...partial, entry_sha256: chain.computeEntrySha256(partial) };
+}
+function mkHeadFor(entry) {
+  return { schema_version: "1.0", seq: entry.seq, bundle_id: entry.bundle_id, entry_sha256: entry.entry_sha256 };
+}
+function line(entry) {
+  return JSON.stringify(entry);
+}
+function writeChainFile(dir, text) {
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  fs.writeFileSync(chain.chainPath(dir), text);
+}
+
+/* ---- validateChain: rows 1/2 (empty states) ---- */
+
+function validateChainEmptyGenesisIsNotAFailure() {
+  const result = chain.validateChain([], null);
+  check("validate-chain-empty-genesis-is-not-a-failure", result.status === "empty", JSON.stringify(result));
+}
+
+function validateChainEmptyWithHeadRefuses() {
+  const e1 = mkEntry(1, null, "b1");
+  const result = chain.validateChain([], mkHeadFor(e1));
+  check("validate-chain-empty-with-head-refuses", result.status === "refuse" && result.class === "empty-chain-with-head", JSON.stringify(result));
+}
+
+/* ---- validateChain: rows 5/6/8 (structural/integrity failures -- refuse-and-latch) ---- */
+
+function validateChainDetectsSequenceGap() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  const result = chain.validateChain([e1, e3], null); // e2 deleted -> gap
+  check("validate-chain-detects-sequence-gap", result.status === "refuse" && result.class === "sequence-gap", JSON.stringify(result));
+}
+
+function validateChainDetectsDuplicateSeqAsFork() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2a = mkEntry(2, e1.entry_sha256, "b2a");
+  const e2b = mkEntry(2, e1.entry_sha256, "b2b"); // same seq, different bundle+hash
+  const result = chain.validateChain([e1, e2a, e2b], null);
+  check("validate-chain-detects-duplicate-seq-as-fork", result.status === "refuse" && result.class === "fork", JSON.stringify(result));
+}
+
+function validateChainDetectsTamperedEntry() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const tampered = { ...e2, entry_sha256: "9".repeat(64) };
+  const result = chain.validateChain([e1, tampered], null);
+  check("validate-chain-detects-tampered-entry", result.status === "refuse" && result.class === "tampered" && result.at === 1, JSON.stringify(result));
+}
+
+function validateChainDetectsBrokenLink() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, "d".repeat(64), "b2"); // internally hash-consistent, wrong link
+  const result = chain.validateChain([e1, e2], null);
+  check("validate-chain-detects-broken-link", result.status === "refuse" && result.class === "broken-link", JSON.stringify(result));
+}
+
+function validateChainDetectsInvalidGenesisSeq() {
+  const forged = mkEntry(2, null, "b1"); // hash-consistent, but not seq=1
+  const result = chain.validateChain([forged], null);
+  check("validate-chain-detects-invalid-genesis-seq", result.status === "refuse" && result.class === "invalid-genesis", JSON.stringify(result));
+}
+
+function validateChainDetectsInvalidGenesisPrev() {
+  const forged = mkEntry(1, "a".repeat(64), "b1"); // seq=1 but prev != null
+  const result = chain.validateChain([forged], null);
+  check("validate-chain-detects-invalid-genesis-prev", result.status === "refuse" && result.class === "invalid-genesis", JSON.stringify(result));
+}
+
+function validateChainRefusesMalformedInteriorRecordNotJustTheLast() {
+  const e1 = mkEntry(1, null, "b1");
+  const e3 = mkEntry(3, "irrelevant-since-interior-is-what-fails", "b3");
+  // null in the MIDDLE (not the physical last position) must never get the
+  // torn-tail accommodation -- always refuse, per C2 row 8.
+  const result = chain.validateChain([e1, null, e3], null);
+  check("validate-chain-refuses-malformed-interior-record", result.status === "refuse" && result.class === "malformed-interior" && result.at === 1, JSON.stringify(result));
+}
+
+/* ---- validateChain: row 7 (mid-run lagging HEAD, single-step, hash-verified) ---- */
+
+function validateChainAutoAdvancesSingleStepLaggingHead() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  const result = chain.validateChain([e1, e2, e3], mkHeadFor(e2));
+  check("validate-chain-auto-advances-single-step-lagging-head", result.status === "reconcilable" && result.headAction === "advance" && result.tail.seq === 3, JSON.stringify(result));
+  check("validate-chain-single-step-lag-emits-a-loud-anomaly", typeof result.anomaly === "string" && result.anomaly.length > 0, JSON.stringify(result));
+}
+
+function validateChainRefusesMultiStepLaggingHead() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  const result = chain.validateChain([e1, e2, e3], mkHeadFor(e1)); // two steps behind
+  check("validate-chain-refuses-multi-step-lagging-head", result.status === "refuse" && result.class === "multi-step-lag", JSON.stringify(result));
+}
+
+function validateChainRefusesHeadAheadOfTail() {
+  const e1 = mkEntry(1, null, "b1");
+  const fakeAhead = { schema_version: "1.0", seq: 2, bundle_id: "ghost", entry_sha256: "b".repeat(64) };
+  const result = chain.validateChain([e1], fakeAhead);
+  check("validate-chain-refuses-head-ahead-of-tail", result.status === "refuse" && result.class === "head-ahead-of-tail", JSON.stringify(result));
+}
+
+function validateChainRefusesHeadSameSeqDifferentHashAsFork() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const forkedHead = { schema_version: "1.0", seq: 2, bundle_id: "b2-other", entry_sha256: "c".repeat(64) };
+  const result = chain.validateChain([e1, e2], forkedHead);
+  check("validate-chain-refuses-head-same-seq-different-hash-as-fork", result.status === "refuse" && result.class === "fork", JSON.stringify(result));
+}
+
+function validateChainRefusesOneStepBackHeadThatIsNotAGenuineAncestor() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  // seq is exactly one behind tail (looks like row 7 at a glance) but its hash does
+  // not actually match tail.prev_entry_sha256 -- must NOT auto-catch-up.
+  const notAnAncestor = { schema_version: "1.0", seq: 1, bundle_id: "b1-impostor", entry_sha256: "e".repeat(64) };
+  const result = chain.validateChain([e1, e2], notAnAncestor);
+  check("validate-chain-refuses-one-step-back-head-that-is-not-a-genuine-ancestor", result.status === "refuse" && result.class === "head-not-ancestor", JSON.stringify(result));
+}
+
+/* ---- validateChain: rows 3/4 (HEAD absent/unusable -- rebuild from verified tail) ---- */
+
+function validateChainRebuildsMissingHeadFromVerifiedTail() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const result = chain.validateChain([e1, e2], null);
+  check("validate-chain-rebuilds-missing-head-from-verified-tail", result.status === "reconcilable" && result.headAction === "rebuild" && result.tail.seq === 2, JSON.stringify(result));
+}
+
+function validateChainDoesNotRebuildWhenTheChainItselfDoesNotValidate() {
+  const e1 = mkEntry(1, null, "b1");
+  // Shape-valid (64-hex prev), but wrong link AND a sequence gap -- HEAD being
+  // absent must never bypass the structural walk and rebuild blindly.
+  const e3 = mkEntry(3, "d".repeat(64), "b3");
+  const result = chain.validateChain([e1, e3], null);
+  check("validate-chain-does-not-rebuild-when-the-chain-itself-does-not-validate", result.status === "refuse", JSON.stringify(result));
+}
+
+/* ---- validateChain: row 9 (torn/unparseable FINAL record) ---- */
+
+function validateChainTruncatesTornFinalRecordAndRebuildsHead() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  // `null` stands in for "this physical line could not be parsed at all" (per
+  // validateChain's own documented input contract).
+  const result = chain.validateChain([e1, e2, null], null);
+  check("validate-chain-truncates-torn-final-record-and-rebuilds-head", result.status === "reconcilable" && result.truncatedTail === true && result.headAction === "rebuild" && result.tail.seq === 2, JSON.stringify(result));
+}
+
+function validateChainTornFinalRecordWithHeadAlreadyAtTheTruncatedTailStillReportsReconciliation() {
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  // HEAD already matches what the truncated chain's tail will be -- this must NOT
+  // be silently reported as "valid" (nothing to do): the on-disk garbage still
+  // needs isolating/truncating, so it must surface as a reconciliation action.
+  const result = chain.validateChain([e1, e2, null], mkHeadFor(e2));
+  check("validate-chain-torn-tail-with-head-already-consistent-still-reconciles-not-silently-valid", result.status === "reconcilable" && result.truncatedTail === true, JSON.stringify(result));
+}
+
+function validateChainTornSoleGenesisRecordWithNoHeadReconcilesToEmptyTail() {
+  const result = chain.validateChain([null], null);
+  check("validate-chain-torn-sole-genesis-record-with-no-head-reconciles-to-empty-tail", result.status === "reconcilable" && result.tail === null && result.truncatedTail === true, JSON.stringify(result));
+}
+
+function validateChainTornSoleRecordWithHeadPresentRefuses() {
+  const ghostHead = { schema_version: "1.0", seq: 1, bundle_id: "ghost", entry_sha256: "f".repeat(64) };
+  const result = chain.validateChain([null], ghostHead);
+  check("validate-chain-torn-sole-record-with-head-present-refuses", result.status === "refuse", JSON.stringify(result));
+}
+
+function validateChainNeverConflatesTornTailWithInteriorCorruption() {
+  // A shape-VALID final record whose hash simply does not recompute is TAMPERING,
+  // not a torn write -- must be refused via the ordinary hash check, never given
+  // the row-9 accommodation.
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const tamperedTail = { ...e2, entry_sha256: "7".repeat(64) };
+  const result = chain.validateChain([e1, tamperedTail], null);
+  check("validate-chain-never-conflates-a-tampered-tail-with-a-torn-tail", result.status === "refuse" && result.class === "tampered", JSON.stringify(result));
+}
+
+/* ---- readChainTail: absent / empty / corrupt stay three distinct outcomes ---- */
+
+function readChainTailAbsentWhenFileDoesNotExist() {
+  const dir = freshDir("tail-absent");
+  fs.mkdirSync(dir, { recursive: true }); // no gateway-sessions/ dir at all
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-absent-when-file-does-not-exist", result.status === "absent", JSON.stringify(result));
+}
+
+function readChainTailEmptyWhenFileIsZeroBytes() {
+  const dir = freshDir("tail-zero-bytes");
+  writeChainFile(dir, "");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-empty-when-file-is-zero-bytes", result.status === "empty", JSON.stringify(result));
+}
+
+function readChainTailEmptyWhenFileIsOnlyBlankLines() {
+  const dir = freshDir("tail-blank-only");
+  writeChainFile(dir, "\n\n\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-empty-when-file-is-only-blank-lines", result.status === "empty", JSON.stringify(result));
+}
+
+function readChainTailSucceedsWithTrailingNewline() {
+  const dir = freshDir("tail-trailing-nl");
+  const e1 = mkEntry(1, null, "b1");
+  writeChainFile(dir, line(e1) + "\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-succeeds-with-trailing-newline", result.status === "ok" && result.hadTrailingNewline === true && result.entry.bundle_id === "b1", JSON.stringify(result));
+}
+
+function readChainTailSucceedsWithoutTrailingNewline() {
+  const dir = freshDir("tail-no-trailing-nl");
+  const e1 = mkEntry(1, null, "b1");
+  writeChainFile(dir, line(e1)); // no trailing \n
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-succeeds-without-trailing-newline", result.status === "ok" && result.hadTrailingNewline === false && result.entry.bundle_id === "b1", JSON.stringify(result));
+}
+
+function readChainTailReturnsTheSameEntryRegardlessOfTrailingNewline() {
+  const dir1 = freshDir("tail-nl-a");
+  const dir2 = freshDir("tail-nl-b");
+  const e1 = mkEntry(1, null, "same-content");
+  writeChainFile(dir1, line(e1) + "\n");
+  writeChainFile(dir2, line(e1));
+  const r1 = chain.readChainTail(dir1);
+  const r2 = chain.readChainTail(dir2);
+  check("read-chain-tail-trailing-newline-does-not-change-the-parsed-entry", r1.status === "ok" && r2.status === "ok" && JSON.stringify(r1.entry) === JSON.stringify(r2.entry), JSON.stringify({ r1, r2 }));
+}
+
+function readChainTailSkipsBlankLinesBeforeTheLastEntry() {
+  const dir = freshDir("tail-blank-between");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  writeChainFile(dir, line(e1) + "\n\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-skips-blank-lines-before-the-last-entry", result.status === "ok" && result.entry.bundle_id === "b2", JSON.stringify(result));
+}
+
+function readChainTailFindsTheLastEntryWhenTheWindowStartsMidRecord() {
+  const dir = freshDir("tail-mid-record");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const e3 = mkEntry(3, e2.entry_sha256, "b3");
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n" + line(e3) + "\n");
+  // A tiny initial window guarantees the first read starts strictly inside e3's own
+  // line (no newline visible), forcing at least one grow-and-retry before success.
+  const result = chain.readChainTail(dir, { initialWindowBytes: 8 });
+  check("read-chain-tail-finds-the-last-entry-when-the-window-starts-mid-record", result.status === "ok" && result.entry.bundle_id === "b3", JSON.stringify(result));
+}
+
+function readChainTailGrowsPastTheInitialWindowForAnOversizedFinalRecord() {
+  const dir = freshDir("tail-oversized-final");
+  const e1 = mkEntry(1, null, "b1");
+  const bigBundleId = "b2-" + "x".repeat(9000); // final record now well over 8 KiB
+  const e2 = mkEntry(2, e1.entry_sha256, bigBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir); // default 8 KiB initial window
+  check("read-chain-tail-grows-past-the-initial-window-for-an-oversized-final-record", result.status === "ok" && result.entry.bundle_id === bigBundleId, JSON.stringify({ status: result.status, matched: result.status === "ok" && result.entry.bundle_id === bigBundleId }));
+}
+
+function readChainTailFindsALargeFinalRecordWhenANewlineIsAlreadyInTheFirstWindow() {
+  // Distinct from the grow case above: here the record is large but the FIRST read
+  // already contains the newline that starts it (no growth needed) -- exercises the
+  // "final record larger than the window, but the window still contains a newline"
+  // boundary without conflating it with the retry path.
+  const dir = freshDir("tail-large-first-window");
+  const e1 = mkEntry(1, null, "b1");
+  const bigBundleId = "b2-" + "y".repeat(4000); // large, but smaller than the window
+  const e2 = mkEntry(2, e1.entry_sha256, bigBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir); // default 8 KiB window comfortably covers this
+  check("read-chain-tail-finds-a-large-final-record-already-inside-the-first-window", result.status === "ok" && result.entry.bundle_id === bigBundleId, JSON.stringify({ status: result.status }));
+}
+
+function readChainTailFailsClosedWhenNoNewlineIsFoundWithinTheCappedWindow() {
+  const dir = freshDir("tail-uncapped");
+  const e1 = mkEntry(1, null, "b1");
+  const hugeBundleId = "z".repeat(5000); // final record itself exceeds the test's tiny cap
+  const e2 = mkEntry(2, e1.entry_sha256, hugeBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2)); // no trailing newline either
+  const result = chain.readChainTail(dir, { initialWindowBytes: 64, maxEntryBytes: 512 });
+  check("read-chain-tail-fails-closed-when-no-newline-boundary-is-found-within-the-capped-window", result.status === "corrupt", JSON.stringify(result));
+  check("read-chain-tail-fail-closed-does-not-fall-back-to-an-earlier-valid-record", !(result.entry && result.entry.bundle_id === "b1"), JSON.stringify(result));
+}
+
+function readChainTailReportsCorruptForATruncatedFinalRecord() {
+  const dir = freshDir("tail-truncated-final");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  const full = line(e1) + "\n" + line(e2) + "\n";
+  const tornPoint = full.length - 5; // cut the last record off mid-field
+  writeChainFile(dir, full.slice(0, tornPoint));
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-reports-corrupt-for-a-truncated-final-record", result.status === "corrupt", JSON.stringify(result));
+  check("read-chain-tail-truncated-final-record-does-not-silently-return-the-earlier-valid-entry", !(result.entry && result.entry.bundle_id === "b1"), JSON.stringify(result));
+}
+
+function readChainTailReportsCorruptForAMalformedFinalRecord() {
+  const dir = freshDir("tail-malformed-final");
+  const e1 = mkEntry(1, null, "b1");
+  writeChainFile(dir, line(e1) + "\n" + "{not even close to json\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-reports-corrupt-for-a-malformed-final-record", result.status === "corrupt", JSON.stringify(result));
+}
+
+function readChainTailReportsCorruptWhenTheFinalRecordFailsItsShapeCheck() {
+  const dir = freshDir("tail-bad-shape-final");
+  const e1 = mkEntry(1, null, "b1");
+  const badShape = { schema_version: "1.0", seq: 2, bundle_id: "b2" }; // missing hash fields, but VALID json
+  writeChainFile(dir, line(e1) + "\n" + JSON.stringify(badShape) + "\n");
+  const result = chain.readChainTail(dir);
+  check("read-chain-tail-reports-corrupt-when-the-final-record-fails-its-shape-check", result.status === "corrupt", JSON.stringify(result));
+}
+
+function readChainTailHandlesUtf8BoundariesSplitAcrossTheWindowEdge() {
+  const dir = freshDir("tail-utf8-boundary");
+  // Multi-byte bundle_id (emoji + accented chars are 2-4 byte UTF-8 sequences) on
+  // the record BEFORE the last one, positioned so a small window's left edge is
+  // very likely to land inside one of its multi-byte characters -- the last
+  // entry's own content must still parse correctly regardless, because only bytes
+  // strictly after the boundary newline are ever decoded.
+  const e1 = mkEntry(1, null, "héllo-🎉-bündle-" + "€".repeat(40));
+  const e2 = mkEntry(2, e1.entry_sha256, "plain-ascii-tail-résumé-日本語");
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  // Small window forced to start somewhere inside e1's multi-byte content.
+  const result = chain.readChainTail(dir, { initialWindowBytes: 20 });
+  check("read-chain-tail-handles-utf8-boundaries-split-across-the-window-edge", result.status === "ok" && result.entry.bundle_id === "plain-ascii-tail-résumé-日本語", JSON.stringify(result));
+}
+
+function readChainTailUtf8LastEntryItselfSurvivesGrowth() {
+  const dir = freshDir("tail-utf8-last-entry-grows");
+  const e1 = mkEntry(1, null, "b1");
+  // The LAST entry itself contains multi-byte UTF-8 content and is large enough
+  // that the window must grow at least once to capture all of it.
+  const unicodeBundleId = "🎉-" + "日".repeat(3000);
+  const e2 = mkEntry(2, e1.entry_sha256, unicodeBundleId);
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+  const result = chain.readChainTail(dir, { initialWindowBytes: 64 });
+  check("read-chain-tail-utf8-last-entry-itself-survives-growth", result.status === "ok" && result.entry.bundle_id === unicodeBundleId, JSON.stringify({ status: result.status }));
+}
+
+function readChainTailHandlesShortReads() {
+  const dir = freshDir("tail-short-reads");
+  const e1 = mkEntry(1, null, "b1");
+  const e2 = mkEntry(2, e1.entry_sha256, "b2");
+  writeChainFile(dir, line(e1) + "\n" + line(e2) + "\n");
+
+  const realReadSync = fs.readSync;
+  let calls = 0;
+  fs.readSync = function shortReadingReadSync(fd, buffer, offset, length, position) {
+    calls++;
+    const cappedLength = Math.min(length, 3); // force many short reads, 3 bytes at a time
+    return realReadSync(fd, buffer, offset, cappedLength, position);
+  };
+  let result;
+  try {
+    result = chain.readChainTail(dir);
+  } finally {
+    fs.readSync = realReadSync;
+  }
+  check("read-chain-tail-handles-short-reads", result.status === "ok" && result.entry.bundle_id === "b2", JSON.stringify(result));
+  check("read-chain-tail-short-reads-actually-exercised-multiple-calls", calls > 1, `calls=${calls}`);
+}
+
+function readChainTailAbsentEmptyCorruptAreThreeDistinctOutcomes() {
+  const absentDir = freshDir("distinct-absent");
+  fs.mkdirSync(absentDir, { recursive: true });
+  const emptyDir = freshDir("distinct-empty");
+  writeChainFile(emptyDir, "");
+  const corruptDir = freshDir("distinct-corrupt");
+  writeChainFile(corruptDir, "{not json\n");
+
+  const absent = chain.readChainTail(absentDir);
+  const empty = chain.readChainTail(emptyDir);
+  const corrupt = chain.readChainTail(corruptDir);
+  const statuses = [absent.status, empty.status, corrupt.status];
+  check("read-chain-tail-absent-empty-corrupt-are-three-distinct-outcomes", new Set(statuses).size === 3 && statuses.includes("absent") && statuses.includes("empty") && statuses.includes("corrupt"), JSON.stringify(statuses));
+}
+
+/* ==================================================================================
+ * Round-1 fix-plan commit 4 -- reconcileHead (startup) + the classified append-time
+ * HEAD/tail check (chain.appendSession / chain.repairMissingChainEntry). Constructs a
+ * genuinely stale HEAD through the real public API (chain.appendSession + a targeted
+ * HEAD.json overwrite mirroring exactly the crash window between chain.appendSession's
+ * own step 2 (chain.jsonl append) and step 3 (HEAD.json update) -- never by disabling
+ * the safety check itself.
+ * ================================================================================== */
+
+function makeStaleHeadFixture(dir, keys, n) {
+  // Appends `n` real, distinct sessions, then rolls HEAD.json back to name an EARLIER
+  // entry -- exactly the on-disk shape a crash between chain.appendSession's own
+  // chain.jsonl-append and HEAD.json-update steps leaves behind, reproduced through the
+  // real public API rather than by hand-crafting a chain.jsonl fixture.
+  const entries = [];
+  for (let i = 0; i < n; i++) {
+    entries.push(chain.appendSession(dir, sealTrivialSession(`stale-head-${i}`, keys)));
+  }
+  return entries;
+}
+
+function appendTimeCheckAutoAdvancesASingleStepLaggingHead() {
+  const dir = freshDir("append-time-single-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  // Roll HEAD back to entry[0] -- exactly one step behind the real tail (entry[1]).
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+  check("append-time-lag-fixture-head-still-stale", chain.readHead(dir).seq === 1, JSON.stringify(chain.readHead(dir)));
+
+  const logs = [];
+  const newEntry = chain.appendSession(dir, sealTrivialSession("stale-head-third", keys), { log: (l) => logs.push(l) });
+  check("append-time-lag-auto-advance-new-entry-is-seq-3", newEntry.seq === 3, JSON.stringify(newEntry));
+  check("append-time-lag-auto-advance-new-entry-links-to-entry2", newEntry.prev_entry_sha256 === entries[1].entry_sha256, JSON.stringify(newEntry));
+  const headAfter = chain.readHead(dir);
+  check("append-time-lag-auto-advance-head-ends-at-entry3", headAfter.seq === 3 && headAfter.bundle_id === newEntry.bundle_id, JSON.stringify(headAfter));
+  check("append-time-lag-auto-advance-chain-has-exactly-3-entries-no-fork", chain.readChain(dir).length === 3, JSON.stringify(chain.readChain(dir).map((e) => e.seq)));
+  const anomalyLog = logs.find((l) => l.includes("gateway_chain_head_lag_auto_advanced"));
+  check("append-time-lag-auto-advance-logs-a-loud-anomaly", Boolean(anomalyLog), JSON.stringify(logs));
+}
+
+/* C2 (docs/contracts/chain-validity.md) SS5's own required proof: "one implementation,
+ * not three copies" -- reconcileHead, the append-time check, and this walk must all
+ * reach the SAME classification for the same on-disk state, because all three now
+ * delegate to the identical chain.validateChain. This constructs C2's row 7 (single-
+ * step lagging HEAD, hash-verified ancestor) -- chosen because it is already the
+ * best-tested case elsewhere (appendTimeCheckAutoAdvancesASingleStepLaggingHead
+ * above) and is unambiguous per the contract: NOT corruption at either call site --
+ * and asserts the status walk (checks/register-gateway-sessions.js, via verifyDir)
+ * and the append-time check (chain.checkHeadAgainstTailOrRepair, the exact function
+ * chain.appendSession calls before every append) agree: neither refuses/latches what
+ * the other treats as a silently-repairable lag. */
+function statusWalkAndAppendTimeCheckAgreeOnSingleStepLaggingHead() {
+  const dir = freshDir("divergence-single-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  const staleHead = { schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 };
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(staleHead));
+
+  // The status walk, on the stale-HEAD state, BEFORE anything repairs it on disk.
+  const walkResult = verifyDir(dir);
+  check(
+    "divergence-status-walk-classifies-single-step-lag-as-reconcilable-not-failed",
+    walkResult.status === "reconcilable" && walkResult.headAction === "advance",
+    JSON.stringify(walkResult)
+  );
+
+  // The append-time check, on the exact same on-disk state -- called directly (rather
+  // than via chain.appendSession) so this test exercises the check in isolation,
+  // without also appending a new entry, which would change what state the two are
+  // being compared against.
+  chain._resetChainIntegrityFailureForTests();
+  const logs = [];
+  let threw = null;
+  let repairedHead = null;
+  try {
+    repairedHead = chain.checkHeadAgainstTailOrRepair(dir, staleHead, (l) => logs.push(l));
+  } catch (error) {
+    threw = error;
+  }
+  check("divergence-append-time-check-does-not-refuse-the-same-state", threw === null, threw ? `${threw.code}: ${threw.message}` : "threw unexpectedly");
+  check("divergence-append-time-check-does-not-latch-the-same-state", chain.getChainIntegrityFailure() === null, JSON.stringify(chain.getChainIntegrityFailure()));
+
+  // Agreement, stated explicitly: both call sites, given the identical on-disk state,
+  // land on the SAME verified tail (entry[1], seq=2) as what HEAD should point at --
+  // neither one refuses/latches what the other one silently repairs.
+  check(
+    "divergence-both-call-sites-agree-on-the-verified-tail",
+    Boolean(repairedHead) && repairedHead.seq === entries[1].seq && repairedHead.entry_sha256 === entries[1].entry_sha256,
+    JSON.stringify(repairedHead)
+  );
+  const anomalyLog = logs.find((l) => l.includes("gateway_chain_head_lag_auto_advanced"));
+  check("divergence-append-time-check-logs-the-same-auto-advance-anomaly-the-walk-reports", Boolean(anomalyLog), JSON.stringify(logs));
+}
+
+function appendTimeCheckRefusesATwoStepLaggingHead() {
+  const dir = freshDir("append-time-two-step-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 3);
+  // Roll HEAD back TWO steps behind the real tail (entry[2]) -- not the auto-repairable
+  // single-step case.
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+
+  chain._resetChainIntegrityFailureForTests();
+  let threw = null;
+  try {
+    chain.appendSession(dir, sealTrivialSession("two-step-lag-new", keys));
+  } catch (error) {
+    threw = error;
+  }
+  check("append-time-two-step-lag-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_HEAD_DIVERGED", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("append-time-two-step-lag-chain-unchanged-no-fourth-entry", chain.readChain(dir).length === 3, JSON.stringify(chain.readChain(dir).map((e) => e.seq)));
+  check("append-time-two-step-lag-head-untouched", chain.readHead(dir).seq === 1, JSON.stringify(chain.readHead(dir)));
+  const latched = chain.getChainIntegrityFailure();
+  check("append-time-two-step-lag-latches-the-integrity-failure", Boolean(latched) && latched.class === "multi-step-lag", JSON.stringify(latched));
+}
+
+function appendTimeCheckRefusesAForkedHead() {
+  const dir = freshDir("append-time-fork");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  // A genuine fork: same seq/bundle_id as the real tail, but a bogus hash that does not
+  // match anything actually in chain.jsonl.
+  const forked = Object.assign({}, entries[1], { entry_sha256: "d".repeat(64) });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(forked));
+
+  let threw = null;
+  try {
+    chain.appendSession(dir, sealTrivialSession("fork-new", keys));
+  } catch (error) {
+    threw = error;
+  }
+  check("append-time-fork-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_HEAD_DIVERGED", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("append-time-fork-chain-unchanged", chain.readChain(dir).length === 2, JSON.stringify(chain.readChain(dir).map((e) => e.seq)));
+}
+
+function reconcileHeadEmptyChainIsANoOpWithZeroWrites() {
+  const dir = freshDir("reconcile-empty");
+  fs.mkdirSync(dir, { recursive: true }); // no gateway-sessions/ dir at all yet
+  const result = chain.reconcileHead(dir);
+  check("reconcile-empty-action-none", result.action === "none", JSON.stringify(result));
+  check("reconcile-empty-writes-no-head-file", !fs.existsSync(chain.headPath(dir)), "HEAD.json was written for a genuinely empty chain");
+  check("reconcile-empty-writes-no-chain-file", !fs.existsSync(chain.chainPath(dir)), "chain.jsonl was written for a genuinely empty chain");
+}
+
+function reconcileHeadRefusesAMultiStepLaggingHeadAtStartupToo() {
+  // Round-1 fix-plan commit 4: multi-step lag is a REFUSE case per C2 row 7's own last
+  // sentence, at BOTH call sites -- reconcileHead delegates entirely to the same
+  // classifyHeadAgainstTail/validateChain classification the O(1) append-time check
+  // uses, it does not get a weaker/more-permissive version just because it can afford a
+  // full walk. Only an EXACT single-step, hash-matching lag ever auto-catches-up.
+  const dir = freshDir("reconcile-multi-lag");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 4);
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+
+  chain._resetChainIntegrityFailureForTests();
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-multi-step-lag-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("reconcile-multi-step-lag-head-untouched", chain.readHead(dir).bundle_id === entries[0].bundle_id, JSON.stringify(chain.readHead(dir)));
+  const latched = chain.getChainIntegrityFailure();
+  check("reconcile-multi-step-lag-latches-the-integrity-failure", Boolean(latched) && latched.class === "multi-step-lag", JSON.stringify(latched));
+}
+
+function reconcileHeadRebuildsFromAMalformedHeadFile() {
+  const dir = freshDir("reconcile-malformed-head");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  fs.writeFileSync(chain.headPath(dir), "{not even close to json");
+
+  const result = chain.reconcileHead(dir);
+  check("reconcile-malformed-head-action-advanced", result.action === "advanced" && result.to.seq === 2, JSON.stringify(result));
+  check("reconcile-malformed-head-rebuilt-correctly", chain.readHead(dir).bundle_id === entries[1].bundle_id, JSON.stringify(chain.readHead(dir)));
+}
+
+/* Codex PR #33 review "renew the claim while validating the startup chain": reconcileHead
+ * renewed the writer claim exactly ONCE before handing the whole chain to validateChain --
+ * so on a long chain the synchronous walk itself could outlast the 45s staleness window
+ * and let another same-host gateway steal the claim mid-walk, after which this function
+ * would still write HEAD.json. The status/health walk already had the per-entry hook
+ * (walkGatewaySessionsCallsMaybeRenewOncePerEntry above); this is the same wiring for the
+ * startup walk. 5 valid entries => 1 pre-walk renew + 5 per-entry renews. A chain that
+ * validates clean returns before the repair write, so no extra renew is expected there.
+ *
+ * Round-N fix (frontier-panel finding #8): readChainForValidation now streams the chain
+ * file in chunks (streamChainFileLines) instead of reading it whole into a string, and
+ * accepts its own onProgress hook wired to the same maybeRenew closure so a chain large
+ * enough to outlast the staleness window is renewed DURING the read, not just before/after
+ * it. This whole 5-entry fixture fits in a single 1MB read chunk, so the streaming read
+ * contributes exactly one additional renew call beyond the pre-walk + per-entry total:
+ * 1 pre-walk + 1 read-phase (one chunk) + 5 per-entry = 7. */
+function reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk() {
+  const dir = freshDir("reconcile-per-entry-renew");
+  const keys = makeKeys();
+  for (let i = 0; i < 5; i++) chain.appendSession(dir, sealTrivialSession(`renew-${i}`, keys));
+
+  let renewCalls = 0;
+  const result = chain.reconcileHead(dir, { maybeRenew: () => { renewCalls++; } });
+  check("reconcile-per-entry-renew-chain-is-valid", result.action === "none", JSON.stringify(result));
+  check(
+    "reconcile-renews-the-claim-once-per-chain-entry-not-only-once-before-the-walk",
+    renewCalls === 7,
+    `expected 7 (1 pre-walk + 1 read-phase + 5 per-entry), got ${renewCalls}`
+  );
+}
+
+/* Second half of the same review item ("revalidate ownership before the repair write"):
+ * the per-entry hook cannot cover a walk of 0-1 entries, so the HEAD.json repair write
+ * gets its own unconditional renew immediately before it, mirroring
+ * gateway.js#abandonConnection's own pre-appendSession renew. 2 entries with a one-step
+ * stale HEAD => 1 pre-walk + 2 per-entry + 1 pre-write = 4, plus the same read-phase renew
+ * described above (Round-N fix, finding #8) since this fixture's tiny chain file also
+ * fits in a single streamed chunk => 1 pre-walk + 1 read-phase + 2 per-entry + 1 pre-write = 5. */
+function reconcileHeadRenewsTheClaimAgainImmediatelyBeforeTheRepairWrite() {
+  const dir = freshDir("reconcile-pre-write-renew");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 }));
+
+  let renewCalls = 0;
+  const result = chain.reconcileHead(dir, { maybeRenew: () => { renewCalls++; } });
+  check("reconcile-pre-write-renew-advanced-the-head", result.action === "advanced" && result.to.seq === 2, JSON.stringify(result));
+  check(
+    "reconcile-renews-the-claim-immediately-before-the-head-repair-write",
+    renewCalls === 5,
+    `expected 5 (1 pre-walk + 1 read-phase + 2 per-entry + 1 pre-write), got ${renewCalls}`
+  );
+}
+
+/* And the point of renewing at all: a lease lost PARTWAY THROUGH the walk must abort the
+ * walk where it happened, never fall through to a HEAD.json write this process no longer
+ * owns the right to make. Fails the SECOND maybeRenew call -- the first entry of the walk,
+ * after the pre-walk renew already succeeded. */
+function reconcileHeadPerEntryLeaseLossAbortsBeforeTheRepairWrite() {
+  const dir = freshDir("reconcile-mid-walk-lease-loss");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  const staleHead = { schema_version: entries[0].schema_version, seq: entries[0].seq, bundle_id: entries[0].bundle_id, entry_sha256: entries[0].entry_sha256 };
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(staleHead));
+
+  let renewCalls = 0;
+  let threw = null;
+  try {
+    chain.reconcileHead(dir, {
+      maybeRenew: () => {
+        renewCalls++;
+        if (renewCalls === 2) throw Object.assign(new Error("simulated lease takeover mid startup chain walk"), { code: "WRITER_CLAIM_LOST" });
+      },
+    });
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-mid-walk-lease-loss-propagates", threw !== null && threw.code === "WRITER_CLAIM_LOST", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("reconcile-mid-walk-lease-loss-leaves-head-untouched", chain.readHead(dir).seq === 1, JSON.stringify(chain.readHead(dir)));
+}
+
+function reconcileHeadRefusesAGenuineFork() {
+  const dir = freshDir("reconcile-fork");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  const forked = Object.assign({}, entries[1], { entry_sha256: "c".repeat(64) });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(forked));
+
+  chain._resetChainIntegrityFailureForTests();
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-fork-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+  check("reconcile-fork-head-untouched", chain.readHead(dir).entry_sha256 === "c".repeat(64), JSON.stringify(chain.readHead(dir)));
+  const latched = chain.getChainIntegrityFailure();
+  check("reconcile-fork-latches-the-integrity-failure", Boolean(latched) && latched.class === "fork", JSON.stringify(latched));
+}
+
+/* Round-1 fix-plan commit 6 (classified false positives): an OPERATIONAL failure
+ * merely opening chain.jsonl (EACCES/EPERM -- exactly what a misapplied or
+ * in-progress commit-2 group-readable chmod pass produces) must refuse THIS append
+ * but must NOT engage the process-wide admission latch. Simulated via a targeted
+ * fs.openSync patch (this sandbox runs as root, where a real chmod would not actually
+ * deny the read) rather than real OS permissions -- mirrors tests/gateway/
+ * startup-permissions/run-tests.js's own withPatched/codeError fault-injection style. */
+function checkHeadAgainstTailOperationalPermissionFailureRefusesButDoesNotLatch() {
+  const dir = freshDir("tail-eacces-operational");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  chain._resetChainIntegrityFailureForTests();
+
+  const targetPath = chain.chainPath(dir);
+  const originalOpenSync = fs.openSync;
+  fs.openSync = function (p, ...rest) {
+    if (p === targetPath) {
+      const err = new Error("permission denied");
+      err.code = "EACCES";
+      throw err;
+    }
+    return originalOpenSync.apply(fs, [p, ...rest]);
+  };
+  let threw = null;
+  try {
+    chain.checkHeadAgainstTailOrRepair(dir, null, () => {});
+  } catch (error) {
+    threw = error;
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+  check(
+    "tail-eacces-refuses-this-append-with-the-operational-code",
+    threw !== null && threw.code === "GATEWAY_CHAIN_TAIL_UNREADABLE_OPERATIONAL",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+  check("tail-eacces-does-not-latch-admission", chain.getChainIntegrityFailure() === null, JSON.stringify(chain.getChainIntegrityFailure()));
+}
+
+/* Companion regression lock: a non-permission open failure (anything other than
+ * EACCES/EPERM) for the exact same "could not even open chain.jsonl" shape must still
+ * refuse AND latch -- proves the operational carve-out above is narrowly scoped to
+ * permission codes, not a general "any open failure is fine" loophole. */
+function checkHeadAgainstTailGenuineUnreadableTailStillLatches() {
+  const dir = freshDir("tail-genuine-unreadable");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  chain._resetChainIntegrityFailureForTests();
+
+  const targetPath = chain.chainPath(dir);
+  const originalOpenSync = fs.openSync;
+  fs.openSync = function (p, ...rest) {
+    if (p === targetPath) {
+      const err = new Error("I/O error");
+      err.code = "EIO";
+      throw err;
+    }
+    return originalOpenSync.apply(fs, [p, ...rest]);
+  };
+  let threw = null;
+  try {
+    chain.checkHeadAgainstTailOrRepair(dir, null, () => {});
+  } catch (error) {
+    threw = error;
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+  check(
+    "tail-eio-refuses-this-append-with-the-diverged-code",
+    threw !== null && threw.code === "GATEWAY_CHAIN_HEAD_DIVERGED",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+  const latched = chain.getChainIntegrityFailure();
+  check("tail-eio-latches-admission", Boolean(latched) && latched.class === "tail-unreadable", JSON.stringify(latched));
+  chain._resetChainIntegrityFailureForTests();
+}
+
+function reconcileHeadAheadRefuses() {
+  const dir = freshDir("reconcile-head-ahead");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 1);
+  const ahead = { schema_version: "1.0", seq: 5, bundle_id: "ghost", entry_sha256: "b".repeat(64) };
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify(ahead));
+
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-head-ahead-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+}
+
+function reconcileHeadRefusesWhenChainFailsStructuralValidation() {
+  const dir = freshDir("reconcile-tampered");
+  const keys = makeKeys();
+  const entries = makeStaleHeadFixture(dir, keys, 2);
+  // Tamper the interior (first) entry directly in chain.jsonl.
+  const lines = fs.readFileSync(chain.chainPath(dir), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  lines[0].entry_sha256 = "9".repeat(64);
+  fs.writeFileSync(chain.chainPath(dir), lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-tampered-chain-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+}
+
+function reconcileHeadRefusesEmptyChainWithHeadPresent() {
+  const dir = freshDir("reconcile-empty-with-head");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true });
+  fs.writeFileSync(chain.headPath(dir), JSON.stringify({ schema_version: "1.0", seq: 1, bundle_id: "ghost", entry_sha256: "a".repeat(64) }));
+  // chain.jsonl itself does not exist -- HEAD.json names a tail that cannot possibly
+  // exist. Zero entries, but NOT the empty-chain-is-fine case (C2 row 2).
+
+  let threw = null;
+  try {
+    chain.reconcileHead(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check("reconcile-empty-with-head-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
+}
+
+/* ==================================================================================
+ * Round-N fix (frontier-panel finding #8 checklist): streamChainFileLines (the shared
+ * chunked-byte-read primitive readChain/readChainForValidation are built on) tested
+ * directly at the primitive level -- chunk-boundary correctness, UTF-8 safety, renewal
+ * firing during the read itself (not only after it), immediate abort on lost ownership
+ * mid-read (the competing-claimant-after-a-stale-lease case), and unchanged behavior for
+ * a file with no trailing newline / an absent file. Exported specifically so these can be
+ * driven with small, fast, deterministic chunkBytes overrides instead of a multi-hundred-
+ * MB fixture (checklist: "a mocked fs / small chunk size that pretends >512MB without
+ * checking in a gigabyte fixture" -- streamChainFileLines's own memory profile is
+ * O(chunk size), not O(file size), so proving correctness across MANY small forced chunk
+ * boundaries generalizes to any file size by construction, without needing an actual
+ * multi-hundred-MB file on disk).
+ * ================================================================================== */
+
+function collectStreamedLines(dir, options) {
+  const lines = [];
+  const progress = [];
+  chain.streamChainFileLines(dir, {
+    ...options,
+    onLine: (buf, idx, meta) => lines.push({ idx, meta, text: buf ? buf.toString("utf8") : null }),
+    onProgress: (n) => progress.push(n),
+  });
+  return { lines, progress };
+}
+
+function streamChainFileLinesHandlesMultiByteUtf8SplitAcrossATinyChunkBoundary() {
+  const dir = freshDir("stream-utf8-chunk");
+  const entries = [
+    { schema_version: "1.0", seq: 1, bundle_id: "plain-ascii" },
+    { schema_version: "1.0", seq: 2, bundle_id: "résumé-日本語-emoji-🎉-more" },
+    { schema_version: "1.0", seq: 3, bundle_id: "back-to-ascii" },
+  ];
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  // chunkBytes=3 forces the raw byte reader to split well inside the multi-byte UTF-8
+  // characters above on nearly every read -- streamChainFileLines only ever decodes a
+  // complete assembled LINE (never a mid-chunk partial buffer), so this must not corrupt
+  // the decoded text regardless of exactly where each chunk boundary lands.
+  const { lines, progress } = collectStreamedLines(dir, { chunkBytes: 3 });
+  check("stream-utf8-forces-many-physical-chunks", progress.length > 10, `only ${progress.length} chunk(s) -- fixture too small to prove the boundary case`);
+  check("stream-utf8-parses-all-three-lines", lines.length === 3, JSON.stringify(lines));
+  check(
+    "stream-utf8-multibyte-content-survives-the-chunk-split-intact",
+    lines.every((l, i) => !l.meta.oversized && JSON.parse(l.text).bundle_id === entries[i].bundle_id),
+    JSON.stringify(lines)
+  );
+}
+
+function streamChainFileLinesRenewsOncePerPhysicalChunkAcrossManyChunks() {
+  const dir = freshDir("stream-renew-many-chunks");
+  const entries = Array.from({ length: 8 }, (_, i) => ({ schema_version: "1.0", seq: i + 1, bundle_id: `chunked-renew-${i}` }));
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  let renewCalls = 0;
+  const lines = [];
+  chain.streamChainFileLines(dir, {
+    chunkBytes: 5, // tiny -- forces dozens of physical read syscalls for this small fixture
+    onProgress: () => { renewCalls++; },
+    onLine: (buf) => lines.push(JSON.parse(buf.toString("utf8"))),
+  });
+  check("stream-renew-parses-every-entry-despite-tiny-chunks", lines.length === 8 && lines.every((l, i) => l.bundle_id === entries[i].bundle_id), JSON.stringify(lines));
+  check(
+    "stream-renew-fires-more-than-once-i.e.-genuinely-during-the-read-not-only-once-at-the-end",
+    renewCalls > 8,
+    `expected many renew opportunities across chunk boundaries, got ${renewCalls}`
+  );
+}
+
+/* The competing-claimant-after-a-stale-lease case at the primitive level: once
+ * onProgress (the caller's maybeRenew hook) detects lost ownership mid-read and throws,
+ * the read must abort AT THAT POINT -- no further physical chunks are read and no further
+ * lines are handed to onLine. This is what actually prevents the former (now-stale) owner
+ * from completing its read and going on to act as if it still held the claim: the error
+ * propagates by reference, unmodified, out of the read entirely. */
+function streamChainFileLinesAbortsImmediatelyWhenOnProgressDetectsLostOwnership() {
+  const dir = freshDir("stream-lost-ownership-mid-read");
+  const entries = Array.from({ length: 6 }, (_, i) => ({ schema_version: "1.0", seq: i + 1, bundle_id: `pre-takeover-${i}` }));
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  const takeoverError = Object.assign(new Error("simulated competing claimant won the lease after an over-TTL stall"), { code: "WRITER_CLAIM_LOST" });
+  let progressCalls = 0;
+  const linesSeenBeforeAbort = [];
+  let threw = null;
+  try {
+    chain.streamChainFileLines(dir, {
+      chunkBytes: 4, // many chunks -- so the second progress call is still mid-file, not the last one
+      onLine: (buf) => linesSeenBeforeAbort.push(buf ? buf.toString("utf8") : null),
+      onProgress: () => {
+        progressCalls++;
+        if (progressCalls === 2) throw takeoverError;
+      },
+    });
+  } catch (error) {
+    threw = error;
+  }
+  check("stream-lost-ownership-propagates-the-exact-error-by-reference", threw === takeoverError, threw && threw.message);
+  check(
+    "stream-lost-ownership-does-not-finish-reading-the-rest-of-the-file",
+    linesSeenBeforeAbort.length < entries.length,
+    `expected an early abort (fewer than ${entries.length} lines), got ${linesSeenBeforeAbort.length}`
+  );
+}
+
+function streamChainFileLinesToleratesFileWithNoTrailingNewline() {
+  const dir = freshDir("stream-no-trailing-newline");
+  const entries = [
+    { schema_version: "1.0", seq: 1, bundle_id: "first" },
+    { schema_version: "1.0", seq: 2, bundle_id: "last-no-newline" },
+  ];
+  // Deliberately no trailing "\n" -- the final unterminated line is still a real record.
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+  const { lines } = collectStreamedLines(dir, {});
+  check("stream-no-trailing-newline-still-parses-both-lines", lines.length === 2, JSON.stringify(lines));
+  check(
+    "stream-no-trailing-newline-final-unterminated-line-is-not-dropped",
+    lines[1] && JSON.parse(lines[1].text).bundle_id === "last-no-newline",
+    JSON.stringify(lines)
+  );
+}
+
+function streamChainFileLinesNoOpWhenChainFileIsAbsent() {
+  const dir = freshDir("stream-absent-file");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true }); // directory exists, chain.jsonl does not
+  const { lines, progress } = collectStreamedLines(dir, {});
+  check("stream-absent-file-calls-onLine-zero-times", lines.length === 0, JSON.stringify(lines));
+  check("stream-absent-file-calls-onProgress-zero-times", progress.length === 0, JSON.stringify(progress));
+}
+
+/* Locks in the finding #8 checklist's distinct-error-code requirement: an oversized
+ * record is a size/resource condition (GATEWAY_CHAIN_ENTRY_TOO_LARGE), never conflated
+ * with CORRUPT_GATEWAY_CHAIN -- the catch-all reserved for genuine content corruption
+ * (malformed JSON, bad hash linkage). Both halves are pinned so a future edit cannot
+ * silently re-merge the two failure classes. */
+function readChainRejectsOversizedRecordWithADistinctCode() {
+  const dir = freshDir("readchain-oversized");
+  const bigBundleId = "x".repeat(chain.MAX_ENTRY_BYTES + 100);
+  writeChainFile(dir, JSON.stringify({ schema_version: "1.0", seq: 1, bundle_id: bigBundleId }) + "\n");
+  let threw = null;
+  try {
+    chain.readChain(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check(
+    "readchain-oversized-record-throws-a-distinct-too-large-code-not-corrupt",
+    threw !== null && threw.code === "GATEWAY_CHAIN_ENTRY_TOO_LARGE",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+}
+
+function readChainStillLabelsGenuineJsonCorruptionAsCorrupt() {
+  const dir = freshDir("readchain-corrupt-json");
+  writeChainFile(dir, '{"schema_version": "1.0", "seq": 1, "bundle_id": "ok"}\n{not even close to json\n');
+  let threw = null;
+  try {
+    chain.readChain(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check(
+    "readchain-malformed-json-record-still-reports-corrupt-not-too-large",
+    threw !== null && threw.code === "CORRUPT_GATEWAY_CHAIN",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+}
+
+/* Integration-level sanity check through the PUBLIC readChain API (default 1MB chunking,
+ * no chunkBytes override) with a real file large enough to force more than one physical
+ * chunk: proves the default production configuration -- not just the primitive with a
+ * tiny forced chunkBytes -- genuinely spans multiple chunks and still parses every entry
+ * correctly, and that onProgress (the lease-renewal hook both real call sites wire in)
+ * actually fires more than once for it. This is the closest cheap proxy for "a chain
+ * exceeding the old whole-file materialization ceiling parses successfully": the read
+ * path here is provably chunked (progress.length > 1), and streamChainFileLines's own
+ * memory profile is chunk-size-invariant, so this generalizes to any file size without
+ * needing an actual 512MB+ fixture checked into the repo. */
+function readChainHandlesARealMultiChunkFileThroughTheDefaultPublicApi() {
+  const dir = freshDir("readchain-multi-chunk-real");
+  // ~40 entries of ~35KB padding each => comfortably over the default 1MB chunk size,
+  // each individual entry still well under MAX_ENTRY_BYTES (64KB) so none is rejected.
+  const entries = Array.from({ length: 40 }, (_, i) => ({ schema_version: "1.0", seq: i + 1, bundle_id: `multi-chunk-${i}`, padding: "p".repeat(35 * 1024) }));
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  const progress = [];
+  const result = chain.readChain(dir, { onProgress: (n) => progress.push(n) });
+  check("readchain-multi-chunk-real-parses-every-entry", result.length === 40 && result.every((e, i) => e.bundle_id === entries[i].bundle_id), `parsed ${result.length} of 40`);
+  check("readchain-multi-chunk-real-genuinely-spans-more-than-one-physical-chunk", progress.length > 1, `expected >1 chunk read, got ${progress.length}`);
+}
+
 function main() {
   tenSessionsInSequence();
   fixtureDataVerifiesIndependently();
@@ -194,6 +1305,81 @@ function main() {
   missingGenesisPrefixDetected();
   bundleIdCollisionRefused();
   emptyChainIsNotApplicable();
+
+  validateChainEmptyGenesisIsNotAFailure();
+  validateChainEmptyWithHeadRefuses();
+  validateChainDetectsSequenceGap();
+  validateChainDetectsDuplicateSeqAsFork();
+  validateChainDetectsTamperedEntry();
+  validateChainDetectsBrokenLink();
+  validateChainDetectsInvalidGenesisSeq();
+  validateChainDetectsInvalidGenesisPrev();
+  validateChainRefusesMalformedInteriorRecordNotJustTheLast();
+  validateChainAutoAdvancesSingleStepLaggingHead();
+  validateChainRefusesMultiStepLaggingHead();
+  validateChainRefusesHeadAheadOfTail();
+  validateChainRefusesHeadSameSeqDifferentHashAsFork();
+  validateChainRefusesOneStepBackHeadThatIsNotAGenuineAncestor();
+  validateChainRebuildsMissingHeadFromVerifiedTail();
+  validateChainDoesNotRebuildWhenTheChainItselfDoesNotValidate();
+  validateChainTruncatesTornFinalRecordAndRebuildsHead();
+  validateChainTornFinalRecordWithHeadAlreadyAtTheTruncatedTailStillReportsReconciliation();
+  validateChainTornSoleGenesisRecordWithNoHeadReconcilesToEmptyTail();
+  validateChainTornSoleRecordWithHeadPresentRefuses();
+  validateChainNeverConflatesTornTailWithInteriorCorruption();
+
+  readChainTailAbsentWhenFileDoesNotExist();
+  readChainTailEmptyWhenFileIsZeroBytes();
+  readChainTailEmptyWhenFileIsOnlyBlankLines();
+  readChainTailSucceedsWithTrailingNewline();
+  readChainTailSucceedsWithoutTrailingNewline();
+  readChainTailReturnsTheSameEntryRegardlessOfTrailingNewline();
+  readChainTailSkipsBlankLinesBeforeTheLastEntry();
+  readChainTailFindsTheLastEntryWhenTheWindowStartsMidRecord();
+  readChainTailGrowsPastTheInitialWindowForAnOversizedFinalRecord();
+  readChainTailFindsALargeFinalRecordWhenANewlineIsAlreadyInTheFirstWindow();
+  readChainTailFailsClosedWhenNoNewlineIsFoundWithinTheCappedWindow();
+  readChainTailReportsCorruptForATruncatedFinalRecord();
+  readChainTailReportsCorruptForAMalformedFinalRecord();
+  readChainTailReportsCorruptWhenTheFinalRecordFailsItsShapeCheck();
+  readChainTailHandlesUtf8BoundariesSplitAcrossTheWindowEdge();
+  readChainTailUtf8LastEntryItselfSurvivesGrowth();
+  readChainTailHandlesShortReads();
+  readChainTailAbsentEmptyCorruptAreThreeDistinctOutcomes();
+
+  appendTimeCheckAutoAdvancesASingleStepLaggingHead();
+  statusWalkAndAppendTimeCheckAgreeOnSingleStepLaggingHead();
+  appendTimeCheckRefusesATwoStepLaggingHead();
+  appendTimeCheckRefusesAForkedHead();
+  checkHeadAgainstTailOperationalPermissionFailureRefusesButDoesNotLatch();
+  checkHeadAgainstTailGenuineUnreadableTailStillLatches();
+  reconcileHeadEmptyChainIsANoOpWithZeroWrites();
+  reconcileHeadRefusesAMultiStepLaggingHeadAtStartupToo();
+  reconcileHeadRebuildsFromAMalformedHeadFile();
+  reconcileHeadRefusesAGenuineFork();
+  reconcileHeadAheadRefuses();
+  reconcileHeadRefusesWhenChainFailsStructuralValidation();
+  reconcileHeadRefusesEmptyChainWithHeadPresent();
+
+  // Codex PR #33 review round 2 (2026-09-17): startup-walk lease keepalive.
+  reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk();
+  reconcileHeadRenewsTheClaimAgainImmediatelyBeforeTheRepairWrite();
+  reconcileHeadPerEntryLeaseLossAbortsBeforeTheRepairWrite();
+
+  // Round-N fix (frontier-panel finding #8 checklist): streamChainFileLines primitive +
+  // readChain error-code tests.
+  streamChainFileLinesHandlesMultiByteUtf8SplitAcrossATinyChunkBoundary();
+  streamChainFileLinesRenewsOncePerPhysicalChunkAcrossManyChunks();
+  streamChainFileLinesAbortsImmediatelyWhenOnProgressDetectsLostOwnership();
+  streamChainFileLinesToleratesFileWithNoTrailingNewline();
+  streamChainFileLinesNoOpWhenChainFileIsAbsent();
+  readChainRejectsOversizedRecordWithADistinctCode();
+  readChainStillLabelsGenuineJsonCorruptionAsCorrupt();
+  readChainHandlesARealMultiChunkFileThroughTheDefaultPublicApi();
+
+  walkGatewaySessionsCallsMaybeRenewOncePerEntry();
+  walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded();
+  walkAbortsOnLeaseTakeoverMidWalkNotDowngradedToAFailedReport();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;

@@ -30,6 +30,7 @@ const modeGate = require("./mode-gate.js");
 const gatewayConfig = require("./config.js");
 const chain = require("./chain.js");
 const session = require("./session.js");
+const recovery = require("./recovery.js");
 const { GatewayProxy, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION } = require("./proxy.js");
 const downstream = require("./downstream.js");
 const { runStdioAgentTransport, runHttpAgentTransport } = require("./agent-transport.js");
@@ -37,6 +38,7 @@ const writerClaimModule = require("../writer-claim.js");
 const { WriterClaim } = writerClaimModule;
 const registerGatewaySessions = require("../../checks/register-gateway-sessions.js");
 const stateStore = require("../state-store.js");
+const { tightenStateDirPermissions } = require("./startup-permissions.js");
 
 /** SS3.7's bounded drain: waits (polling) until every open session on `proxy` has no
  * calls still in flight, or `timeoutMs` elapses, whichever first. Extracted as its own
@@ -133,6 +135,23 @@ function withTimeout(promise, timeoutMs, makeError) {
  * see agent-transport.js's header). Any other case (an http agent transport, or no agent
  * currently connected) gets a real JSON-RPC error naming exactly why, rather than the
  * silent drop this was before. */
+/* Per docs/contracts/wal-append-failure-semantics.md (C1 SS1-2): a throw from
+ * recovery.appendWalEvent means UNKNOWN persistence (possibly nothing written,
+ * possibly a torn line, possibly a complete line that only failed a later fsync/close),
+ * never confirmed absence. Any of those three outcomes is grounds to poison the
+ * connection: marks `session.walPoisoned` on the FIRST such failure only (a later
+ * failure on an already-poisoned connection is not a new fact worth overwriting the
+ * original reason with), so every later appendWalEvent attempt on this connection is
+ * refused before touching the filesystem instead of risking a second write landing on
+ * top of a possibly-torn line. Shared by every appendWalEvent call site in this
+ * function (CALL_START and both CALL_RESULT branches) so the contract is enforced
+ * uniformly rather than re-implemented per call site. */
+function poisonWalOnFailure(s, walError, proxy) {
+  if (s && !s.walPoisoned) {
+    s.walPoisoned = { reason: walError.message, at: proxy ? proxy.now() : Date.now() };
+  }
+}
+
 function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverName) {
   if (msg.method !== "sampling/createMessage") {
     return Promise.resolve({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `This gateway does not forward downstream-initiated method "${msg.method}" to the agent.` } });
@@ -212,13 +231,115 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
       },
     });
   }
+  /* Per docs/contracts/wal-append-failure-semantics.md (C1 SS2): once an earlier call on
+   * this connection poisoned its WAL (see the CALL_START/CALL_RESULT append catches
+   * below, which set s.walPoisoned on the very first append failure), every later
+   * appendWalEvent attempt on the SAME connection must be refused "before it touches the
+   * filesystem" -- not attempted-and-caught again. Checking here, before recordCallStart
+   * or any WAL write, is what makes that true for a brand-new sampling request: it never
+   * reaches the try/catch below at all. The poison is in-memory and connection-scoped
+   * (cleared by a fresh connection getting a fresh session object), so this never blocks
+   * a different connection or survives a reconnect. */
+  if (s && s.walPoisoned) {
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32000,
+        message:
+          "This connection's WAL was poisoned by an earlier append failure " +
+          `(${s.walPoisoned.reason}) and is refusing every further durable write on this ` +
+          "connection rather than risk concatenating onto a possibly-torn line -- per " +
+          "docs/contracts/wal-append-failure-semantics.md (C1). Not admitting this " +
+          "sampling/createMessage request; close and reopen the connection to get a fresh WAL.",
+      },
+    });
+  }
+  /* Codex PR #33 review "persist sampling calls in the recovery WAL": this forward is
+   * recorded into the in-memory session (above) but, before this fix, NEVER into
+   * recovery.js's WAL at all -- unlike proxy.js's own tools/call path. A crash after the
+   * agent answers this sampling request but before the connection's own close would
+   * silently omit that model invocation from a recovered/sealed bundle: recoverCrashedSessions
+   * replays this connection's WAL from scratch and previously had no event type for it,
+   * and even hard-coded isModelCall:false on every CALL_START it did replay. This is
+   * deliberately NOT the same gap as the disclosed one in KNOWN-LIMITATIONS.md item 11
+   * ("an agent-initiated sampling/createMessage forwarded through proxy.js's own dispatch
+   * branch is out of scope for the fence") -- that disclosure is scoped to the opposite
+   * direction (an AGENT sending sampling/createMessage INTO this gateway) and says so
+   * explicitly ("rather than a downstream server"); this is a downstream SERVER's own
+   * request being forwarded UP to the agent, a different code path (this function, not
+   * proxy.js's handleMessage) with no matching disclosure. Reuses the same CALL_START/
+   * CALL_RESULT WAL event shape proxy.js's tools/call path uses (same recoverCrashedSessions/
+   * abandonConnection replay code handles both), with isModelCall:true now carried through
+   * so replay can tell the two apart instead of assuming every replayed call is a plain
+   * tool call. No idempotency-intent fencing is added here (Finding 2's fence is
+   * deliberately scoped to tools/call only, unchanged) -- only Finding 1's WAL/attestation
+   * coverage is extended to this path.
+   *
+   * Ordering note (Cluster H, frontier-panel review 2026-09-14, 5/5 unanimous): the
+   * MAX_COMPLETED_CALLS_PER_SESSION refusal above runs FIRST and returns early, so a
+   * refused call is never admitted, recorded in session.calls, or forwarded to the agent
+   * -- it correctly never reaches the WAL either. The admission gate and the durability
+   * write share one boundary, not two: there is no "evicted call still needs a WAL
+   * entry" case on this path, since eviction here means outright refusal, not eviction
+   * of an already-recorded call from memory. The WAL append below remains unconditional
+   * on whatever this admission check decided; it is never itself capped or tombstoned. */
+  let walCallSeq = null;
+  let walAppendFailed = null;
   if (s) {
+    walCallSeq = s.nextCallSeq;
     session.recordCallStart(s, correlationKey, {
       tool: "sampling/createMessage",
       server: recordedServerName,
       arguments: msg.params,
       isModelCall: true,
       ts: startTs,
+    });
+    try {
+      recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, {
+        type: "CALL_START",
+        call_seq: walCallSeq,
+        tool: "sampling/createMessage",
+        server: recordedServerName,
+        arguments: msg.params,
+        isModelCall: true,
+        ts: proxy.now(),
+      });
+    } catch (walError) {
+      poisonWalOnFailure(s, walError, proxy);
+      walAppendFailed = walError;
+    }
+  }
+  if (walAppendFailed) {
+    /* Codex PR #33 review "refuse sampling when its CALL_START cannot be saved": this
+     * append happens strictly BEFORE agentPusher.current() is ever invoked -- nothing
+     * has been sent to the agent yet at this point, so forwarding anyway is not "already
+     * in flight," it is choosing to forward work this gateway just proved it cannot
+     * durably attest.
+     *
+     * Corrected per docs/contracts/wal-append-failure-semantics.md (C1): this comment
+     * used to say the CALL_RESULT append further below has "no 'don't forward' option
+     * left" because the downstream call had already completed. That is no longer true --
+     * the CALL_RESULT success-branch append below is now fail-closed too (see its own
+     * comment): the gateway withholds the real result and returns an error instead when
+     * that append fails, exactly the same "don't hand back what we can't durably attest"
+     * choice made here. The two branches differ only in WHEN the choice is available: a
+     * CALL_START failure can refuse to forward at all (this branch); a CALL_RESULT
+     * failure can only refuse to RETURN a result the agent already produced -- it cannot
+     * un-invoke the agent.
+     *
+     * A crash before this connection's own close would then replay with no CALL_START
+     * for this call at all, recreating exactly the attestation gap Finding 1 exists to
+     * close. Roll back the in-memory pending-call entry (there is nothing durable to
+     * undo) and return a real JSON-RPC error to the downstream server instead, matching
+     * proxy.js's own "not dispatched -- safe to retry" contract for the identical
+     * failure mode. */
+    if (s) s.pendingCalls.delete(correlationKey);
+    log(`Refusing to forward a downstream-initiated sampling/createMessage request to the agent: its CALL_START could not be durably recorded (${walAppendFailed.message}).`);
+    return Promise.resolve({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: { code: -32000, message: `Failed to durably record this sampling request before forwarding it to the agent: ${walAppendFailed.message}. Not forwarded -- safe to retry.` },
     });
   }
   /* Codex PR #29 review round 3 "log completed downstream-initiated sampling steps":
@@ -252,6 +373,83 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
        * entry the gateway itself already removed. */
       const correlatedNow = s && !s.finalized && s.pendingCalls.has(correlationKey);
       if (correlatedNow) {
+        /* Fail-closed CALL_RESULT WAL append, per docs/contracts/wal-append-failure-
+         * semantics.md (C1) and the 2026-09-15 fix-round decision record. Reordered to
+         * attempt the WAL append BEFORE session.recordCallResult -- matching CALL_START's
+         * own append-before-commit shape above -- rather than the other way around.
+         * recordCallResult moves this call out of pendingCalls into the permanent s.calls
+         * array that toSealableSession later seals verbatim; appending first means that if
+         * the append fails, nothing durable-looking has been committed to the in-memory
+         * record yet, and the caller below can choose what to commit instead of having to
+         * undo an already-sealed-shaped success entry.
+         *
+         * On failure: mark this connection's WAL poisoned (no best-effort second append --
+         * C1 SS3 -- the agent's real result is deliberately NOT re-attempted onto a
+         * possibly-torn line), attest the failure with the SAME anomaly kind the tools/call
+         * path already uses for the identical failure mode (GATEWAY_RECOVERY_WAL_APPEND_
+         * FAILED at proxy.js:344/795/932 -- reusing it, not minting a new kind, keeps one
+         * grep-able string for anything that keys on it), and record the call itself as an
+         * error rather than the real result -- the sealed bundle must not attest a success
+         * this gateway could not durably record.
+         *
+         * `discarded_result_sha256` is deliberately OMITTED here rather than populated: per
+         * C1 SS5, that field is only trustworthy when it hashes the EXACT serialized buffer
+         * recovery.appendWalEvent attempted (recovery.js computes that buffer internally,
+         * stamping its own recorded_at, and does not expose it to this caller) -- hashing a
+         * fresh, separate JSON.stringify(result) here would be a digest of different bytes
+         * than what was actually attempted on disk, which C1 says is worse than no digest.
+         *
+         * Honesty correction (this failure mode is NOT "safe to retry"): the agent already
+         * ran real inference and produced `result` by the time this append is attempted --
+         * unlike the CALL_START failure above, there is no "nothing happened yet" to fall
+         * back on. The message below says so plainly: the gateway did not durably record
+         * the result, the underlying model call may already have executed, and retrying it
+         * may re-execute it -- never "safe to retry."
+         *
+         * Asymmetry with tools/call, disclosed rather than silently copied: proxy.js's own
+         * CALL_RESULT append (its `correlatedNow` branch) stays fail-OPEN on the identical
+         * failure mode -- it logs/attests but still returns the real result, relying on the
+         * intent file's own cached_result as recovery's fallback source of truth. This path
+         * has no such intent fence (sampling is deliberately unfenced, per Finding 2's own
+         * scope), so there is no fallback to lean on here and fail-closed is the only honest
+         * option. Whether proxy.js's fail-open choice is itself still correct now that this
+         * sibling path no longer matches it is out of scope for this commit and is tracked
+         * as SAT-1118, not left as only this comment. */
+        let walError = null;
+        if (walCallSeq !== null) {
+          try {
+            recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError: false, ts: proxy.now() });
+          } catch (e) {
+            walError = e;
+          }
+        }
+        if (walError) {
+          poisonWalOnFailure(s, walError, proxy);
+          session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: "sampling/createMessage", detail: walError.message });
+          session.recordCallResult(s, correlationKey, {
+            result: {
+              error:
+                `This sampling call's result was not durably recorded (${walError.message}). ` +
+                "The gateway did not durably record this result; the underlying model call may " +
+                "already have executed, and retrying it may re-execute it.",
+            },
+            isError: true,
+            ts: proxy.now(),
+          });
+          logCompletion(true);
+          log(`Refusing to return a downstream-initiated sampling/createMessage result: its CALL_RESULT could not be durably recorded (${walError.message}).`);
+          return {
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: {
+              code: -32000,
+              message:
+                `Failed to durably record this sampling call's result: ${walError.message}. ` +
+                "The gateway did not durably record the result; the underlying model call may " +
+                "already have executed, and retrying may re-execute it.",
+            },
+          };
+        }
         session.recordCallResult(s, correlationKey, { result, isError: false, ts: proxy.now() });
         logCompletion(false);
       }
@@ -281,6 +479,27 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
        * closeConnection/handleDownstreamDisconnect already recorded, not a second one. */
       if (correlatedNow) {
         session.recordCallResult(s, correlationKey, { result: { error: error.message }, isError: true, ts: proxy.now() });
+        if (walCallSeq !== null) {
+          try {
+            recovery.appendWalEvent(proxy.stateDir, agentPusher.connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result: { error: error.message }, isError: true, ts: proxy.now() });
+          } catch (walError) {
+            /* Mirror-image of the success branch above, per docs/contracts/
+             * wal-append-failure-semantics.md (C1): the downstream already received (or
+             * is about to receive, via the return below) a real JSON-RPC error for this
+             * call, so there is nothing left to withhold -- this stays fail-OPEN, unlike
+             * the success branch. But per C1 SS2 this failure still poisons the
+             * connection's WAL (a torn line from THIS append is just as real a hazard as
+             * one from the success branch), and it must be ATTESTED, not just logged: a
+             * plain log() line here would leave the sealed bundle silent about a WAL
+             * write this gateway genuinely attempted and failed. Reuses the same
+             * GATEWAY_RECOVERY_WAL_APPEND_FAILED kind as the success branch and the
+             * tools/call path (proxy.js:344/795/932) -- one kind for this whole failure
+             * class, not a new one per call site. */
+            poisonWalOnFailure(s, walError, proxy);
+            session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: "sampling/createMessage", detail: walError.message });
+            log(`Failed to durably record a downstream-initiated sampling call's error result: ${walError.message}`);
+          }
+        }
         logCompletion(true);
       } else if (!s) {
         log(`downstream sampling/createMessage forward to agent failed: ${error.message}`);
@@ -414,27 +633,109 @@ function buildHealthStatus(ctx) {
    * real operational path an operator or monitor can act on -- a non-"verified" result
    * here is a fail-closed, visible signal (tampering, a sequence gap, or an incomplete
    * append), not silently invisible until someone thinks to run --selftest by hand. */
+  /* Round-1 fix-plan item 1, round-2 fix pass (Paul's 2026-09-16 decision): computed
+   * once, here, rather than inline inside the returned object below (its own previous
+   * location) so it can ALSO gate the session-chain walk's own maybeRenew() wiring just
+   * below, without a second disk read. `held_by_this_instance` is false both for a
+   * caller that never wires a real writer-claim into ctx.writerClaim (e.g. the bare
+   * `{ status: () => ({}) }` fakes several existing tests already pass) and for the one
+   * real, expected case where this claim was already released before this ran -- doStop
+   * calls writeStatusFile ONE LAST TIME after writerClaim.release() (see writeStatusFile's
+   * own doc comment) specifically so `gateway.js status` still reports an accurate
+   * "not claimed" snapshot; that call must keep succeeding, not start attempting (and
+   * failing) a renewal against a claim this instance deliberately gave up. */
+  const writerClaimStatus = ctx.writerClaim.status();
+
   let sessionChainIntegrity;
   if (headError) {
     // HEAD.json is already known corrupt/unreadable -- don't bother attempting the walk
     // (which needs `head`) just to rediscover the same failure less clearly.
     sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `HEAD.json is corrupt or unreadable: ${headError}` };
   } else {
+    /* Round-1 fix-plan item 1, round-2 fix pass: this walk is exactly the "long
+     * synchronous phase held under a writer-claim" case commit 1's own plan named
+     * alongside reconcileHead's startup walk and the WAL-replay loops -- but unlike
+     * those two (each run exactly once, before any release() can have happened yet),
+     * this walk also runs on every ~STATUS_WRITE_INTERVAL_MS tick of an already-RUNNING
+     * gateway, so it must only attempt renewal while a claim is genuinely still held by
+     * THIS instance (writerClaimStatus, above). createLeaseGuard is the SAME shared
+     * helper recoverCrashedSessions/reconcileHead's own call sites already use -- no new
+     * renewal mechanism. */
+    const leaseGuard = writerClaimStatus.held_by_this_instance ? createLeaseGuard(ctx.writerClaim) : null;
     try {
+      /* Round-N fix (frontier-panel finding #8, second exposure): chain.readChain now
+       * streams the chain file in bounded chunks instead of reading it whole into a V8
+       * string (which has a hard ~512MB string-length ceiling -- see chain.js's own header
+       * for the full writeup), but a chain large enough to take a while to stream through
+       * still needs the SAME per-progress lease renewal the per-entry walk below already
+       * gets, since this call runs on every ~STATUS_WRITE_INTERVAL_MS tick of an
+       * already-RUNNING, healthy gateway -- not just once at startup like reconcileHead.
+       * Passing leaseGuard.maybeRenew() as onProgress closes that gap the same way
+       * reconcileHead's own onProgress wiring does; a detected lease loss here propagates
+       * through this readChain call exactly like it already does through the per-entry
+       * maybeRenew below, into this try block's own catch. */
       sessionChainIntegrity = registerGatewaySessions.run({
-        chain: chain.readChain(stateDir),
+        chain: chain.readChain(stateDir, leaseGuard ? { onProgress: () => leaseGuard.maybeRenew() } : undefined),
         head,
         computeEntrySha256: chain.computeEntrySha256,
         bundleExists: (bundleId) => fs.existsSync(chain.bundlePath(stateDir, bundleId)),
+        ...(leaseGuard
+          ? { maybeRenew: () => leaseGuard.maybeRenew(), isLeaseError: (error) => leaseGuard.isLeaseError(error) }
+          : {}),
       });
     } catch (error) {
+      /* A lease loss DETECTED by this walk's own maybeRenew() (wired in just above)
+       * must not be downgraded to this catch's ordinary "report a failed
+       * session_chain_integrity, evidence only" handling -- createLeaseGuard's own doc
+       * comment (above) is explicit that a detected lease loss must never be relabeled
+       * as "flag for operator review, continue". Rethrown here, it propagates out of
+       * buildHealthStatus entirely -- this function's every OTHER internal step already
+       * has its own local try/catch that never lets an exception escape (headError,
+       * lastPersistedAt, recoveryStatus below), so this is buildHealthStatus's only
+       * throw path. See writeStatusFile's own doc comment for what happens next. */
+      if (leaseGuard && leaseGuard.isLeaseError(error)) throw error;
       sessionChainIntegrity = { status: "failed", evidence: [], assumptions: [], failure_domain: "trusted-core", reason: `session-chain verification threw: ${error.message}` };
     }
   }
 
+  /* Option C: surface every intent an operator still needs to act on (or that is merely
+   * "dispatched" and not yet stale enough to worry about) so this is discoverable without
+   * an operator having to already know a crash happened -- the whole point of a durable,
+   * un-auto-expired fence (recovery.js's own header) is defeated if nothing ever points an
+   * operator at it. Read directly from disk rather than cached from the one-time startup
+   * recoverCrashedSessions() pass, since a NEW ambiguous intent can appear at any time
+   * during normal operation (proxy.js's closeConnection fences a "dispatched" intent
+   * ambiguous the moment its owning connection closes mid-call, not just at startup). */
+  let recoveryStatus;
+  try {
+    const allIntents = recovery.listAllIntents(stateDir);
+    /* Codex PR #33 review "report each unresolved intent key in recovery output": a
+     * "dispatched" intent is normal (a live call genuinely in flight on a healthy
+     * connection) on most gateways most of the time, BUT it is also exactly the state a
+     * crashed connection's own unresolved call is left in when startup recovery could not
+     * prove its outcome (recoverCrashedSessions' RECOVERY_AMBIGUOUS_INTENT case) -- the
+     * aggregate `in_flight` count alone cannot tell those two apart, and an operator
+     * cannot act on a plain number. Itemize the same way `pending_operator_review`
+     * already does for `ambiguous` intents, so a stuck one is directly actionable
+     * (recovery-resolve/recovery-abandon both require the exact intent key) without first
+     * having to know a crash happened and go hunting through raw recovery files. */
+    const dispatched = allIntents
+      .filter((i) => i.state === "dispatched")
+      .map((i) => ({ connection_id: i.connection_id, intent_key: i.intent_key, tool: i.tool, dispatched_since: i.dispatched_at || null }));
+    recoveryStatus = {
+      pending_operator_review: allIntents
+        .filter((i) => i.state === "ambiguous")
+        .map((i) => ({ connection_id: i.connection_id, intent_key: i.intent_key, tool: i.tool, ambiguous_since: i.ambiguous_at || null, reason: i.ambiguous_reason || null })),
+      in_flight: dispatched.length,
+      dispatched,
+    };
+  } catch (error) {
+    recoveryStatus = { pending_operator_review: [], in_flight: 0, dispatched: [], error: error.message };
+  }
+
   return {
     schema_version: "1.0",
-    writer_claim: ctx.writerClaim.status(),
+    writer_claim: writerClaimStatus,
     downstream_servers: Array.from(ctx.connections.keys()).map((name) => {
       const conn = ctx.connections.get(name);
       return { name, reachable: typeof conn.isReachable === "function" ? conn.isReachable() : !conn.isClosed() };
@@ -444,8 +745,792 @@ function buildHealthStatus(ctx) {
       ? { seq: head.seq, entry_sha256: head.entry_sha256, last_persisted_at: lastPersistedAt }
       : { seq: 0, entry_sha256: null, last_persisted_at: lastPersistedAt, ...(headError ? { error: headError } : {}) },
     session_chain_integrity: sessionChainIntegrity,
+    recovery: recoveryStatus,
     remote_anchor: { implemented: false, reason: "SG-FR-6 not implemented in this build -- see chain.js#pushChainTailToRemoteAnchor" },
   };
+}
+
+/** Shared by recoverCrashedSessions and abandonConnection's own GATEWAY_BUNDLE_ID_
+ * COLLISION handling (Codex PR #33 review "verify bundle collisions before discarding
+ * recovery state", and its follow-up "verify collisions in recovery-abandon before
+ * cleanup"): verified directly against gsa-mcp-shim.js: bundle_id = sha256({init,
+ * grantedTools, n: calls.length}) -- a coarse fingerprint with no timestamp, nonce, or
+ * actual call content. Re-running recovery/abandon for the SAME crash deterministically
+ * reproduces the same bundle_id, which is "already durably appended," not a real
+ * conflict -- but a DIFFERENT crashed session that merely happens to share {init,
+ * grantedTools, call count} would ALSO collide here, and blindly trusting the id match
+ * would then discard that other session's real WAL and completed intents, permanently.
+ * Reads back the bundle actually on disk and compares its real content (the execution
+ * trace, itself a hash of every call's real arguments/result) before treating this as
+ * the expected repeated-attempt case. Returns true only when content is read back and
+ * verified identical; any read/parse failure or mismatch returns false (an unverified
+ * collision must never be treated as "safe to clean up"). */
+function bundleCollisionIsSameContent(stateDir, sealed) {
+  try {
+    const existingRaw = fs.readFileSync(chain.bundlePath(stateDir, sealed.bundle.manifest.bundle_id), "utf8");
+    const existingBundle = JSON.parse(existingRaw);
+    // gsa-produce.js#produceBundle never stores artifact bodies on the bundle itself --
+    // manifest.artifacts.<name>.sha256 is the real per-artifact content fingerprint (the
+    // raw bodies live in bundle.contents, keyed by file path, but the hash already IS the
+    // exact equality check needed here). execution_trace alone (per-call input/result
+    // hashes, tool, granted, error/model flags) is sufficient: it is a hash of every
+    // call's real arguments and result, so two sessions cannot share it without sharing
+    // their actual call content.
+    const existingHash = existingBundle.manifest && existingBundle.manifest.artifacts && existingBundle.manifest.artifacts.execution_trace && existingBundle.manifest.artifacts.execution_trace.sha256;
+    const newHash = sealed.bundle.manifest && sealed.bundle.manifest.artifacts && sealed.bundle.manifest.artifacts.execution_trace && sealed.bundle.manifest.artifacts.execution_trace.sha256;
+    return Boolean(existingHash) && existingHash === newHash;
+  } catch (readError) {
+    return false; // could not verify -- treat as a genuine, unverified conflict
+  }
+}
+
+/** Codex PR #33 review "verify the chain entry before cleaning a colliding WAL": content
+ * verification alone (bundleCollisionIsSameContent above) proves the bundle FILE on disk
+ * (chain.appendSession's own step 1) really is this connection's own durable record -- it
+ * does NOT prove step 2 (the chain.jsonl append) ever happened. If chain.appendSession
+ * crashed after writing the bundle file but before appending chain.jsonl, a recovery pass
+ * that stops at content verification would still delete this connection's WAL/intents as
+ * "already durably sealed," permanently omitting it from the attestation chain even though
+ * it was never actually chain-appended. Shared by recoverCrashedSessions and
+ * abandonConnection (same two callers bundleCollisionIsSameContent already serves) so both
+ * paths get the identical repair, not just content verification. Returns true (safe to
+ * clean up this connection's WAL/intents now -- durably sealed, chain entry confirmed
+ * present, repairing it first if it was merely missing) or false (unverified conflict with
+ * a genuinely different session; caller must not clean up). May throw if content is
+ * verified but the repair write itself fails -- callers must not clean up in that case
+ * either, since the chain still does not durably reference this bundle. */
+/* Round-1 fix-plan item 1 (lease keepalive, generalized): a small per-writerClaim wrapper
+ * shared by recoverCrashedSessions/abandonConnection (and verifyAndRepairBundleCollision,
+ * which both of those call into) so every call site renews the SAME claim through the SAME
+ * two methods -- writer-claim.js's own time-gated maybeRenew() for the WAL-replay per-event
+ * loop, and its unconditional renew() immediately before any write that mutates shared
+ * chain state (chain.appendSession, chain.repairMissingChainEntry). `writerClaim` may be
+ * null (existing direct callers/tests that construct no real claim) -- both wrapped methods
+ * then become no-ops, exactly like the bare `if (writerClaim) writerClaim.renew()` guard
+ * they replace.
+ *
+ * isLeaseError(error) lets a catch block further up this same call chain recognize a
+ * failure that ALREADY passed through this guard's own renew()/maybeRenew() and distinguish
+ * it from an unrelated failure (a chain-append error, a repair-write error) caught at the
+ * same try/catch -- by reference identity, not by error.code string matching, since
+ * writer-claim.js's renew() can propagate a raw fs error (e.g. EIO) that carries no
+ * WRITER_CLAIM_LOST code at all. A detected lease loss must never be downgraded to
+ * per-connection "flag for operator review, continue" handling -- that per-connection
+ * recovery of DIFFERENT connections' state under a claim this process may no longer
+ * exclusively hold is exactly the split-brain condition this fix exists to prevent, so
+ * every catch block that checks isLeaseError rethrows immediately instead, letting it
+ * propagate all the way out (recoverCrashedSessions' caller, startGateway, already releases
+ * the claim and rethrows -- see its own comment above -- making a detected lease loss fatal
+ * to the whole process).
+ *
+ * DISCLOSED, NOT FIXED HERE: this narrows the exposure window (a claim renewed just before
+ * each mutating write is checked far more often than one renewed only by the heartbeat
+ * interval) but does NOT provide atomic fencing -- a competitor could still acquire between
+ * this guard's own renew() call returning and the write it guards actually landing. Never
+ * describe this as "preventing corruption"; see writer-claim.js's own maybeRenew() doc
+ * comment for the same disclosure at the primitive's own level. */
+function createLeaseGuard(writerClaim) {
+  let leaseError = null;
+  return {
+    renew() {
+      if (!writerClaim) return;
+      try {
+        writerClaim.renew();
+      } catch (error) {
+        leaseError = error;
+        throw error;
+      }
+    },
+    maybeRenew() {
+      if (!writerClaim || typeof writerClaim.maybeRenew !== "function") return;
+      try {
+        writerClaim.maybeRenew();
+      } catch (error) {
+        leaseError = error;
+        throw error;
+      }
+    },
+    // Reference-identity check, deliberately not `error.code === "WRITER_CLAIM_LOST"` --
+    // see this function's own doc comment above.
+    isLeaseError(error) {
+      return error === leaseError;
+    },
+  };
+}
+
+/* Round-1 fix-plan commit 4 rewrite (docs/contracts/chain-validity.md's C2): the
+ * original shape of this check ("does chain.jsonl contain SOME entry for this
+ * bundle_id") never actually compared HEAD to anything -- it is strengthened here to
+ * also assert that HEAD genuinely names the chain's own CURRENT TAIL, not merely that
+ * this bundle's own entry exists somewhere in the chain. Critically, this new check
+ * does NOT compare HEAD to THIS bundle's own entry (a draft of this fix did, and that
+ * would have been wrong): a bundle's chain entry can legitimately be an ANCESTOR of a
+ * verified, HEAD-consistent tail -- e.g. this exact connection's own WAL survived a
+ * failed post-seal cleanup, a genuinely newer bundle was committed afterward, and HEAD
+ * correctly points at that newer bundle. Comparing HEAD to "this entry" would refuse
+ * that valid, ordinary case; comparing HEAD to the chain's own tail does not. */
+function verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard = null) {
+  if (!bundleCollisionIsSameContent(stateDir, sealed)) return false;
+  const bundleId = sealed.bundle.manifest.bundle_id;
+
+  /* Round-N fix (frontier-panel finding #8): same streaming reader + onProgress renewal
+   * as buildHealthStatus and reconcileHead above -- this call is reached from inside a
+   * per-connection leaseGuard-held recovery/repair path, so a chain large enough to take
+   * a while to stream through must keep renewing the claim while doing so, not just via
+   * the caller's own once-per-connection renew() before this function was entered. */
+  const chainEntries = chain.readChain(stateDir, leaseGuard ? { onProgress: () => leaseGuard.maybeRenew() } : undefined);
+  const ownEntry = chainEntries.find((e) => e.bundle_id === bundleId);
+
+  if (!ownEntry) {
+    if (leaseGuard) leaseGuard.renew();
+    chain.repairMissingChainEntry(stateDir, bundleId, log);
+    log(
+      `recovery: bundle "${bundleId}" was durably written but never chain-appended (crash between ` +
+        `chain.appendSession's own bundle-write and chain.jsonl-append steps) -- completed the missing ` +
+        `chain.jsonl/HEAD.json append now.`
+    );
+    return true;
+  }
+
+  // This bundle's own chain entry already exists (possibly not as the tail -- see this
+  // function's own doc comment above). What still needs verifying is that HEAD itself
+  // has not diverged from the chain as a whole: reuse the exact same append-time
+  // classifier appendSession/repairMissingChainEntry use (single-step auto-catch-up,
+  // anything else refuses and latches) rather than hand-rolling a third comparison.
+  const head = (() => {
+    try {
+      return chain.readHead(stateDir);
+    } catch (error) {
+      return null; // an unreadable HEAD is handled the same as "missing" by the classifier below.
+    }
+  })();
+  chain.checkHeadAgainstTailOrRepair(stateDir, head, log);
+  return true;
+}
+
+/** Startup crash-recovery pass (Codex PR #29 Finding 1, Option C -- external-panel-
+ * reviewed design, see option-c-hardened-design.md). Runs once, after the writer-claim
+ * is acquired (so this process is the sole owner of state_dir) and BEFORE any downstream
+ * connection or agent-facing listener starts, replaying any WAL a prior crashed instance
+ * left behind under recovery.js's `gateway-recovery/active/` directory.
+ *
+ * Replay reconstructs a session using session.js's real, UNMODIFIED recorder functions
+ * (recordInitialize/recordToolsList/recordCallStart/recordCallResult/
+ * markPendingAsDisconnected) -- there is no second, parallel session shape to keep in
+ * sync with the live one. A call with no matching CALL_RESULT event is exactly Finding
+ * 1's "crash after a completed call but before disconnect" gap turned inside out: it was
+ * IN FLIGHT at crash time, so its real intent record (recovery.js's idempotency store,
+ * Finding 2) is consulted for a proven outcome; only a session with every call proven
+ * terminal is auto-sealed. Anything else is left alone and reported -- never guessed. */
+function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
+  const pendingOperatorReview = [];
+  const leaseGuard = createLeaseGuard(writerClaim);
+  /* Codex + CodeRabbit PR #33 review "sweep expired completed-signature records": the
+   * 24-hour retention on the completed-signature store was only ever enforced per-key, on
+   * read, so signatures for calls with unique arguments were never revisited and never
+   * deleted. Startup recovery is the bounded, once-per-process pass both reviewers named
+   * as the right place to reclaim them: it already owns the writer claim, already walks
+   * this state directory, and runs before any traffic is accepted. Wrapped so a sweep
+   * failure can never keep a gateway from starting -- reclaiming disk space is
+   * housekeeping, not a correctness gate, and the dispatch path's own per-key expiry check
+   * (recovery.readCompletedSignature) remains the authority on whether a record is
+   * replayable. */
+  try {
+    const swept = recovery.sweepExpiredSignatures(stateDir);
+    if (swept.removed > 0) {
+      log(`recovery: swept ${swept.removed} expired completed-call signature record(s) of ${swept.scanned} scanned (retention ${recovery.DEFAULT_RETAINED_SIGNATURE_TTL_MS}ms).`);
+    }
+  } catch (error) {
+    log(`recovery: expired-signature sweep skipped (${error.message}) -- continuing startup; this is space reclamation only.`);
+  }
+  for (const connectionId of recovery.listActiveConnections(stateDir)) {
+    /* Round-1 fix-plan commit 6: a genuine chain-integrity failure latched by ANY
+     * earlier connection's own append-time check in THIS SAME loop (chain.appendSession
+     * / verifyAndRepairBundleCollision below, both routed through chain.js's
+     * checkHeadAgainstTailOrRepair) means every remaining connection in this loop is
+     * guaranteed to hit the identical genuine failure the instant its own
+     * chain.appendSession runs -- the corruption is a property of the shared chain, not
+     * of any one connection's WAL. Checking chain.getChainIntegrityFailure() here, before
+     * spending another connection's worth of fsyncs parsing and replaying its WAL only to
+     * rediscover the same already-known failure, is what "abort immediately" (round-1
+     * fix-round plan, commit 6) means in practice -- this loop has no way to unlatch
+     * mid-run (only a restart re-runs reconcileHead), so continuing is strictly wasted
+     * work, never a second chance at success. Left-untouched connections' WAL/intent
+     * state is exactly as safe to leave in place as any other connection this function
+     * already flags for operator review -- a future restart (after the corruption is
+     * fixed per the runbook) replays them normally. */
+    const alreadyLatched = chain.getChainIntegrityFailure();
+    if (alreadyLatched) {
+      log(
+        `RECOVERY ABORTED: a chain-integrity failure is already latched (${alreadyLatched.reason}` +
+          `${alreadyLatched.class ? `, class=${alreadyLatched.class}` : ""}, at=${alreadyLatched.at}) -- refusing ` +
+          `to replay any further crash-left WAL, since every remaining connection would be quarantined by the ` +
+          `identical failure. Leaving their WAL/intent state untouched for investigation. See ` +
+          `${chain.CHAIN_CORRUPTION_RUNBOOK} for the recovery procedure.`
+      );
+      break;
+    }
+    /* Codex PR #33 review "renew ownership during synchronous recovery": this whole
+     * per-connection body below is synchronous fs work (WAL replay, session.finalizeSession,
+     * chain.appendSession) -- with enough or large enough crash-left WALs it can run past
+     * writer-claim.js's own staleAfterMs before ever yielding to the event loop, which is
+     * the only place the heartbeat startHeartbeat() already started can actually fire.
+     * writer-claim.js's own startHeartbeat() doc comment discloses exactly this gap and
+     * prescribes a synchronous renew() call at the boundary of any long synchronous phase
+     * this claim is held across (mirroring state-store.js's own _assertStillOwned fix) --
+     * done here once PER CONNECTION, not once for the whole loop, so many small WALs are
+     * covered the same as one huge one. `writerClaim` is optional (existing direct callers/
+     * tests that construct no real claim keep working, renewal simply skipped) but
+     * startGateway's own real call site below always passes its live claim. A failed renew
+     * means another process may already hold this state_dir -- propagate immediately
+     * (uncaught by this loop's own per-connection try/catch further down) rather than keep
+     * mutating shared chain/WAL state under a claim that might no longer be exclusive.
+     * Round-1 fix-plan item 1: routed through createLeaseGuard's own leaseGuard.renew()
+     * (rather than a bare writerClaim.renew() call) so a failure here is later
+     * recognizable by isLeaseError -- see this loop's own outer catch below. */
+    leaseGuard.renew();
+    /* CodeRabbit PR #33 review "continue recovery after an unreadable connection state":
+     * readWalEvents/readIntent below can throw (GATEWAY_RECOVERY_WAL_UNREADABLE,
+     * GATEWAY_RECOVERY_INTENT_UNREADABLE, GATEWAY_RECOVERY_INTENT_CORRUPT) on a genuine
+     * fs-level read failure for THIS connection's own state -- a permissions or I/O
+     * problem, not a content/JSON one (which readWalEvents already handles by stopping
+     * at the first bad line, not throwing). Previously unguarded, so one such connection
+     * aborted recovery for every other connection still waiting in this same loop. Wrap
+     * the whole per-connection body so a failure here is isolated to this connection --
+     * flagged for the operator (whose recovery-abandon can now quarantine an unreadable
+     * WAL without needing to re-read it -- see abandonConnection below) and otherwise
+     * left alone, exactly like this function's other own failure branches already do. */
+    try {
+      const events = recovery.readWalEvents(stateDir, connectionId);
+      if (events.length === 0) {
+        // Every line was torn (crash mid-write of the very first event) or the file was
+        // empty -- nothing durable was ever recorded for this connection.
+        recovery.deleteWal(stateDir, connectionId);
+        continue;
+      }
+
+      const startEvent = events.find((e) => e.type === "SESSION_START");
+      // Cluster B: reuse the exact session_id this session's own SESSION_START event
+      // persisted (proxy.js#openConnection) rather than letting session.createSession
+      // mint a fresh one -- replaying the SAME crash-left WAL twice (e.g. this recovery
+      // pass itself crashing before cleanup, see recoverIsIdempotentAcrossACrashDuring
+      // RecoveryItself in tests/gateway/recovery/run-tests.js) must produce the SAME
+      // bundle_id both times. An older WAL written before this field existed has no
+      // session_id on its SESSION_START event; passed through as `null` explicitly
+      // (never generated here) for the same reason -- see session.js#createSession's own
+      // doc comment on the three-way distinction this argument makes.
+      const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
+      const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
+      // Maps this replay's own stable Symbol.for() keys back to the CALL_START event that
+      // produced them, needed only to look up that call's real intent record below.
+      const keyToStartEvent = new Map();
+
+      for (const event of events) {
+        /* Round-1 fix-plan item 1: this per-event loop is exactly the "long synchronous
+         * phase this claim is held across" the per-connection leaseGuard.renew() above
+         * already anticipates for the whole-connection case -- a single sufficiently large
+         * WAL can itself run long enough between yields to the event loop that even a
+         * once-per-connection renew is not enough. maybeRenew() is time-gated by the
+         * claim's own clock (never Date.now()), so this costs nothing beyond an in-memory
+         * comparison on every iteration that doesn't actually need to renew. */
+        leaseGuard.maybeRenew();
+        if (event.type === "SESSION_START") {
+          session.recordToolsList(s, event.tools || []);
+        } else if (event.type === "INITIALIZE") {
+          session.recordInitialize(s, { clientInfo: event.clientInfo, serverInfo: event.serverInfo, model: event.model });
+        } else if (event.type === "CALL_START") {
+          // Symbol.for (the global registry), not Symbol(): this replay's own CALL_START
+          // and CALL_RESULT events for the same call_seq must resolve to the SAME symbol
+          // reference for session.js's Map-keyed pendingCalls to correlate them -- a live
+          // correlationKey may have been a non-reproducible Symbol() or a real JSON-RPC id,
+          // but replay only needs internal consistency within itself, not to match what
+          // the crashed process originally used.
+          const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+          keyToStartEvent.set(key, event);
+          session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
+        } else if (event.type === "CALL_RESULT") {
+          const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+          /* Codex PR #33 review "persist cached replays in the session trace": carry the
+           * replay marker through crash recovery too, so a WAL replayed after a crash
+           * reconstructs the SAME sealed shape a clean close would have produced for that
+           * step -- an idempotency cache hit must not silently become an ordinary call
+           * just because the gateway restarted before sealing. Absent on every ordinary
+           * CALL_RESULT event (including every WAL written before this field existed). */
+          if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts, replayed: Boolean(event.replayed), replayedFromIntentKey: event.intent_key });
+        } else if (event.type === "ANOMALY") {
+          // Codex PR #33 review "append blocked-retry anomalies to the WAL": replays a
+          // dispatch-guard block (GATEWAY_AMBIGUOUS_RETRY/GATEWAY_DOWNSTREAM_OUTCOME_UNKNOWN)
+          // that was recorded in-memory only via session.recordAnomaly in the live proxy --
+          // without this, a crash before the connection's own close would silently drop
+          // that attestation from the recovered/sealed bundle.
+          session.recordAnomaly(s, { kind: event.kind, tool: event.tool, intent_key: event.intent_key, detail: event.detail, ts: event.ts });
+        }
+        // CLOSING is informational only for replay -- if present, the crash happened
+        // between "closeConnection began" and "chain.appendSession completed", which the
+        // GATEWAY_BUNDLE_ID_COLLISION handling below already covers.
+      }
+
+      // Any call still pending after replaying every event was in flight at crash time.
+      // Consult its real intent record for a proven outcome before deciding anything.
+      let needsOperator = false;
+      // Codex PR #33 review "include the intent key in the advertised resolution
+      // command": collected as we go so the RECOVERY_AMBIGUOUS_INTENT log below can name
+      // every actual unresolved key, rather than the literal "<key>" placeholder it used
+      // to print regardless of how many calls (or which ones) were actually unresolved --
+      // recovery-resolve requires the exact intent key, which an operator otherwise had to
+      // discover by hand-parsing raw recovery files.
+      const unresolvedIntentKeys = [];
+      for (const [key] of Array.from(s.pendingCalls.entries())) {
+        const startedFrom = keyToStartEvent.get(key);
+        if (!startedFrom) continue; // defensive; should not happen
+        if (startedFrom.isModelCall) {
+          /* A downstream-initiated sampling/createMessage forward (see
+           * forwardDownstreamRequestToAgent's own WAL comment above) has no
+           * idempotency-intent fence at all -- Finding 2's fence is deliberately scoped to
+           * real tools/call dispatch only, so there is no intent record to consult here and
+           * never will be. Unlike a fenced tool call, there is also no external side effect
+           * this gateway must avoid duplicating: the only real risk of an unresolved
+           * sampling call is an incomplete attestation of what the agent was asked, which
+           * this WAL replay has already captured (the CALL_START event, recorded above).
+           * Record it as a real, disconnected/unproven result and move on rather than
+           * blocking this whole connection's auto-seal on operator review for a call that
+           * has nothing an operator could actually resolve (there is no --result-file or
+           * --confirmed answer that applies to "did the agent's model happen to finish
+           * replying before the crash"). */
+          session.recordCallResult(s, key, { result: { error: "gateway restarted after a crash while this downstream-initiated sampling/createMessage forward was still awaiting the agent's response" }, isError: true, ts: Date.now() });
+          continue;
+        }
+        const intentKey = recovery.computeIntentKey(connectionId, startedFrom.tool, startedFrom.arguments);
+        const intent = recovery.readIntent(stateDir, intentKey);
+        /* Cluster A (generation-aware crash recovery): the intent file's own `generation`
+         * field is overwritten IN PLACE on every supersede (proxy.js's dispatch guard),
+         * so by the time recovery runs it always reflects the MOST RECENT generation --
+         * which is not necessarily the generation THIS specific crashed CALL_START event
+         * belongs to. Concretely: generation 1 completes, but its own CALL_RESULT WAL
+         * write fails (best-effort, logged, not fatal -- see proxy.js's own comment on
+         * that append); the SAME connection later dispatches generation 2 of the exact
+         * same (tool, arguments), which also completes and DOES get its CALL_RESULT
+         * durably written. A later crash then leaves generation 1's CALL_START forever
+         * unresolved in the WAL while the intent file now sits at generation 2. Without
+         * this check, the loop below would bind generation 2's cached_result (a
+         * DIFFERENT call's real outcome) to generation 1's own pending call -- a false
+         * attestation. Comparing against the generation THIS CALL_START event itself
+         * recorded (defaulting to 1 for a WAL line written before this field existed)
+         * ensures a proven outcome is only ever applied to the generation it actually
+         * belongs to; any other generation's crashed call is left for operator review,
+         * exactly like a call with no intent record at all. */
+        const expectedGeneration = typeof startedFrom.generation === "number" ? startedFrom.generation : 1;
+        const intentGeneration = intent && typeof intent.generation === "number" ? intent.generation : 1;
+        if (intent && intent.state === "completed" && intentGeneration === expectedGeneration) {
+          session.recordCallResult(s, key, { result: intent.cached_result, isError: false, ts: Date.now() });
+        } else if (intent && intent.state === "not_executed" && intentGeneration === expectedGeneration) {
+          /* Codex PR #33 review "persist a terminal not-executed resolution": an operator
+           * already answered "did it execute?" (no) via recovery-resolve while this
+           * connection was crashed -- record that as a real (failed) terminal result now,
+           * rather than re-flagging the same connection for operator review forever
+           * because no "completed" intent will ever appear for a call that never ran. */
+          session.recordCallResult(s, key, { result: { error: "operator confirmed via recovery-resolve that this call did not execute downstream" }, isError: true, ts: Date.now() });
+        } else {
+          needsOperator = true;
+          unresolvedIntentKeys.push(intentKey);
+          /* Round-N fix (frontier-panel finding #5, Paul's explicit choice of Fable's
+           * "make the gap observable" proposal): a pending call with startedFrom.replayed
+           * true is not an ordinary "in flight at crash time" case -- proxy.js's own
+           * deliberate fail-OPEN cached-replay branch means the CALL_START for this
+           * completed-signature cache hit WAS durably written, yet its matching
+           * CALL_RESULT never made it into the WAL before the crash, so the agent may
+           * already have received a real result for this exact step. That distinction is
+           * deliberately NOT recorded here: this function never calls
+           * session.finalizeSession/chain.appendSession for a needsOperator connection --
+           * see the `continue` a few lines below -- so any anomaly attached to `s` at this
+           * point would be discarded along with the rest of this in-memory session,
+           * never reaching a sealed bundle (session.recordAnomaly has no side effect
+           * beyond mutating that in-memory object). The actual "INCOMPLETE: step N"
+           * marker Paul asked for is recorded in abandonConnection instead --
+           * recovery-abandon is the only path that unconditionally seals a connection
+           * like this one -- which performs the identical startedFrom.replayed check on
+           * its own WAL replay right before it seals. See that function's own doc
+           * comment for the full rationale. */
+        }
+      }
+
+      if (needsOperator) {
+        pendingOperatorReview.push(connectionId);
+        const resolveCommands = unresolvedIntentKeys
+          .map((key) => `"node scripts/gateway/gateway.js recovery-resolve --connection ${connectionId} --intent ${key} --confirmed executed|not-executed"`)
+          .join(", ");
+        log(
+          `RECOVERY_AMBIGUOUS_INTENT: connection "${connectionId}" crashed with ${unresolvedIntentKeys.length} call(s) in flight whose outcome is not proven (intent key(s): ${unresolvedIntentKeys.join(", ")}) -- ` +
+            `leaving its WAL and intent record(s) in place rather than guessing. Resolve each with ${resolveCommands}, ` +
+            `or "node scripts/gateway/gateway.js recovery-abandon --connection ${connectionId}" to seal only the calls that did reach a proven outcome.`
+        );
+        continue; // do not touch this connection's WAL/intents any further
+      }
+
+      if (s.pendingCalls.size > 0) {
+        session.markPendingAsDisconnected(s, "gateway restarted after a crash; connection never received a clean close", () => Date.now());
+      }
+      let sealed;
+      try {
+        sealed = session.finalizeSession(s, keys);
+      } catch (error) {
+        log(`RECOVERY SEAL FAILURE for connection "${connectionId}": ${error.message} -- leaving its WAL in place for investigation.`);
+        pendingOperatorReview.push(connectionId);
+        continue;
+      }
+      // Round-1 fix-plan item 1: unconditional renew() (not maybeRenew()) immediately
+      // before every chain.appendSession call, in both this normal path and the repair
+      // path below -- this is the one write per connection that actually mutates the
+      // shared chain, so it gets its own fresh, unconditional renewal regardless of how
+      // recently the per-event maybeRenew() above last renewed.
+      leaseGuard.renew();
+      try {
+        chain.appendSession(stateDir, sealed, { log });
+      } catch (error) {
+        if (error.code === "GATEWAY_BUNDLE_ID_COLLISION") {
+          let verified;
+          try {
+            verified = verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard);
+          } catch (repairError) {
+            // A lease loss detected by verifyAndRepairBundleCollision's own leaseGuard.renew()
+            // must not be relabeled as an ordinary chain-repair failure -- rethrow so it
+            // reaches this function's own outer catch below and propagates as fatal.
+            if (leaseGuard.isLeaseError(repairError)) throw repairError;
+            log(`RECOVERY CHAIN-REPAIR FAILURE for connection "${connectionId}": ${repairError.message} -- leaving its WAL in place for investigation.`);
+            pendingOperatorReview.push(connectionId);
+            continue;
+          }
+          if (verified) {
+            log(`recovery: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
+          } else {
+            log(
+              `RECOVERY BUNDLE COLLISION for connection "${connectionId}": bundle_id "${sealed.bundle.manifest.bundle_id}" ` +
+                `already exists on disk but its recorded content does not match this connection's recovered session -- ` +
+                `a genuine conflict between two different sessions, not a repeated recovery attempt of the same one. ` +
+                `Leaving this connection's WAL and intents in place for investigation rather than discarding them.`
+            );
+            pendingOperatorReview.push(connectionId);
+            continue;
+          }
+        } else {
+          log(`RECOVERY CHAIN-APPEND FAILURE for connection "${connectionId}": ${error.message} -- leaving its WAL in place for investigation.`);
+          pendingOperatorReview.push(connectionId);
+          continue;
+        }
+      }
+      recovery.deleteWal(stateDir, connectionId);
+      for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) {
+        if (intent.state === "completed" || intent.state === "not_executed") recovery.deleteIntent(stateDir, intent.intent_key);
+      }
+      log(`recovery: connection "${connectionId}" recovered and sealed from a crash-left WAL (${s.calls.length} call(s)).`);
+    } catch (error) {
+      // Round-1 fix-plan item 1: a lease loss detected anywhere in this connection's own
+      // body above (the per-connection renew(), the per-event maybeRenew(), the pre-append
+      // renew(), or a repair-path renew() rethrown from the inner catch above) must never
+      // be downgraded to this function's own per-connection "flag for operator review,
+      // continue with the next connection" handling -- that would keep mutating OTHER
+      // connections' chain/WAL state under a claim this process may no longer exclusively
+      // hold, which is exactly the split-brain condition this fix exists to prevent.
+      // Rethrow so it propagates out of this whole loop/function -- startGateway's own
+      // call site above already releases the claim and rethrows again, making a detected
+      // lease loss fatal to the whole process, not just this one connection.
+      if (leaseGuard.isLeaseError(error)) throw error;
+      log(`RECOVERY FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- leaving its state in place for investigation. Use "recovery-abandon --connection ${connectionId}" to quarantine it without needing to re-read that state.`);
+      pendingOperatorReview.push(connectionId);
+    }
+  }
+  return { pendingOperatorReview };
+}
+
+/** Operator override for a connection stuck in `pendingOperatorReview` (recovery-abandon
+ * CLI, see main() below): unlike recoverCrashedSessions' own auto-seal path, this treats
+ * EVERY call still pending after WAL replay as terminal regardless of whether its intent
+ * ever reached a proven "completed" outcome -- an explicit "I am giving up on finding out
+ * whether this executed, seal what I have" decision, not a guess made on the operator's
+ * behalf. Any intent still `dispatched`/`ambiguous` for this connection is deleted
+ * afterward: the durable fence Finding 2 provides is deliberately given up on for THIS
+ * specific connection, by explicit operator action, not silently -- if the downstream
+ * operation actually executed, a future identical call is no longer fenced against
+ * re-running it. This tradeoff (and that it is scoped per-connection, never global) is
+ * documented in KNOWN-LIMITATIONS.md. */
+function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null) {
+  /* Codex PR #33 review "renew ownership during synchronous recovery": same rationale as
+   * recoverCrashedSessions' own per-connection renew() above, applied to this CLI's own
+   * synchronous WAL replay/finalize/chain-append for its one connection -- "sufficiently
+   * large" applies just as well to a single big WAL as to many small ones. Round-1
+   * fix-plan item 1: routed through createLeaseGuard so a lease loss anywhere in this
+   * function is recognizable by isLeaseError below and never relabeled as an ordinary
+   * chain-repair/abandon failure; a lease-loss failure here is simply left uncaught
+   * (this function has no per-connection try/catch of its own to swallow it), propagating
+   * out to runRecoveryAbandonCli's caller exactly like any other uncaught error already
+   * would -- fatal to this CLI invocation, consistent with recoverCrashedSessions' own
+   * process-fatal handling. */
+  const leaseGuard = createLeaseGuard(writerClaim);
+  leaseGuard.renew();
+  /* CodeRabbit PR #33 review "continue recovery after an unreadable connection state": this
+   * command is recoverCrashedSessions' own documented remediation path for a connection
+   * it could not process -- including one whose WAL could not even be READ (permissions/
+   * I/O error, not a content problem). Before this, that same unreadable-WAL error would
+   * simply be thrown again here, leaving the operator with no way to actually resolve
+   * it. Quarantine (rename, not delete -- see recovery.quarantineWal's own doc comment)
+   * instead: an operator who explicitly asked to abandon this connection does not need
+   * this command to succeed at reading state it already knows is unreadable, only to stop
+   * this connection from blocking every future startup. */
+  let events;
+  try {
+    events = recovery.readWalEvents(stateDir, connectionId);
+  } catch (error) {
+    const quarantined = recovery.quarantineWal(stateDir, connectionId);
+    for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) recovery.deleteIntent(stateDir, intent.intent_key);
+    log(
+      `recovery-abandon: connection "${connectionId}"'s WAL could not be read (${error.message}) -- ` +
+        (quarantined ? `moved it to "${quarantined}" for manual inspection` : "no WAL file was found to quarantine") +
+        `, and released any of its idempotency fence(s). This connection was NOT sealed into the chain ` +
+        `(there is nothing readable to seal from) -- if it made any real downstream calls, that record is now unrecoverable through this gateway.`
+    );
+    return;
+  }
+  if (events.length === 0) {
+    recovery.deleteWal(stateDir, connectionId);
+    for (const intent of recovery.listIntentsForConnection(stateDir, connectionId)) recovery.deleteIntent(stateDir, intent.intent_key);
+    log(`recovery-abandon: connection "${connectionId}" had no WAL to replay -- nothing to seal, cleaned up any leftover intents.`);
+    return;
+  }
+  const startEvent = events.find((e) => e.type === "SESSION_START");
+  // Cluster B: same reuse-not-regenerate rule as recoverCrashedSessions' own replay
+  // above -- see that call site's doc comment and session.js#createSession's.
+  const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
+  const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
+  // Round-N fix (frontier-panel finding #5): mirrors recoverCrashedSessions' own
+  // keyToStartEvent map (see that function's replay loop above) -- needed here for the
+  // identical reason: to look back from a still-pending call to the CALL_START event
+  // that produced it, so a replayed-but-incomplete cache hit can be distinguished from
+  // an ordinary interrupted call once this replay finishes.
+  const keyToStartEvent = new Map();
+  for (const event of events) {
+    // Round-1 fix-plan item 1: same time-gated renewal as recoverCrashedSessions' own
+    // per-event loop above, for this CLI's own single-connection WAL replay.
+    leaseGuard.maybeRenew();
+    if (event.type === "SESSION_START") {
+      session.recordToolsList(s, event.tools || []);
+    } else if (event.type === "INITIALIZE") {
+      session.recordInitialize(s, { clientInfo: event.clientInfo, serverInfo: event.serverInfo, model: event.model });
+    } else if (event.type === "CALL_START") {
+      const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+      keyToStartEvent.set(key, event);
+      session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
+    } else if (event.type === "CALL_RESULT") {
+      const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+      if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts });
+    } else if (event.type === "ANOMALY") {
+      session.recordAnomaly(s, { kind: event.kind, tool: event.tool, intent_key: event.intent_key, detail: event.detail, ts: event.ts });
+    }
+  }
+  if (s.pendingCalls.size > 0) {
+    /* Round-N fix (frontier-panel finding #5, Paul's explicit choice of Fable's "make the
+     * gap observable" proposal): recoverCrashedSessions' own per-call loop (above in this
+     * file) performs this identical startedFrom.replayed check, but never reaches
+     * session.finalizeSession/chain.appendSession for any connection it flags
+     * needsOperator -- that in-memory session, and any anomaly attached to it, is
+     * discarded entirely once pushed to pendingOperatorReview. recovery-abandon is the
+     * ONLY code path that unconditionally seals a connection like this one (see
+     * chain.appendSession below), so this is the one place a replay-specific INCOMPLETE
+     * marker can actually land in a produced bundle. Deliberately scoped to only the
+     * calls still pending after this replay -- a call that already resolved (proven or
+     * not) needs no such marker. */
+    for (const [key] of Array.from(s.pendingCalls.entries())) {
+      const startedFrom = keyToStartEvent.get(key);
+      if (startedFrom && startedFrom.replayed) {
+        const intentKey = recovery.computeIntentKey(connectionId, startedFrom.tool, startedFrom.arguments);
+        session.recordAnomaly(s, {
+          kind: "GATEWAY_RECOVERY_INCOMPLETE_REPLAYED_STEP",
+          tool: startedFrom.tool,
+          intent_key: intentKey,
+          detail:
+            `INCOMPLETE: step ${startedFrom.call_seq} was a cached replay (see proxy.js's ` +
+            "replay branch) whose CALL_START was durably recorded but whose CALL_RESULT was " +
+            "never written before this connection crashed -- the agent may already have " +
+            "received a result for this step under this gateway's deliberate fail-open replay " +
+            "design, but that outcome was never confirmed durable in this WAL, and the operator " +
+            "ran recovery-abandon without further confirmation of what actually happened.",
+        });
+      }
+    }
+    session.recordAnomaly(s, { kind: "OPERATOR_ABANDONED_RECOVERY", detail: `operator explicitly abandoned recovery for connection "${connectionId}" with ${s.pendingCalls.size} call(s) of unproven outcome` });
+    session.markPendingAsDisconnected(s, "operator ran recovery-abandon: outcome could not be confirmed and was not waited on further", () => Date.now());
+  }
+  const sealed = session.finalizeSession(s, keys);
+  // Round-1 fix-plan item 1: unconditional renew() immediately before chain.appendSession,
+  // same as recoverCrashedSessions' own normal path above.
+  leaseGuard.renew();
+  try {
+    chain.appendSession(stateDir, sealed, { log });
+  } catch (error) {
+    if (error.code !== "GATEWAY_BUNDLE_ID_COLLISION") throw error;
+    /* Codex PR #33 review "verify collisions in recovery-abandon before cleanup": this
+     * used to treat EVERY collision here as the expected repeated-attempt case and fall
+     * straight through to deleting this connection's WAL/intents below -- unlike
+     * recoverCrashedSessions' own already-hardened handling of the identical error code,
+     * which reads back the bundle on disk and verifies its real content first. An
+     * operator running recovery-abandon on a connection that happens to collide with a
+     * genuinely DIFFERENT session's bundle_id would silently discard this connection's
+     * only remaining unrecoverable record. Apply the same content verification here. */
+    let verified;
+    try {
+      verified = verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard);
+    } catch (repairError) {
+      // Round-1 fix-plan item 1: a lease loss detected by verifyAndRepairBundleCollision's
+      // own leaseGuard.renew() must not be relabeled as an ordinary chain-repair failure --
+      // rethrow the original error unwrapped (by reference) rather than wrapping it in
+      // fail()'s own GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED, so isLeaseError-style identity
+      // checks further up this same process's call stack still recognize it.
+      if (leaseGuard.isLeaseError(repairError)) throw repairError;
+      throw fail(
+        `recovery-abandon: connection "${connectionId}" bundle "${sealed.bundle.manifest.bundle_id}" was content-verified as this connection's own record, but completing its missing chain.jsonl append failed: ${repairError.message}. Refusing to abandon: this connection's WAL/intents are NOT cleaned up (the chain still does not durably reference this bundle) -- investigate and retry.`,
+        "GATEWAY_RECOVERY_CHAIN_REPAIR_FAILED"
+      );
+    }
+    if (!verified) {
+      throw fail(
+        `recovery-abandon: connection "${connectionId}" produced bundle_id "${sealed.bundle.manifest.bundle_id}", which already exists on disk, but its recorded content does NOT match this connection's recovered session -- a genuine conflict with a different session, not a repeated abandon attempt. Refusing to abandon: deleting this connection's WAL/intents now would discard its only remaining, unrecoverable record. Investigate the existing bundle before retrying.`,
+        "GATEWAY_RECOVERY_UNVERIFIED_BUNDLE_COLLISION"
+      );
+    }
+    log(`recovery-abandon: connection "${connectionId}" was already durably sealed (bundle_id collision, content-verified match) -- cleaning up.`);
+  }
+  /* Codex PR #33 review "keep the WAL until corrupt-intent cleanup succeeds":
+   * listIntentsForConnection reads EVERY intent record on disk before filtering, and
+   * readIntent throws GATEWAY_RECOVERY_INTENT_UNREADABLE/_CORRUPT on any damaged one --
+   * including an unrelated one. Running it AFTER deleteWal meant recovery-abandon could
+   * irreversibly destroy this connection's last remaining record and then abort on that
+   * scan, leaving the corrupt fence in place with nothing left to quarantine or replay,
+   * and every retry failing at the same point. Enumerate first: a failing scan now leaves
+   * the WAL intact and the whole command safely re-runnable (the bundle is already sealed,
+   * so a re-run takes the content-verified bundle_id-collision path above). */
+  const intentsToClear = recovery.listIntentsForConnection(stateDir, connectionId);
+  recovery.deleteWal(stateDir, connectionId);
+  for (const intent of intentsToClear) recovery.deleteIntent(stateDir, intent.intent_key);
+  log(`recovery-abandon: connection "${connectionId}" sealed (${s.calls.length} call(s)) and its idempotency fence(s) released.`);
+}
+
+/** Minimal `--flag value` / `--boolean-flag` parser for the recovery-* CLI subcommands
+ * below. Not a general-purpose arg parser (no short flags, no `=` form) -- these two
+ * subcommands are the only CLI surface this build needs beyond `node gateway.js
+ * [configPath]` itself. */
+function parseFlags(argv) {
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+    }
+  }
+  return flags;
+}
+
+/** `node scripts/gateway/gateway.js recovery-resolve --connection <id> --intent <key>
+ * --confirmed executed|not-executed [--result-file <path>] [--config <path>]`: answers
+ * recoverCrashedSessions' own RECOVERY_AMBIGUOUS_INTENT log line. Does not itself seal the
+ * connection -- only updates the one intent record; restart the gateway (or run
+ * recovery-abandon) to actually finish sealing once every ambiguous intent on a connection
+ * has been resolved this way. */
+function runRecoveryResolveCli(argv, log) {
+  const flags = parseFlags(argv);
+  const configPath = flags.config || path.join(process.cwd(), "gateway-config.json");
+  const config = gatewayConfig.loadConfig(configPath);
+  const connectionId = flags.connection;
+  const intentKey = flags.intent;
+  const confirmed = flags.confirmed;
+  if (!connectionId || !intentKey || !confirmed) {
+    throw fail("recovery-resolve requires --connection <id> --intent <key> --confirmed executed|not-executed", "GATEWAY_RECOVERY_CLI_USAGE");
+  }
+  if (confirmed !== "executed" && confirmed !== "not-executed") {
+    throw fail(`--confirmed must be "executed" or "not-executed", got ${JSON.stringify(confirmed)}.`, "GATEWAY_RECOVERY_CLI_USAGE");
+  }
+  /* Codex PR #33 review "acquire the writer claim before resolving intents": this
+   * mutates the same intent files the live proxy dispatch guard consults and updates
+   * (recovery.js's readIntent/updateIntent/deleteIntent), unlike recovery-abandon (which
+   * already takes the claim below). Without this, the documented operator workflow --
+   * run this command, then restart the gateway -- could instead run WHILE a gateway
+   * still holds the claim: a live dispatch resolving the same intent to "completed"/
+   * "ambiguous" and this command deleting/overwriting it concurrently can each observe
+   * the other's half-applied state (updateIntent throwing GATEWAY_RECOVERY_INTENT_NOT_FOUND
+   * on a competing delete, or a plain last-write-wins clobber of either resolution). */
+  const writerClaim = new WriterClaim(config.state_dir, { hostId: config.host_id });
+  writerClaim.acquire();
+  try {
+    const existing = recovery.readIntent(config.state_dir, intentKey);
+    if (!existing) throw fail(`No such intent "${intentKey}" under this gateway's state_dir.`, "GATEWAY_RECOVERY_INTENT_NOT_FOUND");
+    if (existing.connection_id !== connectionId) {
+      throw fail(`Intent "${intentKey}" belongs to connection "${existing.connection_id}", not "${connectionId}" -- refusing (likely a copy/paste mismatch).`, "GATEWAY_RECOVERY_CLI_MISMATCH");
+    }
+    if (confirmed === "executed") {
+      /* CodeRabbit PR #33 review "require --result-file for --confirmed executed": a
+       * missing --result-file used to silently resolve with cached_result: null, which
+       * recoverCrashedSessions then replays as an ordinary CLEAN SUCCESS (isError:
+       * false) -- the sealed bundle would attest a confident, is_error:false null
+       * result for a call the gateway itself never actually observed completing; the
+       * operator confirmed only that the external effect occurred, not what it
+       * returned. Reject instead of guessing a shape for evidence that doesn't exist. */
+      if (!flags["result-file"]) {
+        /* Codex PR #33 review "stop advising a false not-executed resolution": this
+         * message used to suggest "use --confirmed not-executed instead" as the fallback
+         * when the operator lacks a result file -- but an operator who chose --confirmed
+         * executed in the first place is telling this CLI they KNOW the side effect ran;
+         * following that suggestion would record the opposite of what they know happened,
+         * seal it as a failed/non-executed call, and release the fence so a retry repeats
+         * the side effect. The only truthful options when the exact result is unrecoverable
+         * are to leave the intent unresolved for now, or to explicitly give up the fence
+         * via recovery-abandon -- never to assert non-execution that isn't true. */
+        throw fail(
+          "recovery-resolve --confirmed executed requires --result-file <path>: a null result would be " +
+            "replayed as an unverified clean success in the sealed bundle. If you know this call executed " +
+            "but cannot recover its exact result, do NOT use --confirmed not-executed -- that records the " +
+            "opposite of what you know happened and lets a future retry repeat the side effect. Instead, " +
+            "either supply the real result via --result-file once you can recover it, leave this intent " +
+            "unresolved for now (this connection will keep being flagged for operator review on every " +
+            "restart, harmlessly), or use recovery-abandon to explicitly give up the fence on this connection.",
+          "GATEWAY_RECOVERY_CLI_USAGE"
+        );
+      }
+      const result = JSON.parse(fs.readFileSync(flags["result-file"], "utf8"));
+      recovery.resolveIntentExecuted(config.state_dir, intentKey, result);
+      log(`recovery-resolve: intent "${intentKey}" (connection "${connectionId}") marked EXECUTED. Restart the gateway to finish sealing this connection.`);
+    } else {
+      recovery.resolveIntentNotExecuted(config.state_dir, intentKey);
+      log(`recovery-resolve: intent "${intentKey}" (connection "${connectionId}") marked NOT EXECUTED; fence released. Restart the gateway to finish sealing this connection.`);
+    }
+  } finally {
+    writerClaim.release();
+  }
+}
+
+/** `node scripts/gateway/gateway.js recovery-abandon --connection <id> [--config <path>]`:
+ * the "give up on the fence, seal what we have" override -- see abandonConnection's own
+ * doc comment above for exactly what this does and does not guarantee. Requires the
+ * writer-claim (this mutates the same trusted chain a live gateway instance would), so it
+ * cannot run concurrently with an actual gateway process against the same state_dir. */
+function runRecoveryAbandonCli(argv, log) {
+  const flags = parseFlags(argv);
+  const configPath = flags.config || path.join(process.cwd(), "gateway-config.json");
+  const config = gatewayConfig.loadConfig(configPath);
+  const connectionId = flags.connection;
+  if (!connectionId) throw fail("recovery-abandon requires --connection <id>", "GATEWAY_RECOVERY_CLI_USAGE");
+  const keys = loadSigningKeys(config);
+  const writerClaim = new WriterClaim(config.state_dir, { hostId: config.host_id });
+  writerClaim.acquire();
+  try {
+    abandonConnection(config.state_dir, keys, connectionId, log, writerClaim);
+  } finally {
+    writerClaim.release();
+  }
 }
 
 /* Cluster D: operational exposure for buildHealthStatus(ctx) above. This is a
@@ -477,15 +1562,130 @@ function gatewayStatusPath(stateDir) {
  * this is purely an observability side channel, not part of SG-FR-5's persisted-session
  * write path. Reuses state-store.js's own atomic-write primitive (temp file + fsync +
  * rename), same as chain.js#appendSession's HEAD.json write, so a reader (the `status`
- * subcommand, or an operator's own tool) can never observe a half-written file. */
+ * subcommand, or an operator's own tool) can never observe a half-written file.
+ *
+ * `{ mode: null }`: the ONE named exception to the group-readable access model (Paul's
+ * decision, 2026-09-15 fix round -- see
+ * claude/graphsmith-fix-round-plan-round1-2026-09-15.md, "Access model"). Every other
+ * caller of atomicOverwriteFile gets that primitive's new 0640-by-default mode; this
+ * file is the operator-facing health surface commit 6 (SG-NFR-3) depends on being
+ * readable by whatever ops tooling polls it, so it stays at its current, pre-existing,
+ * umask-governed mode -- not narrowed, and not pinned to a guessed literal that might
+ * not match every deployment's own umask either. startup-permissions.js's own startup
+ * chmod pass likewise never lists this file among the ones it tightens. */
 function writeStatusFile(ctx, log) {
+  const stateDir = ctx.config.state_dir;
   try {
-    const stateDir = ctx.config.state_dir;
     fs.mkdirSync(stateDir, { recursive: true });
-    const status = { ...buildHealthStatus(ctx), written_at: new Date().toISOString() };
-    stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir);
   } catch (error) {
     log(`failed to write status file (non-fatal): ${error.message}`);
+    return;
+  }
+
+  /* Round-1 fix-plan item 1, round-2 fix pass (Paul's 2026-09-16 decision): unlike the
+   * writes below, buildHealthStatus(ctx) is deliberately called OUTSIDE any try/catch
+   * here. After this round's fix, its only possible throw is a lease loss DETECTED by
+   * checks/register-gateway-sessions.js's own maybeRenew() call during the session-chain
+   * walk (see buildHealthStatus's own doc comment on that call site) -- every one of its
+   * OTHER internal steps already absorbs its own failures locally and never lets an
+   * exception escape. That one throw must NOT be caught here and downgraded to this
+   * function's own "non-fatal" logging below -- createLeaseGuard's own doc comment
+   * (scripts/gateway/gateway.js, above) is explicit that a detected lease loss must
+   * never be relabeled as "flag for operator review, continue", and this status-file
+   * write is no exception to that just because its OTHER failure modes (a momentarily
+   * full disk, an unwritable state_dir) genuinely are non-fatal by design. Left
+   * unguarded, this throw surfaces exactly like the fatal-on-renew-failure policy
+   * already established for reconcileHead/the WAL-replay loops: on the very first call
+   * (synchronous, at startup, before this function returns to startGateway) it rejects
+   * startGateway's own promise, reaching main()'s top-level .catch (process.exitCode =
+   * 1); on a later setInterval tick it is an uncaught exception, halting the process
+   * loudly -- fatal to the whole process either way, never merely logged. */
+  const status = {
+    ...buildHealthStatus(ctx),
+    written_at: new Date().toISOString(),
+    /* Round-1 fix-plan commit 6: documented explicitly, per this commit's own
+     * requirement, both here (the WRITTEN status output an operator actually reads)
+     * and in checks/register-gateway-sessions.js's own header comment -- this walk
+     * reports `session_chain_integrity` as EVIDENCE ONLY (docs/contracts/
+     * chain-validity.md SS5: "the status walk only reports evidence and never writes
+     * anything") and never engages getChainIntegrityFailure()'s admission latch,
+     * regardless of what it finds. That means the ~10s STATUS_WRITE_INTERVAL_MS
+     * cadence is NOT what stops new-session admission on a genuine finding -- only
+     * commit 4's own detectors (the O(1) append-time checkHeadAgainstTailOrRepair, and
+     * reconcileHead's full walk at startup) ever latch. A HEAD/tail POINTER divergence
+     * mid-run is caught immediately (not on any cadence) by that append-time check the
+     * next time this gateway tries to append. Mid-chain INTERIOR corruption -- an
+     * entry whose own hash no longer recomputes, a sequence gap, or a broken link,
+     * where HEAD and the chain's own tail already agree -- is structurally invisible
+     * to that O(1) tail-only check; this walk's own evidence field is currently the
+     * only place such a finding surfaces at all, and it does not stop anything by
+     * itself. Detecting AND acting on that class depends on reconcileHead's full walk
+     * running again at the next startup (which hard-fails per Paul's 2026-09-15
+     * decision), or on an explicit, separately-scheduled deep walk that does not exist
+     * in this build -- see checks/register-gateway-sessions.js's own header for why it
+     * is deliberately not wired to write/latch anything itself. */
+    session_chain_integrity_cadence_note:
+      `session_chain_integrity above is refreshed roughly every ${STATUS_WRITE_INTERVAL_MS}ms and is EVIDENCE ONLY -- ` +
+      "it never stops new-session admission by itself. A HEAD/tail POINTER divergence is instead caught " +
+      "immediately by the append-time check (or by reconcileHead at startup), not by this cadence. Mid-chain " +
+      "INTERIOR corruption (HEAD and the chain's own tail already agreeing, but an interior record tampered, a " +
+      "sequence gap, or a broken link) is invisible to that O(1) check; this field may show it as evidence, but " +
+      "detecting AND acting on it (stopping admission) depends on the full validator running again at the next " +
+      "startup, or on a separately-scheduled deep walk this build does not implement.",
+  };
+
+  try {
+    stateStore.atomicOverwriteFile(gatewayStatusPath(stateDir), JSON.stringify(status, null, 2), stateDir, { mode: null });
+  } catch (error) {
+    log(`failed to write status file (non-fatal): ${error.message}`);
+  }
+}
+
+/* Round-1 fix-plan commit 4: filename for the startup-only diagnostic artifact written
+ * when chain.reconcileHead finds a genuine structural failure (see startGateway's own
+ * call site below and Paul's 2026-09-15 startup-posture decision, docs/contracts/
+ * chain-validity.md SS4). Distinct from STATUS_FILE_NAME above: that one is refreshed
+ * every STATUS_WRITE_INTERVAL_MS by a RUNNING gateway; this one is written exactly once,
+ * by a gateway that is refusing to start at all, and is never cleaned up automatically
+ * (an operator's own recovery action, per the referenced runbook, is what resolves it --
+ * a future successful startup does not delete it, so its presence and mtime remain a
+ * durable record of the last startup failure even after the underlying corruption is
+ * fixed and the gateway starts normally again). */
+const CHAIN_CORRUPTION_DIAGNOSTIC_FILE_NAME = "gateway-startup-failure.json";
+
+function chainCorruptionDiagnosticPath(stateDir) {
+  return path.join(stateDir, CHAIN_CORRUPTION_DIAGNOSTIC_FILE_NAME);
+}
+
+/** Round-1 fix-plan commit 4, Paul's 2026-09-15 startup-posture decision (docs/
+ * contracts/chain-validity.md SS4): when chain.reconcileHead (or, in principle, any
+ * other startup structural-failure verdict) forces a hard-fail, this must be LOUD, not
+ * a silent status field -- a structured top-level diagnostic (logged so it appears even
+ * if the artifact write below itself fails), a written failure artifact (a status file
+ * does not require a running gateway), and an explicit pointer to the manual recovery
+ * runbook this commit ships alongside it, so the diagnostic always ends in a concrete
+ * next step. Writing the artifact is best-effort (mirrors writeStatusFile's own
+ * contract just above) -- a failure to write it must never mask or replace the
+ * already-logged, already-propagating original startup failure. */
+function writeChainCorruptionDiagnostic(stateDir, error, log) {
+  const diagnostic = {
+    schema_version: "1.0",
+    event: "gateway_startup_chain_integrity_failure",
+    code: error && error.code ? error.code : "GATEWAY_CHAIN_STRUCTURAL_FAILURE",
+    message: error && error.message ? error.message : String(error),
+    at: new Date().toISOString(),
+    runbook: chain.CHAIN_CORRUPTION_RUNBOOK,
+    action_required:
+      "This gateway will not start while its gateway-session chain fails structural verification -- " +
+      `no new sessions are being accepted. Follow ${chain.CHAIN_CORRUPTION_RUNBOOK} (restore from backup ` +
+      "/ truncate-at-last-good / rebuild HEAD from the validated chain tail) before restarting.",
+  };
+  log(`FATAL STARTUP CHAIN INTEGRITY FAILURE: ${JSON.stringify(diagnostic)}`);
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    stateStore.atomicOverwriteFile(chainCorruptionDiagnosticPath(stateDir), JSON.stringify(diagnostic, null, 2), stateDir);
+  } catch (writeError) {
+    log(`failed to write the startup chain-integrity diagnostic artifact (non-fatal, already logged above): ${writeError.message}`);
   }
 }
 
@@ -535,6 +1735,27 @@ async function startGateway(options) {
   writerClaim.acquire(); // FR-1: throws and this process must exit non-zero on refusal
   log(`writer-claim acquired: instance ${writerClaim.instanceId} on host ${writerClaim.hostId}`);
 
+  /* Access model (Paul's decision, 2026-09-15 fix round -- see
+   * claude/graphsmith-fix-round-plan-round1-2026-09-15.md, "Access model"): re-chmod
+   * every known-sensitive file/directory already on disk (from a prior run, or an older
+   * build) to this codebase's group-readable model (0750 dirs / 0640 files) BEFORE
+   * recovery reads any of them and before this process accepts any new session. Runs
+   * once we hold the writer-claim (so the state directory and the claim file itself are
+   * guaranteed to exist) but before recoverCrashedSessions. A real permission fault here
+   * (see startup-permissions.js's own doc comment on what is and is not swallowed) must
+   * stop startup outright rather than be discovered later against a file that turned out
+   * to still be more permissive than this model requires -- released the same way, and
+   * for the same reason, as the CodeRabbit PR #33 fix just below release the claim on a
+   * failed recoverCrashedSessions: without this, the claim and its heartbeat are already
+   * live, and an uncaught throw here would reject startGateway's promise while leaving
+   * an orphaned claim blocking the next restart. */
+  try {
+    tightenStateDirPermissions(config.state_dir);
+  } catch (error) {
+    writerClaim.release();
+    throw error;
+  }
+
   let proxy;
   writerClaim.onClaimLost = (error) => {
     log(`writer-claim lost: ${error.message} -- halting: no new sessions will be accepted.`);
@@ -551,6 +1772,74 @@ async function startGateway(options) {
     // detected, but by re-checking liveness at the one write that matters.
   };
   writerClaim.startHeartbeat();
+
+  /* Round-1 fix-plan commit 4 (docs/contracts/chain-validity.md's C2 + SS4): fixes a
+   * stale HEAD pointer ONCE, under the writer-claim and after the heartbeat has
+   * started (commit 1's own generalized keepalive covers reconcileHead's own O(n) walk
+   * via its per-entry maybeRenew()) -- BEFORE recoverCrashedSessions or any chain
+   * append can ever read HEAD stale. Per Paul's 2026-09-15 startup-posture decision: a
+   * genuine structural-failure verdict here must hard-fail startup, loudly (never a
+   * silent status field) -- log a structured top-level diagnostic, write a failure
+   * artifact naming the recovery runbook, release the writer-claim, and rethrow so
+   * this process exits non-zero (main()'s own top-level .catch already turns any
+   * rejected startGateway() into `process.exitCode = 1` with a FATAL log line). */
+  try {
+    const reconciliation = chain.reconcileHead(config.state_dir, writerClaim);
+    if (reconciliation.action === "advanced") {
+      log(
+        JSON.stringify({
+          event: "gateway_startup_chain_head_reconciled",
+          detail:
+            `startup chain reconciliation advanced a lagging HEAD.json to the chain's own verified ` +
+            `tail (seq=${reconciliation.to.seq}, bundle_id=${reconciliation.to.bundle_id}) -- this is ` +
+            "the expected signature of a crash between chain.jsonl's append and HEAD.json's update; " +
+            "no data was lost.",
+        })
+      );
+    }
+  } catch (error) {
+    writeChainCorruptionDiagnostic(config.state_dir, error, log);
+    writerClaim.release();
+    throw error;
+  }
+
+  /* Option C (crash-recovery/idempotency hardening, external-panel-reviewed design --
+   * see option-c-hardened-design.md): replay any WAL left behind by a crashed prior
+   * instance now, while this process holds exclusive writer ownership of state_dir and
+   * BEFORE any new downstream/agent work starts. Recovery must not race a fresh
+   * session's own WAL writes, and no new session should be admitted while a prior
+   * session's calls are still ambiguous. */
+  /* CodeRabbit PR #33 review "release the writer claim when startup recovery fails":
+   * the writer-claim and its heartbeat are already live by this point. Without this,
+   * an exception from recoverCrashedSessions (an unreadable WAL/intent this function's
+   * own per-connection try/catch does not fully absorb, or any other unexpected
+   * failure) would reject startGateway's promise while leaving the claim held -- an
+   * immediate restart would then be refused until the lease goes stale, and any other
+   * live handle to this WriterClaim instance would keep renewing an orphaned claim
+   * indefinitely (writerClaim.release() already stops the heartbeat itself). */
+  /* Round-N fix (frontier-panel finding #7): this log() call was previously OUTSIDE the
+   * try/catch above, even though it runs immediately after recoverCrashedSessions and
+   * before anything else -- a throwing log() (the same failure mode CodeRabbit's own
+   * review comment right above this block was written to guard against, just one
+   * statement too early) would escape startGateway with the writer-claim still held and
+   * its heartbeat still running, exactly the orphaned-claim outcome this whole guard
+   * exists to prevent. Moved inside the try so any exception here also releases the
+   * claim before rethrowing, consistent with every other statement in this guarded
+   * region. */
+  let pendingOperatorReview;
+  try {
+    ({ pendingOperatorReview } = recoverCrashedSessions(config.state_dir, keys, log, writerClaim));
+    if (pendingOperatorReview.length > 0) {
+      log(
+        `startup recovery: ${pendingOperatorReview.length} connection(s) left pending operator ` +
+          `review (see RECOVERY_AMBIGUOUS_INTENT log lines above) -- resolve via the ` +
+          "recovery-resolve/recovery-abandon CLI before their state is cleaned up."
+      );
+    }
+  } catch (error) {
+    writerClaim.release();
+    throw error;
+  }
 
   /* Mutable box, not a plain variable: connectAllDownstreams() below runs (and each
    * downstream stdio connection's onRequest closure over it is created) BEFORE the
@@ -639,6 +1928,10 @@ async function startGateway(options) {
     keys,
     stateDir: config.state_dir,
     log,
+    // Frontier-panel decision (Paul, 2026-09-10, cluster E2): see proxy.js's own
+    // pendingOperatorReviewConnections constructor comment for why a startup snapshot
+    // is sufficient here.
+    pendingOperatorReviewConnections: pendingOperatorReview,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
     onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size, quarantinedTo: error.quarantinedTo || null })),
     // Cluster C: read fresh from disk (WriterClaim#status's own contract) rather than
@@ -647,6 +1940,13 @@ async function startGateway(options) {
     // caught here even if this instance's own heartbeat hasn't yet noticed and fired
     // onClaimLost.
     isWriterClaimValid: () => writerClaim.status().held_by_this_instance,
+    /* Round-1 fix-plan commit 6: wires this process's own chain-integrity latch
+     * (chain.js's process-local getChainIntegrityFailure(), set by commit 4's
+     * checkHeadAgainstTailOrRepair/reconcileHead) into the ONE place a genuine
+     * failure must actually stop new work -- see GatewayProxy#openConnection's own
+     * doc comment for why this is the primary enforcement point and how a runtime
+     * transition into failure gets the same effect as detecting it at startup. */
+    getChainIntegrityFailure: () => chain.getChainIntegrityFailure(),
   });
 
   for (const [name, conn] of downstreamHandles.connections.entries()) {
@@ -661,10 +1961,10 @@ async function startGateway(options) {
   try {
     if (listenConfig.transport === "http") {
       const token = gatewayConfig.resolveSecretRef(listenConfig.token_ref, "agent_listen.token_ref");
-      httpHandle = await runHttpAgentTransport({ proxy }, listenConfig, token);
+      httpHandle = await runHttpAgentTransport({ proxy, log }, listenConfig, token);
       log(`agent-facing HTTP listener on port ${httpHandle.port}`);
     } else {
-      stdioHandle = runStdioAgentTransport({ proxy });
+      stdioHandle = runStdioAgentTransport({ proxy, log });
       // See forwardDownstreamRequestToAgent's doc above: only the stdio transport can
       // push a request to the agent, so this is the one branch that ever populates it.
       agentPusher.current = stdioHandle.pushRequest;
@@ -731,51 +2031,88 @@ async function startGateway(options) {
     return stopPromise;
   }
   async function doStop(reason) {
-    log(`shutting down (${reason || "requested"}): draining ${proxy.openSessionCount()} open session(s)`);
-    clearInterval(statusWriteTimer); // Cluster D: stop refreshing the status file once shutdown begins
-    proxy.stopAcceptingNewSessions();
-    /* SS3.7: "finish in-flight sessions" means actually WAIT (bounded) for calls already
-     * in flight to complete and be recorded with their real result -- not immediately
-     * truncate the connection and let closeConnection's own pending-call handling mark
-     * a call that was about to succeed as an artificial "disconnected" error. Only a
-     * call that is STILL pending once the drain timeout elapses gets that treatment. */
-    await drainOpenSessions(proxy, drainTimeoutMs);
-    agentPusher.current = null; // no agent left to push a forwarded sampling request to
-    agentPusher.connectionId = null;
-    if (stdioHandle) stdioHandle.stop();
-    if (httpHandle) {
-      await new Promise((resolve) => {
-        let settled = false;
-        const finish = () => { if (!settled) { settled = true; resolve(); } };
-        httpHandle.server.close(finish);
-        const forceCloseTimer = setTimeout(() => {
-          // Stop accepting new connections is already implied by close() above; this
-          // forcibly ends any still-open sockets/responses so the callback above (or
-          // this fallback) fires within the bounded deadline rather than whenever the
-          // last active response happens to finish.
-          if (typeof httpHandle.server.closeAllConnections === "function") httpHandle.server.closeAllConnections();
-          finish();
-        }, HTTP_LISTENER_CLOSE_TIMEOUT_MS);
-        if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
-      });
+    /* Codex PR #33 review "prevent shutdown diagnostics from aborting claim release":
+     * `log` is CALLER-SUPPLIED plumbing (options.log) and is permitted to throw. An
+     * earlier round of this PR wrapped each connection's closeConnection in a try/catch so
+     * one failing session could not abort shutdown -- but the handler (and this function's
+     * other diagnostics, starting with the very first line below) still called `log`
+     * directly, so a throwing logger reintroduced the identical failure one level up:
+     * doStop rejects before the remaining sessions, the downstream closes, and
+     * writerClaim.release() ever run, and an embedding process keeps renewing an orphaned
+     * claim indefinitely. Every diagnostic on this shutdown path now goes through this
+     * non-throwing wrapper (same contract as proxy.js#safeLog), AND the release itself sits
+     * in a finally covering the whole body -- so neither a close failure nor a logging
+     * failure can strand the claim. */
+    const safeShutdownLog = (message) => {
+      try {
+        log(message);
+      } catch (loggerError) {
+        // Deliberately swallowed: a failing logger must never keep shutdown from
+        // releasing the writer claim. See this block's own doc comment above.
+      }
+    };
+    try {
+      safeShutdownLog(`shutting down (${reason || "requested"}): draining ${proxy.openSessionCount()} open session(s)`);
+      clearInterval(statusWriteTimer); // Cluster D: stop refreshing the status file once shutdown begins
+      proxy.stopAcceptingNewSessions();
+      /* SS3.7: "finish in-flight sessions" means actually WAIT (bounded) for calls already
+       * in flight to complete and be recorded with their real result -- not immediately
+       * truncate the connection and let closeConnection's own pending-call handling mark
+       * a call that was about to succeed as an artificial "disconnected" error. Only a
+       * call that is STILL pending once the drain timeout elapses gets that treatment. */
+      await drainOpenSessions(proxy, drainTimeoutMs);
+      agentPusher.current = null; // no agent left to push a forwarded sampling request to
+      agentPusher.connectionId = null;
+      if (stdioHandle) stdioHandle.stop();
+      if (httpHandle) {
+        await new Promise((resolve) => {
+          let settled = false;
+          const finish = () => { if (!settled) { settled = true; resolve(); } };
+          httpHandle.server.close(finish);
+          const forceCloseTimer = setTimeout(() => {
+            // Stop accepting new connections is already implied by close() above; this
+            // forcibly ends any still-open sockets/responses so the callback above (or
+            // this fallback) fires within the bounded deadline rather than whenever the
+            // last active response happens to finish.
+            if (typeof httpHandle.server.closeAllConnections === "function") httpHandle.server.closeAllConnections();
+            finish();
+          }, HTTP_LISTENER_CLOSE_TIMEOUT_MS);
+          if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
+        });
+      }
+      // Finalize any still-open sessions (drained above, or forced closed after the timeout).
+      /* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
+       * closeConnection can throw before reaching its own guarded sealing block (e.g.
+       * recovery.listIntentsForConnection hitting a corrupt/unreadable intent FILE for this
+       * connection -- a genuine fs-level problem, not the kind of failure this codebase
+       * treats as recoverable). Previously unguarded here, so one such connection's failure
+       * escaped this loop entirely, skipping every remaining connection's own close, every
+       * downstream conn.close() below, and writerClaim.release() -- leaking a stale claim
+       * that blocks the next restart. Isolate per-connection failures (mirrors
+       * recoverCrashedSessions' own per-connection try/catch) so shutdown always reaches
+       * the downstream-close and writer-claim-release steps regardless. */
+        for (const connectionId of Array.from(proxy.sessions.keys())) {
+          try {
+            await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
+          } catch (error) {
+            safeShutdownLog(`SHUTDOWN CLOSE FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- continuing shutdown for other sessions and releasing the writer claim regardless.`);
+          }
+        }
+      /* Codex PR #29 review round 8 "bound termination of stdio downstream children": same
+       * reasoning as the startup-failure cleanup above -- await close() so a downstream that
+       * traps/ignores SIGTERM is actually confirmed gone (or forcibly SIGKILLed) before this
+       * releases the writer-claim, rather than left running past shutdown. */
+        for (const conn of downstreamHandles.connections.values()) {
+          try { await conn.close(); } catch (error) { /* best effort */ }
+        }
+    } finally {
+      writerClaim.release();
     }
-    // Finalize any still-open sessions (drained above, or forced closed after the timeout).
-    for (const connectionId of Array.from(proxy.sessions.keys())) {
-      await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
-    }
-    /* Codex PR #29 review round 8 "bound termination of stdio downstream children": same
-     * reasoning as the startup-failure cleanup above -- await close() so a downstream that
-     * traps/ignores SIGTERM is actually confirmed gone (or forcibly SIGKILLed) before this
-     * releases the writer-claim, rather than left running past shutdown. */
-    for (const conn of downstreamHandles.connections.values()) {
-      try { await conn.close(); } catch (error) { /* best effort */ }
-    }
-    writerClaim.release();
     // Cluster D: one last write so `gateway.js status` run after this process has
     // exited reports an accurate "not claimed by this instance" / drained snapshot
     // instead of silently going stale mid-run-looking data.
-    writeStatusFile(ctx, log);
-    log("shutdown complete: writer-claim released.");
+    writeStatusFile(ctx, safeShutdownLog);
+    safeShutdownLog("shutdown complete: writer-claim released.");
   }
 
   return {
@@ -855,7 +2192,18 @@ function runStatusCommand(configPathArg) {
 }
 
 function main() {
+  const log = (...args) => console.error("[graphsmith-gateway]", ...args);
   const argv = process.argv.slice(2);
+  if (argv[0] === "recovery-resolve" || argv[0] === "recovery-abandon") {
+    try {
+      if (argv[0] === "recovery-resolve") runRecoveryResolveCli(argv.slice(1), log);
+      else runRecoveryAbandonCli(argv.slice(1), log);
+    } catch (error) {
+      console.error(`[graphsmith-gateway] FATAL: ${error.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (argv[0] === "status") {
     runStatusCommand(argv[1]);
     return;
@@ -881,8 +2229,14 @@ module.exports = {
   startGateway,
   checkModeGate,
   buildHealthStatus,
+  writeStatusFile,
   loadSigningKeys,
   drainOpenSessions,
+  createLeaseGuard,
+  recoverCrashedSessions,
+  abandonConnection,
+  runRecoveryResolveCli,
+  runRecoveryAbandonCli,
   gatewayStatusPath,
   STATUS_WRITE_INTERVAL_MS,
   runStatusCommand,

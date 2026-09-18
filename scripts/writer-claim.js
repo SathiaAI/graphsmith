@@ -269,6 +269,10 @@ class WriterClaim {
     this._claimToken = null;
     this._timer = null;
     this._lastHeartbeatError = null;
+    /* Set by acquire() and renew() (never by maybeRenew() directly -- it only reads
+     * this to decide whether to call renew()). Used by maybeRenew() below to time-gate
+     * renewal for callers doing long synchronous work while holding this claim. */
+    this._lastRenewAt = null;
     // Optional: see startHeartbeat()'s doc comment. Also settable after construction.
     this.onClaimLost = typeof options.onClaimLost === "function" ? options.onClaimLost : null;
   }
@@ -350,6 +354,7 @@ class WriterClaim {
       try {
         const { token } = this._writeNewClaim(now);
         this._claimToken = token;
+        this._lastRenewAt = now;
         return this.status();
       } catch (error) {
         if (error.code !== "EEXIST") throw error;
@@ -378,6 +383,7 @@ class WriterClaim {
         });
         if (decision.outcome === "own") {
           this._claimToken = observed.claim_token;
+          this._lastRenewAt = now;
           return this.status();
         }
         if (decision.outcome === "refuse") {
@@ -457,10 +463,54 @@ class WriterClaim {
       fs.ftruncateSync(fd, 0);
       fs.writeSync(fd, content, 0, "utf8");
       fs.fsyncSync(fd);
+      this._lastRenewAt = now;
       return updated;
     } finally {
       fs.closeSync(fd);
     }
+  }
+
+  /* Round-1 fix-plan item 1 (lease keepalive, generalized): a time-gated renew() for a
+   * caller doing long synchronous work while holding this claim -- WAL replay loops, the
+   * startup chain-integrity walk, `chain.reconcileHead`'s per-entry walk (the last two
+   * land in later commits and will call this same method; it is written now so they
+   * have it to call). startHeartbeat()'s own doc comment above discloses exactly why a
+   * bare setInterval is not sufficient on its own: it only fires when the event loop is
+   * free, and a caller doing synchronous fs work across many small iterations can starve
+   * it past staleAfterMs before a single renewal lands. Calling renew() unconditionally
+   * on every iteration would fix that but adds an fsync per iteration -- for a WAL replay
+   * loop over thousands of events that makes the cure slower than the disease. This
+   * renews only once at least heartbeatMs has elapsed since the LAST successful renewal
+   * from ANY source sharing this same WriterClaim instance -- acquire(), the background
+   * heartbeat, a previous maybeRenew(), or a previous direct renew() call, all update the
+   * same `_lastRenewAt` -- so a caller with many small iterations pays at most roughly one
+   * renewal per heartbeatMs, not one per iteration.
+   *
+   * Uses this.clock.now() -- NEVER Date.now() -- for the elapsed-time check, the same
+   * instance-level clock renew()/acquire() already use and that this class's constructor
+   * enforces via LEASE_CLOCK_REQUIRED/BAD_LEASE_CLOCK (see above): a caller under test can
+   * drive this deterministically with a manual clock (tests/_harness/clock.js), and a
+   * caller mixing in Date.now() here would silently defeat that for exactly the code path
+   * meant to be pinned by a chosen instant.
+   *
+   * A caller that knows a SINGLE unit of work can itself exceed staleAfterMs (a single
+   * oversized WAL event, or -- more importantly -- the actual write that mutates chain
+   * state, e.g. immediately before chain.appendSession/chain.repairMissingChainEntry)
+   * must call renew() directly and unconditionally instead of relying on this time gate;
+   * see gateway.js's own call sites for exactly that case. This method's own gate is a
+   * per-iteration convenience, not a substitute for that unconditional pre-write renewal.
+   *
+   * DISCLOSED, NOT FIXED HERE: neither this method nor renew() provides atomic fencing.
+   * A successful renewal and the shared-state write it is meant to protect remain two
+   * separate operations with no OS-level atomicity between them -- a contender could in
+   * principle take the claim in the gap between this call returning and the next line of
+   * caller code running. This narrows the exposure window from staleAfterMs down to
+   * roughly one iteration's (or one write's) worth of work; it does not close it. Do not
+   * describe this, in a comment, a commit message, or to an operator, as "preventing
+   * corruption" -- say "narrows the window" instead. */
+  maybeRenew() {
+    if (this._lastRenewAt !== null && this._now() - this._lastRenewAt < this.heartbeatMs) return;
+    this.renew();
   }
 
   /* CodeRabbit review (PR #27) found two problems here, both left the module silently
@@ -481,27 +531,37 @@ class WriterClaim {
    *     long synchronous work while holding this claim can starve the heartbeat past
    *     staleAfterMs, exactly the failure mode state-store.js's own lock renewal
    *     (_assertStillOwned) was hardened against by making renewal synchronous at
-   *     durable writes. WriterClaim has NOT had the equivalent fix applied, because
-   *     Phase 0 does not yet wire this claim into any long-running synchronous
-   *     operation (no production entry point calls acquire()/startHeartbeat() as of
-   *     this PR -- see KNOWN-LIMITATIONS.md). This is disclosed here rather than
-   *     silently left implicit: whichever change wires WriterClaim into a real process
-   *     lifecycle must either keep every synchronous critical section well under
-   *     staleAfterMs, or add a synchronous renewal call at the boundaries of any long
-   *     synchronous phase, mirroring state-store.js's fix, before relying on this
-   *     heartbeat alone for correctness. */
+   *     durable writes. Round-1 fix-plan item 1 (lease keepalive, generalized) is that
+   *     equivalent fix: gateway.js now wires acquire()/startHeartbeat() into the real
+   *     process lifecycle immediately after acquire() succeeds (before any startup work
+   *     runs), and calls this class's own maybeRenew()/renew() at the boundaries of every
+   *     long synchronous phase held under this claim (WAL replay loops, immediately
+   *     before every chain-mutating write) -- see gateway.js's recoverCrashedSessions/
+   *     abandonConnection and their shared createLeaseGuard() helper.
+   *
+   * Round-1 fix-plan item 1 also corrects a narrower bug in this method: previously only
+   * `error.code === "WRITER_CLAIM_LOST"` halted the heartbeat -- any OTHER renew()
+   * failure (a raw fs error such as EIO from the openSync in renew() above, or
+   * CORRUPT_CLAIM) fell through this check silently, leaving `_lastHeartbeatError` set
+   * but the timer running, unobserved except by a caller that happens to poll status().
+   * A renewal failure for ANY reason means this process can no longer be certain it is
+   * the sole attesting writer -- lease ownership is process-global, so treating only the
+   * one named code as fatal while quietly retrying every other failure is exactly the
+   * "silently continue after losing exclusivity" bug convention this codebase otherwise
+   * refuses to allow (see the halt-loudly convention cited above). Every renew() failure
+   * now halts the heartbeat and either reports via onClaimLost or rethrows uncaught. */
   startHeartbeat() {
     if (this._timer) return this._timer;
     this._timer = setInterval(() => {
       try { this.renew(); this._lastHeartbeatError = null; }
       catch (error) {
         this._lastHeartbeatError = error;
-        if (error.code === "WRITER_CLAIM_LOST") {
-          this.stopHeartbeat();
-          this._claimToken = null;
-          if (typeof this.onClaimLost === "function") this.onClaimLost(error);
-          else throw error;   // unhandled: halt loudly rather than keep writing
-        }
+        // Any renew() failure is fatal to the heartbeat, not only WRITER_CLAIM_LOST --
+        // see this method's own doc comment above.
+        this.stopHeartbeat();
+        this._claimToken = null;
+        if (typeof this.onClaimLost === "function") this.onClaimLost(error);
+        else throw error;   // unhandled: halt loudly rather than keep writing
       }
     }, this.heartbeatMs);
     if (typeof this._timer.unref === "function") this._timer.unref();

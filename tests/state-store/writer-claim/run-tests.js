@@ -592,6 +592,94 @@ async function crCodex_heartbeatSurfacesClaimLoss() {
     `expected an uncaught WRITER_CLAIM_LOST when no onClaimLost handler was given, got ${uncaught && uncaught.code}`);
 }
 
+/* Round-1 fix-plan item 1 (lease keepalive, generalized): maybeRenew() is the shared,
+ * time-gated renewal helper gateway.js's WAL replay loops (and, in later commits,
+ * chain.reconcileHead's per-entry walk / the startup integrity walk) call at loop
+ * boundaries. Pinned directly against this class with a manual clock -- never Date.now()
+ * -- both to prove the gating math itself and, indirectly, that it reads elapsed time via
+ * this.clock.now(): if it read Date.now() instead, the huge (real, wall-clock) gap
+ * between this manual clock's fixed epoch and the actual current time would make it
+ * renew unconditionally, and the "skip within the window" assertion below would fail. */
+function grFix1_maybeRenewIsTimeGatedByTheClaimsOwnClock() {
+  const root = freshRoot("maybe-renew-gate");
+  const clock = createManualClock();
+  const w = newClaim(root, { instanceId: "7".repeat(32), clock });
+  w.acquire();
+  const afterAcquire = w.status();
+
+  // Advancing LESS than heartbeatMs: maybeRenew() must be a no-op.
+  clock.advance(HEARTBEAT_MS - 1);
+  w.maybeRenew();
+  const stillUnrenewed = w.status();
+  check("maybe-renew-skips-within-the-heartbeat-window",
+    stillUnrenewed.renewed_at === afterAcquire.renewed_at,
+    `expected renewed_at to stay ${afterAcquire.renewed_at}, got ${stillUnrenewed.renewed_at}`);
+
+  // Advancing past heartbeatMs: maybeRenew() must actually renew, using the claim's own
+  // clock for the new renewed_at value.
+  clock.advance(2);
+  w.maybeRenew();
+  const renewed = w.status();
+  check("maybe-renew-renews-once-the-heartbeat-window-has-elapsed",
+    renewed.renewed_at === clock.now(),
+    `expected renewed_at to be bumped to ${clock.now()}, got ${renewed.renewed_at}`);
+
+  // Immediately calling it again must be a no-op again -- the SAME instance-level
+  // _lastRenewAt is shared across every call site, not a fresh window per call.
+  const beforeSecond = w.status().renewed_at;
+  w.maybeRenew();
+  check("maybe-renew-does-not-renew-twice-within-the-same-window",
+    w.status().renewed_at === beforeSecond,
+    `expected renewed_at to stay ${beforeSecond}, got ${w.status().renewed_at}`);
+}
+
+function grFix1_maybeRenewPropagatesALostClaimJustLikeRenew() {
+  const root = freshRoot("maybe-renew-lost");
+  const clock = createManualClock();
+  const w = newClaim(root, { instanceId: "9".repeat(32), clock });
+  w.acquire();
+  clock.advance(HEARTBEAT_MS + 1);
+  fs.unlinkSync(w.path); // simulate an out-of-band loss
+  let thrown = null;
+  try { w.maybeRenew(); } catch (error) { thrown = error; }
+  check("maybe-renew-propagates-writer-claim-lost-once-the-gate-is-due",
+    Boolean(thrown) && thrown.code === "WRITER_CLAIM_LOST", thrown && thrown.code);
+}
+
+/* Round-1 fix-plan item 1: previously only `error.code === "WRITER_CLAIM_LOST"` halted the
+ * background heartbeat -- ANY other renew() failure (a raw fs error, or CORRUPT_CLAIM)
+ * fell through silently, leaving the timer running and only `_lastHeartbeatError` set.
+ * Lease ownership is process-global: a renewal failure for ANY reason means this process
+ * can no longer be certain it is the sole attesting writer, so every failure must halt. */
+async function grFix1_heartbeatHaltsOnAnyRenewFailureNotOnlyClaimLost() {
+  const root = freshRoot("cr-heartbeat-non-lost-failure");
+  const clock = createManualClock();
+  let lostError = null;
+  const w = newClaim(root, {
+    instanceId: "a".repeat(32), clock, heartbeatMs: 20,
+    onClaimLost: (error) => { lostError = error; },
+  });
+  w.acquire();
+  const realRenew = w.renew.bind(w);
+  w.renew = () => {
+    const error = new Error("simulated disk I/O error");
+    error.code = "EIO";
+    throw error;
+  };
+  w.startHeartbeat();
+  await waitUntil(() => lostError !== null, 2000);
+  w.stopHeartbeat();
+  w.renew = realRenew;
+
+  check("heartbeat-halts-on-a-non-writer-claim-lost-renew-failure",
+    Boolean(lostError) && lostError.code === "EIO",
+    `expected the heartbeat to halt and report the raw EIO error, got ${lostError && lostError.code}`);
+  check("heartbeat-clears-token-on-any-renew-failure", w._claimToken === null,
+    "the in-memory claim token must be cleared on ANY renew failure, not only WRITER_CLAIM_LOST");
+  check("heartbeat-stops-timer-on-any-renew-failure", w._timer === null,
+    "the heartbeat timer must stop itself on ANY renew failure");
+}
+
 function crCodex_renewToctouDoesNotClobberContender() {
   /* [inferring] SKIPPED on win32: this technique unlinks owner.path while renew()'s own
    * fd (fs.openSync(this.path, "r+"), held open across the whole check-then-write per
@@ -744,6 +832,9 @@ async function main() {
   crCodex_clockInstantValidated();
   crCodex_releaseKeepsTokenOnThrow();
   await crCodex_heartbeatSurfacesClaimLoss();
+  grFix1_maybeRenewIsTimeGatedByTheClaimsOwnClock();
+  grFix1_maybeRenewPropagatesALostClaimJustLikeRenew();
+  await grFix1_heartbeatHaltsOnAnyRenewFailureNotOnlyClaimLost();
   crCodex_renewToctouDoesNotClobberContender();
   crCodex_unlinkIfTokenDoesNotClobberSwappedFile();
 
