@@ -1160,7 +1160,7 @@ class GatewayProxy {
            * anomaly and a structured log line, and still return the real result. */
           if (s.walPoisoned) {
             session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED", tool: toolName, intent_key: intentKey, detail: s.walPoisoned.reason });
-            this.log(JSON.stringify({ event: "gateway_wal_append_skipped_poisoned", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: s.walPoisoned.reason }));
+            this.safeLog(JSON.stringify({ event: "gateway_wal_append_skipped_poisoned", connection_id: connectionId, tool: toolName, call_seq: walCallSeq, type: "CALL_RESULT", detail: s.walPoisoned.reason }));
           } else {
             try {
               // Cluster A: tagged with the same dispatchGeneration as this call's own

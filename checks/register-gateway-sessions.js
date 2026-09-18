@@ -251,7 +251,8 @@ function walkGatewaySessions(ctx) {
     // work as that work actually happens, and a thrown lease-loss error aborts the walk
     // at exactly the entry chain.validateChain had reached, never after the fact.
     const validateOptions = typeof ctx.maybeRenew === "function" ? { onEntry: ctx.maybeRenew } : undefined;
-    const result = chain.validateChain(rawChain, ctx.head === undefined ? null : ctx.head, validateOptions);
+    // C2 rows 3/4: "absent", "not an object", and "fails headShapeOk" are one input case.
+    const result = chain.validateChain(rawChain, headShapeOk(ctx.head) ? ctx.head : null, validateOptions);
 
     if (result.status === "empty") {
       return { status: "not-applicable", evidence, assumptions, reason: "empty gateway-session log -- nothing to verify" };
