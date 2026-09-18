@@ -55,6 +55,18 @@ function sealBoundaryBundle(session, keys) {
       is_error: !!c.isError,
       model_call: !!c.model_call,                        // sampling/createMessage → non-deterministic
       ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason || null } : {}),
+      /* Round-N fix (frontier-panel finding #2): session.js's own per-call recording
+       * (toSealableSession / the earlier per-call `replayed` bookkeeping) already
+       * propagates `replayed`/`replayed_from_intent_key` correctly onto each call object
+       * -- this sealed execution_trace.jsonl line was the one place downstream that
+       * silently dropped it again, by mirroring the `disconnected` conditional spread
+       * immediately above without also carrying this one. Without it, a replayed call
+       * (the gateway detected a duplicate intent_key and returned the previously
+       * recorded result instead of re-dispatching) is indistinguishable in the signed,
+       * durable attestation bundle from an ordinary fresh call -- an auditor reviewing
+       * the bundle alone has no way to know that call's own downstream effect did not
+       * happen again at that step. */
+      ...(c.replayed ? { replayed: true, replayed_from_intent_key: c.replayed_from_intent_key || null } : {}),
     });
   });
   const outputs = calls.filter((c) => !c.isError).map((c, i) => ({ call: i + 1, result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)) }));

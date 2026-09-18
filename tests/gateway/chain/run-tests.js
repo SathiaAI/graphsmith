@@ -886,7 +886,15 @@ function reconcileHeadRebuildsFromAMalformedHeadFile() {
  * would still write HEAD.json. The status/health walk already had the per-entry hook
  * (walkGatewaySessionsCallsMaybeRenewOncePerEntry above); this is the same wiring for the
  * startup walk. 5 valid entries => 1 pre-walk renew + 5 per-entry renews. A chain that
- * validates clean returns before the repair write, so no sixth renew is expected here. */
+ * validates clean returns before the repair write, so no extra renew is expected there.
+ *
+ * Round-N fix (frontier-panel finding #8): readChainForValidation now streams the chain
+ * file in chunks (streamChainFileLines) instead of reading it whole into a string, and
+ * accepts its own onProgress hook wired to the same maybeRenew closure so a chain large
+ * enough to outlast the staleness window is renewed DURING the read, not just before/after
+ * it. This whole 5-entry fixture fits in a single 1MB read chunk, so the streaming read
+ * contributes exactly one additional renew call beyond the pre-walk + per-entry total:
+ * 1 pre-walk + 1 read-phase (one chunk) + 5 per-entry = 7. */
 function reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk() {
   const dir = freshDir("reconcile-per-entry-renew");
   const keys = makeKeys();
@@ -897,8 +905,8 @@ function reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk() {
   check("reconcile-per-entry-renew-chain-is-valid", result.action === "none", JSON.stringify(result));
   check(
     "reconcile-renews-the-claim-once-per-chain-entry-not-only-once-before-the-walk",
-    renewCalls === 6,
-    `expected 6 (1 pre-walk + 5 per-entry), got ${renewCalls}`
+    renewCalls === 7,
+    `expected 7 (1 pre-walk + 1 read-phase + 5 per-entry), got ${renewCalls}`
   );
 }
 
@@ -906,7 +914,9 @@ function reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk() {
  * the per-entry hook cannot cover a walk of 0-1 entries, so the HEAD.json repair write
  * gets its own unconditional renew immediately before it, mirroring
  * gateway.js#abandonConnection's own pre-appendSession renew. 2 entries with a one-step
- * stale HEAD => 1 pre-walk + 2 per-entry + 1 pre-write = 4. */
+ * stale HEAD => 1 pre-walk + 2 per-entry + 1 pre-write = 4, plus the same read-phase renew
+ * described above (Round-N fix, finding #8) since this fixture's tiny chain file also
+ * fits in a single streamed chunk => 1 pre-walk + 1 read-phase + 2 per-entry + 1 pre-write = 5. */
 function reconcileHeadRenewsTheClaimAgainImmediatelyBeforeTheRepairWrite() {
   const dir = freshDir("reconcile-pre-write-renew");
   const keys = makeKeys();
@@ -918,8 +928,8 @@ function reconcileHeadRenewsTheClaimAgainImmediatelyBeforeTheRepairWrite() {
   check("reconcile-pre-write-renew-advanced-the-head", result.action === "advanced" && result.to.seq === 2, JSON.stringify(result));
   check(
     "reconcile-renews-the-claim-immediately-before-the-head-repair-write",
-    renewCalls === 4,
-    `expected 4 (1 pre-walk + 2 per-entry + 1 pre-write), got ${renewCalls}`
+    renewCalls === 5,
+    `expected 5 (1 pre-walk + 1 read-phase + 2 per-entry + 1 pre-write), got ${renewCalls}`
   );
 }
 
@@ -1095,6 +1105,197 @@ function reconcileHeadRefusesEmptyChainWithHeadPresent() {
   check("reconcile-empty-with-head-refuses", threw !== null && threw.code === "GATEWAY_CHAIN_STRUCTURAL_FAILURE", threw ? `${threw.code}: ${threw.message}` : "did not throw");
 }
 
+/* ==================================================================================
+ * Round-N fix (frontier-panel finding #8 checklist): streamChainFileLines (the shared
+ * chunked-byte-read primitive readChain/readChainForValidation are built on) tested
+ * directly at the primitive level -- chunk-boundary correctness, UTF-8 safety, renewal
+ * firing during the read itself (not only after it), immediate abort on lost ownership
+ * mid-read (the competing-claimant-after-a-stale-lease case), and unchanged behavior for
+ * a file with no trailing newline / an absent file. Exported specifically so these can be
+ * driven with small, fast, deterministic chunkBytes overrides instead of a multi-hundred-
+ * MB fixture (checklist: "a mocked fs / small chunk size that pretends >512MB without
+ * checking in a gigabyte fixture" -- streamChainFileLines's own memory profile is
+ * O(chunk size), not O(file size), so proving correctness across MANY small forced chunk
+ * boundaries generalizes to any file size by construction, without needing an actual
+ * multi-hundred-MB file on disk).
+ * ================================================================================== */
+
+function collectStreamedLines(dir, options) {
+  const lines = [];
+  const progress = [];
+  chain.streamChainFileLines(dir, {
+    ...options,
+    onLine: (buf, idx, meta) => lines.push({ idx, meta, text: buf ? buf.toString("utf8") : null }),
+    onProgress: (n) => progress.push(n),
+  });
+  return { lines, progress };
+}
+
+function streamChainFileLinesHandlesMultiByteUtf8SplitAcrossATinyChunkBoundary() {
+  const dir = freshDir("stream-utf8-chunk");
+  const entries = [
+    { schema_version: "1.0", seq: 1, bundle_id: "plain-ascii" },
+    { schema_version: "1.0", seq: 2, bundle_id: "résumé-日本語-emoji-🎉-more" },
+    { schema_version: "1.0", seq: 3, bundle_id: "back-to-ascii" },
+  ];
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  // chunkBytes=3 forces the raw byte reader to split well inside the multi-byte UTF-8
+  // characters above on nearly every read -- streamChainFileLines only ever decodes a
+  // complete assembled LINE (never a mid-chunk partial buffer), so this must not corrupt
+  // the decoded text regardless of exactly where each chunk boundary lands.
+  const { lines, progress } = collectStreamedLines(dir, { chunkBytes: 3 });
+  check("stream-utf8-forces-many-physical-chunks", progress.length > 10, `only ${progress.length} chunk(s) -- fixture too small to prove the boundary case`);
+  check("stream-utf8-parses-all-three-lines", lines.length === 3, JSON.stringify(lines));
+  check(
+    "stream-utf8-multibyte-content-survives-the-chunk-split-intact",
+    lines.every((l, i) => !l.meta.oversized && JSON.parse(l.text).bundle_id === entries[i].bundle_id),
+    JSON.stringify(lines)
+  );
+}
+
+function streamChainFileLinesRenewsOncePerPhysicalChunkAcrossManyChunks() {
+  const dir = freshDir("stream-renew-many-chunks");
+  const entries = Array.from({ length: 8 }, (_, i) => ({ schema_version: "1.0", seq: i + 1, bundle_id: `chunked-renew-${i}` }));
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  let renewCalls = 0;
+  const lines = [];
+  chain.streamChainFileLines(dir, {
+    chunkBytes: 5, // tiny -- forces dozens of physical read syscalls for this small fixture
+    onProgress: () => { renewCalls++; },
+    onLine: (buf) => lines.push(JSON.parse(buf.toString("utf8"))),
+  });
+  check("stream-renew-parses-every-entry-despite-tiny-chunks", lines.length === 8 && lines.every((l, i) => l.bundle_id === entries[i].bundle_id), JSON.stringify(lines));
+  check(
+    "stream-renew-fires-more-than-once-i.e.-genuinely-during-the-read-not-only-once-at-the-end",
+    renewCalls > 8,
+    `expected many renew opportunities across chunk boundaries, got ${renewCalls}`
+  );
+}
+
+/* The competing-claimant-after-a-stale-lease case at the primitive level: once
+ * onProgress (the caller's maybeRenew hook) detects lost ownership mid-read and throws,
+ * the read must abort AT THAT POINT -- no further physical chunks are read and no further
+ * lines are handed to onLine. This is what actually prevents the former (now-stale) owner
+ * from completing its read and going on to act as if it still held the claim: the error
+ * propagates by reference, unmodified, out of the read entirely. */
+function streamChainFileLinesAbortsImmediatelyWhenOnProgressDetectsLostOwnership() {
+  const dir = freshDir("stream-lost-ownership-mid-read");
+  const entries = Array.from({ length: 6 }, (_, i) => ({ schema_version: "1.0", seq: i + 1, bundle_id: `pre-takeover-${i}` }));
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  const takeoverError = Object.assign(new Error("simulated competing claimant won the lease after an over-TTL stall"), { code: "WRITER_CLAIM_LOST" });
+  let progressCalls = 0;
+  const linesSeenBeforeAbort = [];
+  let threw = null;
+  try {
+    chain.streamChainFileLines(dir, {
+      chunkBytes: 4, // many chunks -- so the second progress call is still mid-file, not the last one
+      onLine: (buf) => linesSeenBeforeAbort.push(buf ? buf.toString("utf8") : null),
+      onProgress: () => {
+        progressCalls++;
+        if (progressCalls === 2) throw takeoverError;
+      },
+    });
+  } catch (error) {
+    threw = error;
+  }
+  check("stream-lost-ownership-propagates-the-exact-error-by-reference", threw === takeoverError, threw && threw.message);
+  check(
+    "stream-lost-ownership-does-not-finish-reading-the-rest-of-the-file",
+    linesSeenBeforeAbort.length < entries.length,
+    `expected an early abort (fewer than ${entries.length} lines), got ${linesSeenBeforeAbort.length}`
+  );
+}
+
+function streamChainFileLinesToleratesFileWithNoTrailingNewline() {
+  const dir = freshDir("stream-no-trailing-newline");
+  const entries = [
+    { schema_version: "1.0", seq: 1, bundle_id: "first" },
+    { schema_version: "1.0", seq: 2, bundle_id: "last-no-newline" },
+  ];
+  // Deliberately no trailing "\n" -- the final unterminated line is still a real record.
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+  const { lines } = collectStreamedLines(dir, {});
+  check("stream-no-trailing-newline-still-parses-both-lines", lines.length === 2, JSON.stringify(lines));
+  check(
+    "stream-no-trailing-newline-final-unterminated-line-is-not-dropped",
+    lines[1] && JSON.parse(lines[1].text).bundle_id === "last-no-newline",
+    JSON.stringify(lines)
+  );
+}
+
+function streamChainFileLinesNoOpWhenChainFileIsAbsent() {
+  const dir = freshDir("stream-absent-file");
+  fs.mkdirSync(chain.sessionsDir(dir), { recursive: true }); // directory exists, chain.jsonl does not
+  const { lines, progress } = collectStreamedLines(dir, {});
+  check("stream-absent-file-calls-onLine-zero-times", lines.length === 0, JSON.stringify(lines));
+  check("stream-absent-file-calls-onProgress-zero-times", progress.length === 0, JSON.stringify(progress));
+}
+
+/* Locks in the finding #8 checklist's distinct-error-code requirement: an oversized
+ * record is a size/resource condition (GATEWAY_CHAIN_ENTRY_TOO_LARGE), never conflated
+ * with CORRUPT_GATEWAY_CHAIN -- the catch-all reserved for genuine content corruption
+ * (malformed JSON, bad hash linkage). Both halves are pinned so a future edit cannot
+ * silently re-merge the two failure classes. */
+function readChainRejectsOversizedRecordWithADistinctCode() {
+  const dir = freshDir("readchain-oversized");
+  const bigBundleId = "x".repeat(chain.MAX_ENTRY_BYTES + 100);
+  writeChainFile(dir, JSON.stringify({ schema_version: "1.0", seq: 1, bundle_id: bigBundleId }) + "\n");
+  let threw = null;
+  try {
+    chain.readChain(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check(
+    "readchain-oversized-record-throws-a-distinct-too-large-code-not-corrupt",
+    threw !== null && threw.code === "GATEWAY_CHAIN_ENTRY_TOO_LARGE",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+}
+
+function readChainStillLabelsGenuineJsonCorruptionAsCorrupt() {
+  const dir = freshDir("readchain-corrupt-json");
+  writeChainFile(dir, '{"schema_version": "1.0", "seq": 1, "bundle_id": "ok"}\n{not even close to json\n');
+  let threw = null;
+  try {
+    chain.readChain(dir);
+  } catch (error) {
+    threw = error;
+  }
+  check(
+    "readchain-malformed-json-record-still-reports-corrupt-not-too-large",
+    threw !== null && threw.code === "CORRUPT_GATEWAY_CHAIN",
+    threw ? `${threw.code}: ${threw.message}` : "did not throw"
+  );
+}
+
+/* Integration-level sanity check through the PUBLIC readChain API (default 1MB chunking,
+ * no chunkBytes override) with a real file large enough to force more than one physical
+ * chunk: proves the default production configuration -- not just the primitive with a
+ * tiny forced chunkBytes -- genuinely spans multiple chunks and still parses every entry
+ * correctly, and that onProgress (the lease-renewal hook both real call sites wire in)
+ * actually fires more than once for it. This is the closest cheap proxy for "a chain
+ * exceeding the old whole-file materialization ceiling parses successfully": the read
+ * path here is provably chunked (progress.length > 1), and streamChainFileLines's own
+ * memory profile is chunk-size-invariant, so this generalizes to any file size without
+ * needing an actual 512MB+ fixture checked into the repo. */
+function readChainHandlesARealMultiChunkFileThroughTheDefaultPublicApi() {
+  const dir = freshDir("readchain-multi-chunk-real");
+  // ~40 entries of ~35KB padding each => comfortably over the default 1MB chunk size,
+  // each individual entry still well under MAX_ENTRY_BYTES (64KB) so none is rejected.
+  const entries = Array.from({ length: 40 }, (_, i) => ({ schema_version: "1.0", seq: i + 1, bundle_id: `multi-chunk-${i}`, padding: "p".repeat(35 * 1024) }));
+  writeChainFile(dir, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  const progress = [];
+  const result = chain.readChain(dir, { onProgress: (n) => progress.push(n) });
+  check("readchain-multi-chunk-real-parses-every-entry", result.length === 40 && result.every((e, i) => e.bundle_id === entries[i].bundle_id), `parsed ${result.length} of 40`);
+  check("readchain-multi-chunk-real-genuinely-spans-more-than-one-physical-chunk", progress.length > 1, `expected >1 chunk read, got ${progress.length}`);
+}
+
 function main() {
   tenSessionsInSequence();
   fixtureDataVerifiesIndependently();
@@ -1164,6 +1365,17 @@ function main() {
   reconcileHeadRenewsTheClaimPerEntryAcrossTheStartupWalk();
   reconcileHeadRenewsTheClaimAgainImmediatelyBeforeTheRepairWrite();
   reconcileHeadPerEntryLeaseLossAbortsBeforeTheRepairWrite();
+
+  // Round-N fix (frontier-panel finding #8 checklist): streamChainFileLines primitive +
+  // readChain error-code tests.
+  streamChainFileLinesHandlesMultiByteUtf8SplitAcrossATinyChunkBoundary();
+  streamChainFileLinesRenewsOncePerPhysicalChunkAcrossManyChunks();
+  streamChainFileLinesAbortsImmediatelyWhenOnProgressDetectsLostOwnership();
+  streamChainFileLinesToleratesFileWithNoTrailingNewline();
+  streamChainFileLinesNoOpWhenChainFileIsAbsent();
+  readChainRejectsOversizedRecordWithADistinctCode();
+  readChainStillLabelsGenuineJsonCorruptionAsCorrupt();
+  readChainHandlesARealMultiChunkFileThroughTheDefaultPublicApi();
 
   walkGatewaySessionsCallsMaybeRenewOncePerEntry();
   walkGatewaySessionsMaybeRenewInterleavedWithValidateChainNotFrontLoaded();

@@ -1815,6 +1815,56 @@ function abandonConnectionOnAlreadyCleanConnectionIsANoOp() {
   check("abandon-of-a-connection-with-no-wal-does-not-throw", threw === null, threw && threw.message);
 }
 
+/** Round-N fix (frontier-panel finding #5, Paul's explicit choice of Fable's "make the gap
+ * observable" proposal): mirrors proxy.js's own cached-replay branch -- the CALL_START for
+ * a completed-signature cache hit IS durably written with replayed:true, but its matching
+ * CALL_RESULT never makes it into the WAL before the crash. The intent stays "dispatched"
+ * (never proven), so this is exactly the orphaned-replayed-step gap finding #5 named. */
+function seedOrphanedReplayedCallWal(dir, connectionId) {
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", started_at: 1, goal: null, tools: [{ name: "echo", server: "srv", schema: {} }] });
+  recovery.appendWalEvent(dir, connectionId, { type: "INITIALIZE", clientInfo: { name: "agent", version: "1" }, serverInfo: { name: "srv", version: "1" } });
+  recovery.appendWalEvent(dir, connectionId, { type: "CALL_START", call_seq: 7, tool: "echo", server: "srv", arguments: { a: 99 }, ts: 10, replayed: true });
+  const intentKey = recovery.computeIntentKey(connectionId, "echo", { a: 99 });
+  recovery.createIntentIfAbsent(dir, intentKey, { connection_id: connectionId, tool: "echo", arguments: { a: 99 }, state: "dispatched", dispatched_at: 9 });
+  return intentKey;
+}
+
+/** Proves finding #5 Part B end-to-end, not just "no regression": recoverCrashedSessions'
+ * own per-pending-call loop performs the identical startedFrom.replayed check but can
+ * never seal a needsOperator connection (see that function's own doc comment) -- an
+ * earlier version of this fix added the anomaly there, which was confirmed dead code
+ * (never reaches a sealed bundle). abandonConnection is the actual sealing path, so this
+ * test constructs the orphaned-replayed-step WAL, confirms recoverCrashedSessions flags it
+ * for operator review WITHOUT sealing anything, then confirms recovery-abandon actually
+ * produces a sealed bundle whose decision_record.md contains the explicit "INCOMPLETE:
+ * step 7" marker Paul asked for. */
+function abandonConnectionRecordsIncompleteMarkerForOrphanedReplayedStep() {
+  const dir = freshDir("abandon-replayed-incomplete");
+  const keys = makeKeys();
+  const connectionId = "conn-replayed-incomplete";
+  const intentKey = seedOrphanedReplayedCallWal(dir, connectionId);
+
+  const { pendingOperatorReview } = recoverCrashedSessions(dir, keys, silentLog);
+  check("replayed-incomplete-precondition-flagged-for-operator-review", pendingOperatorReview.includes(connectionId), JSON.stringify(pendingOperatorReview));
+  check("replayed-incomplete-precondition-nothing-sealed-yet", chain.readHead(dir) === null, JSON.stringify(chain.readHead(dir)));
+  check("replayed-incomplete-precondition-intent-still-dispatched", recovery.readIntent(dir, intentKey).state === "dispatched", JSON.stringify(recovery.readIntent(dir, intentKey)));
+
+  abandonConnection(dir, keys, connectionId, silentLog);
+
+  const headEntry = chain.readHead(dir);
+  check("replayed-incomplete-abandon-produces-a-sealed-chain-entry", headEntry && headEntry.seq === 1, JSON.stringify(headEntry));
+  const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, headEntry.bundle_id), "utf8"));
+  const decisionRecord = bundle.contents["decision_record.md"];
+  check(
+    "replayed-incomplete-sealed-bundle-contains-the-incomplete-marker",
+    /GATEWAY_RECOVERY_INCOMPLETE_REPLAYED_STEP/.test(decisionRecord) && /INCOMPLETE: step 7 was a cached replay/.test(decisionRecord),
+    decisionRecord
+  );
+  check("replayed-incomplete-generic-abandon-anomaly-also-present", /OPERATOR_ABANDONED_RECOVERY/.test(decisionRecord), decisionRecord);
+  check("replayed-incomplete-fence-still-released", recovery.readIntent(dir, intentKey) === null, "intent still present");
+  check("replayed-incomplete-wal-still-cleaned-up", recovery.readWalEvents(dir, connectionId).length === 0, "WAL still present");
+}
+
 // ---------------------------------------------------------------------------
 // PR #33 round-2 fixes that need a real WriterClaim / real startGateway plumbing.
 // ---------------------------------------------------------------------------
@@ -2406,6 +2456,7 @@ function main() {
 
   abandonConnectionSealsAndReleasesTheFenceForAnUnprovenCall();
   abandonConnectionOnAlreadyCleanConnectionIsANoOp();
+  abandonConnectionRecordsIncompleteMarkerForOrphanedReplayedStep();
 
   pathBearingIdentifiersAreRejected();
   bundleCollisionWithDifferentContentIsFlaggedNotDiscarded();

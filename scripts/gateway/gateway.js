@@ -663,8 +663,19 @@ function buildHealthStatus(ctx) {
      * renewal mechanism. */
     const leaseGuard = writerClaimStatus.held_by_this_instance ? createLeaseGuard(ctx.writerClaim) : null;
     try {
+      /* Round-N fix (frontier-panel finding #8, second exposure): chain.readChain now
+       * streams the chain file in bounded chunks instead of reading it whole into a V8
+       * string (which has a hard ~512MB string-length ceiling -- see chain.js's own header
+       * for the full writeup), but a chain large enough to take a while to stream through
+       * still needs the SAME per-progress lease renewal the per-entry walk below already
+       * gets, since this call runs on every ~STATUS_WRITE_INTERVAL_MS tick of an
+       * already-RUNNING, healthy gateway -- not just once at startup like reconcileHead.
+       * Passing leaseGuard.maybeRenew() as onProgress closes that gap the same way
+       * reconcileHead's own onProgress wiring does; a detected lease loss here propagates
+       * through this readChain call exactly like it already does through the per-entry
+       * maybeRenew below, into this try block's own catch. */
       sessionChainIntegrity = registerGatewaySessions.run({
-        chain: chain.readChain(stateDir),
+        chain: chain.readChain(stateDir, leaseGuard ? { onProgress: () => leaseGuard.maybeRenew() } : undefined),
         head,
         computeEntrySha256: chain.computeEntrySha256,
         bundleExists: (bundleId) => fs.existsSync(chain.bundlePath(stateDir, bundleId)),
@@ -862,7 +873,12 @@ function verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard = null
   if (!bundleCollisionIsSameContent(stateDir, sealed)) return false;
   const bundleId = sealed.bundle.manifest.bundle_id;
 
-  const chainEntries = chain.readChain(stateDir);
+  /* Round-N fix (frontier-panel finding #8): same streaming reader + onProgress renewal
+   * as buildHealthStatus and reconcileHead above -- this call is reached from inside a
+   * per-connection leaseGuard-held recovery/repair path, so a chain large enough to take
+   * a while to stream through must keep renewing the claim while doing so, not just via
+   * the caller's own once-per-connection renew() before this function was entered. */
+  const chainEntries = chain.readChain(stateDir, leaseGuard ? { onProgress: () => leaseGuard.maybeRenew() } : undefined);
   const ownEntry = chainEntries.find((e) => e.bundle_id === bundleId);
 
   if (!ownEntry) {
@@ -1117,6 +1133,24 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
         } else {
           needsOperator = true;
           unresolvedIntentKeys.push(intentKey);
+          /* Round-N fix (frontier-panel finding #5, Paul's explicit choice of Fable's
+           * "make the gap observable" proposal): a pending call with startedFrom.replayed
+           * true is not an ordinary "in flight at crash time" case -- proxy.js's own
+           * deliberate fail-OPEN cached-replay branch means the CALL_START for this
+           * completed-signature cache hit WAS durably written, yet its matching
+           * CALL_RESULT never made it into the WAL before the crash, so the agent may
+           * already have received a real result for this exact step. That distinction is
+           * deliberately NOT recorded here: this function never calls
+           * session.finalizeSession/chain.appendSession for a needsOperator connection --
+           * see the `continue` a few lines below -- so any anomaly attached to `s` at this
+           * point would be discarded along with the rest of this in-memory session,
+           * never reaching a sealed bundle (session.recordAnomaly has no side effect
+           * beyond mutating that in-memory object). The actual "INCOMPLETE: step N"
+           * marker Paul asked for is recorded in abandonConnection instead --
+           * recovery-abandon is the only path that unconditionally seals a connection
+           * like this one -- which performs the identical startedFrom.replayed check on
+           * its own WAL replay right before it seals. See that function's own doc
+           * comment for the full rationale. */
         }
       }
 
@@ -1267,6 +1301,12 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
   // above -- see that call site's doc comment and session.js#createSession's.
   const sessionId = startEvent && typeof startEvent.session_id === "string" && startEvent.session_id.length > 0 ? startEvent.session_id : null;
   const s = session.createSession(connectionId, { now: () => Date.now(), goal: startEvent ? startEvent.goal : undefined, sessionId });
+  // Round-N fix (frontier-panel finding #5): mirrors recoverCrashedSessions' own
+  // keyToStartEvent map (see that function's replay loop above) -- needed here for the
+  // identical reason: to look back from a still-pending call to the CALL_START event
+  // that produced it, so a replayed-but-incomplete cache hit can be distinguished from
+  // an ordinary interrupted call once this replay finishes.
+  const keyToStartEvent = new Map();
   for (const event of events) {
     // Round-1 fix-plan item 1: same time-gated renewal as recoverCrashedSessions' own
     // per-event loop above, for this CLI's own single-connection WAL replay.
@@ -1277,6 +1317,7 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
       session.recordInitialize(s, { clientInfo: event.clientInfo, serverInfo: event.serverInfo, model: event.model });
     } else if (event.type === "CALL_START") {
       const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
+      keyToStartEvent.set(key, event);
       session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
     } else if (event.type === "CALL_RESULT") {
       const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
@@ -1286,6 +1327,35 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
     }
   }
   if (s.pendingCalls.size > 0) {
+    /* Round-N fix (frontier-panel finding #5, Paul's explicit choice of Fable's "make the
+     * gap observable" proposal): recoverCrashedSessions' own per-call loop (above in this
+     * file) performs this identical startedFrom.replayed check, but never reaches
+     * session.finalizeSession/chain.appendSession for any connection it flags
+     * needsOperator -- that in-memory session, and any anomaly attached to it, is
+     * discarded entirely once pushed to pendingOperatorReview. recovery-abandon is the
+     * ONLY code path that unconditionally seals a connection like this one (see
+     * chain.appendSession below), so this is the one place a replay-specific INCOMPLETE
+     * marker can actually land in a produced bundle. Deliberately scoped to only the
+     * calls still pending after this replay -- a call that already resolved (proven or
+     * not) needs no such marker. */
+    for (const [key] of Array.from(s.pendingCalls.entries())) {
+      const startedFrom = keyToStartEvent.get(key);
+      if (startedFrom && startedFrom.replayed) {
+        const intentKey = recovery.computeIntentKey(connectionId, startedFrom.tool, startedFrom.arguments);
+        session.recordAnomaly(s, {
+          kind: "GATEWAY_RECOVERY_INCOMPLETE_REPLAYED_STEP",
+          tool: startedFrom.tool,
+          intent_key: intentKey,
+          detail:
+            `INCOMPLETE: step ${startedFrom.call_seq} was a cached replay (see proxy.js's ` +
+            "replay branch) whose CALL_START was durably recorded but whose CALL_RESULT was " +
+            "never written before this connection crashed -- the agent may already have " +
+            "received a result for this step under this gateway's deliberate fail-open replay " +
+            "design, but that outcome was never confirmed durable in this WAL, and the operator " +
+            "ran recovery-abandon without further confirmation of what actually happened.",
+        });
+      }
+    }
     session.recordAnomaly(s, { kind: "OPERATOR_ABANDONED_RECOVERY", detail: `operator explicitly abandoned recovery for connection "${connectionId}" with ${s.pendingCalls.size} call(s) of unproven outcome` });
     session.markPendingAsDisconnected(s, "operator ran recovery-abandon: outcome could not be confirmed and was not waited on further", () => Date.now());
   }
@@ -1747,19 +1817,28 @@ async function startGateway(options) {
    * immediate restart would then be refused until the lease goes stale, and any other
    * live handle to this WriterClaim instance would keep renewing an orphaned claim
    * indefinitely (writerClaim.release() already stops the heartbeat itself). */
+  /* Round-N fix (frontier-panel finding #7): this log() call was previously OUTSIDE the
+   * try/catch above, even though it runs immediately after recoverCrashedSessions and
+   * before anything else -- a throwing log() (the same failure mode CodeRabbit's own
+   * review comment right above this block was written to guard against, just one
+   * statement too early) would escape startGateway with the writer-claim still held and
+   * its heartbeat still running, exactly the orphaned-claim outcome this whole guard
+   * exists to prevent. Moved inside the try so any exception here also releases the
+   * claim before rethrowing, consistent with every other statement in this guarded
+   * region. */
   let pendingOperatorReview;
   try {
     ({ pendingOperatorReview } = recoverCrashedSessions(config.state_dir, keys, log, writerClaim));
+    if (pendingOperatorReview.length > 0) {
+      log(
+        `startup recovery: ${pendingOperatorReview.length} connection(s) left pending operator ` +
+          `review (see RECOVERY_AMBIGUOUS_INTENT log lines above) -- resolve via the ` +
+          "recovery-resolve/recovery-abandon CLI before their state is cleaned up."
+      );
+    }
   } catch (error) {
     writerClaim.release();
     throw error;
-  }
-  if (pendingOperatorReview.length > 0) {
-    log(
-      `startup recovery: ${pendingOperatorReview.length} connection(s) left pending operator ` +
-        `review (see RECOVERY_AMBIGUOUS_INTENT log lines above) -- resolve via the ` +
-        "recovery-resolve/recovery-abandon CLI before their state is cleaned up."
-    );
   }
 
   /* Mutable box, not a plain variable: connectAllDownstreams() below runs (and each
@@ -1882,10 +1961,10 @@ async function startGateway(options) {
   try {
     if (listenConfig.transport === "http") {
       const token = gatewayConfig.resolveSecretRef(listenConfig.token_ref, "agent_listen.token_ref");
-      httpHandle = await runHttpAgentTransport({ proxy }, listenConfig, token);
+      httpHandle = await runHttpAgentTransport({ proxy, log }, listenConfig, token);
       log(`agent-facing HTTP listener on port ${httpHandle.port}`);
     } else {
-      stdioHandle = runStdioAgentTransport({ proxy });
+      stdioHandle = runStdioAgentTransport({ proxy, log });
       // See forwardDownstreamRequestToAgent's doc above: only the stdio transport can
       // push a request to the agent, so this is the one branch that ever populates it.
       agentPusher.current = stdioHandle.pushRequest;

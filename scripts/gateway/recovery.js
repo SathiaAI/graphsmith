@@ -147,12 +147,43 @@ function signaturePath(stateDir, signatureKey) {
  * reset them to 0700, silently undoing it. Use the shared constants so the two agree; the
  * original intent (never the umask-dependent world-readable 0755/0644 default) is
  * unchanged, only the group bit that the later access model deliberately requires. */
+/* Round-N fix (frontier-panel finding #4): mkdirSync(dir, {recursive:true}) can create
+ * MULTIPLE new ancestor levels in one call (e.g. both gateway-recovery/ and
+ * gateway-recovery/active/ when neither existed yet on a fresh state_dir), but every call
+ * site below only ever fsyncs `dir` itself (the leaf) afterward, via its own later
+ * fsyncDir(dir) call following the actual WAL/intent/signature write (CodeRabbit PR #33's
+ * review just above named exactly that convention for the leaf). A newly created
+ * ancestor's own directory entry -- its name appearing in ITS parent -- never gets
+ * fsynced by anyone in that case, so a crash shortly after the FIRST-ever recovery write
+ * on a fresh state_dir could lose the gateway-recovery/ directory entry itself even
+ * though active/ and the file inside it were both durably fsynced, leaving a WAL file
+ * that is unreachable (its parent directory's own entry never landed) despite the
+ * gateway believing it was fully durable. Detect which ancestors are missing BEFORE
+ * creating anything (existsSync walk-up, stopping at the first that already exists),
+ * then fsync each of those -- and only those -- newly created ancestors after mkdirSync
+ * returns. `dir` itself is intentionally excluded here: every call site already fsyncs it
+ * via its own existing post-write fsyncDir(dir) call, unchanged by this fix. */
 function ensureDir(dir) {
+  const missingAncestors = [];
+  let cursor = dir;
+  while (cursor && !fs.existsSync(cursor)) {
+    missingAncestors.push(cursor);
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break; // filesystem root -- stop rather than loop forever
+    cursor = parent;
+  }
+
   fs.mkdirSync(dir, { recursive: true, mode: stateStore.DEFAULT_DIR_MODE });
   try {
     fs.chmodSync(dir, stateStore.DEFAULT_DIR_MODE);
   } catch (error) {
     /* best effort -- see doc comment above */
+  }
+
+  // Fsync every newly created ancestor's directory entry, topmost (closest to the
+  // pre-existing root) first. Index 0 is `dir` itself -- excluded, see doc comment above.
+  for (let i = missingAncestors.length - 1; i >= 1; i--) {
+    fsyncDir(missingAncestors[i]);
   }
 }
 

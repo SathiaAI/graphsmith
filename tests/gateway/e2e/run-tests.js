@@ -830,7 +830,22 @@ async function cleanSigtermDrainsAndExitsZero() {
  * unreadable/corrupt intent FILE (a real fs-level problem, distinct from the content
  * issues it already tolerates) -- previously unguarded in gateway.js's shutdown loop, so
  * that exception escaped doStop() entirely, skipping every remaining step including
- * writerClaim.release() and leaking a stale claim that blocks the next start. */
+ * writerClaim.release() and leaking a stale claim that blocks the next start.
+ *
+ * Round-N fix (frontier-panel finding #1) changed WHERE this failure surfaces: before
+ * that fix, closeConnection's own intent-fencing loop threw before this.sessions.delete
+ * ran, leaving a ghost session that gateway.js's shutdown loop (iterating
+ * proxy.sessions.keys()) would then redundantly retry and log via its own "SHUTDOWN
+ * CLOSE FAILURE" wording -- this test originally asserted on THAT retry's log line.
+ * Finding #1's fix makes closeConnection always clean up this.sessions/agentInitialized
+ * (try/finally), which removes the ghost session and therefore the redundant shutdown-
+ * loop retry entirely: the SAME fixture's single stdio-disconnect handler call now fails,
+ * cleans up, and is the ONLY attempt -- so it never reaches gateway.js's shutdown loop at
+ * all (the connection is already gone from proxy.sessions by the time that loop runs).
+ * agent-transport.js's own stdio-disconnect catch was updated in the same round to log
+ * this (previously-silent) failure via "CONNECTION CLOSE FAILURE" instead, so this test
+ * now looks for that wording -- still proving the failure was hit and handled, just via
+ * its new (and, post-fix, only) logging surface rather than the old redundant one. */
 async function sigtermStillReleasesClaimWhenAConnectionsCloseFails() {
   if (process.platform === "win32") {
     skip("e2e-sigterm-releases-claim-despite-close-failure", "Windows cannot deliver a real SIGTERM for graceful in-process handling -- same platform limitation as the other SIGTERM test.");
@@ -856,7 +871,7 @@ async function sigtermStillReleasesClaimWhenAConnectionsCloseFails() {
   gw.child.kill("SIGTERM");
   const code = await gw.exitCode();
   check("e2e-close-failure-still-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
-  check("e2e-close-failure-logged-the-isolated-failure", gw.stderr().includes("SHUTDOWN CLOSE FAILURE"), gw.stderr());
+  check("e2e-close-failure-logged-the-isolated-failure", gw.stderr().includes("CONNECTION CLOSE FAILURE"), gw.stderr());
 
   // Decisive proof the claim was actually released (not merely that the process exited):
   // a brand-new instance must be able to acquire it immediately, with no stale lease wait.
