@@ -320,7 +320,21 @@ function atomicCreateExclusive(targetPath, payload, options = {}) {
   const mode = Object.prototype.hasOwnProperty.call(options, "mode") ? options.mode : DEFAULT_FILE_MODE;
   const temporary = `${targetPath}.new-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const writeTo = (target, flag) => {
-    const fd = fs.openSync(target, flag);
+    /* CodeRabbit PR #33 review round-4 follow-up "close the no-hard-link fallback's
+     * creation-time exposure window": the WAL half of this finding was closed by passing
+     * DEFAULT_FILE_MODE to fs.openSync's creation-time mode argument (see recovery.js's
+     * appendDurableLine, commit 7932754) -- this primitive still opened both the
+     * temporary file AND (on filesystems without hard-link support) the FINAL targetPath
+     * itself with the umask-derived default mode, relying solely on the fchmodSync below
+     * to narrow it afterward. For the temporary file that gap is latent (its name is
+     * unguessable), but for the no-hard-link fallback -- which writes directly to the
+     * predictable, discoverable targetPath -- it is a real window during which another
+     * local user could read a freshly-created intent/WAL record before applyFileMode
+     * narrows it. Pass mode to fs.openSync itself so the file never has a wider mode than
+     * intended, even momentarily; applyFileMode is kept unconditionally as belt-and-braces
+     * (this file's own established defense-in-depth pattern) and as the sole enforcement
+     * point for a caller that opts out via {mode: null}. */
+    const fd = fs.openSync(target, flag, mode === null || mode === undefined ? undefined : mode);
     try { writeFullySync(fd, payload); applyFileMode(fd, mode, target); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   };
   writeTo(temporary, "wx");
