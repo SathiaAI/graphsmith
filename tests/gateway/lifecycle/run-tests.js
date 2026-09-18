@@ -22,6 +22,8 @@ const { drainOpenSessions, startGateway } = require(path.join(ROOT, "scripts", "
 const { GatewayProxy } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
 const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 const { writeConfirmedMode } = require("../_fixtures/mode-file.js");
+const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
+const FIXTURE_SERVER = path.join(ROOT, "tests", "gateway", "_fixtures", "fixture-mcp-server.js");
 
 let failures = 0;
 const results = [];
@@ -266,6 +268,69 @@ async function samplingForwardStillWorksBelowTheCap() {
   check("sampling-forward-records-the-completed-call-below-the-cap", s.calls.length === 1 && s.calls[0].model_call === true, JSON.stringify(s.calls));
 }
 
+
+/* Codex PR #33 review "prevent shutdown diagnostics from aborting claim release": an
+ * earlier round of this PR wrapped each connection's closeConnection in a try/catch so one
+ * failing session could not abort shutdown -- but the HANDLER itself called the
+ * caller-supplied `log` callback directly. `log` is caller plumbing and is allowed to
+ * throw, so a throwing logger reintroduced the exact failure one level up: doStop rejected
+ * before the remaining sessions, the downstream closes, and writerClaim.release() ever ran,
+ * leaving an embedding process renewing an orphaned claim indefinitely. */
+async function aThrowingLoggerDuringShutdownStillReleasesTheWriterClaim() {
+  const root = freshDir("shutdown-throwing-logger");
+  writeConfirmedMode(root, "standalone");
+  const kp = crypto.generateKeyPairSync("ed25519");
+  const keyPath = path.join(root, "signing-key.pem");
+  fs.writeFileSync(keyPath, kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  const stateDir = path.join(root, "state");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "shutdown-logger-test-token");
+  const configPath = path.join(root, "gateway-config.json");
+  fs.writeFileSync(configPath, JSON.stringify({
+    schema_version: "1.0",
+    state_dir: stateDir,
+    downstream_servers: [{ name: "fixture", transport: "stdio", endpoint: `${process.execPath} ${FIXTURE_SERVER} --server-name fixture` }],
+    signing_key_ref: keyPath,
+    /* Deliberately the HTTP agent transport, not stdio: the stdio branch wires
+     * `stdioHandle.closed -> stop() -> process.exit(0)`, so stopping a stdio gateway
+     * in-process would terminate this whole test runner before it could report. The
+     * shutdown path under test (doStop's diagnostics and writerClaim.release()) is
+     * transport-independent. */
+    agent_listen: { transport: "http", token_ref: tokenPath },
+  }, null, 2));
+
+  // A logger that works during startup (so the gateway actually starts) but throws for
+  // every shutdown diagnostic -- precisely the caller-supplied-plumbing failure mode.
+  let shuttingDown = false;
+  const log = () => { if (shuttingDown) throw new Error("caller-supplied logger exploded during shutdown"); };
+
+  const handle = await startGateway({ configPath, root, log });
+  check("throwing-logger-shutdown-gateway-actually-started", Boolean(handle) && handle.dormant !== true, JSON.stringify(handle && { dormant: handle.dormant }));
+
+  // Open a real session AND make its close fail, so the catch handler (the one that used
+  // to call the throwing logger directly) is genuinely entered during shutdown.
+  handle.proxy.openConnection("conn-shutdown");
+  await handle.proxy.handleMessage("conn-shutdown", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  fs.mkdirSync(recovery.intentsDir(stateDir), { recursive: true });
+  fs.mkdirSync(recovery.intentPath(stateDir, "corrupt-intent"), { recursive: true });
+
+  shuttingDown = true;
+  let stopError = null;
+  try {
+    await handle.stop("test shutdown");
+  } catch (error) {
+    stopError = error;
+  }
+  check("throwing-logger-during-shutdown-does-not-reject-stop", stopError === null, stopError && stopError.message);
+
+  // Decisive proof the claim was actually released: a brand-new instance must be able to
+  // acquire it immediately, with no stale-lease wait.
+  const fresh = new WriterClaim(stateDir, { hostId: "post-shutdown-check" });
+  let acquireError = null;
+  try { fresh.acquire(); fresh.release(); } catch (error) { acquireError = error; }
+  check("throwing-logger-during-shutdown-still-releases-the-writer-claim", acquireError === null, acquireError && acquireError.message);
+}
+
 async function main() {
   await drainWaitsForInFlightCallToComplete();
   await drainTimesOutAndReportsIncomplete();
@@ -273,6 +338,7 @@ async function main() {
   await samplingForwardRefusesOnceCompletedCallCapReached();
   await samplingForwardStillWorksBelowTheCap();
   await startupWatchdogTimesOutOnHungDownstreamConnect();
+  await aThrowingLoggerDuringShutdownStillReleasesTheWriterClaim();
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;

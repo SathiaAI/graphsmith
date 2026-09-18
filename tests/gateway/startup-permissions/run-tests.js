@@ -30,6 +30,18 @@ const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
 const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 const stateStore = require(path.join(ROOT, "scripts", "state-store.js"));
+const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
+const { GatewayProxy } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
+
+/** A genuinely sealed bundle produced by session.js's own real finalizeSession -- used by
+ * the runtime-creation-mode tests below, which must drive the REAL chain.js/proxy.js write
+ * paths rather than hand-crafting files whose modes would prove nothing. */
+function makeSealedBundle(keys, connectionId) {
+  const s = session.createSession(connectionId, { now: () => Date.now() });
+  session.recordInitialize(s, { clientInfo: {}, serverInfo: {} });
+  session.recordToolsList(s, []);
+  return session.finalizeSession(s, keys);
+}
 
 let failures = 0;
 const results = [];
@@ -254,6 +266,119 @@ function aRealChmodFailureAbortsTheWholePassRatherThanBeingSwallowed() {
     `expected STATE_STORE_CHMOD_FAILED, got ${threw ? threw.code : "no error"}`);
 }
 
+
+/* Codex PR #33 review "enforce modes when creating post-startup session files": this
+ * permission pass runs ONCE, at startup, and skips paths that do not exist yet. On a fresh
+ * state directory gateway-sessions/ and chain.jsonl are created LATER -- by chain.js's own
+ * mkdirSync/openSync -- and the sealed-bundle quarantine directory/file are created later
+ * still, only when an append fails. Without explicit modes at those runtime creation sites
+ * they are born 0755/0644 (world-readable) under the usual 022 umask and stay that way
+ * until the next restart re-runs this pass. Deliberately runs with a PERMISSIVE umask, so
+ * a regression cannot be masked by whatever umask the CI runner happens to have. */
+function runtimeCreatedSessionPathsAreBornWithTheConfiguredModes() {
+  if (process.platform === "win32") {
+    console.log("SKIP runtime-created-session-paths-get-the-configured-modes (POSIX modes are not meaningful on win32)");
+    results.push({ name: "runtime-created-session-paths-get-the-configured-modes", status: "SKIP", reason: "win32" });
+    return;
+  }
+  const dir = freshDir("runtime-modes");
+  const keys = (() => { const kp = crypto.generateKeyPairSync("ed25519"); return { privateKey: kp.privateKey, signer: "test-key", algo: "ed25519" }; })();
+  const sealed = makeSealedBundle(keys, "runtime-modes-session");
+
+  const previousUmask = process.umask(0o022);
+  try {
+    // NOTE: the startup pass is deliberately NOT run here -- these paths do not exist at
+    // startup on a fresh state directory, which is precisely the gap being closed.
+    chain.appendSession(dir, sealed);
+  } finally {
+    process.umask(previousUmask);
+  }
+  check(
+    "runtime-created-gateway-sessions-dir-gets-the-configured-dir-mode",
+    mode(chain.sessionsDir(dir)) === stateStore.DEFAULT_DIR_MODE,
+    `${chain.sessionsDir(dir)} is 0${mode(chain.sessionsDir(dir)).toString(8)}, expected 0${stateStore.DEFAULT_DIR_MODE.toString(8)}`
+  );
+  check(
+    "runtime-created-chain-jsonl-gets-the-configured-file-mode",
+    mode(chain.chainPath(dir)) === stateStore.DEFAULT_FILE_MODE,
+    `${chain.chainPath(dir)} is 0${mode(chain.chainPath(dir)).toString(8)}, expected 0${stateStore.DEFAULT_FILE_MODE.toString(8)}`
+  );
+  check(
+    "runtime-created-chain-jsonl-is-never-world-readable",
+    (mode(chain.chainPath(dir)) & 0o007) === 0,
+    `0${mode(chain.chainPath(dir)).toString(8)}`
+  );
+}
+
+/* Same Codex finding, for the worst of the three paths: proxy.js#quarantineSealedBundle
+ * writes the FULL raw sealed bundle, and both its directory and its file are created only
+ * at the moment an append fails -- long after this module's one-time startup pass. */
+function runtimeCreatedSealedBundleQuarantineIsBornWithTheConfiguredModes() {
+  if (process.platform === "win32") {
+    console.log("SKIP runtime-created-sealed-bundle-quarantine-gets-the-configured-modes (POSIX modes are not meaningful on win32)");
+    results.push({ name: "runtime-created-sealed-bundle-quarantine-gets-the-configured-modes", status: "SKIP", reason: "win32" });
+    return;
+  }
+  const dir = freshDir("runtime-quarantine-modes");
+  const keys = (() => { const kp = crypto.generateKeyPairSync("ed25519"); return { privateKey: kp.privateKey, signer: "test-key", algo: "ed25519" }; })();
+  const sealed = makeSealedBundle(keys, "runtime-quarantine-session");
+
+  // Drive the REAL production path: an append that fails after sealing quarantines the
+  // bundle. isWriterClaimValid()===false is exactly the branch closeConnection takes to
+  // quarantine rather than append (see proxy.js's writer-claim revalidation).
+  const conn = {
+    transport: "fake",
+    call: async () => ({ ok: true }),
+    close: () => {},
+    isClosed: () => false,
+    whenClosed: () => new Promise(() => {}),
+  };
+  const proxy = new GatewayProxy({
+    connections: new Map([["srv", conn]]),
+    mergedTools: [{ name: "echo", server: "srv", schema: {} }],
+    toolOwners: new Map([["echo", "srv"]]),
+    serverInfos: {},
+    keys,
+    stateDir: dir,
+    log: () => {},
+    isWriterClaimValid: () => false,
+    onSealFailure: () => {},
+  });
+
+  const previousUmask = process.umask(0o022);
+  let quarantineDir = null;
+  return (async () => {
+    try {
+      proxy.openConnection("conn-q");
+      await proxy.handleMessage("conn-q", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+      await proxy.handleMessage("conn-q", { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+      await proxy.closeConnection("conn-q", "forcing a quarantine");
+    } finally {
+      process.umask(previousUmask);
+    }
+    quarantineDir = startupPermissions.sessionQuarantineDir(dir);
+    const files = fs.existsSync(quarantineDir) ? fs.readdirSync(quarantineDir).filter((n) => n.endsWith(".json")) : [];
+    check("a-sealed-bundle-was-actually-quarantined", files.length === 1, `quarantine dir contents: ${JSON.stringify(files)}`);
+    if (files.length !== 1) return;
+    check(
+      "runtime-created-sealed-bundle-quarantine-dir-gets-the-configured-dir-mode",
+      mode(quarantineDir) === stateStore.DEFAULT_DIR_MODE,
+      `0${mode(quarantineDir).toString(8)}, expected 0${stateStore.DEFAULT_DIR_MODE.toString(8)}`
+    );
+    const quarantinedFile = path.join(quarantineDir, files[0]);
+    check(
+      "runtime-created-sealed-bundle-quarantine-file-gets-the-configured-file-mode",
+      mode(quarantinedFile) === stateStore.DEFAULT_FILE_MODE,
+      `0${mode(quarantinedFile).toString(8)}, expected 0${stateStore.DEFAULT_FILE_MODE.toString(8)}`
+    );
+    check(
+      "the-raw-quarantined-sealed-bundle-is-never-world-readable",
+      (mode(quarantinedFile) & 0o007) === 0,
+      `0${mode(quarantinedFile).toString(8)}`
+    );
+  })();
+}
+
 function main() {
   sensitiveDirectoriesListIsExactlyTheDocumentedSet();
   sensitiveFilesListNamesTheFixedFilesAndNeverHeadJsonTwice();
@@ -262,11 +387,18 @@ function main() {
   freshDeploymentWithNothingOnDiskYetDoesNotThrow();
   partiallyPopulatedDeploymentSkipsWhatIsMissingAndTightensWhatExists();
   aRealChmodFailureAbortsTheWholePassRatherThanBeingSwallowed();
+  runtimeCreatedSessionPathsAreBornWithTheConfiguredModes();
 
-  const passed = results.filter((r) => r.status === "PASS").length;
-  const failed = results.filter((r) => r.status === "FAIL").length;
-  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
-  process.exit(failures ? 1 : 0);
+  return Promise.resolve(runtimeCreatedSealedBundleQuarantineIsBornWithTheConfiguredModes()).then(() => {
+    const passed = results.filter((r) => r.status === "PASS").length;
+    const failed = results.filter((r) => r.status === "FAIL").length;
+    const skipped = results.filter((r) => r.status === "SKIP").length;
+    console.log(`SUMMARY passed=${passed} failed=${failed} skipped=${skipped}`);
+    process.exit(failures ? 1 : 0);
+  });
 }
 
-main();
+main().catch((error) => {
+  console.error("FATAL:", error);
+  process.exit(1);
+});

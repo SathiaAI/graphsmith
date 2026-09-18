@@ -20,7 +20,11 @@
  * session.js, gsa-mcp-shim.js#sealBoundaryBundle, and chain.js's write order and
  * collision semantics completely untouched (verified against the actual current code,
  * not assumed): this module never signs anything and is never itself chain-appended.
- * `session.js` has ZERO diff for this change: the WAL replays through session.js's
+ * `session.js` is very nearly untouched by this change (its only diff, added late in PR
+ * #33 for Codex's "persist cached replays in the session trace" finding, is one OPTIONAL
+ * `replayed` marker spread conditionally into an already-recorded call -- exactly the
+ * mechanism the pre-existing `disconnected` marker already used, so no ordinary session's
+ * sealed shape changes): the WAL replays through session.js's
  * existing, unmodified createSession/recordInitialize/recordToolsList/recordCallStart/
  * recordCallResult/markPendingAsDisconnected -- recovery reconstructs an in-memory
  * session using the exact same recorder functions the live gateway already calls, so
@@ -312,6 +316,19 @@ function quarantineWal(stateDir, connectionId) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+  /* Codex PR #33 review "fsync both directories after quarantining a WAL": this rename IS
+   * the durable save point recovery-abandon reports success on -- it must both remove the
+   * connection from active/ and preserve its evidence under quarantine/. rename(2) only
+   * mutates two DIRECTORY ENTRIES, and neither is durable until its own parent directory's
+   * fd is fsynced (exactly the reason appendWalEvent/createIntentIfAbsent already fsync
+   * theirs). Without this, a power loss right after the command printed "quarantined" can
+   * resurrect the active/ entry or lose the quarantine/ one -- and by then abandonConnection
+   * has already deleted this connection's intent fences, so the resurrected WAL would
+   * re-enter startup recovery stripped of the very guards that were protecting it. Both
+   * directories, source and destination, through the same tolerated-codes fsyncDir helper
+   * hardened earlier in this PR. */
+  fsyncDir(activeDir(stateDir));
+  fsyncDir(quarantineDir(stateDir));
   return to;
 }
 
@@ -460,6 +477,72 @@ function readCompletedSignature(stateDir, signatureKey, ttlMs) {
     return null;
   }
   return record;
+}
+
+/* Codex PR #33 review "sweep expired completed-signature records" + CodeRabbit PR #33
+ * review "sweep expired completed signatures" (the same finding, from both reviewers):
+ * readCompletedSignature above enforces DEFAULT_RETAINED_SIGNATURE_TTL_MS only for the
+ * one key being looked up, and recordCompletedSignature writes one file per DISTINCT
+ * (tool, arguments, idempotency key) signature. Calls with unique arguments are therefore
+ * never looked up again, so their records -- which hold the raw arguments and the raw
+ * cached result -- are never deleted by anything, and a long-running gateway accumulates
+ * them (and their inodes) without bound despite the advertised 24-hour retention. This is
+ * the global counterpart to that per-key check: one readdir of signatures/, unlink of
+ * every record already past its own TTL.
+ *
+ * Deliberately BOUNDED and best-effort, because its only caller is startup recovery, on
+ * the critical path to accepting traffic:
+ *   - `maxEntries` caps how many directory entries one sweep will examine (default
+ *     DEFAULT_SIGNATURE_SWEEP_MAX_ENTRIES). A directory bigger than that is simply swept
+ *     across successive restarts rather than making one startup arbitrarily long --
+ *     progress is monotonic, since a swept file is gone and never reconsidered.
+ *   - Expiry is decided by the record's own `completed_at`, the EXACT field
+ *     readCompletedSignature already uses, so the two can never disagree about what
+ *     "expired" means.
+ *   - A record that cannot be read, parsed, or unlinked is SKIPPED, not fatal: this is
+ *     space reclamation, never a correctness gate, and an unreadable signature is already
+ *     handled (fail-closed) by readCompletedSignature on the dispatch path where it
+ *     actually matters. A malformed record with no usable `completed_at` is treated as
+ *     expired, matching readCompletedSignature's own identical rule.
+ * Returns { scanned, removed } so the caller can log what it reclaimed. */
+const DEFAULT_SIGNATURE_SWEEP_MAX_ENTRIES = 5000;
+
+function sweepExpiredSignatures(stateDir, options = {}) {
+  const ttlMs = typeof options.ttlMs === "number" ? options.ttlMs : DEFAULT_RETAINED_SIGNATURE_TTL_MS;
+  const maxEntries = typeof options.maxEntries === "number" ? options.maxEntries : DEFAULT_SIGNATURE_SWEEP_MAX_ENTRIES;
+  const now = typeof options.now === "function" ? options.now() : Date.now();
+  const dir = signaturesDir(stateDir);
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (error) {
+    if (error.code === "ENOENT") return { scanned: 0, removed: 0 };
+    throw error;
+  }
+  let scanned = 0;
+  let removed = 0;
+  for (const name of entries) {
+    if (scanned >= maxEntries) break;
+    if (!name.endsWith(".json")) continue;
+    scanned += 1;
+    const filePath = path.join(dir, name);
+    let expired;
+    try {
+      const record = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      expired = typeof record.completed_at !== "number" || now - record.completed_at > ttlMs;
+    } catch (error) {
+      continue; // unreadable/corrupt: leave it for an operator, never delete on a guess
+    }
+    if (!expired) continue;
+    try {
+      fs.unlinkSync(filePath);
+      removed += 1;
+    } catch (error) {
+      /* best effort -- another process may have removed it, or it may be locked */
+    }
+  }
+  if (removed > 0) fsyncDir(dir);
+  return { scanned, removed };
 }
 
 function readIntent(stateDir, intentKey) {
@@ -696,6 +779,8 @@ module.exports = {
   computeSignatureKey,
   recordCompletedSignature,
   readCompletedSignature,
+  sweepExpiredSignatures,
+  DEFAULT_SIGNATURE_SWEEP_MAX_ENTRIES,
   readIntent,
   createIntentIfAbsent,
   updateIntent,

@@ -909,6 +909,24 @@ function verifyAndRepairBundleCollision(stateDir, sealed, log, leaseGuard = null
 function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
   const pendingOperatorReview = [];
   const leaseGuard = createLeaseGuard(writerClaim);
+  /* Codex + CodeRabbit PR #33 review "sweep expired completed-signature records": the
+   * 24-hour retention on the completed-signature store was only ever enforced per-key, on
+   * read, so signatures for calls with unique arguments were never revisited and never
+   * deleted. Startup recovery is the bounded, once-per-process pass both reviewers named
+   * as the right place to reclaim them: it already owns the writer claim, already walks
+   * this state directory, and runs before any traffic is accepted. Wrapped so a sweep
+   * failure can never keep a gateway from starting -- reclaiming disk space is
+   * housekeeping, not a correctness gate, and the dispatch path's own per-key expiry check
+   * (recovery.readCompletedSignature) remains the authority on whether a record is
+   * replayable. */
+  try {
+    const swept = recovery.sweepExpiredSignatures(stateDir);
+    if (swept.removed > 0) {
+      log(`recovery: swept ${swept.removed} expired completed-call signature record(s) of ${swept.scanned} scanned (retention ${recovery.DEFAULT_RETAINED_SIGNATURE_TTL_MS}ms).`);
+    }
+  } catch (error) {
+    log(`recovery: expired-signature sweep skipped (${error.message}) -- continuing startup; this is space reclamation only.`);
+  }
   for (const connectionId of recovery.listActiveConnections(stateDir)) {
     /* Round-1 fix-plan commit 6: a genuine chain-integrity failure latched by ANY
      * earlier connection's own append-time check in THIS SAME loop (chain.appendSession
@@ -1016,7 +1034,13 @@ function recoverCrashedSessions(stateDir, keys, log, writerClaim = null) {
           session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
         } else if (event.type === "CALL_RESULT") {
           const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
-          if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts });
+          /* Codex PR #33 review "persist cached replays in the session trace": carry the
+           * replay marker through crash recovery too, so a WAL replayed after a crash
+           * reconstructs the SAME sealed shape a clean close would have produced for that
+           * step -- an idempotency cache hit must not silently become an ordinary call
+           * just because the gateway restarted before sealing. Absent on every ordinary
+           * CALL_RESULT event (including every WAL written before this field existed). */
+          if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts, replayed: Boolean(event.replayed), replayedFromIntentKey: event.intent_key });
         } else if (event.type === "ANOMALY") {
           // Codex PR #33 review "append blocked-retry anomalies to the WAL": replays a
           // dispatch-guard block (GATEWAY_AMBIGUOUS_RETRY/GATEWAY_DOWNSTREAM_OUTCOME_UNKNOWN)
@@ -1928,65 +1952,88 @@ async function startGateway(options) {
     return stopPromise;
   }
   async function doStop(reason) {
-    log(`shutting down (${reason || "requested"}): draining ${proxy.openSessionCount()} open session(s)`);
-    clearInterval(statusWriteTimer); // Cluster D: stop refreshing the status file once shutdown begins
-    proxy.stopAcceptingNewSessions();
-    /* SS3.7: "finish in-flight sessions" means actually WAIT (bounded) for calls already
-     * in flight to complete and be recorded with their real result -- not immediately
-     * truncate the connection and let closeConnection's own pending-call handling mark
-     * a call that was about to succeed as an artificial "disconnected" error. Only a
-     * call that is STILL pending once the drain timeout elapses gets that treatment. */
-    await drainOpenSessions(proxy, drainTimeoutMs);
-    agentPusher.current = null; // no agent left to push a forwarded sampling request to
-    agentPusher.connectionId = null;
-    if (stdioHandle) stdioHandle.stop();
-    if (httpHandle) {
-      await new Promise((resolve) => {
-        let settled = false;
-        const finish = () => { if (!settled) { settled = true; resolve(); } };
-        httpHandle.server.close(finish);
-        const forceCloseTimer = setTimeout(() => {
-          // Stop accepting new connections is already implied by close() above; this
-          // forcibly ends any still-open sockets/responses so the callback above (or
-          // this fallback) fires within the bounded deadline rather than whenever the
-          // last active response happens to finish.
-          if (typeof httpHandle.server.closeAllConnections === "function") httpHandle.server.closeAllConnections();
-          finish();
-        }, HTTP_LISTENER_CLOSE_TIMEOUT_MS);
-        if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
-      });
-    }
-    // Finalize any still-open sessions (drained above, or forced closed after the timeout).
-    /* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
-     * closeConnection can throw before reaching its own guarded sealing block (e.g.
-     * recovery.listIntentsForConnection hitting a corrupt/unreadable intent FILE for this
-     * connection -- a genuine fs-level problem, not the kind of failure this codebase
-     * treats as recoverable). Previously unguarded here, so one such connection's failure
-     * escaped this loop entirely, skipping every remaining connection's own close, every
-     * downstream conn.close() below, and writerClaim.release() -- leaking a stale claim
-     * that blocks the next restart. Isolate per-connection failures (mirrors
-     * recoverCrashedSessions' own per-connection try/catch) so shutdown always reaches
-     * the downstream-close and writer-claim-release steps regardless. */
-    for (const connectionId of Array.from(proxy.sessions.keys())) {
+    /* Codex PR #33 review "prevent shutdown diagnostics from aborting claim release":
+     * `log` is CALLER-SUPPLIED plumbing (options.log) and is permitted to throw. An
+     * earlier round of this PR wrapped each connection's closeConnection in a try/catch so
+     * one failing session could not abort shutdown -- but the handler (and this function's
+     * other diagnostics, starting with the very first line below) still called `log`
+     * directly, so a throwing logger reintroduced the identical failure one level up:
+     * doStop rejects before the remaining sessions, the downstream closes, and
+     * writerClaim.release() ever run, and an embedding process keeps renewing an orphaned
+     * claim indefinitely. Every diagnostic on this shutdown path now goes through this
+     * non-throwing wrapper (same contract as proxy.js#safeLog), AND the release itself sits
+     * in a finally covering the whole body -- so neither a close failure nor a logging
+     * failure can strand the claim. */
+    const safeShutdownLog = (message) => {
       try {
-        await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
-      } catch (error) {
-        log(`SHUTDOWN CLOSE FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- continuing shutdown for other sessions and releasing the writer claim regardless.`);
+        log(message);
+      } catch (loggerError) {
+        // Deliberately swallowed: a failing logger must never keep shutdown from
+        // releasing the writer claim. See this block's own doc comment above.
       }
+    };
+    try {
+      safeShutdownLog(`shutting down (${reason || "requested"}): draining ${proxy.openSessionCount()} open session(s)`);
+      clearInterval(statusWriteTimer); // Cluster D: stop refreshing the status file once shutdown begins
+      proxy.stopAcceptingNewSessions();
+      /* SS3.7: "finish in-flight sessions" means actually WAIT (bounded) for calls already
+       * in flight to complete and be recorded with their real result -- not immediately
+       * truncate the connection and let closeConnection's own pending-call handling mark
+       * a call that was about to succeed as an artificial "disconnected" error. Only a
+       * call that is STILL pending once the drain timeout elapses gets that treatment. */
+      await drainOpenSessions(proxy, drainTimeoutMs);
+      agentPusher.current = null; // no agent left to push a forwarded sampling request to
+      agentPusher.connectionId = null;
+      if (stdioHandle) stdioHandle.stop();
+      if (httpHandle) {
+        await new Promise((resolve) => {
+          let settled = false;
+          const finish = () => { if (!settled) { settled = true; resolve(); } };
+          httpHandle.server.close(finish);
+          const forceCloseTimer = setTimeout(() => {
+            // Stop accepting new connections is already implied by close() above; this
+            // forcibly ends any still-open sockets/responses so the callback above (or
+            // this fallback) fires within the bounded deadline rather than whenever the
+            // last active response happens to finish.
+            if (typeof httpHandle.server.closeAllConnections === "function") httpHandle.server.closeAllConnections();
+            finish();
+          }, HTTP_LISTENER_CLOSE_TIMEOUT_MS);
+          if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
+        });
+      }
+      // Finalize any still-open sessions (drained above, or forced closed after the timeout).
+      /* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
+       * closeConnection can throw before reaching its own guarded sealing block (e.g.
+       * recovery.listIntentsForConnection hitting a corrupt/unreadable intent FILE for this
+       * connection -- a genuine fs-level problem, not the kind of failure this codebase
+       * treats as recoverable). Previously unguarded here, so one such connection's failure
+       * escaped this loop entirely, skipping every remaining connection's own close, every
+       * downstream conn.close() below, and writerClaim.release() -- leaking a stale claim
+       * that blocks the next restart. Isolate per-connection failures (mirrors
+       * recoverCrashedSessions' own per-connection try/catch) so shutdown always reaches
+       * the downstream-close and writer-claim-release steps regardless. */
+        for (const connectionId of Array.from(proxy.sessions.keys())) {
+          try {
+            await proxy.closeConnection(connectionId, `gateway shutdown (${reason || "requested"})`);
+          } catch (error) {
+            safeShutdownLog(`SHUTDOWN CLOSE FAILURE for connection "${connectionId}": ${error.message} (${error.code || "no code"}) -- continuing shutdown for other sessions and releasing the writer claim regardless.`);
+          }
+        }
+      /* Codex PR #29 review round 8 "bound termination of stdio downstream children": same
+       * reasoning as the startup-failure cleanup above -- await close() so a downstream that
+       * traps/ignores SIGTERM is actually confirmed gone (or forcibly SIGKILLed) before this
+       * releases the writer-claim, rather than left running past shutdown. */
+        for (const conn of downstreamHandles.connections.values()) {
+          try { await conn.close(); } catch (error) { /* best effort */ }
+        }
+    } finally {
+      writerClaim.release();
     }
-    /* Codex PR #29 review round 8 "bound termination of stdio downstream children": same
-     * reasoning as the startup-failure cleanup above -- await close() so a downstream that
-     * traps/ignores SIGTERM is actually confirmed gone (or forcibly SIGKILLed) before this
-     * releases the writer-claim, rather than left running past shutdown. */
-    for (const conn of downstreamHandles.connections.values()) {
-      try { await conn.close(); } catch (error) { /* best effort */ }
-    }
-    writerClaim.release();
     // Cluster D: one last write so `gateway.js status` run after this process has
     // exited reports an accurate "not claimed by this instance" / drained snapshot
     // instead of silently going stale mid-run-looking data.
-    writeStatusFile(ctx, log);
-    log("shutdown complete: writer-claim released.");
+    writeStatusFile(ctx, safeShutdownLog);
+    safeShutdownLog("shutdown complete: writer-claim released.");
   }
 
   return {

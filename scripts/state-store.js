@@ -283,12 +283,45 @@ function chmodPathOrFail(targetPath, mode) {
 // source's inode (and therefore its mode) with the target, so setting it on the
 // temporary file is sufficient for both the link path and the no-hard-link fallback
 // below. Pass `{ mode: null }` to opt out entirely (see applyFileMode's own doc comment).
+/* Codex PR #33 review "write the entire intent record before dispatching": fs.writeSync
+ * is permitted by Node's own docs to write FEWER bytes than requested in a single call.
+ * Both atomic primitives below previously made exactly ONE writeSync call and then
+ * fsync'd and linked/renamed the result into place, so a short write PUBLISHED a
+ * truncated file while still returning success to the caller. For the gateway's
+ * recovery.js#createIntentIfAbsent that is the worst possible shape: the function returns
+ * a valid-looking intent record and proxy.js dispatches the downstream side effect, while
+ * the on-disk fence that is supposed to make that dispatch replay-safe is invalid JSON --
+ * a later crash or completion update cannot use it and forces ambiguous operator
+ * recovery. Loops until every byte has actually been written, mirroring
+ * gateway/recovery.js#writeFullySync's own established pattern for the WAL.
+ *
+ * No truncate-on-failure rollback is needed here (unlike writeFullySync, which appends
+ * in place to a live WAL): both call sites below write into a freshly-created file that
+ * is either a temporary never linked into place, or -- on the no-hard-link fallback
+ * path -- a target the caller must treat as failed anyway, so a throw before fsync can
+ * never publish a partial record through either primitive's success path. */
+function writeFullySync(fd, payload) {
+  const buffer = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), "utf8");
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = fs.writeSync(fd, buffer, offset, buffer.length - offset);
+    if (!(written > 0)) {
+      throw fail(
+        `fs.writeSync made no progress (wrote ${written} of ${buffer.length - offset} remaining byte(s)) -- ` +
+          "refusing to publish a possibly-incomplete record.",
+        "STATE_STORE_SHORT_WRITE"
+      );
+    }
+    offset += written;
+  }
+}
+
 function atomicCreateExclusive(targetPath, payload, options = {}) {
   const mode = Object.prototype.hasOwnProperty.call(options, "mode") ? options.mode : DEFAULT_FILE_MODE;
   const temporary = `${targetPath}.new-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const writeTo = (target, flag) => {
     const fd = fs.openSync(target, flag);
-    try { fs.writeSync(fd, payload); applyFileMode(fd, mode, target); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    try { writeFullySync(fd, payload); applyFileMode(fd, mode, target); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   };
   writeTo(temporary, "wx");
   try {
@@ -322,7 +355,7 @@ function atomicOverwriteFile(targetPath, content, dirPath, options = {}) {
   const temporary = `${targetPath}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const fd = fs.openSync(temporary, "wx");
   try {
-    fs.writeSync(fd, content);
+    writeFullySync(fd, content);
     applyFileMode(fd, mode, temporary);
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
@@ -1672,6 +1705,7 @@ api.systemLeaseClock = systemLeaseClock;
 /* Exported so writer-claim.js (a separate, standing process-lifetime claim mechanism --
  * see .plans/v0.5.0/GATEWAY-MULTI-INSTANCE-HANDOFF.md FR-1..FR-4) reuses these SAME
  * primitives rather than a second near-identical copy, per that plan's NFR-2. */
+api.writeFullySync = writeFullySync;
 api.atomicCreateExclusive = atomicCreateExclusive;
 api.atomicOverwriteFile = atomicOverwriteFile;
 api.pidAlive = pidAlive;

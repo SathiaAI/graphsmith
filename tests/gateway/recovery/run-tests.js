@@ -1819,6 +1819,193 @@ function abandonConnectionOnAlreadyCleanConnectionIsANoOp() {
 // PR #33 round-2 fixes that need a real WriterClaim / real startGateway plumbing.
 // ---------------------------------------------------------------------------
 
+
+/* Codex PR #33 review "write the entire intent record before dispatching": state-store.js's
+ * atomicCreateExclusive/atomicOverwriteFile each made exactly ONE fs.writeSync call and
+ * then fsync'd + linked/renamed the result into place. fs.writeSync is permitted to write
+ * FEWER bytes than requested, so a short write PUBLISHED a truncated file while returning
+ * success -- for createIntentIfAbsent that means proxy.js dispatches a real downstream side
+ * effect against an intent fence that is invalid JSON on disk. */
+function atomicWritesLoopUntilTheWholePayloadIsWritten() {
+  const dir = freshDir("short-write");
+  const intentKey = recovery.computeIntentKey("conn-short-write", "email", { to: "a@b.c" });
+
+  // Force a pathological short write: one byte per fs.writeSync call, exactly what Node's
+  // own docs permit and what a real pipe/quota-pressured filesystem actually does.
+  const realWriteSync = fs.writeSync;
+  /* One byte per call, for BOTH fs.writeSync call shapes this codebase uses: the
+   * (fd, buffer, offset, length) form recovery.js#writeFullySync already loops on, and the
+   * (fd, string) form state-store.js's atomic primitives use -- a stub that only shortened
+   * the former would silently stop exercising the fix the moment the code under test
+   * passed a string, which is exactly what it does. */
+  const shortWriteSync = function (fd, buffer, offset, length, ...rest) {
+    if (Buffer.isBuffer(buffer) && typeof offset === "number" && typeof length === "number" && length > 1) {
+      return realWriteSync.call(fs, fd, buffer, offset, 1);
+    }
+    if (offset === undefined && length === undefined && rest.length === 0) {
+      const encoded = Buffer.isBuffer(buffer) ? buffer : Buffer.from(String(buffer), "utf8");
+      if (encoded.length > 1) return realWriteSync.call(fs, fd, encoded, 0, 1);
+    }
+    return realWriteSync.apply(fs, [fd, buffer, offset, length, ...rest]);
+  };
+  fs.writeSync = shortWriteSync;
+  let created = null;
+  let thrown = null;
+  try {
+    created = recovery.createIntentIfAbsent(dir, intentKey, {
+      connection_id: "conn-short-write",
+      tool: "email",
+      arguments: { to: "a@b.c" },
+      state: "dispatched",
+      dispatched_at: 1,
+      idempotency_key: "short-write-key",
+      generation: 1,
+    });
+  } catch (error) {
+    thrown = error;
+  } finally {
+    fs.writeSync = realWriteSync;
+  }
+  check("short-write-intent-create-did-not-throw", thrown === null, thrown && thrown.message);
+  check("short-write-intent-create-returned-a-record", Boolean(created) && created.intent_key === intentKey, JSON.stringify(created));
+
+  // The decisive assertion: what is actually ON DISK must be the complete record, not a
+  // truncated prefix that only LOOKS like a successful create to the caller.
+  const rawOnDisk = fs.readFileSync(recovery.intentPath(dir, intentKey), "utf8");
+  let parsed = null;
+  let parseError = null;
+  try { parsed = JSON.parse(rawOnDisk); } catch (error) { parseError = error; }
+  check(
+    "short-write-intent-is-complete-valid-json-on-disk",
+    parseError === null && parsed && parsed.intent_key === intentKey && parsed.state === "dispatched" && parsed.idempotency_key === "short-write-key",
+    `parseError=${parseError && parseError.message}; raw=${JSON.stringify(rawOnDisk)}`
+  );
+  check(
+    "short-write-intent-round-trips-through-readIntent",
+    (() => { try { const r = recovery.readIntent(dir, intentKey); return Boolean(r) && r.arguments && r.arguments.to === "a@b.c"; } catch (error) { return false; } })(),
+    rawOnDisk
+  );
+
+  // Same guarantee for the overwrite primitive (updateIntent / recordCompletedSignature).
+  fs.writeSync = shortWriteSync;
+  try {
+    recovery.updateIntent(dir, intentKey, { state: "completed", completed_at: 2, cached_result: { ok: true, padding: "x".repeat(200) } });
+  } finally {
+    fs.writeSync = realWriteSync;
+  }
+  const rawAfterUpdate = fs.readFileSync(recovery.intentPath(dir, intentKey), "utf8");
+  let updated = null;
+  try { updated = JSON.parse(rawAfterUpdate); } catch (error) { updated = null; }
+  check(
+    "short-write-intent-overwrite-is-complete-valid-json-on-disk",
+    Boolean(updated) && updated.state === "completed" && updated.cached_result && updated.cached_result.padding.length === 200,
+    JSON.stringify(rawAfterUpdate).slice(0, 300)
+  );
+}
+
+/* Codex PR #33 review "fsync both directories after quarantining a WAL": recovery-abandon's
+ * active/ -> quarantine/ rename is the durable save point it reports success on, but
+ * rename(2) only mutates two DIRECTORY ENTRIES -- neither is durable until its own parent
+ * directory's fd is fsynced. */
+function quarantineWalFsyncsBothSourceAndDestinationDirectories() {
+  const dir = freshDir("quarantine-fsync");
+  const connectionId = "conn-quarantine-fsync";
+  recovery.appendWalEvent(dir, connectionId, { type: "SESSION_START", session_id: "sid-1", tools: [] });
+
+  // Record which PATHS actually get an fsync during quarantineWal, by correlating each
+  // fsync'd fd back to the path it was opened from.
+  const fdToPath = new Map();
+  const realOpenSync = fs.openSync;
+  const realFsyncSync = fs.fsyncSync;
+  const fsyncedPaths = [];
+  fs.openSync = function (p, ...rest) {
+    const fd = realOpenSync.call(fs, p, ...rest);
+    fdToPath.set(fd, String(p));
+    return fd;
+  };
+  fs.fsyncSync = function (fd) {
+    if (fdToPath.has(fd)) fsyncedPaths.push(fdToPath.get(fd));
+    return realFsyncSync.call(fs, fd);
+  };
+  let to = null;
+  try {
+    to = recovery.quarantineWal(dir, connectionId);
+  } finally {
+    fs.openSync = realOpenSync;
+    fs.fsyncSync = realFsyncSync;
+  }
+  check("quarantine-wal-moved-the-file", Boolean(to) && fs.existsSync(to) && !fs.existsSync(recovery.walPath(dir, connectionId)), String(to));
+  check(
+    "quarantine-wal-fsyncs-the-source-active-directory",
+    fsyncedPaths.includes(recovery.activeDir(dir)),
+    JSON.stringify(fsyncedPaths)
+  );
+  check(
+    "quarantine-wal-fsyncs-the-destination-quarantine-directory",
+    fsyncedPaths.includes(recovery.quarantineDir(dir)),
+    JSON.stringify(fsyncedPaths)
+  );
+}
+
+/* Codex PR #33 review "sweep expired completed-signature records" + CodeRabbit PR #33
+ * review "sweep expired completed signatures" (the same finding from both reviewers): the
+ * advertised 24-hour retention was only ever enforced per-key on read, so a signature whose
+ * exact (tool, arguments, idempotency key) is never presented again was never deleted by
+ * anything and accumulated without bound. */
+function sweepExpiredSignaturesRemovesOnlyExpiredRecordsAndIsBounded() {
+  const dir = freshDir("signature-sweep");
+  const ttl = recovery.DEFAULT_RETAINED_SIGNATURE_TTL_MS;
+  const now = Date.now();
+
+  const expiredKeys = [];
+  for (let i = 0; i < 4; i++) {
+    const key = recovery.computeSignatureKey("email", { n: i }, `expired-${i}`);
+    expiredKeys.push(key);
+    recovery.recordCompletedSignature(dir, key, { completed_at: now - ttl - 60000, idempotency_key: `expired-${i}`, cached_result: { ok: true } });
+  }
+  const liveKey = recovery.computeSignatureKey("email", { n: "live" }, "live-key");
+  recovery.recordCompletedSignature(dir, liveKey, { completed_at: now - 1000, idempotency_key: "live-key", cached_result: { ok: true } });
+  // A record with no usable completed_at: readCompletedSignature already treats this as
+  // expired, so the sweep must agree rather than keep it forever.
+  const malformedKey = recovery.computeSignatureKey("email", { n: "malformed" }, "malformed-key");
+  recovery.recordCompletedSignature(dir, malformedKey, { idempotency_key: "malformed-key", cached_result: { ok: true } });
+
+  const result = recovery.sweepExpiredSignatures(dir);
+  check(
+    "sweep-removes-every-expired-signature-record",
+    expiredKeys.every((k) => !fs.existsSync(recovery.signaturePath(dir, k))),
+    JSON.stringify(result)
+  );
+  check("sweep-keeps-a-still-live-signature-record", fs.existsSync(recovery.signaturePath(dir, liveKey)), JSON.stringify(result));
+  check("sweep-removes-a-record-with-no-usable-completed-at", !fs.existsSync(recovery.signaturePath(dir, malformedKey)), JSON.stringify(result));
+  check("sweep-reports-what-it-reclaimed", result.removed === 5 && result.scanned === 6, JSON.stringify(result));
+  check(
+    "sweep-leaves-a-still-live-record-readable-through-the-normal-path",
+    (() => { const r = recovery.readCompletedSignature(dir, liveKey); return Boolean(r) && r.idempotency_key === "live-key"; })(),
+    "live record unreadable after the sweep"
+  );
+
+  // Bounded: one sweep never examines more than maxEntries directory entries, so a huge
+  // signatures/ directory cannot make a single startup arbitrarily long.
+  const bounded = recovery.sweepExpiredSignatures(dir, { maxEntries: 1 });
+  check("sweep-honors-its-maxEntries-bound", bounded.scanned <= 1, JSON.stringify(bounded));
+}
+
+/* The sweep above is only useful if something actually CALLS it: startup recovery is the
+ * bounded, once-per-process pass both reviewers named as the right place. */
+function startupRecoverySweepsExpiredSignatureRecords() {
+  const dir = freshDir("startup-signature-sweep");
+  const ttl = recovery.DEFAULT_RETAINED_SIGNATURE_TTL_MS;
+  const expiredKey = recovery.computeSignatureKey("email", { n: 1 }, "startup-expired");
+  recovery.recordCompletedSignature(dir, expiredKey, { completed_at: Date.now() - ttl - 60000, idempotency_key: "startup-expired", cached_result: { ok: true } });
+  const liveKey = recovery.computeSignatureKey("email", { n: 2 }, "startup-live");
+  recovery.recordCompletedSignature(dir, liveKey, { completed_at: Date.now(), idempotency_key: "startup-live", cached_result: { ok: true } });
+
+  recoverCrashedSessions(dir, makeKeys(), silentLog);
+  check("startup-recovery-sweeps-an-expired-signature-record", !fs.existsSync(recovery.signaturePath(dir, expiredKey)), "expired record survived startup recovery");
+  check("startup-recovery-keeps-a-live-signature-record", fs.existsSync(recovery.signaturePath(dir, liveKey)), "live record was wrongly swept");
+}
+
 function writerClaimIsReleasedWhenStartupRecoveryThrows() {
   const root = freshDir("release-on-recovery-failure");
   const stateDir = path.join(root, "state");
@@ -2256,6 +2443,12 @@ function main() {
     .then(() => {
       recoverPreservesModelCallFlagOnSamplingReplay();
       recoverDoesNotBlockAutoSealOnAnUnresolvedSamplingCall();
+    })
+    .then(() => {
+      atomicWritesLoopUntilTheWholePayloadIsWritten();
+      quarantineWalFsyncsBothSourceAndDestinationDirectories();
+      sweepExpiredSignaturesRemovesOnlyExpiredRecordsAndIsBounded();
+      startupRecoverySweepsExpiredSignatureRecords();
     })
     .then(() => writerClaimIsReleasedWhenStartupRecoveryThrows())
     .then(() => {

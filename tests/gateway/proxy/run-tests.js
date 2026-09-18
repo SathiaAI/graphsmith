@@ -24,6 +24,7 @@ const ROOT = path.resolve(__dirname, "../../..");
 const { GatewayProxy } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
 const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
+const session = require(path.join(ROOT, "scripts", "gateway", "session.js"));
 
 let failures = 0;
 const results = [];
@@ -860,6 +861,144 @@ async function replayedCallGetsAStructuredCompletionLogToo() {
   const replayedLog = parsedLogs.find((l) => l && l.event === "gateway_call_completed" && l.status === "replayed");
   check("replayed-call-gets-a-structured-completion-log", Boolean(replayedLog) && replayedLog.tool === "echo", JSON.stringify(logLines));
   await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "persist cached replays in the session trace": an idempotency-key
+ * cache hit returned the cached tool result to the agent without recordCallStart/
+ * recordCallResult, so the agent observed a successful tools/call that appeared nowhere in
+ * the session's own trace. It must now appear as a real, ordered step that is EXPLICITLY
+ * marked as a replay rather than passed off as a fresh downstream dispatch. */
+async function cachedReplayIsRecordedAsAnExplicitlyReplayedStep() {
+  const dir = freshDir("replay-trace");
+  const conn = fakeConnectionCapturing(async () => ({ value: 1 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: () => {} });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  const params = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "replay-trace-key" } };
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  const retry = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params });
+
+  const s = proxy.sessions.get("conn-1");
+  const recorded = s.calls.slice().sort((a, b) => a.seq - b.seq);
+  check(
+    "cached-replay-dispatched-downstream-exactly-once",
+    conn.calls.filter((c) => c.method === "tools/call").length === 1,
+    JSON.stringify(conn.calls)
+  );
+  check(
+    "cached-replay-is-recorded-as-its-own-step-in-the-trace",
+    recorded.length === 2 && recorded[1].tool === "echo",
+    `recorded ${recorded.length} call(s): ${JSON.stringify(recorded.map((c) => c.tool))}`
+  );
+  check(
+    "cached-replay-step-is-explicitly-marked-replayed",
+    recorded.length === 2 && recorded[1].replayed === true && typeof recorded[1].replayed_from_intent_key === "string",
+    JSON.stringify(recorded[1] || null)
+  );
+  check(
+    "first-dispatch-step-is-not-marked-replayed",
+    recorded.length === 2 && recorded[0].replayed === undefined,
+    JSON.stringify(recorded[0] || null)
+  );
+  check("cached-replay-still-returns-the-cached-result", retry && retry.result && retry.result.value === 1, JSON.stringify(retry));
+
+  // The replayed step must also survive a crash: it is in the WAL, marked, so
+  // gateway.js#recoverCrashedSessions reconstructs the same shape a clean close would.
+  const walEvents = recovery.readWalEvents(dir, "conn-1");
+  const replayedResultEvents = walEvents.filter((e) => e.type === "CALL_RESULT" && e.replayed === true);
+  check(
+    "cached-replay-is-durably-recorded-in-the-wal-as-a-replay",
+    replayedResultEvents.length === 1 && replayedResultEvents[0].result && replayedResultEvents[0].result.value === 1,
+    JSON.stringify(walEvents.map((e) => ({ type: e.type, replayed: e.replayed })))
+  );
+
+  // And the sealed bundle must carry the marker through toSealableSession.
+  const sealable = session.toSealableSession(s);
+  check(
+    "sealed-trace-carries-the-replay-marker",
+    sealable.calls.length === 2 && sealable.calls[1].replayed === true,
+    JSON.stringify(sealable.calls)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "emit one log line for each replayed step": a cached replay used to
+ * emit BOTH gateway_intent_replayed and gateway_call_completed for one handled step,
+ * double-counting it for any consumer keeping to this repo's one-line-per-step invariant. */
+async function cachedReplayEmitsExactlyOneLogLine() {
+  const dir = freshDir("replay-one-log");
+  const conn = fakeConnectionCapturing(async () => ({ value: 1 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  const params = { name: "echo", arguments: { a: 1 }, _meta: { idempotencyKey: "one-log-key" } };
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  logLines.length = 0; // only the retry's own logging matters below
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 2, method: "tools/call", params });
+  check("cached-replay-emits-exactly-one-log-line", logLines.length === 1, JSON.stringify(logLines));
+  const parsed = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } });
+  check(
+    "the-single-replay-log-line-carries-the-replay-metadata",
+    parsed.length === 1 && parsed[0] && parsed[0].event === "gateway_call_completed" && parsed[0].status === "replayed" &&
+      parsed[0].replayed === true && typeof parsed[0].intent_key === "string" && parsed[0].step !== null,
+    JSON.stringify(logLines)
+  );
+  check(
+    "no-separate-gateway-intent-replayed-line-is-emitted-any-more",
+    !parsed.some((l) => l && l.event === "gateway_intent_replayed"),
+    JSON.stringify(logLines)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* Codex PR #33 review "continue sealing when the closing WAL append fails": closeConnection
+ * removes the session from both live maps BEFORE appending the CLOSING WAL event, so an
+ * unguarded throw there left a completed, healthy session permanently absent from the
+ * signed chain with nothing in memory left to retry from. */
+async function closingWalAppendFailureStillSealsTheSession() {
+  const dir = freshDir("closing-wal-fails");
+  const conn = fakeConnectionCapturing(async () => ({ value: 1 }));
+  const mergedTools = [{ name: "echo", server: "srv", schema: {} }];
+  const toolOwners = new Map([["echo", "srv"]]);
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: () => {} });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } });
+
+  // Fail ONLY the CLOSING append, on an otherwise completely healthy connection.
+  const realAppend = recovery.appendWalEvent;
+  recovery.appendWalEvent = (stateDir, connectionId, event) => {
+    if (event && event.type === "CLOSING") throw Object.assign(new Error("simulated ENOSPC on the CLOSING append"), { code: "ENOSPC" });
+    return realAppend(stateDir, connectionId, event);
+  };
+  let entry = null;
+  let thrown = null;
+  try {
+    entry = await proxy.closeConnection("conn-1", "test close");
+  } catch (error) {
+    thrown = error;
+  } finally {
+    recovery.appendWalEvent = realAppend;
+  }
+  check("closing-wal-append-failure-does-not-throw-out-of-closeConnection", thrown === null, thrown && thrown.message);
+  check("closing-wal-append-failure-still-appends-the-session-to-the-chain", Boolean(entry) && entry.seq === 1, JSON.stringify(entry));
+  const head = chain.readHead(dir);
+  check("closing-wal-append-failure-still-advances-HEAD", Boolean(head) && head.seq === 1, JSON.stringify(head));
+  const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, entry.bundle_id), "utf8"));
+  const raw = JSON.stringify(bundle);
+  check(
+    "closing-wal-append-failure-is-attested-in-the-sealed-bundle",
+    raw.includes("GATEWAY_RECOVERY_WAL_APPEND_FAILED"),
+    raw.slice(0, 400)
+  );
 }
 
 /* Frontier-panel decision (Paul, 2026-09-10, cluster E2): a reconnecting agent gets a
@@ -1903,6 +2042,9 @@ async function main() {
   await blockedRetryAnomalyIsDurablyRecorded();
   await blockedRetryAnomaliesAreUncappedInTheWalDespiteTheSessionCap();
   await replayedCallGetsAStructuredCompletionLogToo();
+  await cachedReplayIsRecordedAsAnExplicitlyReplayedStep();
+  await cachedReplayEmitsExactlyOneLogLine();
+  await closingWalAppendFailureStillSealsTheSession();
   await callStartWalAppendFailureRollsBackAndStaysRetryable();
   await postDispatchUpdateSkippedWhenIntentConcurrentlyRemoved();
 

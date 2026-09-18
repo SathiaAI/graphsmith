@@ -18,6 +18,7 @@ const path = require("path");
 const session = require("./session.js");
 const chain = require("./chain.js");
 const recovery = require("./recovery.js");
+const stateStore = require("../state-store.js");
 
 function fail(message, code = "GATEWAY_PROXY_ERROR") {
   const error = new Error(message);
@@ -40,9 +41,16 @@ function fail(message, code = "GATEWAY_PROXY_ERROR") {
 function quarantineSealedBundle(stateDir, connectionId, sealed, cause) {
   try {
     const dir = path.join(chain.sessionsDir(stateDir), "quarantine");
-    fs.mkdirSync(dir, { recursive: true });
+    /* Codex PR #33 review "enforce modes when creating post-startup session files": this
+     * directory and file are created at the moment an append FAILS -- long after
+     * startup-permissions.js's one-time pass skipped them for not existing yet -- and the
+     * file is the full raw sealed bundle (the most sensitive artifact this gateway
+     * writes). Without explicit modes it lands 0755/0644 (world-readable) under a 022
+     * umask and stays that way until the next restart re-runs that pass. Use the same
+     * DEFAULT_DIR_MODE/DEFAULT_FILE_MODE constants every other state write here uses. */
+    fs.mkdirSync(dir, { recursive: true, mode: stateStore.DEFAULT_DIR_MODE });
     const target = path.join(dir, `${connectionId}-${Date.now()}.json`);
-    fs.writeFileSync(target, JSON.stringify({ sealed, quarantined_at: new Date().toISOString(), reason: cause && cause.message }, null, 2), { encoding: "utf8", flag: "wx" });
+    fs.writeFileSync(target, JSON.stringify({ sealed, quarantined_at: new Date().toISOString(), reason: cause && cause.message }, null, 2), { encoding: "utf8", flag: "wx", mode: stateStore.DEFAULT_FILE_MODE });
     return target;
   } catch (quarantineError) {
     // Best effort only: a quarantine-write failure (e.g. the same ENOSPC that caused the
@@ -825,15 +833,53 @@ class GatewayProxy {
         }
         if (intentDecision.kind === "replay") {
           if (isNotification) return null;
-          /* Codex PR #33 review "emit complete step logs for replayed and blocked
-           * calls": this used to emit only the special-purpose gateway_intent_replayed
-           * line, missing the step/status/duration fields every other handled call gets
-           * via gateway_call_completed below -- an operator scanning for one
-           * consistently-shaped log line per call would miss this one. Emit both: the
-           * existing event (kept for any consumer already matching on it) and a normal
-           * structured completion record. */
-          this.log(JSON.stringify({ event: "gateway_intent_replayed", connection_id: connectionId, tool: toolName, intent_key: intentKey }));
-          this.log(JSON.stringify({ event: "gateway_call_completed", connection_id: connectionId, step: null, tool: toolName, server: serverName, status: "replayed", duration_ms: 0 }));
+          /* Codex PR #33 review "persist cached replays in the session trace": this branch
+           * returned the cached tool result WITHOUT recordCallStart/recordCallResult and
+           * without either WAL append, so the agent observed a successful tools/call that
+           * appeared in neither the clean-close nor the crash-recovered signed trace --
+           * defeating this PR's own premise that the sealed bundle records every MCP
+           * boundary input/output the session handled. Record it as a real, ordered step,
+           * explicitly MARKED as a replay (`replayed: true`, carried through session.js's
+           * existing optional-marker mechanism -- the same one `disconnected` already
+           * uses -- and through the WAL so crash recovery reconstructs it identically) so
+           * the trace is complete without misrepresenting a cache hit as a fresh
+           * downstream dispatch. The per-session admission caps above (MAX_PENDING_CALLS_
+           * PER_SESSION / MAX_COMPLETED_CALLS_PER_SESSION) already gate this path, so the
+           * extra recorded step stays bounded exactly like any other call.
+           *
+           * Durability posture, deliberately fail-OPEN: unlike a fresh dispatch there is
+           * nothing here this gateway could refuse to do -- the side effect already
+           * happened, on an earlier call that WAS durably recorded, and withholding the
+           * cached result would only push the caller into another retry that lands right
+           * back on this same branch. So an append failure poisons the WAL (C1 SS2),
+           * attests itself as an anomaly, and still returns the replayed result -- the
+           * same choice proxy.js's own CALL_RESULT append already makes. */
+          const replayTs = this.now();
+          const replayCallSeq = s.nextCallSeq;
+          session.recordCallStart(s, correlationKey, { tool: toolName, server: serverName, arguments: callArgs, isModelCall: false, ts: replayTs });
+          if (s.walPoisoned) {
+            session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED", tool: toolName, intent_key: intentKey, detail: s.walPoisoned.reason });
+          } else {
+            try {
+              recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_START", call_seq: replayCallSeq, tool: toolName, server: serverName, arguments: callArgs, ts: replayTs, generation: dispatchGeneration, replayed: true });
+              recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: replayCallSeq, result: intentDecision.cachedResult, isError: false, ts: replayTs, generation: dispatchGeneration, replayed: true, intent_key: intentKey });
+            } catch (walError) {
+              poisonWalOnFailure(s, walError, this.now);
+              session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: `replayed step: ${walError.message}` });
+            }
+          }
+          session.recordCallResult(s, correlationKey, { result: intentDecision.cachedResult, isError: false, ts: replayTs, replayed: true, replayedFromIntentKey: intentKey });
+          /* Codex PR #33 review "emit one log line for each replayed step": an earlier
+           * round of this same PR added a gateway_call_completed line ALONGSIDE the
+           * pre-existing gateway_intent_replayed one, so every cached replay emitted two
+           * records for a single handled step and any consumer counting steps double-
+           * counted it -- breaking AGENTS.md's one-line-per-step invariant that the same
+           * earlier round was trying to satisfy. Consolidated: ONE gateway_call_completed
+           * line, in the same shape every other handled call emits, carrying the replay
+           * metadata (status "replayed" plus the intent key the separate
+           * gateway_intent_replayed event used to supply) as fields rather than as a
+           * second line. */
+          this.safeLog(JSON.stringify({ event: "gateway_call_completed", connection_id: connectionId, step: replayCallSeq, tool: toolName, server: serverName, status: "replayed", duration_ms: 0, replayed: true, intent_key: intentKey }));
           return { jsonrpc: "2.0", id, result: intentDecision.cachedResult };
         }
         if (intentDecision.kind === "block") {
@@ -1255,7 +1301,30 @@ class GatewayProxy {
       session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_SKIPPED_POISONED", detail: s.walPoisoned.reason });
       this.safeLog(JSON.stringify({ event: "gateway_wal_append_skipped_poisoned", connection_id: connectionId, type: "CLOSING", detail: s.walPoisoned.reason }));
     } else {
-      recovery.appendWalEvent(this.stateDir, connectionId, { type: "CLOSING", reason: reason || null });
+      /* Codex PR #33 review "continue sealing when the closing WAL append fails": this was
+       * the one unguarded appendWalEvent left on this path, and it sits AFTER
+       * this.sessions.delete(connectionId) above -- so a throw here (ENOSPC, EIO) escaped
+       * closeConnection with the session already gone from both live maps and
+       * finalizeSession/chain.appendSession never reached. On the HTTP idle-timeout/DELETE
+       * path the caller swallows that rejection, so an otherwise completely healthy,
+       * finished session was permanently absent from the signed chain with nothing left in
+       * memory to retry from. The CLOSING event is INFORMATIONAL for replay (see
+       * gateway.js#recoverCrashedSessions: "CLOSING is informational only for replay"), so
+       * losing it is strictly less harmful than losing the whole sealed session. Treat it
+       * exactly like every other best-effort append failure in this file -- poison the WAL
+       * per docs/contracts/wal-append-failure-semantics.md C1 SS2 so no later append
+       * concatenates onto a possibly-torn line, ATTEST it as an anomaly so the sealed
+       * bundle is not silent about a durable write this gateway attempted and failed, log
+       * it through safeLog -- and then fall through to finalization rather than abandoning
+       * it. The WAL file itself is left in place for recovery either way (deleteWal only
+       * runs after a successful chain.appendSession). */
+      try {
+        recovery.appendWalEvent(this.stateDir, connectionId, { type: "CLOSING", reason: reason || null });
+      } catch (walError) {
+        poisonWalOnFailure(s, walError, this.now);
+        session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", detail: `CLOSING event: ${walError.message}` });
+        this.safeLog(JSON.stringify({ event: "gateway_wal_append_failed", connection_id: connectionId, type: "CLOSING", detail: walError.message }));
+      }
     }
     let sealed;
     try {

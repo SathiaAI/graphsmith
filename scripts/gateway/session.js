@@ -166,6 +166,16 @@ function recordCallResult(session, jsonRpcId, result) {
     model_call: pending.model_call,
     ts: pending.ts,
     seq: pending.seq,
+    /* Codex PR #33 review "persist cached replays in the session trace": an OPTIONAL,
+     * additive marker (absent on every ordinary call, exactly like `disconnected` above)
+     * letting proxy.js record an idempotency-key cache hit as a real, ordered step that
+     * is nonetheless not claimed to be a fresh downstream dispatch. Only the caller can
+     * know this -- session.js never decides it -- so it is passed in rather than derived,
+     * and toSealableSession spreads it conditionally the same way it already spreads the
+     * disconnect fields, so no ordinary session's sealed shape (or bundle_id) changes. */
+    ...(result && result.replayed
+      ? { replayed: true, replayed_from_intent_key: result.replayedFromIntentKey || null }
+      : {}),
   });
   return true;
 }
@@ -342,6 +352,7 @@ function toSealableSession(session) {
       model_call: c.model_call,
       ts: c.ts,
       ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason, jsonRpcId: c.jsonRpcId } : {}),
+      ...(c.replayed ? { replayed: true, replayed_from_intent_key: c.replayed_from_intent_key } : {}),
     })),
     goal: session.goal,
     anomalies: session.anomalies,
