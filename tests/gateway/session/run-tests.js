@@ -210,6 +210,36 @@ function finalizeSealsAndVerifies() {
   check("cannot-finalize-twice", threw2 && threw2.code === "SESSION_FINALIZED", threw2 && threw2.code);
 }
 
+/* PR #29 review thread 4000335147, frontier-panel review (4/4 converged) "flag
+ * structurally malformed tools/call results distinctly from tool-level errors": the
+ * predicate itself lives in proxy.js (isMalformedToolCallResult) -- this module's own
+ * job, tested here, is just to store whatever the caller computed (like isError) and
+ * carry it through to sealBoundaryBundle's trace line, additive-only. */
+function malformedResultFlagStoredAndPropagatedToSealedTrace() {
+  const keys = makeKeys();
+
+  const flagged = session.createSession("conn-malformed");
+  session.recordCallStart(flagged, 1, { tool: "shapeless", server: "srv", arguments: {}, ts: 1 });
+  session.recordCallResult(flagged, 1, { result: {}, malformedResult: true, ts: 2 });
+  check("recordCallResult-stores-malformedResult-true", flagged.calls[0].malformedResult === true, JSON.stringify(flagged.calls));
+
+  const clean = session.createSession("conn-clean");
+  session.recordCallStart(clean, 1, { tool: "clean", server: "srv", arguments: {}, ts: 1 });
+  // malformedResult intentionally omitted from the recordCallResult options, exactly like
+  // every non-tools/call caller (e.g. sampling/createMessage) does -- must default to a
+  // plain false, never undefined/truthy.
+  session.recordCallResult(clean, 1, { result: { content: [] }, ts: 2 });
+  check("recordCallResult-defaults-malformedResult-to-false-when-omitted", clean.calls[0].malformedResult === false, JSON.stringify(clean.calls));
+
+  const sealedFlagged = session.finalizeSession(flagged, keys);
+  const traceFlagged = sealedFlagged.bundle.contents["execution_trace.jsonl"];
+  check("sealed-trace-carries-malformed-result-true-for-flagged-call", traceFlagged.includes("\"malformed_result\":true"), traceFlagged);
+
+  const sealedClean = session.finalizeSession(clean, keys);
+  const traceClean = sealedClean.bundle.contents["execution_trace.jsonl"];
+  check("sealed-trace-omits-malformed-result-key-for-well-formed-call-byte-parity", !traceClean.includes("malformed_result"), traceClean);
+}
+
 function main() {
   createSessionRejectsBadConnectionId();
   toolServerAttribution();
@@ -220,6 +250,7 @@ function main() {
   disconnectMarksPendingAsError();
   disconnectCallbackFailureDoesNotAbortLoopOrPropagate();
   modelCallFlagPreserved();
+  malformedResultFlagStoredAndPropagatedToSealedTrace();
   duplicateJsonRpcIdRejected();
   finalizeRefusesWithPendingCalls();
   finalizeSealsAndVerifies();

@@ -140,6 +140,18 @@ function recordCallResult(session, jsonRpcId, result) {
     arguments: pending.arguments,
     result: callResult,
     isError: Boolean(result && result.isError),
+    /* PR #29 review thread 4000335147, frontier-panel review (4/4 converged) "flag
+     * structurally malformed tools/call results distinctly from tool-level errors":
+     * `malformedResult` is the caller's (proxy.js) own pure, `tools/call`-only,
+     * transport-success-only judgement (see isMalformedToolCallResult) of whether
+     * `callResult` itself is even a recognizable CallToolResult shape -- this module
+     * stores it verbatim, exactly like `isError`, and does not itself compute or
+     * re-derive it (this module has no opinion on MCP result shapes, by design -- see
+     * this file's header). Always Boolean-coerced so an absent field (every non-
+     * tools/call caller, e.g. a sampling/createMessage result) stores a plain `false`,
+     * never `undefined`, keeping this an audit-only annotation that never needs a
+     * caller to opt in. */
+    malformedResult: Boolean(result && result.malformedResult),
     model_call: pending.model_call,
     ts: pending.ts,
     seq: pending.seq,
@@ -281,6 +293,13 @@ function toSealableSession(session) {
       arguments: c.arguments,
       result: c.result,
       isError: c.isError,
+      /* Additive, backward-compatible field (see recordCallResult's own comment above
+       * and gsa-mcp-shim.js's sealBoundaryBundle, which folds this into the signed
+       * `malformed_result` trace field ONLY when true -- a well-formed call's trace line
+       * is unaffected). Carried through unconditionally here (like isError/model_call)
+       * because it is now part of every call's base recorded shape, not an optional
+       * extra like disconnected/jsonRpcId below. */
+      malformedResult: c.malformedResult,
       model_call: c.model_call,
       ts: c.ts,
       ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason, jsonRpcId: c.jsonRpcId } : {}),

@@ -59,6 +59,38 @@ function isModelCallMethod(method) {
   return method === "sampling/createMessage";
 }
 
+/* PR #29 review thread 4000335147, frontier-panel review (4/4 independent models
+ * converged, two rounds of critique) "flag structurally malformed tools/call results
+ * distinctly from tool-level errors": before this, a `tools/call` result was only ever
+ * judged by `isError` (Board decision 2026-09-04, above) -- a downstream that returned a
+ * response with NEITHER a recognizable success shape (`content` array) NOR a recognizable
+ * error/structured shape (`structuredContent` object, or an explicit `isError` boolean)
+ * was recorded as a normal, non-error call, because nothing about `isError: true`/`false`
+ * was ever asserted on it. That is a THIRD state, distinct from both "transport failed"
+ * and "tool reported isError: true": the downstream answered, but not in any shape the
+ * MCP CallToolResult contract recognizes at all. This predicate is deliberately narrow --
+ * it does not validate per-content-block schemas (e.g. a `content` array full of garbage
+ * blocks still counts as well-formed here), and extra/unknown fields on an otherwise
+ * -recognizable object never trip it (the MCP spec allows a server to add fields this
+ * gateway doesn't know about yet). It is purely an AUDIT annotation on the sealed
+ * session/trace record -- it never changes `isError`, never changes the JSON-RPC response
+ * actually returned to the agent, and never gates or blocks anything (see the two call
+ * sites below). Exception-safe by construction: a thrown error during the check itself
+ * (e.g. a poisoned getter on a hostile downstream's response object) is treated as "not
+ * malformed" -- failing open on an audit signal is correct; failing closed on one would
+ * turn a defensive annotation into an availability risk for a legitimate call. */
+function isMalformedToolCallResult(result) {
+  try {
+    if (result === null || typeof result !== "object" || Array.isArray(result)) return true;
+    const hasContent = Array.isArray(result.content);
+    const hasStructuredContent = result.structuredContent !== null && result.structuredContent !== undefined && typeof result.structuredContent === "object" && !Array.isArray(result.structuredContent);
+    const hasIsError = typeof result.isError === "boolean";
+    return !(hasContent || hasStructuredContent || hasIsError);
+  } catch (error) {
+    return false;
+  }
+}
+
 /* This build only ever negotiates the one protocol version it actually implements
  * (matching the literal default this file used to echo back unconditionally). Kept as a
  * named constant so "what we claim to speak" and "what we validate against" cannot drift
@@ -465,6 +497,25 @@ class GatewayProxy {
        * the agent below is still keyed on `transportFailed` alone, unchanged. */
       const toolLevelError = !transportFailed && method === "tools/call" && result && typeof result === "object" && result.isError === true;
       const isError = transportFailed || toolLevelError;
+      /* PR #29 review thread 4000335147, frontier-panel review (4/4 converged) "flag
+       * structurally malformed tools/call results distinctly from tool-level errors":
+       * this is now a THREE-state audit model for a `tools/call` outcome -- transport
+       * error (`transportFailed`), tool-level error (`toolLevelError`, an `isError: true`
+       * on an otherwise well-formed result), and malformed shape (`malformedResult`,
+       * neither of the above but also not a recognizable CallToolResult at all). All
+       * three can be reasoned about independently -- `malformedResult` and `isError` are
+       * NOT mutually exclusive with each other, and a call can be malformed without being
+       * an error or vice versa. Scoped to `tools/call` only (never `sampling/
+       * createMessage` -- a model_call's result shape is not a CallToolResult and this
+       * predicate says nothing about it) and only when the downstream actually responded
+       * (`!transportFailed` -- a transport failure already gets its own, unrelated
+       * synthetic `result` shape assigned in the catch block above, which this must not
+       * re-judge). This is audit-only: it does not change `isError`, does not change the
+       * JSON-RPC response returned to the agent below (still the raw, untouched
+       * `result`), and is not a validation gate -- see isMalformedToolCallResult's own
+       * comment for what it deliberately does not check (per-content-block schemas are
+       * out of scope). */
+      const malformedResult = !transportFailed && method === "tools/call" && isMalformedToolCallResult(result);
       const completedAt = this.now();
       /* CodeRabbit PR #29 review "recording the result after the session is closed can
        * throw or write a false anomaly": closeConnection()/handleDownstreamDisconnect()
@@ -479,7 +530,7 @@ class GatewayProxy {
        * (and log) when the call is still genuinely pending. */
       const correlatedNow = !s.finalized && s.pendingCalls.has(correlationKey);
       if (correlatedNow) {
-        session.recordCallResult(s, correlationKey, { result, isError, ts: completedAt });
+        session.recordCallResult(s, correlationKey, { result, isError, malformedResult, ts: completedAt });
         /* Board decision 2026-09-04, PR #29 review "emit the required structured log for
          * each call": the only prior gateway log for a call was the session-finalize log
          * emitted much later (or never, if the process crashes first) -- this gives every
@@ -493,6 +544,10 @@ class GatewayProxy {
           server: method === "tools/call" ? serverName : "sampling",
           status: isError ? "error" : "ok",
           duration_ms: completedAt - ts,
+          /* Mirrors sealBoundaryBundle's own `malformed_result` trace field (gsa-mcp-
+           * shim.js) into the operational log, additive-only: omitted entirely for a
+           * well-formed call so existing log consumers parsing this line see no change. */
+          ...(malformedResult ? { malformed_result: true } : {}),
         }));
       }
       if (isNotification) return null;
@@ -651,4 +706,4 @@ class GatewayProxy {
   }
 }
 
-module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION, MAX_SESSION_CALL_BYTES };
+module.exports = { GatewayProxy, isModelCallMethod, isMalformedToolCallResult, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION, MAX_SESSION_CALL_BYTES };

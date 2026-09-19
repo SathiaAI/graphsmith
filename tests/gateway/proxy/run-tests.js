@@ -21,7 +21,7 @@ const os = require("os");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "../../..");
-const { GatewayProxy } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
+const { GatewayProxy, isMalformedToolCallResult } = require(path.join(ROOT, "scripts", "gateway", "proxy.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
 
 let failures = 0;
@@ -600,6 +600,135 @@ async function writerClaimCheckDefaultsToValidWhenNotProvided() {
   check("append-not-refused-when-no-writer-claim-check-configured", Boolean(entry && typeof entry.bundle_id === "string"), JSON.stringify(entry));
 }
 
+/* PR #29 review thread 4000335147, frontier-panel review (4/4 independent models
+ * converged, two rounds of critique) "flag structurally malformed tools/call results
+ * distinctly from tool-level errors": pure predicate matrix, direct against
+ * isMalformedToolCallResult -- no proxy/session plumbing needed for these, they exercise
+ * the converged shape itself (a well-formed CallToolResult must have at least one of a
+ * `content` array, a `structuredContent` object, or an explicit `isError` boolean;
+ * extra/unknown fields never trip it). */
+function malformedResultPredicateMatrix() {
+  check("null-is-malformed", isMalformedToolCallResult(null) === true);
+  check("string-is-malformed", isMalformedToolCallResult("some string") === true);
+  check("number-is-malformed", isMalformedToolCallResult(42) === true);
+  check("array-is-malformed", isMalformedToolCallResult([]) === true);
+  check("empty-object-is-malformed", isMalformedToolCallResult({}) === true);
+  check("empty-content-array-is-not-malformed", isMalformedToolCallResult({ content: [] }) === false);
+  check("populated-content-array-is-not-malformed", isMalformedToolCallResult({ content: [{ type: "text", text: "ok" }] }) === false);
+  check(
+    "isError-true-with-content-is-not-malformed-both-flags-coexist",
+    isMalformedToolCallResult({ isError: true, content: [] }) === false
+  );
+  check("structuredContent-object-is-not-malformed", isMalformedToolCallResult({ structuredContent: {} }) === false);
+  check(
+    "extra-unknown-fields-do-not-trigger-malformed",
+    isMalformedToolCallResult({ content: [{ type: "text", text: "ok" }], extra_field: 1 }) === false
+  );
+  check("isError-boolean-alone-is-not-malformed", isMalformedToolCallResult({ isError: false }) === false);
+  check("predicate-does-not-throw-on-hostile-input", (() => {
+    const hostile = {};
+    Object.defineProperty(hostile, "content", { get() { throw new Error("boom"); } });
+    let threw = false;
+    let out;
+    try { out = isMalformedToolCallResult(hostile); } catch (error) { threw = true; }
+    return !threw && out === false; // fails open on the check itself, per spec
+  })());
+}
+
+/* Integration: malformedResult wired through handleMessage -> session.recordCallResult,
+ * additive-only and independent of isError/the JSON-RPC response. */
+async function malformedResultRecordedAndResponseUnchanged() {
+  const dir = freshDir("malformed-result");
+  const conn = fakeConnection(async () => ({})); // no content/structuredContent/isError
+  const mergedTools = [{ name: "shapeless", server: "srv", schema: {} }];
+  const toolOwners = new Map([["shapeless", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  const resp = await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "shapeless", arguments: {} } });
+  check(
+    "malformed-result-json-rpc-response-and-isError-completely-unchanged",
+    resp.error === undefined && resp.result && typeof resp.result === "object" && Object.keys(resp.result).length === 0 && resp.result.isError === undefined,
+    JSON.stringify(resp)
+  );
+  const s = proxy.sessions.get("conn-1");
+  check(
+    "malformed-result-flagged-in-session-without-flipping-isError",
+    s.calls.length === 1 && s.calls[0].malformedResult === true && s.calls[0].isError === false,
+    JSON.stringify(s.calls)
+  );
+  const callLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed");
+  check(
+    "malformed-result-log-line-carries-malformed-result-true",
+    Boolean(callLog && callLog.malformed_result === true && callLog.status === "ok"),
+    JSON.stringify(logLines)
+  );
+  await proxy.closeConnection("conn-1", "test cleanup");
+}
+
+/* A well-formed call must be completely unaffected: no malformedResult flag, no
+ * malformed_result key on the log line, and -- the byte-parity requirement -- no
+ * malformed_result key anywhere in the signed execution_trace line either. */
+async function wellFormedCallLeavesNoMalformedResultTrace() {
+  const dir = freshDir("malformed-result-clean");
+  const conn = fakeConnection(async () => ({ content: [{ type: "text", text: "ok" }] }));
+  const mergedTools = [{ name: "clean", server: "srv", schema: {} }];
+  const toolOwners = new Map([["clean", "srv"]]);
+  const logLines = [];
+  const proxy = makeProxy(dir, new Map([["srv", conn]]), mergedTools, toolOwners, { log: (line) => logLines.push(line) });
+  proxy.openConnection("conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxy, "conn-1");
+  await proxy.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "clean", arguments: {} } });
+  const s = proxy.sessions.get("conn-1");
+  check("well-formed-call-not-flagged-malformed", s.calls.length === 1 && s.calls[0].malformedResult === false, JSON.stringify(s.calls));
+  const callLog = logLines.map((l) => { try { return JSON.parse(l); } catch (error) { return null; } }).find((l) => l && l.event === "gateway_call_completed");
+  check("well-formed-call-log-line-has-no-malformed-result-key", Boolean(callLog) && !Object.prototype.hasOwnProperty.call(callLog, "malformed_result"), JSON.stringify(logLines));
+  const entry = await proxy.closeConnection("conn-1", "test cleanup");
+  const bundle = JSON.parse(fs.readFileSync(chain.bundlePath(dir, entry.bundle_id), "utf8"));
+  const trace = bundle.contents["execution_trace.jsonl"];
+  check("well-formed-call-trace-line-byte-parity-no-malformed-result-key", !trace.includes("malformed_result"), trace);
+}
+
+/* Scoped strictly to tools/call + !transportFailed: a sampling/createMessage (model_call)
+ * result and a transport-failed tools/call must never get malformedResult computed for
+ * them, regardless of how shapeless the underlying value is. */
+async function malformedResultNotComputedOutsideItsScope() {
+  const dir = freshDir("malformed-result-scope");
+  const samplingConn = fakeConnection(async () => null); // maximally shapeless
+  const mergedToolsA = [];
+  const proxyA = makeProxy(dir, new Map([["srv", samplingConn]]), mergedToolsA, new Map());
+  proxyA.openConnection("conn-1");
+  await proxyA.handleMessage("conn-1", { jsonrpc: "2.0", id: 1, method: "sampling/createMessage", params: { server: "srv" } });
+  const sA = proxyA.sessions.get("conn-1");
+  check(
+    "malformed-result-never-computed-for-sampling-createMessage",
+    sA.calls.length === 1 && sA.calls[0].model_call === true && sA.calls[0].malformedResult === false,
+    JSON.stringify(sA.calls)
+  );
+  await proxyA.closeConnection("conn-1", "test cleanup");
+
+  const dir2 = freshDir("malformed-result-transport-fail");
+  const failingConn = fakeConnection(async () => { throw new Error("downstream exploded"); });
+  const mergedTools = [{ name: "boom", server: "srv", schema: {} }];
+  const toolOwners = new Map([["boom", "srv"]]);
+  const proxyB = makeProxy(dir2, new Map([["srv", failingConn]]), mergedTools, toolOwners);
+  proxyB.openConnection("conn-2");
+  await proxyB.handleMessage("conn-2", { jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  await sendInitializedNotification(proxyB, "conn-2");
+  const resp = await proxyB.handleMessage("conn-2", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "boom", arguments: {} } });
+  check("transport-failure-still-a-protocol-error", resp.error !== undefined, JSON.stringify(resp));
+  const sB = proxyB.sessions.get("conn-2");
+  check(
+    "malformed-result-never-computed-for-a-transport-failed-call",
+    sB.calls.length === 1 && sB.calls[0].isError === true && sB.calls[0].malformedResult === false,
+    JSON.stringify(sB.calls)
+  );
+  await proxyB.closeConnection("conn-2", "test cleanup");
+}
+
 async function main() {
   await multipleDownstreamAttribution();
   await unknownToolRejected();
@@ -611,6 +740,10 @@ async function main() {
   await completedCallHistoryCapped();
   await stopAcceptingNewSessionsRefusesNewButNotExisting();
   await toolLevelErrorRecordedButNotProtocolError();
+  malformedResultPredicateMatrix();
+  await malformedResultRecordedAndResponseUnchanged();
+  await wellFormedCallLeavesNoMalformedResultTrace();
+  await malformedResultNotComputedOutsideItsScope();
   await preservesDownstreamJsonRpcErrorEnvelope();
   await initializationLifecycleEnforced();
   await noIdInitializeDoesNotUnlockToolsWithoutNotification();

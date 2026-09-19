@@ -22,7 +22,8 @@ function sha256Hex(s) { return crypto.createHash("sha256").update(Buffer.from(St
  *   initialize: { clientInfo:{name,version}, serverInfo:{name,version}, model?:string },
  *   tools:      [{ name, server, schema }],            // from tools/list — the GRANTED surface
  *   calls:      [{ tool, arguments, result, isError?, model_call?, ts?,
- *                  disconnected?, disconnect_reason?, jsonRpcId? }],  // tools/call sequence
+ *                  disconnected?, disconnect_reason?, jsonRpcId?, malformedResult? }],
+ *                  // tools/call sequence
  *   goal?:      string,
  *   anomalies?: [{ kind, jsonRpcId, detail, ts }]  // e.g. UNMATCHED_RESPONSE (session.js)
  * }
@@ -68,6 +69,22 @@ function sealBoundaryBundle(session, keys) {
       model_call: !!c.model_call,                        // sampling/createMessage → non-deterministic
       ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason || null } : {}),
       ...(c.jsonRpcId !== undefined ? { jsonRpcId: c.jsonRpcId } : {}),
+      /* PR #29 review thread 4000335147, frontier-panel review (4/4 converged) "flag
+       * structurally malformed tools/call results distinctly from tool-level errors":
+       * a THIRD state alongside is_error/model_call above -- the downstream answered,
+       * but not in any shape the MCP CallToolResult contract recognizes (see proxy.js's
+       * isMalformedToolCallResult for the exact predicate). Purely an audit annotation
+       * on the signed trace, same discipline as disconnected/jsonRpcId immediately
+       * above: additive and OMITTED (not `false`) when the call was well-formed, so a
+       * clean call's trace line -- and its hash, for anything that hashes trace lines --
+       * is byte-for-byte identical to what it was before this field existed. Never
+       * asserted for a model_call (sampling/createMessage is not a tools/call and this
+       * predicate is never computed for one -- see proxy.js) or for a transport failure
+       * (own unrelated failure shape, judged before this predicate ever runs). This is
+       * NOT full CallToolResult validation -- per-content-block schema conformance is
+       * explicitly out of scope; it only asks whether the result carries ANY recognizable
+       * success/error shape at all. */
+      ...(c.malformedResult ? { malformed_result: true } : {}),
     });
   });
   const outputs = calls.filter((c) => !c.isError).map((c, i) => ({ call: i + 1, result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)) }));
