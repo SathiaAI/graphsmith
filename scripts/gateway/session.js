@@ -47,6 +47,13 @@ function createSession(connectionId, options = {}) {
      * response result, serialized -- see proxy.js's MAX_SESSION_CALL_BYTES for why),
      * updated alongside session.calls in recordCallResult/markPendingAsDisconnected. */
     totalCallBytes: 0,
+    /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+     * 4000335132): whether this connection negotiated the sampling capability (set by
+     * GatewayProxy#openConnection from gateway.js's own agentTransportSupportsSampling).
+     * Carried through toSealableSession below so sealBoundaryBundle (gsa-mcp-shim.js) can
+     * grant a model_call entry by this fact instead of checking sampling/createMessage
+     * against the downstream tools/list surface, which was never meant to cover it. */
+    samplingNegotiated: Boolean(options.samplingNegotiated),
   };
 }
 
@@ -280,6 +287,7 @@ function toSealableSession(session) {
     })),
     goal: session.goal,
     anomalies: session.anomalies,
+    samplingNegotiated: Boolean(session.samplingNegotiated),
   };
 }
 

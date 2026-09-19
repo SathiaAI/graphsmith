@@ -44,12 +44,24 @@ function sealBoundaryBundle(session, keys) {
   const anomalies = Array.isArray(session.anomalies) ? session.anomalies : [];
 
   const grantedTools = tools.map((t) => (t.server ? t.server + ":" : "") + t.name);
-  // execution_trace: one entry per tool call; a call to a tool NOT in the granted surface is flagged.
+  /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+   * 4000335132): a model_call (sampling/createMessage) is not a tools/call -- its id
+   * (e.g. "fs:sampling/createMessage") can never appear in grantedTools (the tools/list
+   * surface), so checking it there always read as "not granted" in the signed record even
+   * when sampling was genuinely negotiated and the call genuinely authorized. Sampling is
+   * its own MCP capability, negotiated once per connection at initialize -- session.
+   * samplingNegotiated (set by GatewayProxy#openConnection from gateway.js's own
+   * agentTransportSupportsSampling, the same fact that already gates whether this gateway
+   * advertises `capabilities: { sampling: {} }` to a downstream and whether
+   * forwardDownstreamRequestToAgent will relay a call at all) is the honest signal for it. */
+  const samplingNegotiated = Boolean(session.samplingNegotiated);
+  // execution_trace: one entry per tool call; a call to a tool NOT in the granted surface is flagged
+  // (tools/call), or one whose connection never negotiated sampling is flagged (model_call).
   const traceLines = calls.map((c, i) => {
     const id = (c.server ? c.server + ":" : "") + c.tool;
     return JSON.stringify({
       step: i + 1, kind: "mcp_tool_call", tool: id,
-      granted: grantedTools.indexOf(id) !== -1,          // requested ⊆ granted signal
+      granted: c.model_call ? samplingNegotiated : grantedTools.indexOf(id) !== -1,
       input_sha256: sha256Hex(JSON.stringify(c.arguments === undefined ? null : c.arguments)),
       result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)),
       is_error: !!c.isError,

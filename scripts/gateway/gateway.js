@@ -656,6 +656,16 @@ async function startGateway(options) {
     keys,
     stateDir: config.state_dir,
     log,
+    /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+     * 4000335132): sampling/createMessage is a distinct MCP capability negotiated at
+     * initialize, not a tools/call -- agentTransportSupportsSampling (computed above
+     * from config.agent_listen.transport, the same fact this gateway already uses to
+     * decide whether to advertise the sampling capability to each downstream server
+     * and whether forwardDownstreamRequestToAgent can relay a call at all) is threaded
+     * into every session opened on this proxy so sealBoundaryBundle can honestly grant
+     * a model_call by whether sampling was actually negotiated for the connection,
+     * instead of checking it against the downstream tools/list surface. */
+    agentSupportsSampling: agentTransportSupportsSampling,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
     onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size, quarantinedTo: error.quarantinedTo || null })),
     // Cluster C: read fresh from disk (WriterClaim#status's own contract) rather than

@@ -149,6 +149,15 @@ class GatewayProxy {
     this.now = opts.now || (() => Date.now());
     this.isWriterClaimValid = typeof opts.isWriterClaimValid === "function" ? opts.isWriterClaimValid : () => true;
     this.renewWriterClaim = typeof opts.renewWriterClaim === "function" ? opts.renewWriterClaim : () => {};
+    /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+     * 4000335132): whether THIS gateway instance negotiated the sampling capability at
+     * all (gateway.js's own agentTransportSupportsSampling -- the same fact already used
+     * to advertise `capabilities: { sampling: {} }` to each downstream and to gate
+     * forwardDownstreamRequestToAgent). Snapshotted once here (not read live at seal
+     * time) and stamped onto every session this proxy opens, so a model_call's granted
+     * status in the sealed bundle reflects what was actually negotiated for THAT
+     * connection, not whatever this mutable fact happens to be when the session finalizes. */
+    this.agentSupportsSampling = Boolean(opts.agentSupportsSampling);
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
     this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
@@ -196,7 +205,7 @@ class GatewayProxy {
       throw fail("Gateway is no longer accepting new sessions (writer-claim lost or shutting down)", "GATEWAY_NOT_ACCEPTING");
     }
     if (this.sessions.has(connectionId)) throw fail(`connectionId "${connectionId}" is already open`, "GATEWAY_DUPLICATE_CONNECTION");
-    const s = session.createSession(connectionId, { now: this.now, goal: options.goal });
+    const s = session.createSession(connectionId, { now: this.now, goal: options.goal, samplingNegotiated: this.agentSupportsSampling });
     /* SS3.3: the granted tool surface must be recorded regardless of whether the agent
      * ever bothers to issue tools/list on this connection -- otherwise a cached tool
      * invoked without a prior tools/list would be sealed with an empty granted surface,
