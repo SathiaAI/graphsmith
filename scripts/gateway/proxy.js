@@ -87,6 +87,18 @@ const MAX_PENDING_CALLS_PER_SESSION = 1000;
  * check above. Same "fixed, non-speculative default" discipline as that constant. */
 const MAX_COMPLETED_CALLS_PER_SESSION = 100000;
 
+/* Codex PR #29 re-triage "bound retained session bytes, not only call count": the two
+ * caps above bound how many calls a session may retain, but not their SIZE -- at the
+ * declared maxima (MAX_COMPLETED_CALLS_PER_SESSION calls, each able to retain a request
+ * near the agent input cap and a downstream result near downstream.js's own
+ * MAX_HTTP_RESPONSE_BYTES) the retained payload budget is roughly a terabyte. A
+ * sequential authenticated client (never tripping the pending-call cap) or a compromised
+ * downstream can exhaust memory well before reaching either count limit. Same "fixed,
+ * non-speculative default" discipline as MAX_PENDING_CALLS_PER_SESSION/
+ * MAX_COMPLETED_CALLS_PER_SESSION above -- session.totalCallBytes (session.js) tracks the
+ * running total this bounds. */
+const MAX_SESSION_CALL_BYTES = 256 * 1024 * 1024;
+
 /* Per-connection agent-initialization lifecycle states (Codex PR #29 review round 8
  * "wait for notifications/initialized before admitting tools") -- see the
  * GatewayProxy#agentInitialized field comment in the constructor for the full rationale. */
@@ -113,6 +125,17 @@ class GatewayProxy {
    *   the moment onClaimLost first fires. Defaults to always-valid so existing callers/tests that
    *   construct a GatewayProxy directly (no writer-claim of their own) are unaffected, mirroring
    *   onSessionFinalized/onSealFailure's own default-no-op contract above.
+   * @param {() => void} [opts.renewWriterClaim] Re-triage fix: a synchronous
+   *   `() => writerClaim.renew()` consulted immediately before chain.appendSession in
+   *   closeConnection, alongside isWriterClaimValid above -- writer-claim.js's own
+   *   startHeartbeat() doc comment warns that a long synchronous critical section (this
+   *   append) can starve the setInterval-driven heartbeat past staleAfterMs, letting the
+   *   claim go stale even though isWriterClaimValid's read-fresh-from-disk check passed a
+   *   moment earlier. Renewing synchronously right before the write closes that gap.
+   *   Thrown failures are handled by the same try/catch as chain.appendSession itself
+   *   (quarantine + onSealFailure + return null -- see closeConnection). Defaults to a
+   *   no-op so existing callers/tests with no writer-claim of their own are unaffected,
+   *   mirroring isWriterClaimValid's own default-no-op contract above.
    */
   constructor(opts) {
     this.connections = opts.connections;
@@ -125,6 +148,7 @@ class GatewayProxy {
     this.stateDir = opts.stateDir;
     this.now = opts.now || (() => Date.now());
     this.isWriterClaimValid = typeof opts.isWriterClaimValid === "function" ? opts.isWriterClaimValid : () => true;
+    this.renewWriterClaim = typeof opts.renewWriterClaim === "function" ? opts.renewWriterClaim : () => {};
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
     this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
@@ -378,6 +402,15 @@ class GatewayProxy {
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error };
       }
+      /* Codex PR #29 re-triage "bound retained session bytes, not only call count": see
+       * MAX_SESSION_CALL_BYTES's own comment above. Mirrors the two count-based checks
+       * above exactly -- same admission point, same error family, same refuse-until-a-
+       * new-session shape. */
+      if (s.totalCallBytes >= MAX_SESSION_CALL_BYTES) {
+        const error = { code: -32000, message: `This session has already retained ${MAX_SESSION_CALL_BYTES} bytes of call payloads -- refusing to admit another call on this connection; start a new session.` };
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error };
+      }
       const conn = method === "tools/call" ? this.connections.get(serverName) : this.connections.values().next().value;
       const callArgs = method === "tools/call" ? (params && params.arguments) : params;
       const ts = this.now();
@@ -581,6 +614,13 @@ class GatewayProxy {
      * contract as a sealing failure so the documented behavior actually holds. */
     let entry;
     try {
+      /* Re-triage fix: renew the writer-claim synchronously immediately before the
+       * durable write, right alongside the isWriterClaimValid re-check above -- see
+       * this.renewWriterClaim's own doc comment in the constructor for why. A thrown
+       * renewal failure (e.g. WRITER_CLAIM_LOST) falls through to the same
+       * quarantine-and-report handling as an appendSession failure below, exactly as it
+       * should: either way, this instance can no longer be trusted to append safely. */
+      this.renewWriterClaim();
       entry = chain.appendSession(this.stateDir, sealed);
     } catch (error) {
       error.quarantinedTo = quarantineSealedBundle(this.stateDir, connectionId, sealed, error);
@@ -602,4 +642,4 @@ class GatewayProxy {
   }
 }
 
-module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION };
+module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION, MAX_SESSION_CALL_BYTES };

@@ -311,7 +311,23 @@ function connectStdio(endpoint, options = {}) {
        * itself stays a dumb pipe and always writes back whatever response object
        * onRequest resolves to, so the downstream never hangs waiting on an id that will
        * never come back. */
-      if (typeof options.onRequest === "function") {
+      /* Codex PR #29 re-triage "validate downstream requests before forwarding
+       * sampling": this branch previously admitted any object with a string `method` and
+       * a non-null `id` -- it need not carry `jsonrpc: "2.0"` or a valid identifier type,
+       * so a faulty downstream could send a malformed object like {"id":1,"method":
+       * "sampling/createMessage"} and still reach options.onRequest, triggering a real
+       * agent model invocation and an attested call from traffic that was never a
+       * conforming JSON-RPC request. Mirrors proxy.js#handleMessage's own envelope/id-type
+       * validation (same -32600 code, same "string or finite safe-integer number" id
+       * rule) rather than inventing a new one -- validated here, before onRequest, not
+       * forwarded. */
+      const idType = typeof msg.id;
+      const validId = idType === "string" || (idType === "number" && Number.isFinite(msg.id) && Number.isSafeInteger(msg.id));
+      if (msg.jsonrpc !== "2.0" || !validId) {
+        if (!closed) {
+          child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: validId ? msg.id : null, error: { code: -32600, message: `Malformed JSON-RPC 2.0 request envelope from downstream (missing/invalid "jsonrpc", or "id" not a string or finite safe-integer number).` } }) + "\n");
+        }
+      } else if (typeof options.onRequest === "function") {
         Promise.resolve(options.onRequest(msg))
           .then((response) => {
             if (response && !closed) child.stdin.write(JSON.stringify(response) + "\n");

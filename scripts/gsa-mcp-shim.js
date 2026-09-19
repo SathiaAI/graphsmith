@@ -55,6 +55,7 @@ function sealBoundaryBundle(session, keys) {
       is_error: !!c.isError,
       model_call: !!c.model_call,                        // sampling/createMessage → non-deterministic
       ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason || null } : {}),
+      ...(c.jsonRpcId !== undefined ? { jsonRpcId: c.jsonRpcId } : {}),
     });
   });
   const outputs = calls.filter((c) => !c.isError).map((c, i) => ({ call: i + 1, result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)) }));

@@ -43,7 +43,21 @@ function createSession(connectionId, options = {}) {
     startedAt: typeof options.now === "function" ? options.now() : Date.now(),
     finalized: false,
     nextCallSeq: 1, // monotonic per-session invocation counter; see recordCallStart.
+    /* Re-triage fix: running total of retained call payload bytes (request params +
+     * response result, serialized -- see proxy.js's MAX_SESSION_CALL_BYTES for why),
+     * updated alongside session.calls in recordCallResult/markPendingAsDisconnected. */
+    totalCallBytes: 0,
   };
+}
+
+/** Serialized byte size of a JSON-RPC-safe value (request params or a call result),
+ * matching downstream.js's own MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES style
+ * (Buffer.byteLength(JSON.stringify(...))). `value` always originated from a JSON-parsed
+ * wire message, so JSON.stringify cannot throw here -- the `|| ""` guard only covers the
+ * `undefined` case (e.g. an argument-less call), where JSON.stringify itself returns
+ * `undefined` rather than a string. */
+function payloadByteSize(value) {
+  return Buffer.byteLength(JSON.stringify(value) || "");
 }
 
 /** Records the initialize handshake verbatim (SS3.3). Downstream serverInfo responses
@@ -112,16 +126,20 @@ function recordCallResult(session, jsonRpcId, result) {
     return false;
   }
   session.pendingCalls.delete(jsonRpcId);
+  const callResult = result ? result.result : undefined;
   session.calls.push({
     tool: pending.tool,
     server: pending.server,
     arguments: pending.arguments,
-    result: result ? result.result : undefined,
+    result: callResult,
     isError: Boolean(result && result.isError),
     model_call: pending.model_call,
     ts: pending.ts,
     seq: pending.seq,
   });
+  /* Re-triage fix: MAX_SESSION_CALL_BYTES (proxy.js) needs a running total of what this
+   * session has actually retained -- see payloadByteSize's own comment above. */
+  session.totalCallBytes += payloadByteSize(pending.arguments) + payloadByteSize(callResult);
   return true;
 }
 
@@ -206,6 +224,10 @@ function markPendingAsDisconnected(session, reason, now, serverFilter, onDisconn
     };
     session.calls.push(call);
     session.pendingCalls.delete(jsonRpcId);
+    /* Re-triage fix: a disconnected call still retains its request params in
+     * session.calls (its result is always null) -- count it the same as an ordinarily
+     * completed call so the byte cap cannot be bypassed via repeated disconnects. */
+    session.totalCallBytes += payloadByteSize(call.arguments);
     /* CodeRabbit PR #29 review round 4 "contain disconnect-callback failures during
      * session finalization": onDisconnect is the caller's own side effect (proxy.js
      * wires it to a JSON.stringify + this.log() call) and this module deliberately has

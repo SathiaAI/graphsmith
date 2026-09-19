@@ -230,18 +230,35 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
    * other completed-call log line carries. Mirror that same structured shape here so a
    * session containing a downstream-initiated sampling call has a complete, consistent
    * operational log regardless of which side (agent or downstream) initiated the call. */
+  /* Codex PR #29 re-triage "use the non-throwing logger for sampling completions":
+   * this fires AFTER the agent's model result has already been recorded (recordCallResult
+   * above, in both the success and failure branches below) -- exactly the class of call
+   * site GatewayProxy#safeLog's own doc comment (proxy.js) says must never call a
+   * caller-supplied `log` directly, since a throwing logger here would reject this
+   * function's returned promise and send the downstream an internal-error response for a
+   * model invocation that in fact already completed, inviting a retry that could
+   * duplicate an externally consequential effect. Wrapped inline (rather than routed
+   * through proxy.safeLog) because this function's own tests construct a minimal
+   * `proxy`-like object ({sessions, now}) that does not carry GatewayProxy's full
+   * method set -- the try/catch below gives the exact same non-throwing guarantee as
+   * safeLog's own body without assuming `proxy` is a real GatewayProxy instance. */
   function logCompletion(isError) {
     const completedAt = proxy ? proxy.now() : Date.now();
     const recordedCall = s ? s.calls[s.calls.length - 1] : null;
-    log(JSON.stringify({
-      event: "gateway_call_completed",
-      connection_id: agentPusher.connectionId || null,
-      step: recordedCall ? recordedCall.seq : null,
-      tool: "sampling/createMessage",
-      server: recordedServerName,
-      status: isError ? "error" : "ok",
-      duration_ms: completedAt - startTs,
-    }));
+    try {
+      log(JSON.stringify({
+        event: "gateway_call_completed",
+        connection_id: agentPusher.connectionId || null,
+        step: recordedCall ? recordedCall.seq : null,
+        tool: "sampling/createMessage",
+        server: recordedServerName,
+        status: isError ? "error" : "ok",
+        duration_ms: completedAt - startTs,
+      }));
+    } catch (error) {
+      // Deliberately swallowed -- see comment above: a failing logger must never turn an
+      // already-completed sampling call into a rejected forward/error response.
+    }
   }
   return agentPusher.current(msg.method, msg.params).then(
     (result) => {
@@ -647,6 +664,12 @@ async function startGateway(options) {
     // caught here even if this instance's own heartbeat hasn't yet noticed and fired
     // onClaimLost.
     isWriterClaimValid: () => writerClaim.status().held_by_this_instance,
+    // Re-triage fix: renew the writer-claim synchronously immediately before
+    // chain.appendSession in closeConnection (see GatewayProxy#renewWriterClaim's own
+    // doc comment) -- closes the gap where a long synchronous append blocks the
+    // setInterval heartbeat past staleAfterMs even though isWriterClaimValid above just
+    // read a fresh, still-valid claim a moment earlier.
+    renewWriterClaim: () => writerClaim.renew(),
   });
 
   for (const [name, conn] of downstreamHandles.connections.entries()) {
