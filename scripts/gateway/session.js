@@ -88,7 +88,28 @@ function createSession(connectionId, options = {}) {
      * directly on the session record, the same way they already read/write
      * pendingCalls/calls. */
     walPoisoned: null,
+    /* Re-triage fix: running total of retained call payload bytes (request params +
+     * response result, serialized -- see proxy.js's MAX_SESSION_CALL_BYTES for why),
+     * updated alongside session.calls in recordCallResult/markPendingAsDisconnected. */
+    totalCallBytes: 0,
+    /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+     * 4000335132): whether this connection negotiated the sampling capability (set by
+     * GatewayProxy#openConnection from gateway.js's own agentTransportSupportsSampling).
+     * Carried through toSealableSession below so sealBoundaryBundle (gsa-mcp-shim.js) can
+     * grant a model_call entry by this fact instead of checking sampling/createMessage
+     * against the downstream tools/list surface, which was never meant to cover it. */
+    samplingNegotiated: Boolean(options.samplingNegotiated),
   };
+}
+
+/** Serialized byte size of a JSON-RPC-safe value (request params or a call result),
+ * matching downstream.js's own MAX_TOTAL_TOOLS_DESCRIPTOR_BYTES style
+ * (Buffer.byteLength(JSON.stringify(...))). `value` always originated from a JSON-parsed
+ * wire message, so JSON.stringify cannot throw here -- the `|| ""` guard only covers the
+ * `undefined` case (e.g. an argument-less call), where JSON.stringify itself returns
+ * `undefined` rather than a string. */
+function payloadByteSize(value) {
+  return Buffer.byteLength(JSON.stringify(value) || "");
 }
 
 /** Records the initialize handshake verbatim (SS3.3). Downstream serverInfo responses
@@ -157,12 +178,25 @@ function recordCallResult(session, jsonRpcId, result) {
     return false;
   }
   session.pendingCalls.delete(jsonRpcId);
+  const callResult = result ? result.result : undefined;
   session.calls.push({
     tool: pending.tool,
     server: pending.server,
     arguments: pending.arguments,
-    result: result ? result.result : undefined,
+    result: callResult,
     isError: Boolean(result && result.isError),
+    /* PR #29 review thread 4000335147, frontier-panel review (4/4 converged) "flag
+     * structurally malformed tools/call results distinctly from tool-level errors":
+     * `malformedResult` is the caller's (proxy.js) own pure, `tools/call`-only,
+     * transport-success-only judgement (see isMalformedToolCallResult) of whether
+     * `callResult` itself is even a recognizable CallToolResult shape -- this module
+     * stores it verbatim, exactly like `isError`, and does not itself compute or
+     * re-derive it (this module has no opinion on MCP result shapes, by design -- see
+     * this file's header). Always Boolean-coerced so an absent field (every non-
+     * tools/call caller, e.g. a sampling/createMessage result) stores a plain `false`,
+     * never `undefined`, keeping this an audit-only annotation that never needs a
+     * caller to opt in. */
+    malformedResult: Boolean(result && result.malformedResult),
     model_call: pending.model_call,
     ts: pending.ts,
     seq: pending.seq,
@@ -177,6 +211,9 @@ function recordCallResult(session, jsonRpcId, result) {
       ? { replayed: true, replayed_from_intent_key: result.replayedFromIntentKey || null }
       : {}),
   });
+  /* Re-triage fix: MAX_SESSION_CALL_BYTES (proxy.js) needs a running total of what this
+   * session has actually retained -- see payloadByteSize's own comment above. */
+  session.totalCallBytes += payloadByteSize(pending.arguments) + payloadByteSize(callResult);
   return true;
 }
 
@@ -302,6 +339,10 @@ function markPendingAsDisconnected(session, reason, now, serverFilter, onDisconn
     };
     session.calls.push(call);
     session.pendingCalls.delete(jsonRpcId);
+    /* Re-triage fix: a disconnected call still retains its request params in
+     * session.calls (its result is always null) -- count it the same as an ordinarily
+     * completed call so the byte cap cannot be bypassed via repeated disconnects. */
+    session.totalCallBytes += payloadByteSize(call.arguments);
     /* CodeRabbit PR #29 review round 4 "contain disconnect-callback failures during
      * session finalization": onDisconnect is the caller's own side effect (proxy.js
      * wires it to a JSON.stringify + this.log() call) and this module deliberately has
@@ -349,6 +390,13 @@ function toSealableSession(session) {
       arguments: c.arguments,
       result: c.result,
       isError: c.isError,
+      /* Additive, backward-compatible field (see recordCallResult's own comment above
+       * and gsa-mcp-shim.js's sealBoundaryBundle, which folds this into the signed
+       * `malformed_result` trace field ONLY when true -- a well-formed call's trace line
+       * is unaffected). Carried through unconditionally here (like isError/model_call)
+       * because it is now part of every call's base recorded shape, not an optional
+       * extra like disconnected/jsonRpcId below. */
+      malformedResult: c.malformedResult,
       model_call: c.model_call,
       ts: c.ts,
       ...(c.disconnected ? { disconnected: true, disconnect_reason: c.disconnect_reason, jsonRpcId: c.jsonRpcId } : {}),
@@ -356,6 +404,7 @@ function toSealableSession(session) {
     })),
     goal: session.goal,
     anomalies: session.anomalies,
+    samplingNegotiated: Boolean(session.samplingNegotiated),
   };
 }
 

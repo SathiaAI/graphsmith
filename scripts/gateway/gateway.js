@@ -351,18 +351,35 @@ function forwardDownstreamRequestToAgent(msg, agentPusher, log, proxy, serverNam
    * other completed-call log line carries. Mirror that same structured shape here so a
    * session containing a downstream-initiated sampling call has a complete, consistent
    * operational log regardless of which side (agent or downstream) initiated the call. */
+  /* Codex PR #29 re-triage "use the non-throwing logger for sampling completions":
+   * this fires AFTER the agent's model result has already been recorded (recordCallResult
+   * above, in both the success and failure branches below) -- exactly the class of call
+   * site GatewayProxy#safeLog's own doc comment (proxy.js) says must never call a
+   * caller-supplied `log` directly, since a throwing logger here would reject this
+   * function's returned promise and send the downstream an internal-error response for a
+   * model invocation that in fact already completed, inviting a retry that could
+   * duplicate an externally consequential effect. Wrapped inline (rather than routed
+   * through proxy.safeLog) because this function's own tests construct a minimal
+   * `proxy`-like object ({sessions, now}) that does not carry GatewayProxy's full
+   * method set -- the try/catch below gives the exact same non-throwing guarantee as
+   * safeLog's own body without assuming `proxy` is a real GatewayProxy instance. */
   function logCompletion(isError) {
     const completedAt = proxy ? proxy.now() : Date.now();
     const recordedCall = s ? s.calls[s.calls.length - 1] : null;
-    log(JSON.stringify({
-      event: "gateway_call_completed",
-      connection_id: agentPusher.connectionId || null,
-      step: recordedCall ? recordedCall.seq : null,
-      tool: "sampling/createMessage",
-      server: recordedServerName,
-      status: isError ? "error" : "ok",
-      duration_ms: completedAt - startTs,
-    }));
+    try {
+      log(JSON.stringify({
+        event: "gateway_call_completed",
+        connection_id: agentPusher.connectionId || null,
+        step: recordedCall ? recordedCall.seq : null,
+        tool: "sampling/createMessage",
+        server: recordedServerName,
+        status: isError ? "error" : "ok",
+        duration_ms: completedAt - startTs,
+      }));
+    } catch (error) {
+      // Deliberately swallowed -- see comment above: a failing logger must never turn an
+      // already-completed sampling call into a rejected forward/error response.
+    }
   }
   return agentPusher.current(msg.method, msg.params).then(
     (result) => {
@@ -1321,7 +1338,14 @@ function abandonConnection(stateDir, keys, connectionId, log, writerClaim = null
       session.recordCallStart(s, key, { tool: event.tool, server: event.server, arguments: event.arguments, isModelCall: Boolean(event.isModelCall), ts: event.ts });
     } else if (event.type === "CALL_RESULT") {
       const key = Symbol.for(`wal-replay:${connectionId}:${event.call_seq}`);
-      if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, ts: event.ts });
+      /* Merge fix (PR #29 x PR #33 composition, 2026-09-20): event.malformedResult is
+       * PR #29's own new field on the CALL_RESULT WAL event (see proxy.js's own doc
+       * comment on this same fix) -- absent on a WAL line written before this fix (or by
+       * a non-tools/call CALL_RESULT such as gateway.js's own sampling-forward path,
+       * which never sets it at all), where `undefined` is exactly right: session.js's
+       * recordCallResult Boolean-coerces it to `false`, the correct value for a call this
+       * flag never applied to. */
+      if (s.pendingCalls.has(key)) session.recordCallResult(s, key, { result: event.result, isError: event.isError, malformedResult: event.malformedResult, ts: event.ts });
     } else if (event.type === "ANOMALY") {
       session.recordAnomaly(s, { kind: event.kind, tool: event.tool, intent_key: event.intent_key, detail: event.detail, ts: event.ts });
     }
@@ -1932,6 +1956,16 @@ async function startGateway(options) {
     // pendingOperatorReviewConnections constructor comment for why a startup snapshot
     // is sufficient here.
     pendingOperatorReviewConnections: pendingOperatorReview,
+    /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+     * 4000335132): sampling/createMessage is a distinct MCP capability negotiated at
+     * initialize, not a tools/call -- agentTransportSupportsSampling (computed above
+     * from config.agent_listen.transport, the same fact this gateway already uses to
+     * decide whether to advertise the sampling capability to each downstream server
+     * and whether forwardDownstreamRequestToAgent can relay a call at all) is threaded
+     * into every session opened on this proxy so sealBoundaryBundle can honestly grant
+     * a model_call by whether sampling was actually negotiated for the connection,
+     * instead of checking it against the downstream tools/list surface. */
+    agentSupportsSampling: agentTransportSupportsSampling,
     onSessionFinalized: (connectionId, entry) => log(`session ${connectionId} finalized: chain seq ${entry.seq}, bundle ${entry.bundle_id}`),
     onSealFailure: (session, error) => log(`SEAL FAILURE for connection ${session.connectionId}: ${error.message} -- session state:`, JSON.stringify({ calls: session.calls.length, pendingCalls: session.pendingCalls.size, quarantinedTo: error.quarantinedTo || null })),
     // Cluster C: read fresh from disk (WriterClaim#status's own contract) rather than
@@ -1947,6 +1981,12 @@ async function startGateway(options) {
      * doc comment for why this is the primary enforcement point and how a runtime
      * transition into failure gets the same effect as detecting it at startup. */
     getChainIntegrityFailure: () => chain.getChainIntegrityFailure(),
+    // Re-triage fix: renew the writer-claim synchronously immediately before
+    // chain.appendSession in closeConnection (see GatewayProxy#renewWriterClaim's own
+    // doc comment) -- closes the gap where a long synchronous append blocks the
+    // setInterval heartbeat past staleAfterMs even though isWriterClaimValid above just
+    // read a fresh, still-valid claim a moment earlier.
+    renewWriterClaim: () => writerClaim.renew(),
   });
 
   for (const [name, conn] of downstreamHandles.connections.entries()) {

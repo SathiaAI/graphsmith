@@ -22,7 +22,8 @@ function sha256Hex(s) { return crypto.createHash("sha256").update(Buffer.from(St
  *   initialize: { clientInfo:{name,version}, serverInfo:{name,version}, model?:string },
  *   tools:      [{ name, server, schema }],            // from tools/list — the GRANTED surface
  *   calls:      [{ tool, arguments, result, isError?, model_call?, ts?,
- *                  disconnected?, disconnect_reason?, jsonRpcId? }],  // tools/call sequence
+ *                  disconnected?, disconnect_reason?, jsonRpcId?, malformedResult? }],
+ *                  // tools/call sequence
  *   goal?:      string,
  *   anomalies?: [{ kind, jsonRpcId, detail, ts }]  // e.g. UNMATCHED_RESPONSE (session.js)
  * }
@@ -44,12 +45,24 @@ function sealBoundaryBundle(session, keys) {
   const anomalies = Array.isArray(session.anomalies) ? session.anomalies : [];
 
   const grantedTools = tools.map((t) => (t.server ? t.server + ":" : "") + t.name);
-  // execution_trace: one entry per tool call; a call to a tool NOT in the granted surface is flagged.
+  /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+   * 4000335132): a model_call (sampling/createMessage) is not a tools/call -- its id
+   * (e.g. "fs:sampling/createMessage") can never appear in grantedTools (the tools/list
+   * surface), so checking it there always read as "not granted" in the signed record even
+   * when sampling was genuinely negotiated and the call genuinely authorized. Sampling is
+   * its own MCP capability, negotiated once per connection at initialize -- session.
+   * samplingNegotiated (set by GatewayProxy#openConnection from gateway.js's own
+   * agentTransportSupportsSampling, the same fact that already gates whether this gateway
+   * advertises `capabilities: { sampling: {} }` to a downstream and whether
+   * forwardDownstreamRequestToAgent will relay a call at all) is the honest signal for it. */
+  const samplingNegotiated = Boolean(session.samplingNegotiated);
+  // execution_trace: one entry per tool call; a call to a tool NOT in the granted surface is flagged
+  // (tools/call), or one whose connection never negotiated sampling is flagged (model_call).
   const traceLines = calls.map((c, i) => {
     const id = (c.server ? c.server + ":" : "") + c.tool;
     return JSON.stringify({
       step: i + 1, kind: "mcp_tool_call", tool: id,
-      granted: grantedTools.indexOf(id) !== -1,          // requested ⊆ granted signal
+      granted: c.model_call ? samplingNegotiated : grantedTools.indexOf(id) !== -1,
       input_sha256: sha256Hex(JSON.stringify(c.arguments === undefined ? null : c.arguments)),
       result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)),
       is_error: !!c.isError,
@@ -67,6 +80,23 @@ function sealBoundaryBundle(session, keys) {
        * the bundle alone has no way to know that call's own downstream effect did not
        * happen again at that step. */
       ...(c.replayed ? { replayed: true, replayed_from_intent_key: c.replayed_from_intent_key || null } : {}),
+      ...(c.jsonRpcId !== undefined ? { jsonRpcId: c.jsonRpcId } : {}),
+      /* PR #29 review thread 4000335147, frontier-panel review (4/4 converged) "flag
+       * structurally malformed tools/call results distinctly from tool-level errors":
+       * a THIRD state alongside is_error/model_call above -- the downstream answered,
+       * but not in any shape the MCP CallToolResult contract recognizes (see proxy.js's
+       * isMalformedToolCallResult for the exact predicate). Purely an audit annotation
+       * on the signed trace, same discipline as disconnected/jsonRpcId immediately
+       * above: additive and OMITTED (not `false`) when the call was well-formed, so a
+       * clean call's trace line -- and its hash, for anything that hashes trace lines --
+       * is byte-for-byte identical to what it was before this field existed. Never
+       * asserted for a model_call (sampling/createMessage is not a tools/call and this
+       * predicate is never computed for one -- see proxy.js) or for a transport failure
+       * (own unrelated failure shape, judged before this predicate ever runs). This is
+       * NOT full CallToolResult validation -- per-content-block schema conformance is
+       * explicitly out of scope; it only asks whether the result carries ANY recognizable
+       * success/error shape at all. */
+      ...(c.malformedResult ? { malformed_result: true } : {}),
     });
   });
   const outputs = calls.filter((c) => !c.isError).map((c, i) => ({ call: i + 1, result_sha256: sha256Hex(JSON.stringify(c.result === undefined ? null : c.result)) }));

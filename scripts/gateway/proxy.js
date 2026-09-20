@@ -165,6 +165,38 @@ function walPoisonedError(id, s, verb) {
   };
 }
 
+/* PR #29 review thread 4000335147, frontier-panel review (4/4 independent models
+ * converged, two rounds of critique) "flag structurally malformed tools/call results
+ * distinctly from tool-level errors": before this, a `tools/call` result was only ever
+ * judged by `isError` (Board decision 2026-09-04, above) -- a downstream that returned a
+ * response with NEITHER a recognizable success shape (`content` array) NOR a recognizable
+ * error/structured shape (`structuredContent` object, or an explicit `isError` boolean)
+ * was recorded as a normal, non-error call, because nothing about `isError: true`/`false`
+ * was ever asserted on it. That is a THIRD state, distinct from both "transport failed"
+ * and "tool reported isError: true": the downstream answered, but not in any shape the
+ * MCP CallToolResult contract recognizes at all. This predicate is deliberately narrow --
+ * it does not validate per-content-block schemas (e.g. a `content` array full of garbage
+ * blocks still counts as well-formed here), and extra/unknown fields on an otherwise
+ * -recognizable object never trip it (the MCP spec allows a server to add fields this
+ * gateway doesn't know about yet). It is purely an AUDIT annotation on the sealed
+ * session/trace record -- it never changes `isError`, never changes the JSON-RPC response
+ * actually returned to the agent, and never gates or blocks anything (see the two call
+ * sites below). Exception-safe by construction: a thrown error during the check itself
+ * (e.g. a poisoned getter on a hostile downstream's response object) is treated as "not
+ * malformed" -- failing open on an audit signal is correct; failing closed on one would
+ * turn a defensive annotation into an availability risk for a legitimate call. */
+function isMalformedToolCallResult(result) {
+  try {
+    if (result === null || typeof result !== "object" || Array.isArray(result)) return true;
+    const hasContent = Array.isArray(result.content);
+    const hasStructuredContent = result.structuredContent !== null && result.structuredContent !== undefined && typeof result.structuredContent === "object" && !Array.isArray(result.structuredContent);
+    const hasIsError = typeof result.isError === "boolean";
+    return !(hasContent || hasStructuredContent || hasIsError);
+  } catch (error) {
+    return false;
+  }
+}
+
 /* This build only ever negotiates the one protocol version it actually implements
  * (matching the literal default this file used to echo back unconditionally). Kept as a
  * named constant so "what we claim to speak" and "what we validate against" cannot drift
@@ -192,6 +224,18 @@ const MAX_PENDING_CALLS_PER_SESSION = 1000;
  * until this process exhausts memory, entirely bypassing the pending-call admission
  * check above. Same "fixed, non-speculative default" discipline as that constant. */
 const MAX_COMPLETED_CALLS_PER_SESSION = 100000;
+
+/* Codex PR #29 re-triage "bound retained session bytes, not only call count": the two
+ * caps above bound how many calls a session may retain, but not their SIZE -- at the
+ * declared maxima (MAX_COMPLETED_CALLS_PER_SESSION calls, each able to retain a request
+ * near the agent input cap and a downstream result near downstream.js's own
+ * MAX_HTTP_RESPONSE_BYTES) the retained payload budget is roughly a terabyte. A
+ * sequential authenticated client (never tripping the pending-call cap) or a compromised
+ * downstream can exhaust memory well before reaching either count limit. Same "fixed,
+ * non-speculative default" discipline as MAX_PENDING_CALLS_PER_SESSION/
+ * MAX_COMPLETED_CALLS_PER_SESSION above -- session.totalCallBytes (session.js) tracks the
+ * running total this bounds. */
+const MAX_SESSION_CALL_BYTES = 256 * 1024 * 1024;
 
 /* Per-connection agent-initialization lifecycle states (Codex PR #29 review round 8
  * "wait for notifications/initialized before admitting tools") -- see the
@@ -238,6 +282,17 @@ class GatewayProxy {
    *   to `() => null` (never latched) so existing callers/tests that construct a
    *   GatewayProxy directly (no chain-integrity concern of their own) are unaffected,
    *   mirroring isWriterClaimValid's own always-valid default just above.
+   * @param {() => void} [opts.renewWriterClaim] Re-triage fix: a synchronous
+   *   `() => writerClaim.renew()` consulted immediately before chain.appendSession in
+   *   closeConnection, alongside isWriterClaimValid above -- writer-claim.js's own
+   *   startHeartbeat() doc comment warns that a long synchronous critical section (this
+   *   append) can starve the setInterval-driven heartbeat past staleAfterMs, letting the
+   *   claim go stale even though isWriterClaimValid's read-fresh-from-disk check passed a
+   *   moment earlier. Renewing synchronously right before the write closes that gap.
+   *   Thrown failures are handled by the same try/catch as chain.appendSession itself
+   *   (quarantine + onSealFailure + return null -- see closeConnection). Defaults to a
+   *   no-op so existing callers/tests with no writer-claim of their own are unaffected,
+   *   mirroring isWriterClaimValid's own default-no-op contract above.
    */
   constructor(opts) {
     this.connections = opts.connections;
@@ -251,6 +306,16 @@ class GatewayProxy {
     this.now = opts.now || (() => Date.now());
     this.isWriterClaimValid = typeof opts.isWriterClaimValid === "function" ? opts.isWriterClaimValid : () => true;
     this.getChainIntegrityFailure = typeof opts.getChainIntegrityFailure === "function" ? opts.getChainIntegrityFailure : () => null;
+    this.renewWriterClaim = typeof opts.renewWriterClaim === "function" ? opts.renewWriterClaim : () => {};
+    /* Codex PR #29 review "treat sampling as a negotiated client capability" (comment
+     * 4000335132): whether THIS gateway instance negotiated the sampling capability at
+     * all (gateway.js's own agentTransportSupportsSampling -- the same fact already used
+     * to advertise `capabilities: { sampling: {} }` to each downstream and to gate
+     * forwardDownstreamRequestToAgent). Snapshotted once here (not read live at seal
+     * time) and stamped onto every session this proxy opens, so a model_call's granted
+     * status in the sealed bundle reflects what was actually negotiated for THAT
+     * connection, not whatever this mutable fact happens to be when the session finalizes. */
+    this.agentSupportsSampling = Boolean(opts.agentSupportsSampling);
     this.sessions = new Map(); // connectionId -> in-memory session (scripts/gateway/session.js)
     this.acceptingNewSessions = true; // SS3.7/SS7: false once writer-claim is lost
     this.downstreamCallIds = new Map(); // `${connectionId}:${agentJsonRpcId}` -> { server, downstreamId } (SS3.3 cancellation)
@@ -337,8 +402,15 @@ class GatewayProxy {
      * session_id (and therefore a bundle_id) to exercise bundle-id-collision handling,
      * exactly as they could before session_id existed by giving two connections
      * identical {init, tools, calls} content; no real caller of openConnection has a
-     * reason to ever pass this. */
-    const s = session.createSession(connectionId, { now: this.now, goal: options.goal, sessionId: options.sessionId });
+     * reason to ever pass this. Combined with samplingNegotiated (PR #29 "treat sampling
+     * as a negotiated client capability") -- both fields are independent, additive
+     * session-creation inputs and there is no interaction between them. */
+    const s = session.createSession(connectionId, {
+      now: this.now,
+      goal: options.goal,
+      sessionId: options.sessionId,
+      samplingNegotiated: this.agentSupportsSampling,
+    });
     /* SS3.3: the granted tool surface must be recorded regardless of whether the agent
      * ever bothers to issue tools/list on this connection -- otherwise a cached tool
      * invoked without a prior tools/list would be sealed with an empty granted surface,
@@ -603,6 +675,15 @@ class GatewayProxy {
        * calls that happen to have already resolved at check time. */
       if (s.calls.length + s.pendingCalls.size >= MAX_COMPLETED_CALLS_PER_SESSION) {
         const error = { code: -32000, message: `This session has already completed ${MAX_COMPLETED_CALLS_PER_SESSION} call(s) -- refusing to admit another call on this connection; start a new session.` };
+        if (isNotification) return null;
+        return { jsonrpc: "2.0", id, error };
+      }
+      /* Codex PR #29 re-triage "bound retained session bytes, not only call count": see
+       * MAX_SESSION_CALL_BYTES's own comment above. Mirrors the two count-based checks
+       * above exactly -- same admission point, same error family, same refuse-until-a-
+       * new-session shape. */
+      if (s.totalCallBytes >= MAX_SESSION_CALL_BYTES) {
+        const error = { code: -32000, message: `This session has already retained ${MAX_SESSION_CALL_BYTES} bytes of call payloads -- refusing to admit another call on this connection; start a new session.` };
         if (isNotification) return null;
         return { jsonrpc: "2.0", id, error };
       }
@@ -1121,6 +1202,25 @@ class GatewayProxy {
        * the agent below is still keyed on `transportFailed` alone, unchanged. */
       const toolLevelError = !transportFailed && method === "tools/call" && result && typeof result === "object" && result.isError === true;
       const isError = transportFailed || toolLevelError;
+      /* PR #29 review thread 4000335147, frontier-panel review (4/4 converged) "flag
+       * structurally malformed tools/call results distinctly from tool-level errors":
+       * this is now a THREE-state audit model for a `tools/call` outcome -- transport
+       * error (`transportFailed`), tool-level error (`toolLevelError`, an `isError: true`
+       * on an otherwise well-formed result), and malformed shape (`malformedResult`,
+       * neither of the above but also not a recognizable CallToolResult at all). All
+       * three can be reasoned about independently -- `malformedResult` and `isError` are
+       * NOT mutually exclusive with each other, and a call can be malformed without being
+       * an error or vice versa. Scoped to `tools/call` only (never `sampling/
+       * createMessage` -- a model_call's result shape is not a CallToolResult and this
+       * predicate says nothing about it) and only when the downstream actually responded
+       * (`!transportFailed` -- a transport failure already gets its own, unrelated
+       * synthetic `result` shape assigned in the catch block above, which this must not
+       * re-judge). This is audit-only: it does not change `isError`, does not change the
+       * JSON-RPC response returned to the agent below (still the raw, untouched
+       * `result`), and is not a validation gate -- see isMalformedToolCallResult's own
+       * comment for what it deliberately does not check (per-content-block schemas are
+       * out of scope). */
+      const malformedResult = !transportFailed && method === "tools/call" && isMalformedToolCallResult(result);
       const completedAt = this.now();
 
       /* Codex PR #29 Finding 2 (Option C): resolve the intent based on the outcome. Only
@@ -1201,7 +1301,7 @@ class GatewayProxy {
        * (and log) when the call is still genuinely pending. */
       const correlatedNow = !s.finalized && s.pendingCalls.has(correlationKey);
       if (correlatedNow) {
-        session.recordCallResult(s, correlationKey, { result, isError, ts: completedAt });
+        session.recordCallResult(s, correlationKey, { result, isError, malformedResult, ts: completedAt });
         if (method === "tools/call") {
           /* Part of the Codex/CodeRabbit PR #33 review cluster on unguarded WAL appends
            * (mirrors the CALL_START/INITIALIZE/ANOMALY appends elsewhere in this file):
@@ -1226,7 +1326,15 @@ class GatewayProxy {
             try {
               // Cluster A: tagged with the same dispatchGeneration as this call's own
               // CALL_START event above -- see that event's own doc comment.
-              recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, ts: completedAt, generation: dispatchGeneration });
+              /* Merge fix (PR #29 x PR #33 composition, 2026-09-20): malformedResult is
+               * PR #29's own new audit annotation (isMalformedToolCallResult above,
+               * "flag structurally malformed tools/call results distinctly from
+               * tool-level errors") and did not exist when this WAL CALL_RESULT event
+               * shape was designed for PR #33's crash recovery. Included here so a crash
+               * between this append and CLOSING does not silently lose the flag on
+               * replay -- see gateway.js#recoverCrashedSessions' own CALL_RESULT replay
+               * branch, updated in the same fix to read it back. */
+              recovery.appendWalEvent(this.stateDir, connectionId, { type: "CALL_RESULT", call_seq: walCallSeq, result, isError, malformedResult, ts: completedAt, generation: dispatchGeneration });
             } catch (walError) {
               poisonWalOnFailure(s, walError, this.now);
               session.recordAnomaly(s, { kind: "GATEWAY_RECOVERY_WAL_APPEND_FAILED", tool: toolName, intent_key: intentKey, detail: walError.message });
@@ -1251,6 +1359,10 @@ class GatewayProxy {
           server: method === "tools/call" ? serverName : "sampling",
           status: isError ? "error" : "ok",
           duration_ms: completedAt - ts,
+          /* Mirrors sealBoundaryBundle's own `malformed_result` trace field (gsa-mcp-
+           * shim.js) into the operational log, additive-only: omitted entirely for a
+           * well-formed call so existing log consumers parsing this line see no change. */
+          ...(malformedResult ? { malformed_result: true } : {}),
         }));
       }
       if (isNotification) return null;
@@ -1462,6 +1574,17 @@ class GatewayProxy {
      * contract as a sealing failure so the documented behavior actually holds. */
     let entry;
     try {
+      /* Re-triage fix: renew the writer-claim synchronously immediately before the
+       * durable write, right alongside the isWriterClaimValid re-check above -- see
+       * this.renewWriterClaim's own doc comment in the constructor for why. A thrown
+       * renewal failure (e.g. WRITER_CLAIM_LOST) falls through to the same
+       * quarantine-and-report handling as an appendSession failure below, exactly as it
+       * should: either way, this instance can no longer be trusted to append safely. */
+      this.renewWriterClaim();
+      /* `{ log: this.log }` (Round-1 fix-plan commit 4/6, chain-validity.md C2 SS4):
+       * chain.appendSession's own HEAD-vs-tail check logs loudly on an auto-repaired
+       * single-step lag -- preserved here across the writer-claim-renewal fix above,
+       * which touched this same call site independently for an unrelated reason. */
       entry = chain.appendSession(this.stateDir, sealed, { log: this.log });
     } catch (error) {
       error.quarantinedTo = quarantineSealedBundle(this.stateDir, connectionId, sealed, error);
@@ -1491,4 +1614,4 @@ class GatewayProxy {
   }
 }
 
-module.exports = { GatewayProxy, isModelCallMethod, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION };
+module.exports = { GatewayProxy, isModelCallMethod, isMalformedToolCallResult, MAX_PENDING_CALLS_PER_SESSION, MAX_COMPLETED_CALLS_PER_SESSION, MAX_SESSION_CALL_BYTES };
