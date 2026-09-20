@@ -162,7 +162,19 @@ function signaturePath(stateDir, signatureKey) {
  * creating anything (existsSync walk-up, stopping at the first that already exists),
  * then fsync each of those -- and only those -- newly created ancestors after mkdirSync
  * returns. `dir` itself is intentionally excluded here: every call site already fsyncs it
- * via its own existing post-write fsyncDir(dir) call, unchanged by this fix. */
+ * via its own existing post-write fsyncDir(dir) call, unchanged by this fix.
+ *
+ * Post-review correction (found during PR #33/#29 merge-verification, still describing
+ * finding #4): the loop below originally stopped at the TOPMOST missing ancestor without
+ * also fsyncing that ancestor's own pre-existing PARENT (`cursor`, once the walk-up loop
+ * ends). fsyncDir(X) persists X's own directory CONTENTS -- i.e. that X's children are
+ * durably listed inside X -- it says nothing about whether X's own entry is durably
+ * listed inside X's parent. So the original code fsynced gateway-recovery/'s listing of
+ * active/ (via fsyncDir(gateway-recovery)) but never fsynced state_dir's listing of
+ * gateway-recovery/ itself -- exactly the "lost the gateway-recovery/ directory entry
+ * itself" scenario this comment already claimed to prevent. Fixed below by also fsyncing
+ * `cursor` (the first pre-existing ancestor the walk-up found) whenever anything was
+ * actually created under it. */
 function ensureDir(dir) {
   const missingAncestors = [];
   let cursor = dir;
@@ -184,6 +196,13 @@ function ensureDir(dir) {
   // pre-existing root) first. Index 0 is `dir` itself -- excluded, see doc comment above.
   for (let i = missingAncestors.length - 1; i >= 1; i--) {
     fsyncDir(missingAncestors[i]);
+  }
+  // The topmost missing ancestor's own directory ENTRY lives in `cursor` (the first
+  // pre-existing ancestor found by the walk-up above). Nothing else fsyncs cursor's
+  // listing, so without this, a crash right after the very first recovery write on a
+  // fresh state_dir could still lose the whole newly-created subtree's entry point.
+  if (missingAncestors.length > 0) {
+    fsyncDir(cursor);
   }
 }
 

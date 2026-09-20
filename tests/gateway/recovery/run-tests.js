@@ -250,6 +250,42 @@ function directoryFsyncUnsupportedAndMissingAreStillTolerated() {
   }
 }
 
+/* PR #33/#29 merge-verification correction to frontier-panel finding #4: ensureDir's
+ * ancestor-fsync loop originally fsynced every newly-created ancestor's own CONTENTS
+ * (e.g. gateway-recovery/'s listing of active/) but never the pre-existing PARENT's
+ * listing of the topmost newly-created ancestor (e.g. state_dir's listing of
+ * gateway-recovery/ itself) -- so the very directory-entry loss this comment already
+ * claimed to prevent was still possible. On a completely fresh state_dir (only the
+ * top-level dir itself pre-exists), createIntentIfAbsent's ensureDir(intentsDir(...))
+ * call must create BOTH gateway-recovery/ and gateway-recovery/intents/ in one
+ * mkdirSync(recursive:true) -- exactly the multi-level-ancestor case the fix targets.
+ * Spy on fs.openSync(path, "r") (fsyncDir's own open call) to capture every directory
+ * path actually fsynced, and assert the fresh state_dir itself -- the pre-existing
+ * parent whose own listing must record the new gateway-recovery/ entry -- is one of
+ * them. */
+function ensureDirFsyncsThePreexistingParentOfTheTopmostNewAncestor() {
+  const stateDir = freshDir("ensuredir-cursor");
+  const intentKey = recovery.computeIntentKey("conn-cursor-fsync", "toolA", {});
+
+  const realOpenSync = fs.openSync;
+  const openedForFsync = [];
+  fs.openSync = function (p, flags, mode) {
+    if (flags === "r") openedForFsync.push(p);
+    return realOpenSync.call(fs, p, flags, mode);
+  };
+  try {
+    recovery.createIntentIfAbsent(stateDir, intentKey, { connection_id: "conn-cursor-fsync", tool: "toolA", arguments: {}, state: "dispatched", dispatched_at: 1 });
+  } finally {
+    fs.openSync = realOpenSync;
+  }
+
+  const gatewayRecoveryDir = recovery.recoveryDir(stateDir);
+  const intentsDirPath = recovery.intentsDir(stateDir);
+  check("ensuredir-fsyncs-the-fresh-state-dir-itself-not-just-its-new-children", openedForFsync.includes(stateDir), `fsynced dirs: ${JSON.stringify(openedForFsync)}`);
+  check("ensuredir-still-fsyncs-the-intermediate-newly-created-ancestor", openedForFsync.includes(gatewayRecoveryDir), `fsynced dirs: ${JSON.stringify(openedForFsync)}`);
+  check("ensuredir-leaf-itself-fsynced-separately-by-the-write-that-follows", openedForFsync.includes(intentsDirPath), `fsynced dirs: ${JSON.stringify(openedForFsync)}`);
+}
+
 /* Codex PR #33 review "retain operator-confirmed results for reconnect replay": when an
  * operator resolves a crashed keyed call as EXECUTED, this used to update only the
  * connection-scoped intent. Startup recovery then consumes and deletes that intent, so --
@@ -2426,6 +2462,8 @@ function main() {
   // Codex PR #33 review round 2 (2026-09-17):
   directoryFsyncRealIoFailurePropagates();
   directoryFsyncUnsupportedAndMissingAreStillTolerated();
+  // PR #33/#29 merge-verification correction to frontier-panel finding #4 (2026-09-20):
+  ensureDirFsyncsThePreexistingParentOfTheTopmostNewAncestor();
   operatorConfirmedExecutedRetainsTheCrossConnectionSignature();
   operatorConfirmedExecutedWithoutAKeyWritesNoSignature();
   abandonConnectionKeepsTheWalWhenTheIntentScanFails();
