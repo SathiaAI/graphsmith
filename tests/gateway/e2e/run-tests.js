@@ -36,6 +36,8 @@ const { writeConfirmedMode } = require("../_fixtures/mode-file.js");
 const { walkGatewaySessions } = require(path.join(ROOT, "checks", "register-gateway-sessions.js"));
 const chain = require(path.join(ROOT, "scripts", "gateway", "chain.js"));
 const { verifyBundle } = require(path.join(ROOT, "scripts", "gsa-verify.js"));
+const recovery = require(path.join(ROOT, "scripts", "gateway", "recovery.js"));
+const { WriterClaim } = require(path.join(ROOT, "scripts", "writer-claim.js"));
 
 let failures = 0;
 const results = [];
@@ -582,6 +584,115 @@ async function httpAgentSessionsAreIdBasedNotSocketBased() {
   await gw.exitCode();
 }
 
+/** Polls the on-disk quarantine directory (proxy.js#quarantineSealedBundle) rather
+ * than sleeping a fixed duration -- matches this suite's own "signal, not sleep"
+ * discipline (see waitForHttpPort above). A quarantined bundle appearing is the
+ * externally-observable proof that a real closeConnection ran chain.appendSession,
+ * hit the genuine chain-integrity failure, and (per round-1 fix-plan commit 6) latched
+ * admission -- agent-transport.js's own DELETE handler fires closeConnection
+ * fire-and-forget (never awaited before the 204 response), so this cannot be inferred
+ * from the DELETE response alone. */
+function waitForQuarantinedBundle(stateDir, timeoutMs = 5000) {
+  const quarantineDir = path.join(chain.sessionsDir(stateDir), "quarantine");
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      if (fs.existsSync(quarantineDir) && fs.readdirSync(quarantineDir).length > 0) {
+        resolve();
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error("timed out waiting for a quarantined bundle to appear"));
+        return;
+      }
+      setTimeout(poll, 25);
+    };
+    poll();
+  });
+}
+
+function httpDelete(port, token, sessionId) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, method: "DELETE", headers: { authorization: `Bearer ${token}`, "mcp-session-id": sessionId } }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/** Round-1 fix-plan commit 6, full-stack wiring proof: a genuine chain-integrity
+ * failure discovered by a RUNNING gateway's own append-time check (commit 4,
+ * chain.js#checkHeadAgainstTailOrRepair) must immediately refuse every subsequent new
+ * session admission on that same process -- not merely be recorded for the next
+ * restart. Uses the HTTP agent transport (unlike the stdio-based tests above, it
+ * supports multiple independent, still-running sessions on one live gateway process),
+ * and corrupts HEAD.json on disk from this TEST process -- deliberately not via any
+ * chain.js private test hook, since chain.js's own process-local latch lives inside
+ * the SEPARATE gateway subprocess and can only actually be exercised by making that
+ * subprocess's own code discover the divergence itself. */
+async function chainIntegrityLatchRefusesNewHttpSessionAdmission() {
+  const root = freshRoot("chain-integrity-http");
+  writeConfirmedMode(root, "standalone");
+  const tokenPath = path.join(root, "agent-token.txt");
+  fs.writeFileSync(tokenPath, "a-fake-but-long-enough-bearer-token-value");
+  const { configPath, stateDir } = writeGatewayConfig(root, { agent_listen: { transport: "http", token_ref: tokenPath } });
+  const gw = spawnGateway(root, configPath);
+  const port = await waitForHttpPort(gw);
+  const token = fs.readFileSync(tokenPath, "utf8").trim();
+
+  // Session A: a normal, fully clean session, sealed via an explicit DELETE -- gives
+  // the chain a real, verified first entry to fork HEAD against below.
+  const initA = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-A", version: "1.0" } } });
+  const sessionA = initA.headers["mcp-session-id"];
+  await httpNotify(port, token, { jsonrpc: "2.0", method: "notifications/initialized" }, undefined, sessionA);
+  await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, undefined, sessionA);
+  const deleteAStatus = await httpDelete(port, token, sessionA);
+  check("e2e-chain-integrity-session-a-deletes-cleanly", deleteAStatus === 204, String(deleteAStatus));
+
+  const realHead = chain.readHead(stateDir);
+  check("e2e-chain-integrity-fixture-session-a-actually-sealed", Boolean(realHead) && realHead.seq === 1, JSON.stringify(realHead));
+
+  // Corrupt HEAD.json into a genuine fork -- the same "worse than single-step lag"
+  // divergence commit 4's append-time check refuses and latches on -- directly on
+  // disk, exactly like the startup-hard-fail test above does for reconcileHead.
+  const forkedHead = Object.assign({}, realHead, { entry_sha256: "9".repeat(64) });
+  fs.writeFileSync(chain.headPath(stateDir), JSON.stringify(forkedHead));
+
+  // Session B: admission itself is unaffected (nothing has re-checked HEAD since
+  // session A's own clean append) -- it is session B's own CLOSE that is the append
+  // which discovers the fork, refuses it (quarantining the sealed bundle), and
+  // latches admission for the whole process.
+  const initB = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-B", version: "1.0" } } });
+  const sessionB = initB.headers["mcp-session-id"];
+  check("e2e-chain-integrity-session-b-opens-fine-before-the-close-time-check-reruns", typeof sessionB === "string" && sessionB.length > 0, JSON.stringify(initB.body));
+  await httpNotify(port, token, { jsonrpc: "2.0", method: "notifications/initialized" }, undefined, sessionB);
+  await httpPost(port, token, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "fixture_echo", arguments: {} } }, undefined, sessionB);
+  const deleteBStatus = await httpDelete(port, token, sessionB);
+  check("e2e-chain-integrity-session-b-delete-still-returns-204-even-though-its-append-was-refused", deleteBStatus === 204, String(deleteBStatus));
+
+  // Wait for externally-observable proof that closeConnection's own chain.appendSession
+  // ran and was refused (see waitForQuarantinedBundle's own doc comment on why this
+  // cannot be inferred from the DELETE response alone).
+  await waitForQuarantinedBundle(stateDir);
+  check("e2e-chain-integrity-chain-not-advanced-past-session-a", chain.readChain(stateDir).length === 1, JSON.stringify(chain.readChain(stateDir).map((e) => e.seq)));
+
+  // Session C: a brand-new admission attempt AFTER the latch -- commit 6's own primary
+  // enforcement point. Must be refused immediately by openConnection, surfaced by
+  // agent-transport.js's existing openSession() try/catch as a 503 naming the reason.
+  const initC = await httpPost(port, token, { jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-C", version: "1.0" } } });
+  check(
+    "e2e-chain-integrity-latch-refuses-new-session-admission",
+    Boolean(initC.body && initC.body.error && /chain-integrity/i.test(initC.body.error.message) && /GATEWAY_CHAIN_INTEGRITY_FAILED|chain-integrity failure is latched/i.test(initC.body.error.message)),
+    JSON.stringify(initC.body)
+  );
+  check("e2e-chain-integrity-latch-mints-no-session-id-for-the-refused-attempt", !initC.headers["mcp-session-id"], JSON.stringify(initC.headers));
+
+  gw.child.kill();
+  await gw.exitCode();
+}
+
 /** Codex PR #29 review "validate initialize before allocating an HTTP session": a
  * headerless request whose method is "initialize" but whose envelope is otherwise
  * malformed (missing "jsonrpc": "2.0" here) previously still got a real session with a
@@ -714,6 +825,62 @@ async function cleanSigtermDrainsAndExitsZero() {
   check("e2e-sigterm-session-still-finalized-and-persisted", head && head.seq === 1, JSON.stringify(head));
 }
 
+/* Codex PR #33 review "release the writer claim when intent cleanup aborts shutdown":
+ * closeConnection's own recovery.listIntentsForConnection can throw on a genuinely
+ * unreadable/corrupt intent FILE (a real fs-level problem, distinct from the content
+ * issues it already tolerates) -- previously unguarded in gateway.js's shutdown loop, so
+ * that exception escaped doStop() entirely, skipping every remaining step including
+ * writerClaim.release() and leaking a stale claim that blocks the next start.
+ *
+ * Round-N fix (frontier-panel finding #1) changed WHERE this failure surfaces: before
+ * that fix, closeConnection's own intent-fencing loop threw before this.sessions.delete
+ * ran, leaving a ghost session that gateway.js's shutdown loop (iterating
+ * proxy.sessions.keys()) would then redundantly retry and log via its own "SHUTDOWN
+ * CLOSE FAILURE" wording -- this test originally asserted on THAT retry's log line.
+ * Finding #1's fix makes closeConnection always clean up this.sessions/agentInitialized
+ * (try/finally), which removes the ghost session and therefore the redundant shutdown-
+ * loop retry entirely: the SAME fixture's single stdio-disconnect handler call now fails,
+ * cleans up, and is the ONLY attempt -- so it never reaches gateway.js's shutdown loop at
+ * all (the connection is already gone from proxy.sessions by the time that loop runs).
+ * agent-transport.js's own stdio-disconnect catch was updated in the same round to log
+ * this (previously-silent) failure via "CONNECTION CLOSE FAILURE" instead, so this test
+ * now looks for that wording -- still proving the failure was hit and handled, just via
+ * its new (and, post-fix, only) logging surface rather than the old redundant one. */
+async function sigtermStillReleasesClaimWhenAConnectionsCloseFails() {
+  if (process.platform === "win32") {
+    skip("e2e-sigterm-releases-claim-despite-close-failure", "Windows cannot deliver a real SIGTERM for graceful in-process handling -- same platform limitation as the other SIGTERM test.");
+    return;
+  }
+  const root = freshRoot("sigterm-close-failure");
+  writeConfirmedMode(root, "standalone");
+  const { configPath, stateDir } = writeGatewayConfig(root);
+  const gw = spawnGateway(root, configPath);
+
+  gw.send({ jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+  const initResp = await gw.nextMessage();
+  check("e2e-close-failure-preinitialize-succeeded", initResp && initResp.id === 0 && initResp.result, JSON.stringify(initResp));
+
+  // Corrupt an intent record on disk -- listIntentsForConnection's own readdirSync scan
+  // reads EVERY intent file regardless of which connection it names, so this breaks the
+  // scan for the live stdio connection's own closeConnection() at shutdown, the same way
+  // a real fs-level I/O error would (a directory where a file is expected reproduces
+  // EISDIR, mirroring this suite's own existing "unreadable WAL" fixtures elsewhere).
+  fs.mkdirSync(recovery.intentsDir(stateDir), { recursive: true });
+  fs.mkdirSync(recovery.intentPath(stateDir, "corrupt-intent"));
+
+  gw.child.kill("SIGTERM");
+  const code = await gw.exitCode();
+  check("e2e-close-failure-still-exits-zero", code === 0, `exit code ${code}; stderr: ${gw.stderr()}`);
+  check("e2e-close-failure-logged-the-isolated-failure", gw.stderr().includes("CONNECTION CLOSE FAILURE"), gw.stderr());
+
+  // Decisive proof the claim was actually released (not merely that the process exited):
+  // a brand-new instance must be able to acquire it immediately, with no stale lease wait.
+  const fresh = new WriterClaim(stateDir, { hostId: "post-shutdown-check" });
+  let acquireError = null;
+  try { fresh.acquire(); fresh.release(); } catch (error) { acquireError = error; }
+  check("e2e-close-failure-writer-claim-still-released", acquireError === null, acquireError && acquireError.message);
+}
+
 /* Cluster E (partial fix): checkModeGate's root must track configPath's own directory,
  * not process.cwd() -- `gateway.js --config /path/to/project-b/gateway.json` run with
  * cwd somewhere else entirely must still validate project B's own
@@ -814,10 +981,12 @@ async function main() {
   await agentHttpListenerRejectsNonPostMethod();
   await agentHttpListenerBindFailureRejectedCleanly();
   await httpAgentSessionsAreIdBasedNotSocketBased();
+  await chainIntegrityLatchRefusesNewHttpSessionAdmission();
   await httpFailedInitializeDoesNotLeakSession();
   await modeDormantExitsZero();
   await secondInstanceRefused();
   await cleanSigtermDrainsAndExitsZero();
+  await sigtermStillReleasesClaimWhenAConnectionsCloseFails();
   await modeGateRootTracksConfigPathNotCwd();
   await statusCommandReadsRunningGatewaysStatusFile();
 

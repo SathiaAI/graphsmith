@@ -155,7 +155,53 @@ function runStdioAgentTransport(ctx) {
         reject(new Error("agent stdio disconnected before responding to a pushed request"));
       }
       pendingPushed.clear();
-      await ctx.proxy.closeConnection(connectionId, "agent stdio disconnected");
+      /* Pre-existing gap surfaced by merging PR #29's gateway.js doStop() fix ("await
+       * close() so a downstream ... is actually confirmed gone" -- Codex PR #29 review
+       * round 8): this listener runs as an async callback on the readline "close" EVENT,
+       * which nothing awaits or catches -- a rejection here (e.g. closeConnection's own
+       * intent-fencing loop hitting an unreadable/corrupt recovery intent, see
+       * proxy.js#closeConnection) becomes an unhandled promise rejection that crashes the
+       * WHOLE gateway process. This is not specific to shutdown: any ordinary stdio
+       * disconnect that races an unreadable intent for this connection hits the same
+       * path. gateway.js's own doStop() loop already guards its own (redundant, in the
+       * shutdown case) call to closeConnection for exactly this failure mode -- mirror
+       * that guard here so a single connection's fs-level intent corruption can never take
+       * the process down. Note this failure throws before closeConnection reaches its own
+       * onSealFailure/recordAnomaly reporting (both live further down, past the
+       * intent-fencing loop that threw), so outside of a shutdown that also runs
+       * gateway.js's own logged loop for this same connectionId, this catch previously had
+       * no logging surface of its own -- silently swallowing was a deliberate "never let
+       * one connection's fs corruption take the whole process down" choice, not a claim
+       * that the failure is reported elsewhere.
+       *
+       * Round-N fix (frontier-panel finding #1's own follow-on): proxy.js#closeConnection
+       * now guarantees this.sessions/this.agentInitialized are always cleaned up (a
+       * try/finally around the same intent-fencing loop this comment describes), which
+       * removes the ghost session that previously let gateway.js's own shutdown loop
+       * redundantly retry (and loudly log) THIS SAME failure a second time during a
+       * shutdown -- so this catch is now, in the ordinary case, the ONLY place this
+       * failure is ever surfaced at all, not just the no-shutdown case the paragraph
+       * above originally scoped this to. ctx.log (when provided -- see gateway.js's own
+       * call site) closes exactly the gap that paragraph named as "a reasonable follow-up
+       * but out of scope"; still best effort, so a throwing logger cannot turn an
+       * already-swallowed close failure into a crash. */
+      try {
+        await ctx.proxy.closeConnection(connectionId, "agent stdio disconnected");
+      } catch (error) {
+        // best effort only -- matches this file's own process.stdout "error" listener
+        // above, which absorbs a comparable stream-level failure for the same reason.
+        if (typeof ctx.log === "function") {
+          try {
+            ctx.log(
+              `CONNECTION CLOSE FAILURE for connection "${connectionId}" (agent stdio disconnected): ` +
+                `${error.message} (${error.code || "no code"}) -- session state was still cleaned up; ` +
+                "this connection will not be retried during shutdown."
+            );
+          } catch (logError) {
+            // never let a failing logger turn an already-swallowed close failure into a crash.
+          }
+        }
+      }
       resolve();
     });
   });
@@ -230,12 +276,30 @@ function runHttpAgentTransport(ctx, listenConfig, token) {
 
   const httpSessions = new Map(); // sessionId -> { idleTimer } -- transport-level bookkeeping proxy.js has no reason to know about.
 
+  /* Round-N fix (frontier-panel finding #1's own follow-on): same rationale as the stdio
+   * transport's own closeConnection catch above -- proxy.js#closeConnection's
+   * try/finally now guarantees session cleanup even when the intent-fencing loop throws,
+   * but this call site previously swallowed that failure with no logging surface at all.
+   * ctx.log (best effort; never lets a throwing logger turn this into a crash) closes the
+   * same gap here. */
   function sealSession(sessionId, reason) {
     const entry = httpSessions.get(sessionId);
     if (!entry) return;
     clearTimeout(entry.idleTimer);
     httpSessions.delete(sessionId);
-    ctx.proxy.closeConnection(sessionId, reason).catch(() => {});
+    ctx.proxy.closeConnection(sessionId, reason).catch((error) => {
+      if (typeof ctx.log === "function") {
+        try {
+          ctx.log(
+            `CONNECTION CLOSE FAILURE for connection "${sessionId}" (${reason}): ` +
+              `${error.message} (${error.code || "no code"}) -- session state was still cleaned up; ` +
+              "this connection will not be retried during shutdown."
+          );
+        } catch (logError) {
+          // never let a failing logger turn an already-swallowed close failure into a crash.
+        }
+      }
+    });
   }
 
   function touchSession(sessionId) {
