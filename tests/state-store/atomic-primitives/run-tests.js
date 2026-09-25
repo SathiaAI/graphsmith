@@ -42,6 +42,20 @@ function check(name, cond, reason) {
   if (cond) record(name, "PASS"); else record(name, "FAIL", reason);
 }
 
+/* POSIX file-mode-bit assertions are meaningless on win32: fchmodSync/chmod are no-ops
+ * there, so a freshly created file just keeps whatever default mode Windows reports,
+ * never the exact 0640/0644 this codebase enforces on POSIX. Route every exact-mode
+ * check through this helper instead of a bare check() so it skips (not fails) on win32,
+ * matching the SKIP convention already used elsewhere in this test suite family
+ * (tests/gateway/recovery/run-tests.js, tests/gateway/startup-permissions/run-tests.js). */
+function checkPosixMode(name, actualMode, expectedMode, reason) {
+  if (process.platform === "win32") {
+    record(name, "SKIP", "POSIX file mode bits do not apply on win32");
+    return;
+  }
+  check(name, actualMode === expectedMode, reason);
+}
+
 function freshDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `gs-atomic-${prefix}-`));
 }
@@ -282,7 +296,7 @@ function atomicCreateExclusiveDefaultModeIsGroupReadable() {
   const target = path.join(dir, "record.json");
   stateStore.atomicCreateExclusive(target, "payload");
   const mode = fs.statSync(target).mode & 0o777;
-  check("atomicCreateExclusive-default-mode-is-0640", mode === 0o640,
+  checkPosixMode("atomicCreateExclusive-default-mode-is-0640", mode, 0o640,
     `expected the new access-model default 0640, got ${mode.toString(8)}`);
 }
 
@@ -292,7 +306,7 @@ function atomicOverwriteFileDefaultModeIsGroupReadable() {
   fs.writeFileSync(target, "seed");
   stateStore.atomicOverwriteFile(target, "new-content", dir);
   const mode = fs.statSync(target).mode & 0o777;
-  check("atomicOverwriteFile-default-mode-is-0640", mode === 0o640,
+  checkPosixMode("atomicOverwriteFile-default-mode-is-0640", mode, 0o640,
     `expected the new access-model default 0640, got ${mode.toString(8)}`);
 }
 
@@ -310,7 +324,7 @@ function atomicCreateExclusiveUmaskZeroStillProducesConfiguredMode() {
     stateStore.atomicCreateExclusive(target, "payload");
   });
   const mode = fs.statSync(target).mode & 0o777;
-  check("atomicCreateExclusive-umask-0-still-yields-0640-not-0666", mode === 0o640,
+  checkPosixMode("atomicCreateExclusive-umask-0-still-yields-0640-not-0666", mode, 0o640,
     `expected 0640 regardless of umask 0 -- a result of 0666 here would mean fchmodSync ` +
     `is not actually running, only the ambient umask is -- got ${mode.toString(8)}`);
 }
@@ -333,9 +347,9 @@ function atomicOverwriteFileRenameCarriesNewInodeModeOverPreExistingFile() {
     stateStore.atomicOverwriteFile(target, "new-content", dir);
   });
   const mode = fs.statSync(target).mode & 0o777;
-  check("atomicOverwriteFile-pre-existing-target-really-was-0644", preExistingMode === 0o644,
+  checkPosixMode("atomicOverwriteFile-pre-existing-target-really-was-0644", preExistingMode, 0o644,
     `test setup invariant broken: expected the pre-existing target to be 0644, got ${preExistingMode.toString(8)}`);
-  check("atomicOverwriteFile-rename-carries-new-inode-mode-not-preexisting-0644", mode === 0o640,
+  checkPosixMode("atomicOverwriteFile-rename-carries-new-inode-mode-not-preexisting-0644", mode, 0o640,
     `expected the post-rename target to carry the NEW temp file's mode (0640), not the ` +
     `pre-existing target's 0644 -- got ${mode.toString(8)}`);
   check("atomicOverwriteFile-rename-carries-new-inode-mode-content-still-correct",
@@ -496,7 +510,8 @@ function main() {
 
   const passed = results.filter((r) => r.status === "PASS").length;
   const failed = results.filter((r) => r.status === "FAIL").length;
-  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=0`);
+  const skipped = results.filter((r) => r.status === "SKIP").length;
+  console.log(`SUMMARY passed=${passed} failed=${failed} skipped=${skipped}`);
   process.exit(failures ? 1 : 0);
 }
 

@@ -54,6 +54,20 @@ function check(name, cond, reason) {
   record(name, cond ? "PASS" : "FAIL", reason);
 }
 
+/* POSIX file-mode-bit assertions are meaningless on win32: chmod/fchmod are no-ops there,
+ * so a tightened file/dir just keeps whatever default mode Windows reports, never the
+ * exact 0640/0750/0644 this pass enforces on POSIX. Route every exact-mode check through
+ * this helper instead of a bare check() so it skips (not fails) on win32, matching the
+ * SKIP convention this file already uses for its two runtime-creation-mode tests below. */
+function checkPosixMode(name, actualMode, expectedMode, reason) {
+  if (process.platform === "win32") {
+    console.log(`SKIP ${name} (POSIX modes are not meaningful on win32)`);
+    results.push({ name, status: "SKIP", reason: "win32" });
+    return;
+  }
+  check(name, actualMode === expectedMode, reason);
+}
+
 function freshDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `gs-startup-permissions-${prefix}-`));
 }
@@ -181,24 +195,24 @@ function tightenStateDirPermissionsRetrofitsEveryRealSensitivePathToTheAccessMod
 
   const changed = startupPermissions.tightenStateDirPermissions(dir);
 
-  check("real-writer-claim-file-tightened-to-0640", mode(claimPath) === 0o640, mode(claimPath).toString(8));
-  check("real-bundle-file-tightened-to-0640", mode(chain.bundlePath(dir, "bundle-real-1")) === 0o640, "");
-  check("real-chain-jsonl-tightened-to-0640", mode(chain.chainPath(dir)) === 0o640, "");
-  check("real-head-json-tightened-to-0640", mode(chain.headPath(dir)) === 0o640, "");
-  check("real-quarantined-bundle-tightened-to-0640", mode(quarantinedBundlePath) === 0o640, "");
-  check("real-wal-file-tightened-to-0640", mode(walPath) === 0o640, "");
-  check("real-intent-file-tightened-to-0640", mode(intentPath) === 0o640, "");
-  check("real-signature-file-tightened-to-0640", mode(signaturePath) === 0o640, "");
+  checkPosixMode("real-writer-claim-file-tightened-to-0640", mode(claimPath), 0o640, mode(claimPath).toString(8));
+  checkPosixMode("real-bundle-file-tightened-to-0640", mode(chain.bundlePath(dir, "bundle-real-1")), 0o640, "");
+  checkPosixMode("real-chain-jsonl-tightened-to-0640", mode(chain.chainPath(dir)), 0o640, "");
+  checkPosixMode("real-head-json-tightened-to-0640", mode(chain.headPath(dir)), 0o640, "");
+  checkPosixMode("real-quarantined-bundle-tightened-to-0640", mode(quarantinedBundlePath), 0o640, "");
+  checkPosixMode("real-wal-file-tightened-to-0640", mode(walPath), 0o640, "");
+  checkPosixMode("real-intent-file-tightened-to-0640", mode(intentPath), 0o640, "");
+  checkPosixMode("real-signature-file-tightened-to-0640", mode(signaturePath), 0o640, "");
 
-  check("real-state-dir-tightened-to-0750", mode(dir) === 0o750, "");
-  check("real-sessions-dir-tightened-to-0750", mode(chain.sessionsDir(dir)) === 0o750, "");
-  check("real-quarantine-dir-tightened-to-0750", mode(quarantineDir) === 0o750, "");
-  check("real-recovery-dir-tightened-to-0750", mode(recovery.recoveryDir(dir)) === 0o750, "");
-  check("real-active-dir-tightened-to-0750", mode(recovery.activeDir(dir)) === 0o750, "");
-  check("real-intents-dir-tightened-to-0750", mode(recovery.intentsDir(dir)) === 0o750, "");
-  check("real-signatures-dir-tightened-to-0750", mode(recovery.signaturesDir(dir)) === 0o750, "");
+  checkPosixMode("real-state-dir-tightened-to-0750", mode(dir), 0o750, "");
+  checkPosixMode("real-sessions-dir-tightened-to-0750", mode(chain.sessionsDir(dir)), 0o750, "");
+  checkPosixMode("real-quarantine-dir-tightened-to-0750", mode(quarantineDir), 0o750, "");
+  checkPosixMode("real-recovery-dir-tightened-to-0750", mode(recovery.recoveryDir(dir)), 0o750, "");
+  checkPosixMode("real-active-dir-tightened-to-0750", mode(recovery.activeDir(dir)), 0o750, "");
+  checkPosixMode("real-intents-dir-tightened-to-0750", mode(recovery.intentsDir(dir)), 0o750, "");
+  checkPosixMode("real-signatures-dir-tightened-to-0750", mode(recovery.signaturesDir(dir)), 0o750, "");
 
-  check("gateway-status-json-mode-untouched-by-this-pass", mode(statusPath) === 0o644,
+  checkPosixMode("gateway-status-json-mode-untouched-by-this-pass", mode(statusPath), 0o644,
     `expected the operator status file to be left at 0644, got ${mode(statusPath).toString(8)}`);
   check("gateway-status-json-not-reported-as-changed",
     !changed.files.includes(statusPath), JSON.stringify(changed.files));
@@ -223,7 +237,7 @@ function freshDeploymentWithNothingOnDiskYetDoesNotThrow() {
     changed && changed.dirs.includes(dir), JSON.stringify(changed));
   check("empty-state-dir-reports-no-files-changed",
     changed && changed.files.length === 0, JSON.stringify(changed));
-  check("empty-state-dir-mode-is-0750", mode(dir) === 0o750, mode(dir).toString(8));
+  checkPosixMode("empty-state-dir-mode-is-0750", mode(dir), 0o750, mode(dir).toString(8));
 }
 
 function partiallyPopulatedDeploymentSkipsWhatIsMissingAndTightensWhatExists() {
@@ -239,8 +253,8 @@ function partiallyPopulatedDeploymentSkipsWhatIsMissingAndTightensWhatExists() {
   try { changed = startupPermissions.tightenStateDirPermissions(dir); }
   catch (error) { threw = error; }
   check("partial-deployment-does-not-throw", threw === null, threw && threw.message);
-  check("partial-deployment-tightens-the-existing-claim-file",
-    mode(claim.path) === 0o640, mode(claim.path).toString(8));
+  checkPosixMode("partial-deployment-tightens-the-existing-claim-file",
+    mode(claim.path), 0o640, mode(claim.path).toString(8));
   check("partial-deployment-reports-only-the-existing-file",
     changed.files.length === 1 && changed.files[0] === claim.path, JSON.stringify(changed.files));
 }
