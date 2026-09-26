@@ -32,8 +32,14 @@ let failures = 0;
 const results = [];
 
 function record(name, status, reason) {
-  const line = status === "PASS" ? `PASS ${name}` : `FAIL ${name}+${reason || "unknown"}`;
-  console.log(line);
+  /* Codex PR #34 review: checkPosixMode's SKIP calls (below) were being printed with the
+   * generic "FAIL" prefix -- this function only special-cased "PASS", treating every other
+   * status (including a deliberate SKIP) as "FAIL" text even though `failures` and the
+   * SUMMARY line correctly counted it as skipped, not failed. That left Windows CI logs
+   * showing "FAIL ..." lines for assertions that actually passed (by skipping), which is
+   * misleading even though the process still exits 0. */
+  const prefix = status === "PASS" ? "PASS" : status === "SKIP" ? "SKIP" : "FAIL";
+  console.log(`${prefix} ${name}${status === "PASS" ? "" : `+${reason || "unknown"}`}`);
   results.push({ name, status, reason: reason || "" });
   if (status === "FAIL") failures++;
 }
