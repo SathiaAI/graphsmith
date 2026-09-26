@@ -5,7 +5,7 @@
 <img src="assets/banner.png" alt="GraphSmith — agent workflows that survive" width="820">
 
 
-**Describe the job. Approve the plan. Get an AI workflow that's *tested* to survive failure — before you ever trust it.**
+**GraphSmith is a free, open-source tool that generates AI agent workflows that survive crashes, never duplicate work and don't hallucinate code.**
 
 [![Website](https://img.shields.io/badge/Website-graphsmith.ai-F5A623?labelColor=2B1D18)](https://graphsmith.ai) [![Docs](https://img.shields.io/badge/Docs-graphsmith.wiki-7B2230?labelColor=2B1D18)](https://graphsmith.wiki) [![Adversarially reviewed](https://img.shields.io/badge/adversarially%20reviewed-GPT--5.1%20%C2%B7%20Gemini%202.5%20Pro%20%C2%B7%20DeepSeek%20R1-E8850C?labelColor=0D1117)](docs/reviews/) [![GSA](https://img.shields.io/badge/GSA-v0.3--draft-6E40C9?labelColor=0D1117)](docs/GSA-CONFORMANCE.md) [![gauntlet](https://img.shields.io/badge/gauntlet-395%2F395%20HOLD%20%C2%B7%200%20BREAK-1F883D?labelColor=0D1117)](tests/gauntlet/v0.4.0-battery.js) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![npm](https://img.shields.io/badge/npm-graphsmith--skill-red)](https://www.npmjs.com/package/graphsmith-skill) [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-open%20standard-blue)](https://agentskills.io) [![Release](https://img.shields.io/github/v/release/SathiaAI/graphsmith)](https://github.com/SathiaAI/graphsmith/releases) [![CI](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml/badge.svg)](https://github.com/SathiaAI/graphsmith/actions/workflows/ci.yml)
 
@@ -287,3 +287,7 @@ Open an issue with your agent name/version, OS, and the failing script's output.
 ---
 
 Born from building [Sathia](https://sathia.ai) - where "just say it" becomes action.
+
+---
+
+GraphSmith is built and run by [Viaknox](https://viaknox.com/products).
