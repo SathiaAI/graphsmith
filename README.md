@@ -286,7 +286,7 @@ Open an issue with your agent name/version, OS, and the failing script's output.
 
 ---
 
-Born from building [Sathia](https://sathia.ai) - where "just say it" becomes action.
+Built by [Viaknox](https://viaknox.com).
 
 ---
 
